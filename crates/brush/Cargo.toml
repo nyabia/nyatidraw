@@ -1,0 +1,10 @@
+[package]
+name = "nyatidraw-brush"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nyatidraw-input.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,7 @@
+[package]
+name = "nyatidraw-api"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "nyatidraw-tiles"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+blake3.workspace = true
+nyatidraw-api.workspace = true
+
+[lints]
+workspace = true

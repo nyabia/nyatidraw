@@ -1,0 +1,17 @@
+/target/
+/.nyatidraw/
+/.playwright-cli/
+/output/
+/vendor/
+
+# Local editor and environment state
+/.idea/
+/.vscode/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+*.log
+*.trace
+*.profile.json

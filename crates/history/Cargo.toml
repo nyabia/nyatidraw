@@ -1,0 +1,12 @@
+[package]
+name = "nyatidraw-history"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nyatidraw-api.workspace = true
+nyatidraw-brush.workspace = true
+nyatidraw-stroke.workspace = true
+
+[lints]
+workspace = true

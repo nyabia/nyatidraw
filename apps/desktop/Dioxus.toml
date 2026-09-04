@@ -1,0 +1,8 @@
+[application]
+name = "NyatiDraw"
+asset_dir = "assets"
+
+[bundle]
+identifier = "io.nyati.draw"
+publisher = "NyatiDraw"
+short_description = "Native ink drawing application"

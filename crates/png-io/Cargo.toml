@@ -1,0 +1,12 @@
+[package]
+name = "nyatidraw-png-io"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nyatidraw-api.workspace = true
+nyatidraw-tiles.workspace = true
+png.workspace = true
+
+[lints]
+workspace = true

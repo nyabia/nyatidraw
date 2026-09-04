@@ -1,0 +1,18 @@
+[package]
+name = "nyatidraw-editor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nyatidraw-api.workspace = true
+nyatidraw-brush.workspace = true
+nyatidraw-diagnostics.workspace = true
+nyatidraw-document.workspace = true
+nyatidraw-history.workspace = true
+nyatidraw-input.workspace = true
+nyatidraw-project.workspace = true
+nyatidraw-stroke.workspace = true
+nyatidraw-tiles.workspace = true
+
+[lints]
+workspace = true

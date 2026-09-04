@@ -1,0 +1,134 @@
+# Windows 개발판 설치와 파일 연결
+
+## 목적
+
+NyatiDraw 개발판을 매 빌드마다 무거운 설치 프로그램 없이 사용자별 고정 경로에
+갱신한다. `.ntdr`은 직접 열고, `.png`에서는 Windows `Open with` 후보로 NyatiDraw를
+선택할 수 있어야 한다.
+
+```text
+game-project/art/player.png를 NyatiDraw로 열기
+  -> sibling player.ntdr 탐색
+  -> 있으면 project 열기
+  -> 없으면 PNG를 가져와 player.ntdr 복구 원본 즉시 생성
+  -> Save 시 최신 player.ntdr 확인 후 PNG export
+  -> player.png background export
+```
+
+자세한 pair 규칙은 [Godot 작업 폴더와 PNG 연결](godot-integration.md)이 정한다.
+
+## 두 가지 배포 경로
+
+### 빠른 개발 설치
+
+`tools/install-dev.ps1`은 다음을 수행한다.
+
+1. `dx build --release --windows --renderer webview --package nyatidraw-desktop --locked`
+2. DX가 수집한 app과 assets를 `%LOCALAPPDATA%\Programs\NyatiDraw Development`의
+   고정 경로에 설치
+3. 현재 사용자 범위에 `.ntdr` open handler와 아이콘 등록
+4. NyatiDraw를 `.png`의 `Open with` 후보로 등록하되 기본 PNG 앱은 유지
+5. Shell association 변경 알림
+
+관리자 권한은 요구하지 않는다. 설치 갱신은 실행 중인 프로세스를 확인하고 파일을
+반쯤 교체하지 않는다.
+
+앱 시작 시 Windows parent window는 현재 커서가 있는 모니터의 작업 영역을 기준으로
+최대화를 시도한다. Win32 모니터 조회나 위치 변경이 실패하면 오류를 로그에 남기고
+OS 기본 최대화로 계속 실행하므로 설치/업데이트 경로와는 독립적이다. 다중 모니터와
+DPI 조합의 실제 수동 검증은 아직 미검증이다.
+
+### 마일스톤 설치
+
+DX CLI가 지원하는 NSIS bundle을 기준으로 한다.
+
+```powershell
+dx bundle --release --windows --renderer webview `
+  --package nyatidraw-desktop --package-types nsis --locked
+```
+
+MSI는 조직 배포 요구가 생길 때 추가한다. 정식 배포 서명, update, clean-VM 공개판
+uninstall 검증은 Sprint 8 범위다.
+
+## 파일 형식 등록
+
+### NyatiDraw project
+
+| 항목 | 값 |
+|---|---|
+| 확장자 | `.ntdr` |
+| 표시 이름 | `NyatiDraw Project` |
+| versioned ProgID | `NyatiDraw.Project.1` |
+| open command | `\"<installed exe>\" \"%1\"` |
+
+### PNG Open With
+
+| 항목 | 값 |
+|---|---|
+| 대상 | `.png` |
+| application key | `Applications\\NyatiDraw.exe` |
+| open command | `\"<installed exe>\" \"%1\"` |
+| 정책 | supported/open-with 등록만 수행; PNG 기본 handler는 변경하지 않음 |
+
+개발판은 Windows에 정확히 `NyatiDraw`로 표시되고, 기본 등록 위치는 `HKCU\Software\Classes`다. `.ntdr`에는 versioned ProgID,
+`DefaultIcon`, `shell\open\command`를 등록한다. PNG에는 NyatiDraw application open
+command와 supported type만 등록한다. Windows `UserChoice`는 installer나 앱이
+강제로 바꾸지 않는다.
+
+Windows Shell은 HKCU와 HKLM의 `Software\Classes`를 합친 view를 사용하고 사용자
+등록을 우선한다. 등록 변경 뒤에는 `SHChangeNotify(SHCNE_ASSOCCHANGED)`를 호출한다.
+설치 스크립트는 build나 설치 경로 교체 전에 기존 `.ntdr` handler와 NyatiDraw registry
+command의 소유권을 확인해 다른 앱의 등록을 덮어쓰지 않는다. 이미 설치된 과거 개발판이
+`NyatiDrawDevOwner` marker가 있는 현재 개발판 등록만 갱신한다. marker가 없거나 네
+루트와 명시된 자식 키에 다른 값·자식이 있거나 일부만 존재하면 승계하지 않고 즉시
+fail-closed 한다. 이전 무표식 개발판을 자동 채택하는 일회성 호환 분기는 유지하지
+않는다.
+
+- [Microsoft: HKEY_CLASSES_ROOT와 사용자별 Classes](https://learn.microsoft.com/en-us/windows/win32/sysinfo/hkey-classes-root-key)
+- [Microsoft: File Types 등록](https://learn.microsoft.com/en-us/windows/win32/shell/fa-file-types)
+- [Microsoft: ProgID](https://learn.microsoft.com/en-us/windows/win32/shell/fa-progids)
+- [Dioxus 0.7: desktop installer와 DX bundle](https://dioxuslabs.com/learn/0.7/guides/deploy/)
+
+## 앱 activation 계약
+
+- 첫 positional argument 하나를 activation path로 받는다.
+- `.ntdr` path는 missing/정확히 0-byte일 때만 같은 파일에 새 project로 초기화한다.
+- `.png` path는 exact sibling `.ntdr`을 찾고 [PNG activation 규칙](godot-integration.md#png-activation-규칙)을 따른다.
+- non-empty invalid `.ntdr`은 오류를 표시하고 절대 덮어쓰거나 untitled로 fallback하지
+  않는다.
+- 상대 path는 startup 시 canonical absolute path로 고정한다.
+- Windows primary process는 `Local\\NyatiDraw.SingleInstance.v1` named mutex를
+  보유한다. 두 번째 실행은 새 writer를 만들지 않고 bounded UTF-16 named-pipe
+  activation을 primary로 전달한 뒤 종료한다.
+- primary는 parent window restore/foreground를 best-effort 요청하고 child WGPU
+  canvas UI thread에서 activation을 직렬 처리한다. 기존 writer/export FIFO를
+  drain/join해 redb file lock을 먼저 해제한 뒤 새 project를 연다.
+- target `.ntdr`의 non-empty validity와 PNG decode는 기존 문서를 닫기 전에
+  preflight한다. target open이 그 뒤 실패하면 직전 project를 다시 열고 visible
+  activation notice를 보인다. non-empty invalid project는 절대 bootstrap/fallback으로
+  덮지 않는다.
+- 같은 paired `.ntdr`을 PNG 또는 project path로 다시 활성화하면 storage identity가
+  같다고 판정해 reopen하지 않는다. 따라서 competing writer가 생기지 않는다.
+- pipe 전달 실패는 secondary process failure다. secondary가 독자 untitled/project
+  writer로 fallback하지 않는다.
+- 현재 `NAYATI_PROJECT_PATH` 환경변수는 probe 호환용으로만 유지하고 정상 positional
+  activation보다 우선하지 않는다.
+
+2026-09-03 설치판 프로세스 acceptance에서는 `sprint1-check.ntdr`을 연 primary가
+살아 있는 동안 별도 실행으로 `player.ntdr`을 전달했다. secondary는 code 0으로
+종료했고 primary PID 하나만 유지됐으며, CLI에서 첫 project는 즉시 다시 열리고 전달
+대상만 `Locked`로 거부됐다. 이는 IPC와 writer lock 교체 증거다. Explorer의 실제
+`Open with`, foreground 허용, 다중 모니터 시각 결과는 아직 수동 미검증이다.
+
+## 제거 계약
+
+개발판 제거는 자신이 만든 설치 파일과 자신이 소유한 registry value만 제거한다.
+다음은 절대 삭제하지 않는다.
+
+- 사용자의 `.ntdr` 프로젝트
+- sibling PNG와 다른 export
+- PNG의 현재 기본 handler와 `UserChoice`
+- 다른 NyatiDraw 제품의 등록 정보
+
+uninstall 후에도 프로젝트와 PNG는 일반 파일로 남고, 새 버전 재설치나 `Open with`로
+다시 연결할 수 있어야 한다.

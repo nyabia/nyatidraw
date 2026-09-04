@@ -1,0 +1,14 @@
+[package]
+name = "nyatidraw-paint-cpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nyatidraw-brush.workspace = true
+nyatidraw-api.workspace = true
+nyatidraw-document.workspace = true
+nyatidraw-input.workspace = true
+nyatidraw-tiles.workspace = true
+
+[lints]
+workspace = true

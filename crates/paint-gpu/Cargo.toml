@@ -1,0 +1,20 @@
+[package]
+name = "nyatidraw-paint-gpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nyatidraw-api.workspace = true
+nyatidraw-brush.workspace = true
+nyatidraw-document.workspace = true
+nyatidraw-input.workspace = true
+nyatidraw-tiles.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+nyatidraw-input.workspace = true
+nyatidraw-paint-cpu.workspace = true
+pollster = "=0.4.0"
+
+[lints]
+workspace = true

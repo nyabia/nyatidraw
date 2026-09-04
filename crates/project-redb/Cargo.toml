@@ -1,0 +1,31 @@
+[package]
+name = "nyatidraw-project-redb"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# Enables a subprocess-only transaction pause seam used by the scratch crash
+# probe. This is deliberately absent from normal and release production builds.
+diagnostic = []
+
+[[example]]
+name = "crash_recovery_probe"
+required-features = ["diagnostic"]
+
+[dependencies]
+nyatidraw-api.workspace = true
+nyatidraw-document.workspace = true
+nyatidraw-history.workspace = true
+nyatidraw-project.workspace = true
+nyatidraw-stroke.workspace = true
+nyatidraw-tiles.workspace = true
+redb = "=2.6.3"
+
+[dev-dependencies]
+nyatidraw-brush.workspace = true
+nyatidraw-editor.workspace = true
+nyatidraw-input.workspace = true
+nyatidraw-stroke.workspace = true
+
+[lints]
+workspace = true

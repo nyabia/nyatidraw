@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/cli",
+    "apps/desktop",
+    "crates/api",
+    "crates/brush",
+    "crates/diagnostics",
+    "crates/document",
+    "crates/editor",
+    "crates/history",
+    "crates/input",
+    "crates/input-queue",
+    "crates/input-platform",
+    "crates/paint-gpu",
+    "crates/paint-cpu",
+    "crates/png-io",
+    "crates/project",
+    "crates/project-redb",
+    "crates/stroke",
+    "crates/tiles",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+nyatidraw-api = { path = "crates/api" }
+nyatidraw-brush = { path = "crates/brush" }
+nyatidraw-diagnostics = { path = "crates/diagnostics" }
+nyatidraw-document = { path = "crates/document" }
+nyatidraw-editor = { path = "crates/editor" }
+nyatidraw-history = { path = "crates/history" }
+nyatidraw-input = { path = "crates/input" }
+nyatidraw-input-queue = { path = "crates/input-queue" }
+nyatidraw-input-platform = { path = "crates/input-platform" }
+nyatidraw-paint-gpu = { path = "crates/paint-gpu" }
+nyatidraw-paint-cpu = { path = "crates/paint-cpu" }
+nyatidraw-png-io = { path = "crates/png-io" }
+nyatidraw-project = { path = "crates/project" }
+nyatidraw-project-redb = { path = "crates/project-redb" }
+nyatidraw-stroke = { path = "crates/stroke" }
+nyatidraw-tiles = { path = "crates/tiles" }
+blake3 = "=1.8.7"
+dioxus = { version = "=0.7.9", default-features = false, features = ["desktop", "launch", "lib"] }
+dioxus-desktop = { version = "=0.7.9", default-features = false, features = ["tokio_runtime"] }
+pollster = "=0.4.0"
+raw-window-handle = { version = "=0.6.2", features = ["std"] }
+wgpu = "=26.0.1"
+png = "=0.17.16"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

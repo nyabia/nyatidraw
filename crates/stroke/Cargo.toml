@@ -1,0 +1,14 @@
+[package]
+name = "nyatidraw-stroke"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nyatidraw-api.workspace = true
+nyatidraw-brush.workspace = true
+nyatidraw-input.workspace = true
+nyatidraw-paint-cpu.workspace = true
+nyatidraw-tiles.workspace = true
+
+[lints]
+workspace = true
