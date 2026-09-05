@@ -284,3 +284,6 @@ pub const SCHEMA_VERSION: u64 = 1;
 pub const LAYER_HISTORY_SCHEMA_VERSION: u64 = 2;
 /// Selected stroke records require readers that preserve their replay coverage.
 pub const SELECTION_STROKE_SCHEMA_VERSION: u64 = 3;
+
+/// Adds immutable per-snapshot page dimensions and atomic page/cursor restoration.
+pub const CANVAS_HISTORY_SCHEMA_VERSION: u64 = 4;

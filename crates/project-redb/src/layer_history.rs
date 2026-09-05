@@ -5,7 +5,7 @@ use super::{
     ProjectOpenError, ReadableTable, RecordKind, SNAPSHOTS, STATE, SnapshotId, TableDefinition,
     decode_envelope, decode_layer_tree, encode_layer_tree,
 };
-use nyatidraw_project::SELECTION_STROKE_SCHEMA_VERSION;
+use nyatidraw_project::{CANVAS_HISTORY_SCHEMA_VERSION, SELECTION_STROKE_SCHEMA_VERSION};
 use std::collections::BTreeSet;
 
 pub(super) const SNAPSHOT_LAYERS: TableDefinition<&[u8], &[u8]> =
@@ -25,7 +25,9 @@ impl ProjectDb {
             .is_some_and(|value| {
                 matches!(
                     value.value(),
-                    LAYER_HISTORY_SCHEMA_VERSION | SELECTION_STROKE_SCHEMA_VERSION
+                    LAYER_HISTORY_SCHEMA_VERSION
+                        | SELECTION_STROKE_SCHEMA_VERSION
+                        | CANVAS_HISTORY_SCHEMA_VERSION
                 )
             }))
     }
@@ -97,7 +99,9 @@ impl ProjectDb {
                 .is_some_and(|value| {
                     matches!(
                         value.value(),
-                        LAYER_HISTORY_SCHEMA_VERSION | SELECTION_STROKE_SCHEMA_VERSION
+                        LAYER_HISTORY_SCHEMA_VERSION
+                            | SELECTION_STROKE_SCHEMA_VERSION
+                            | CANVAS_HISTORY_SCHEMA_VERSION
                     )
                 })
         };

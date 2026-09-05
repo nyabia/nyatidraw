@@ -38,6 +38,7 @@ pub enum RecordKind {
     HistoryCursor = 6,
     InitialHistoryCursor = 7,
     LayerTree = 8,
+    CanvasSpec = 9,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,6 +135,7 @@ impl TryFrom<u8> for RecordKind {
             6 => Ok(Self::HistoryCursor),
             7 => Ok(Self::InitialHistoryCursor),
             8 => Ok(Self::LayerTree),
+            9 => Ok(Self::CanvasSpec),
             _ => Err(WireError::InvalidEnum),
         }
     }

@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+mod canvas_history;
 mod layer_history;
 
 #[cfg(feature = "diagnostic")]
@@ -18,12 +19,12 @@ use nyatidraw_api::{CanvasSpec, ContentRootId, HistoryNodeId, SnapshotId};
 use nyatidraw_document::LayerTree;
 use nyatidraw_history::{History, HistoryNode};
 use nyatidraw_project::{
-    Envelope, LAYER_HISTORY_SCHEMA_VERSION, MAX_LAYER_TREE_RECORD_BYTES, OpenMode,
-    ProjectCommitBatch, ProjectHistoryCursor, ProjectOpenError, ProjectRepository,
-    ProjectStructuralBatch, RecordKind, ReopenedProject, RootManifest, SCHEMA_VERSION,
-    SELECTION_STROKE_SCHEMA_VERSION, decode_history_cursor, decode_history_node,
-    decode_initial_history_cursor, decode_layer_tree, decode_project_head, decode_root_manifest,
-    decode_stroke_commit, encode_history_cursor, encode_history_node,
+    CANVAS_HISTORY_SCHEMA_VERSION, Envelope, LAYER_HISTORY_SCHEMA_VERSION,
+    MAX_LAYER_TREE_RECORD_BYTES, OpenMode, ProjectCommitBatch, ProjectHistoryCursor,
+    ProjectOpenError, ProjectRepository, ProjectStructuralBatch, RecordKind, ReopenedProject,
+    RootManifest, SCHEMA_VERSION, SELECTION_STROKE_SCHEMA_VERSION, decode_history_cursor,
+    decode_history_node, decode_initial_history_cursor, decode_layer_tree, decode_project_head,
+    decode_root_manifest, decode_stroke_commit, encode_history_cursor, encode_history_node,
     encode_initial_history_cursor, encode_layer_tree, encode_project_head, encode_root_manifest,
     encode_stroke_commit, open_mode,
 };
@@ -149,6 +150,7 @@ impl ProjectDb {
             this.load_layer_tree()?;
             this.load_reopened()?;
             this.validate_layer_history()?;
+            this.validate_canvas_history()?;
         }
         Ok(this)
     }
@@ -173,7 +175,7 @@ impl ProjectDb {
         &self,
         batch: &ProjectStructuralBatch,
     ) -> Result<(), ProjectOpenError> {
-        self.commit_structural_inner(batch, None, &CommitControl::Normal)
+        self.commit_structural_inner(batch, None, None, &CommitControl::Normal)
     }
 
     /// Commits artwork, layer hierarchy, history and current cursor atomically.
@@ -187,7 +189,24 @@ impl ProjectDb {
         batch: &ProjectStructuralBatch,
         tree: &LayerTree,
     ) -> Result<(), ProjectOpenError> {
-        self.commit_structural_inner(batch, Some(tree), &CommitControl::Normal)
+        self.commit_structural_inner(batch, Some(tree), None, &CommitControl::Normal)
+    }
+
+    /// Commits page dimensions, artwork and history in one immediate transaction.
+    /// Legacy snapshots inherit their last known page size on the first change.
+    ///
+    /// # Errors
+    /// Rejects invalid dimensions/lineage or failed durability without a partial
+    /// page change. Old writers reject the upgraded schema marker.
+    pub fn commit_structural_with_canvas(
+        &self,
+        batch: &ProjectStructuralBatch,
+        canvas: CanvasSpec,
+    ) -> Result<(), ProjectOpenError> {
+        canvas
+            .validate()
+            .map_err(|error| self.io(format!("invalid canvas: {error:?}")))?;
+        self.commit_structural_inner(batch, None, Some(canvas), &CommitControl::Normal)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -195,12 +214,20 @@ impl ProjectDb {
         &self,
         batch: &ProjectStructuralBatch,
         tree: Option<&LayerTree>,
+        canvas: Option<CanvasSpec>,
         control: &CommitControl,
     ) -> Result<(), ProjectOpenError> {
         self.validate_structural_lineage(batch)?;
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
         transaction.set_durability(Durability::Immediate);
-        self.capture_snapshot_layers(&transaction, batch.snapshot_id, SnapshotId(0), tree, false)?;
+        self.capture_snapshot_layers(
+            &transaction,
+            batch.snapshot_id,
+            SnapshotId(0),
+            tree,
+            canvas.is_some(),
+        )?;
+        self.capture_snapshot_canvas(&transaction, batch.snapshot_id, SnapshotId(0), canvas)?;
         {
             let mut objects = transaction
                 .open_table(OBJECTS)
@@ -321,7 +348,7 @@ impl ProjectDb {
         tree: &LayerTree,
         pause: DiagnosticCommitPause,
     ) -> Result<(), ProjectOpenError> {
-        self.commit_structural_inner(batch, Some(tree), &CommitControl::Pause(pause))
+        self.commit_structural_inner(batch, Some(tree), None, &CommitControl::Pause(pause))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -340,11 +367,25 @@ impl ProjectDb {
             None,
             batch.stroke.selection().is_some(),
         )?;
+        self.capture_snapshot_canvas(
+            &transaction,
+            batch.snapshot_id,
+            batch.stroke.parent_snapshot,
+            None,
+        )?;
         if batch.stroke.selection().is_some() {
-            transaction
+            let mut metadata = transaction
                 .open_table(META)
+                .map_err(|error| self.io(error))?;
+            let current = metadata
+                .get("schema_version")
                 .map_err(|error| self.io(error))?
-                .insert("schema_version", SELECTION_STROKE_SCHEMA_VERSION)
+                .map_or(SCHEMA_VERSION, |value| value.value());
+            metadata
+                .insert(
+                    "schema_version",
+                    current.max(SELECTION_STROKE_SCHEMA_VERSION),
+                )
                 .map_err(|error| self.io(error))?;
         }
 
@@ -796,8 +837,15 @@ impl ProjectDb {
             None => self.validate_initial_cursor(cursor)?,
         }
         let layers = self.cursor_layer_record(cursor)?;
+        let canvas = self.cursor_canvas_record(cursor)?;
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
         transaction.set_durability(Durability::Immediate);
+        if let Some(canvas) = canvas {
+            let mut metadata = transaction
+                .open_table(META)
+                .map_err(|error| self.io(error))?;
+            write_canvas_metadata(&mut metadata, canvas).map_err(|error| self.io(error))?;
+        }
         {
             let mut state = transaction
                 .open_table(STATE)
@@ -881,6 +929,9 @@ impl ProjectDb {
         let version = metadata_value(&table, CANVAS_METADATA_VERSION_KEY)
             .map_err(|error| self.corrupt(error))?;
         let Some(version) = version else {
+            if self.canvas_history_enabled()? {
+                return Err(self.corrupt("versioned page history requires current canvas metadata"));
+            }
             return Ok(CanvasSpec::DEFAULT);
         };
         if version != CANVAS_METADATA_VERSION {
@@ -911,6 +962,9 @@ impl ProjectDb {
     /// Returns an error when the specification is invalid or immediate
     /// metadata durability cannot be established.
     pub fn persist_canvas_spec(&self, canvas: CanvasSpec) -> Result<(), ProjectOpenError> {
+        if self.canvas_history_enabled()? {
+            return Err(self.io("page history requires an atomic structural commit"));
+        }
         let canvas = canvas
             .validate()
             .map_err(|error| self.io(format!("invalid canvas spec: {error:?}")))?;
@@ -1185,7 +1239,10 @@ impl ProjectDb {
             .is_some_and(|value| {
                 matches!(
                     value.value(),
-                    SCHEMA_VERSION | LAYER_HISTORY_SCHEMA_VERSION | SELECTION_STROKE_SCHEMA_VERSION
+                    SCHEMA_VERSION
+                        | LAYER_HISTORY_SCHEMA_VERSION
+                        | SELECTION_STROKE_SCHEMA_VERSION
+                        | CANVAS_HISTORY_SCHEMA_VERSION
                 )
             }))
     }
@@ -1596,6 +1653,7 @@ mod tests {
                 .commit_structural_inner(
                     &batch,
                     Some(&changed),
+                    None,
                     &CommitControl::Failure(CommitFailurePoint::BeforeCommitAbort)
                 )
                 .is_err()
@@ -1912,6 +1970,241 @@ mod tests {
         );
         drop(database);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn page_history_upgrade_and_cursor_moves_never_split_dimensions_from_artwork() {
+        let path = temp("page-history-atomic");
+        let database = ProjectDb::open(&path).unwrap();
+        let baseline = CanvasSpec {
+            width_px: 257,
+            height_px: 65,
+            pixels_per_inch: 96,
+        };
+        let resized = CanvasSpec {
+            width_px: 129,
+            height_px: 41,
+            pixels_per_inch: 144,
+        };
+        let branched = CanvasSpec {
+            width_px: 65,
+            height_px: 129,
+            pixels_per_inch: 300,
+        };
+        database.persist_canvas_spec(baseline).unwrap();
+        let template = prepared_batch();
+        database.commit(&template).unwrap();
+        let old = database.load_reopened().unwrap().unwrap();
+        let old_cursor = old.clone().into_parts().current_cursor;
+        let initial = database.load_initial_cursor().unwrap().unwrap();
+        let mut session = HeadlessStrokeSession::from_reopened(old);
+        let page = session
+            .prepare_structural_change(SnapshotId(3), HistoryNodeId(4), 50, session.tiles().clone())
+            .unwrap();
+        assert!(
+            database
+                .commit_structural_inner(
+                    &page,
+                    None,
+                    Some(resized),
+                    &CommitControl::Failure(CommitFailurePoint::BeforeCommitAbort)
+                )
+                .is_err()
+        );
+        assert!(!database.canvas_history_enabled().unwrap());
+        assert!(!database.layer_history_enabled().unwrap());
+        assert_eq!(database.load_canvas_spec().unwrap(), baseline);
+        assert_eq!(
+            database
+                .load_reopened()
+                .unwrap()
+                .unwrap()
+                .into_parts()
+                .current_cursor,
+            old_cursor
+        );
+        // Ambiguous acknowledgement must still leave a complete durable commit.
+        assert!(
+            database
+                .commit_structural_inner(
+                    &page,
+                    None,
+                    Some(resized),
+                    &CommitControl::Failure(CommitFailurePoint::AfterCommitReturn)
+                )
+                .is_err()
+        );
+        database.validate_canvas_history().unwrap();
+        session.accept_structural_change(&page).unwrap();
+        let page_cursor = database
+            .load_reopened()
+            .unwrap()
+            .unwrap()
+            .into_parts()
+            .current_cursor;
+        assert!(
+            database.persist_canvas_spec(baseline).is_err(),
+            "no out-of-band page writes after upgrade"
+        );
+        let mut packed = vec![255; (129_usize * 41).div_ceil(8)];
+        *packed.last_mut().unwrap() = 1;
+        let mask = std::sync::Arc::new(
+            nyatidraw_stroke::StrokeSelection::from_packed_bits(129, 41, &packed).unwrap(),
+        );
+        let stroke = &template.stroke;
+        let selected = session
+            .prepare_round_stroke_with_selection(
+                SnapshotId(4),
+                HistoryNodeId(5),
+                60,
+                stroke.layer,
+                stroke.brush,
+                stroke.recorded.clone(),
+                stroke.color,
+                stroke.samples().to_vec(),
+                Some(mask),
+            )
+            .unwrap();
+        database.commit(&selected).unwrap();
+        assert!(
+            database.canvas_history_enabled().unwrap(),
+            "selected strokes cannot downgrade v4 to v3"
+        );
+        let selected_cursor = database
+            .load_reopened()
+            .unwrap()
+            .unwrap()
+            .into_parts()
+            .current_cursor;
+        database.persist_history_cursor(old_cursor).unwrap();
+        let branch_session =
+            HeadlessStrokeSession::from_reopened(database.load_reopened().unwrap().unwrap());
+        let branch = branch_session
+            .prepare_structural_change(
+                SnapshotId(5),
+                HistoryNodeId(6),
+                70,
+                branch_session.tiles().clone(),
+            )
+            .unwrap();
+        database
+            .commit_structural_with_canvas(&branch, branched)
+            .unwrap();
+        let branch_cursor = database
+            .load_reopened()
+            .unwrap()
+            .unwrap()
+            .into_parts()
+            .current_cursor;
+        drop(database);
+        for (cursor, canvas, tiles) in [
+            (old_cursor, baseline, &template.materialized.after),
+            (page_cursor, resized, &page.after),
+            (selected_cursor, resized, &selected.materialized.after),
+            (branch_cursor, branched, &branch.after),
+            (initial, baseline, &template.before),
+        ] {
+            let database = ProjectDb::open(&path).unwrap();
+            assert_eq!(database.load_cursor_canvas_spec(cursor).unwrap(), canvas);
+            database.persist_history_cursor(cursor).unwrap();
+            drop(database);
+            let reopened = ProjectDb::open(&path).unwrap();
+            assert_eq!(reopened.load_canvas_spec().unwrap(), canvas);
+            let artwork = reopened.load_reopened().unwrap().unwrap();
+            assert_eq!(artwork.current_tiles(), tiles);
+            assert_eq!(artwork.history().node_count(), 4);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn corrupt_page_history_is_rejected_without_rewriting_the_original_project() {
+        for fault in [
+            "missing",
+            "checksum",
+            "orphan",
+            "zero",
+            "current",
+            "downgrade",
+            "unmarked-current",
+        ] {
+            let path = temp(&format!("page-history-{fault}"));
+            let database = ProjectDb::open(&path).unwrap();
+            let template = prepared_batch();
+            database.commit(&template).unwrap();
+            let session =
+                HeadlessStrokeSession::from_reopened(database.load_reopened().unwrap().unwrap());
+            let batch = session
+                .prepare_structural_change(
+                    SnapshotId(3),
+                    HistoryNodeId(4),
+                    50,
+                    session.tiles().clone(),
+                )
+                .unwrap();
+            database
+                .commit_structural_with_canvas(&batch, CanvasSpec::DEFAULT)
+                .unwrap();
+            database.validate_canvas_history().unwrap();
+            let transaction = database.db.begin_write().unwrap();
+            if fault == "unmarked-current" {
+                transaction
+                    .open_table(META)
+                    .unwrap()
+                    .remove(CANVAS_METADATA_VERSION_KEY)
+                    .unwrap();
+            } else if fault == "current" || fault == "downgrade" {
+                let mut metadata = transaction.open_table(META).unwrap();
+                let (key, value) = if fault == "current" {
+                    (CANVAS_WIDTH_KEY, 99)
+                } else {
+                    ("schema_version", SELECTION_STROKE_SCHEMA_VERSION)
+                };
+                metadata.insert(key, value).unwrap();
+            } else {
+                let mut pages = transaction
+                    .open_table(super::canvas_history::SNAPSHOT_CANVAS)
+                    .unwrap();
+                let key = 2_u128.to_le_bytes(); // A non-current snapshot must also be validated.
+                let mut bytes = pages.get(key.as_slice()).unwrap().unwrap().value().to_vec();
+                match fault {
+                    "missing" => {
+                        pages.remove(key.as_slice()).unwrap();
+                    }
+                    "checksum" => {
+                        *bytes.last_mut().unwrap() ^= 1;
+                        pages.insert(key.as_slice(), bytes.as_slice()).unwrap();
+                    }
+                    "orphan" => {
+                        pages
+                            .insert(99_u128.to_le_bytes().as_slice(), bytes.as_slice())
+                            .unwrap();
+                    }
+                    "zero" => {
+                        let invalid = Envelope::new(RecordKind::CanvasSpec, vec![0; 12]).encode();
+                        pages.insert(key.as_slice(), invalid.as_slice()).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            transaction.commit().unwrap();
+            drop(database);
+            let original = std::fs::read(&path).unwrap();
+            assert!(
+                matches!(
+                    ProjectDb::open(&path),
+                    Err(ProjectOpenError::Corrupt { .. })
+                ),
+                "{fault}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                original,
+                "{fault}: invalid file preservation"
+            );
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

@@ -229,3 +229,23 @@ worker를 join한다. End 전 active stroke는 직전 durable snapshot까지만 
 초기 파일은 바이너리다. 현재 CLI는 `validate`, PPM `export`, owned
 `diagnostic-smoke`만 제공한다. deterministic `inspect`, `unpack`, `pack`은 후속
 과제다. 일반 durable commit에서 compaction이나 history GC를 실행하지 않는다.
+
+
+## 페이지 크기 history 확장 (schema v4)
+
+첫 페이지 변경은 `commit_structural_with_canvas`로 artwork root, history, 현재
+cursor, 현재 CanvasSpec과 snapshot별 CanvasSpec을 하나의 Immediate transaction에
+저장한다. `snapshot_canvas`는 snapshot ID별 64-byte checksum envelope이며 record
+kind 9의 payload는 width/height/PPI 세 u32다. Legacy snapshot과 initial cursor에는
+첫 업그레이드 직전의 페이지 크기를 고정한다. 이전 형식이 저장하지 않은 과거 크기를
+추측하지 않는다. 변경 없는 열기는 업그레이드하지 않는다.
+
+v4에서는 모든 후속 stroke/structural snapshot이 현재 페이지 크기를 상속한다.
+선택 stroke도 schema marker를 v3로 낮추지 않는다. History cursor 이동은 해당
+snapshot의 페이지·layer tree·pixels를 함께 복원하고, out-of-band
+`persist_canvas_spec`는 거부한다. 구버전 writer는 v4 marker를 거부한다.
+
+Open은 모든 snapshot과 initial page record의 일대일 대응, 길이·checksum·유효 치수,
+현재 page/cursor 일치와 버전 marker를 검사한다. 손상된 과거 분기도 조용히 무시하지
+않으며 invalid 파일을 보존한다. 이 저장 기반의 검증과 UI 연결 상태는
+[ADR-0024](decisions/ADR-0024-page-history-storage.md)를 따른다.

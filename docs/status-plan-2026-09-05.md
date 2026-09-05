@@ -614,3 +614,23 @@ native canvas/GPU가 다시 생성되지 않았다. 근거는 `target/transform-
 이는 수치 입력으로 확정하는 기본 변형이다. 자유 각도·캔버스 위 transform handle과
 실시간 preview는 포함하지 않는다. 출력 page 크기/crop 및 release 성능 계측은 다음
 작업이며, 이 작은 fixture 결과를 대형 장면 성능 통과로 판정하지 않는다.
+
+
+### 출력 페이지 변경의 atomic history 저장 기반
+
+페이지 크기가 기존 history와 별도로 저장되어 Undo가 pixels와 출력 범위를 서로
+다르게 복원할 수 있었다. Schema v4의 snapshot별 page record와 atomic structural
+commit을 추가했다. 기존 파일은 첫 page 변경 때 마지막으로 알려진 크기를 모든
+과거 branch와 initial cursor에 고정하며, 정상 열기만으로 변환하지 않는다.
+
+핵심 복구 테스트 2개로 upgrade abort/commit 뒤 오류 반환, 크기·해상도별 branch와
+initial Undo 복원, 선택 stroke의 v4 유지, missing/checksum/orphan/zero/current
+불일치/marker 손상과 invalid 파일 보존을 검증했다. 전체 74개 테스트가 통과했고
+마지막 current-marker 검사 추가 후 focused 2개도 재통과했다. 전체 Clippy도 통과했다
+(`target/page-history-workspace-tests.log`, `page-history-tests-final.log`,
+`page-history-clippy-final.log`).
+
+[ADR-0024](decisions/ADR-0024-page-history-storage.md)에 저장 계약을 기록했다.
+현재 변경은 page resize/crop의 저장 기반이다. 실제 명령·writer/renderer page 채택,
+PNG의 최신 page 사용, UI와 설치판 Save/process restart/reopen 검증은 계속 진행할
+작업이며 아직 페이지 크기 기능 전체 완료로 판정하지 않는다.
