@@ -4,6 +4,7 @@ mod desktop_shell;
 mod edit_gesture;
 mod edit_worker;
 mod layer_drag;
+mod layout_store;
 mod live_ink;
 mod native_canvas;
 mod preview;
@@ -91,7 +92,12 @@ fn app() -> Element {
     let live_ink = use_context::<LiveInkBridge>();
     let notifier_ink = live_ink.clone();
     use_hook(move || notifier_ink.set_ui_notifier(dioxus_core::schedule_update()));
-    let mut ui_projection = use_signal(initial_ui_projection);
+    let initial_dock = live_ink.protocol_snapshot().0.dock;
+    let mut ui_projection = use_signal(move || {
+        let mut initial = initial_ui_projection();
+        initial.dock = initial_dock;
+        initial
+    });
     let (authoritative, latest_event) = live_ink.protocol_snapshot();
     if latest_event.is_some()
         && authoritative.revision >= ui_projection.peek().revision
@@ -108,6 +114,8 @@ fn app() -> Element {
     let export_status = live_ink.export_status_snapshot();
     let close_status = live_ink.close_status();
     let activation_notice = live_ink.activation_notice_snapshot();
+    let layout_notice = live_ink.layout_notice();
+    let has_layout_notice = layout_notice.is_some();
     let edit = ui_projection.read().edit.clone();
     let clear_edit_ink = live_ink.clone();
     let dock_drop_ink = live_ink.clone();
@@ -125,7 +133,7 @@ fn app() -> Element {
         document::Link { rel: "stylesheet", href: STYLESHEET }
         style { {STYLES} }
         main {
-            class: "app-shell",
+            class: if has_layout_notice { "app-shell layout-has-notice" } else { "app-shell" },
             tabindex: 0,
             onmouseup: move |_| {
                 let Some(drag) = *dock_drag.read() else { return };
@@ -184,6 +192,9 @@ fn app() -> Element {
                 }
             },
             ActionBar { ui_projection, export_status }
+            if let Some(notice) = layout_notice {
+                div { class: "layout-notice", role: "status", "{notice}" }
+            }
             section {
                 class: if dock_drag.read().is_some() { "workspace dock-dragging" } else { "workspace" },
                 aria_label: "Editor workspace. F6 returns to the drawing canvas.",
@@ -343,6 +354,8 @@ fn initial_ui_projection() -> UiProjection {
 #[component]
 fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -> Element {
     let live_ink = use_context::<LiveInkBridge>();
+    let reset_layout_ink = live_ink.clone();
+    let mut menu_open = use_signal(|| false);
     let save_ink = live_ink.clone();
     let retry_ink = live_ink.clone();
     let undo_ink = live_ink.clone();
@@ -361,8 +374,15 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
 
     rsx! {
         nav { class: "commandbar", aria_label: "주요 명령",
-            button { class: "command hamburger-button", title: "메뉴 (후속 구현)", aria_label: "메뉴", disabled: true,
+            button { class: "command hamburger-button", title: "메뉴", aria_label: "메뉴", aria_expanded: "{menu_open}",
+                onclick: move |_| menu_open.toggle(),
                 span { class: "hamburger", i {}, i {}, i {} }
+            }
+            if menu_open() {
+                button { class: "command", onclick: move |_| {
+                    send_dock_command(&reset_layout_ink, DockCommand::ResetToSafeDefault);
+                    menu_open.set(false);
+                }, "기본 화면 배치" }
             }
             button { class: "command", title: "열기 (후속 구현)", disabled: true, UiIcon { name: "folder" } span { class: "shortcut", "Alt O" } }
             button { class: "command", title: "저장 (S)", onclick: move |_| {

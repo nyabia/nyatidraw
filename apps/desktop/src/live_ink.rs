@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::{
-    Arc, Mutex, MutexGuard,
+    Arc, Mutex, MutexGuard, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
@@ -139,6 +139,7 @@ pub(crate) struct LiveInkBridge {
 }
 
 struct LiveInkInner {
+    layout: OnceLock<crate::layout_store::LayoutStore>,
     raw_input: Mutex<RawInputState>,
     canvas_viewport: Mutex<CanvasViewportSnapshot>,
     editor_commands: Mutex<VecDeque<CommandEnvelope>>,
@@ -257,9 +258,47 @@ pub(crate) struct AdmittedSample {
 }
 
 impl LiveInkBridge {
+    /// Called once by the primary shell before creating the canvas or UI.
+    pub(crate) fn enable_layout_persistence(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        let (store, tree) = crate::layout_store::LayoutStore::open(Arc::new(move || {
+            if let Some(inner) = weak.upgrade() {
+                Self { inner }.notify_ui();
+            }
+        }));
+        if self.inner.layout.set(store).is_ok() {
+            self.inner
+                .protocol
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .projection
+                .dock = tree;
+        }
+    }
+
+    pub(crate) fn persist_layout(&self, tree: &nyatidraw_api::DockTree) {
+        if let Some(store) = self.inner.layout.get() {
+            store.submit(tree);
+        }
+    }
+
+    pub(crate) fn layout_notice(&self) -> Option<String> {
+        self.inner
+            .layout
+            .get()
+            .and_then(crate::layout_store::LayoutStore::notice)
+    }
+
+    pub(crate) fn flush_layout(&self) {
+        if let Some(store) = self.inner.layout.get() {
+            store.flush();
+        }
+    }
+
     pub(crate) fn with_capacity(capacity: usize, initial_layer: LayerId) -> Self {
         Self {
             inner: Arc::new(LiveInkInner {
+                layout: OnceLock::new(),
                 raw_input: Mutex::new(RawInputState {
                     queue: InputQueue::with_capacity(capacity),
                     pending_transitions: VecDeque::with_capacity(capacity),

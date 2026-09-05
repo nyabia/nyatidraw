@@ -1409,6 +1409,7 @@ impl ActiveCanvas {
 
     fn apply_command(&mut self, envelope: CommandEnvelope, width: u32, height: u32, scale: f64) {
         let command_id = envelope.id;
+        let persist_dock = matches!(&envelope.command, EditorCommand::Dock(_));
         if self.synchronize_workspace_failure() {
             self.reject_command(command_id, CommandRejectReason::WorkspaceFailed);
             return;
@@ -1447,6 +1448,11 @@ impl ActiveCanvas {
                 );
                 match publish {
                     Ok(_) => {
+                        if persist_dock {
+                            self.stroke
+                                .live_ink
+                                .persist_layout(&self.projection.current().dock);
+                        }
                         let revision = self.projection.current().revision;
                         self.stroke.live_ink.publish_editor_event(
                             EditorEvent::CommandAccepted {
@@ -3411,6 +3417,7 @@ impl Drop for ActiveCanvas {
         if let Some(generation) = self.pending_save.take() {
             if self.stroke.live_ink.workspace_failed() {
                 self.stroke.live_ink.fail_incomplete_export();
+                self.stroke.live_ink.flush_layout();
                 return;
             }
             if let Some(path) = self.project_export_path.clone()
@@ -3425,6 +3432,7 @@ impl Drop for ActiveCanvas {
                     .publish_export_status(ExportStatus::Failed { generation });
             }
         }
+        self.stroke.live_ink.flush_layout();
     }
 }
 

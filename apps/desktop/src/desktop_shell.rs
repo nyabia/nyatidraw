@@ -40,6 +40,7 @@ fn launch_with_instance(
     #[cfg(not(windows))] _instance: Option<()>,
 ) {
     let live_ink = LiveInkBridge::with_capacity(INPUT_QUEUE_CAPACITY, INITIAL_ACTIVE_LAYER);
+    live_ink.enable_layout_persistence();
     let context_ink = live_ink.clone();
     let config = Config::new()
         // Windows' native file-drop handler intercepts HTML layer drag/drop.

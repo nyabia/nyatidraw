@@ -19,6 +19,8 @@ button:focus, [tabindex="0"]:focus { outline: 2px solid #9ee8ff; outline-offset:
 .divider { width: 1px; height: 27px; margin: 0 4px; background: #d0d0d0; }
 .mini-divider { width: 1px; height: 18px; margin: 0 3px; background: #aaa; }
 .hamburger-button { width: 38px; }
+.app-shell.layout-has-notice { grid-template-rows: 45px auto minmax(0, 1fr); }
+.layout-notice { padding: 6px 12px; background: #3a3423; color: #ffe7a3; font-size: 12px; }
 .hamburger { display: grid; width: 24px; gap: 4px; }
 .hamburger i { height: 3px; border-radius: 2px; background: #fff; }
 .toolbar-dock { display: flex; align-items: center; height: 38px; border-block: 1px solid #707070; border-right: 1px solid #707070; background: rgba(105, 105, 105, .28); box-shadow: inset 0 1px rgba(255,255,255,.18); }
