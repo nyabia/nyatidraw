@@ -1,6 +1,7 @@
 #[cfg(windows)]
 mod desktop_canvas;
 mod desktop_shell;
+mod dock_drag;
 mod edit_gesture;
 mod edit_worker;
 mod layer_drag;
@@ -20,10 +21,10 @@ use std::{
 use dioxus::prelude::*;
 use live_ink::{CloseStatus, ExportStatus, LiveInkBridge};
 use nyatidraw_api::{
-    CommandRejectReason, DockAxis, DockCommand, DockNode, DockPosition, DrawingTool, EditorCommand,
-    EditorEvent, EventEnvelope, GroupId, HistoryCommand, HistoryOperationLabel, LayerCommand,
-    LayerId, LayerProjection, LayerProjectionKind, LayerTreeNodeId, PanelKind, ProjectCommand,
-    ToolCommand, UiProjection, ViewportCommand, WorkspaceProjection,
+    CommandRejectReason, DockAxis, DockCommand, DockNode, DrawingTool, EditorCommand, EditorEvent,
+    EventEnvelope, GroupId, HistoryCommand, HistoryOperationLabel, LayerCommand, LayerId,
+    LayerProjection, LayerProjectionKind, LayerTreeNodeId, PanelKind, ProjectCommand, ToolCommand,
+    UiProjection, ViewportCommand, WorkspaceProjection,
 };
 use preview::LayerThumbnailFrame;
 
@@ -35,18 +36,6 @@ const INK_GROUP: GroupId = GroupId(10);
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 const STYLES: &str = include_str!("../assets/styles.css");
 const STYLESHEET: Asset = asset!("/assets/styles.css");
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DockDrop {
-    target: PanelKind,
-    position: DockPosition,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DockDrag {
-    source: PanelKind,
-    hovered: Option<DockDrop>,
-}
 
 #[derive(Clone, Copy, Debug)]
 struct NavigatorDrag {
@@ -105,7 +94,7 @@ fn app() -> Element {
     {
         ui_projection.set(authoritative);
     }
-    let mut dock_drag = use_signal(|| Option::<DockDrag>::None);
+    dock_drag::use_dock_drag(live_ink.clone());
     let mut navigator_drag = use_context_provider(|| Signal::new(Option::<NavigatorDrag>::None));
     let projected_revision = ui_projection.read().revision.0;
     let dock = ui_projection.read().dock.clone();
@@ -118,7 +107,6 @@ fn app() -> Element {
     let has_layout_notice = layout_notice.is_some();
     let edit = ui_projection.read().edit.clone();
     let clear_edit_ink = live_ink.clone();
-    let dock_drop_ink = live_ink.clone();
     let shortcut_ink = live_ink.clone();
     let navigator_move_ink = shortcut_ink.clone();
     let navigator_up_ink = shortcut_ink.clone();
@@ -134,21 +122,8 @@ fn app() -> Element {
         style { {STYLES} }
         main {
             class: if has_layout_notice { "app-shell layout-has-notice" } else { "app-shell" },
+            "data-dock-revision": "{projected_revision}",
             tabindex: 0,
-            onmouseup: move |_| {
-                let Some(drag) = *dock_drag.read() else { return };
-                if let Some(drop_target) = drag.hovered {
-                    send_dock_command(
-                        &dock_drop_ink,
-                        DockCommand::MovePanel {
-                            panel: drag.source,
-                            target: drop_target.target,
-                            position: drop_target.position,
-                        },
-                    );
-                }
-                dock_drag.set(None);
-            },
             onpointermove: move |event| {
                 continue_navigator_drag(navigator_drag, &navigator_move_ink, &event.data());
             },
@@ -178,7 +153,6 @@ fn app() -> Element {
                     "6" => Some(PanelKind::Layers),
                     "7" => Some(PanelKind::History),
                     "Escape" => {
-                        dock_drag.set(None);
                         navigator_drag.set(None);
                         None
                     }
@@ -191,15 +165,15 @@ fn app() -> Element {
                     send_dock_command(&shortcut_ink, DockCommand::ActivatePanel(panel));
                 }
             },
-            ActionBar { ui_projection, export_status, dock_drag }
+            ActionBar { ui_projection, export_status }
             if let Some(notice) = layout_notice {
                 div { class: "layout-notice", role: "status", "{notice}" }
             }
             section {
-                class: if dock_drag.read().is_some() { "workspace dock-dragging" } else { "workspace" },
+                class: "workspace",
                 aria_label: "Editor workspace. F6 returns to the drawing canvas.",
                 title: "{document_title} · r{projected_revision} · {protocol_status(latest_event.as_ref())}",
-                DockNodeView { node: dock.root().clone(), ui_projection, dock_drag }
+                DockNodeView { node: dock.root().clone(), ui_projection }
             }
             if dirty { span { class: "unsaved-dot", title: "저장되지 않은 변경", "•" } }
             if edit.busy || edit.has_selection || edit.error.is_some() {
@@ -352,11 +326,7 @@ fn initial_ui_projection() -> UiProjection {
 }
 
 #[component]
-fn ActionBar(
-    ui_projection: Signal<UiProjection>,
-    export_status: ExportStatus,
-    dock_drag: Signal<Option<DockDrag>>,
-) -> Element {
+fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -> Element {
     let live_ink = use_context::<LiveInkBridge>();
     let reset_layout_ink = live_ink.clone();
     let mut menu_open = use_signal(|| false);
@@ -407,9 +377,9 @@ fn ActionBar(
             }, UiIcon { name: "redo" } span { class: "shortcut", "Shift Z" } }
 
             for panel in top {
-                TopToolbar { panel, ui_projection, dock_drag }
+                TopToolbar { panel, ui_projection }
             }
-            ToolbarTopTarget { before: None, dock_drag }
+            div { class: "toolbar-top-space", "data-dock-top": "" }
             if let Some(message) = error.read().as_ref() {
                 span { class: "commandbar-error", role: "alert", "{message}" }
             }
@@ -486,45 +456,11 @@ fn QuickColors(ui_projection: Signal<UiProjection>) -> Element {
 }
 
 #[component]
-fn TopToolbar(
-    panel: PanelKind,
-    ui_projection: Signal<UiProjection>,
-    mut dock_drag: Signal<Option<DockDrag>>,
-) -> Element {
+fn TopToolbar(panel: PanelKind, ui_projection: Signal<UiProjection>) -> Element {
     rsx! {
-        div { class: "toolbar-dock", aria_label: "{panel_label(panel)}",
-            span { class: "toolbar-grip", title: "{panel_label(panel)} 이동",
-                onmousedown: move |_| dock_drag.set(Some(DockDrag { source: panel, hovered: None })),
-            }
+        div { class: "toolbar-dock", aria_label: "{panel_label(panel)}", "data-dock-top": "{panel_slug(panel)}",
+            span { class: "toolbar-grip", title: "{panel_label(panel)} 이동", "data-dock-source": "{panel_slug(panel)}" }
             ToolbarContents { panel, ui_projection }
-            ToolbarTopTarget { before: Some(panel), dock_drag }
-        }
-    }
-}
-
-#[component]
-fn ToolbarTopTarget(before: Option<PanelKind>, mut dock_drag: Signal<Option<DockDrag>>) -> Element {
-    let live_ink = use_context::<LiveInkBridge>();
-    let enabled = dock_drag
-        .read()
-        .is_some_and(|drag| drag.source.is_toolbar() && Some(drag.source) != before);
-    rsx! {
-        if enabled {
-            div { class: if before.is_some() { "toolbar-top-target" } else { "toolbar-top-target trailing" },
-                onmouseenter: move |_| {
-                    let current = *dock_drag.read();
-                    if let Some(mut drag) = current { drag.hovered = None; dock_drag.set(Some(drag)); }
-                },
-                onmouseup: move |event| {
-                    event.stop_propagation();
-                    let current = *dock_drag.read();
-                    if let Some(drag) = current {
-                        send_dock_command(&live_ink, DockCommand::MoveToolbarToTop { panel: drag.source, before });
-                        dock_drag.set(None);
-                    }
-                },
-                span { class: "dock-insert vertical" }
-            }
         }
     }
 }
@@ -575,14 +511,10 @@ fn dock_stack_height(node: &DockNode) -> Option<u16> {
 }
 
 #[component]
-fn DockNodeView(
-    node: DockNode,
-    ui_projection: Signal<UiProjection>,
-    dock_drag: Signal<Option<DockDrag>>,
-) -> Element {
+fn DockNodeView(node: DockNode, ui_projection: Signal<UiProjection>) -> Element {
     match node {
         DockNode::Panel(panel) => rsx! {
-            DockPanel { panel, ui_projection, dock_drag }
+            DockPanel { panel, ui_projection }
         },
         DockNode::Tabs { active, panels } => {
             let active_panel = panels[active];
@@ -590,10 +522,10 @@ fn DockNodeView(
                 section { class: "dock-tabs", aria_label: "Docked panel tabs",
                     nav { class: "tab-strip", aria_label: "Panel tabs",
                         for (index, panel) in panels.iter().copied().enumerate() {
-                            DockTab { panel, selected: index == active, dock_drag }
+                            DockTab { panel, selected: index == active }
                         }
                     }
-                    DockPanel { panel: active_panel, ui_projection, dock_drag }
+                    DockPanel { panel: active_panel, ui_projection }
                 }
             }
         }
@@ -614,17 +546,17 @@ fn DockNodeView(
                 let mut nodes = Vec::new();
                 collect_side_stack(*first, &mut nodes);
                 collect_side_stack(*second, &mut nodes);
-                return rsx! { SideStack { nodes, ui_projection, dock_drag } };
+                return rsx! { SideStack { nodes, ui_projection } };
             }
             let first_style = format!("flex: {first_per_mille} 1 0;");
             let second_style = format!("flex: {} 1 0;", 1000_u16.saturating_sub(first_per_mille));
             rsx! {
                 section { class: "{class}",
                     div { class: "dock-child", style: "{first_style}",
-                        DockNodeView { node: *first, ui_projection, dock_drag }
+                        DockNodeView { node: *first, ui_projection }
                     }
                     div { class: "dock-child", style: "{second_style}",
-                        DockNodeView { node: *second, ui_projection, dock_drag }
+                        DockNodeView { node: *second, ui_projection }
                     }
                 }
             }
@@ -648,11 +580,7 @@ fn collect_side_stack(node: DockNode, nodes: &mut Vec<DockNode>) {
 }
 
 #[component]
-fn SideStack(
-    nodes: Vec<DockNode>,
-    ui_projection: Signal<UiProjection>,
-    dock_drag: Signal<Option<DockDrag>>,
-) -> Element {
+fn SideStack(nodes: Vec<DockNode>, ui_projection: Signal<UiProjection>) -> Element {
     let len = nodes.len();
     let entries: Vec<_> = nodes
         .into_iter()
@@ -670,7 +598,7 @@ fn SideStack(
         section { class: "dock-split dock-vertical side-stack",
             for (node, style) in entries {
                 div { class: "dock-child", style,
-                    DockNodeView { node, ui_projection, dock_drag }
+                    DockNodeView { node, ui_projection }
                 }
             }
         }
@@ -678,37 +606,32 @@ fn SideStack(
 }
 
 #[component]
-fn DockTab(panel: PanelKind, selected: bool, dock_drag: Signal<Option<DockDrag>>) -> Element {
+fn DockTab(panel: PanelKind, selected: bool) -> Element {
     let live_ink = use_context::<LiveInkBridge>();
     rsx! {
         button {
             class: if selected { "dock-tab active" } else { "dock-tab" },
             aria_selected: if selected { "true" } else { "false" },
             onclick: move |_| send_dock_command(&live_ink, DockCommand::ActivatePanel(panel)),
-            onmousedown: move |_| dock_drag.set(Some(DockDrag { source: panel, hovered: None })),
+            "data-dock-source": "{panel_slug(panel)}",
             "{panel_label(panel)}"
         }
     }
 }
 
 #[component]
-fn DockPanel(
-    panel: PanelKind,
-    ui_projection: Signal<UiProjection>,
-    dock_drag: Signal<Option<DockDrag>>,
-) -> Element {
+fn DockPanel(panel: PanelKind, ui_projection: Signal<UiProjection>) -> Element {
     let workspace = ui_projection.read().workspace.clone();
     let panel_title = panel_label(panel);
     let panel_class = format!("dock-panel panel-{}", panel_slug(panel));
-    let is_source = dock_drag.read().is_some_and(|drag| drag.source == panel);
 
     rsx! {
-        section { class: if is_source { "{panel_class} dock-drag-source" } else { "{panel_class}" }, aria_label: "{panel_title} panel",
+        section { class: "{panel_class}", aria_label: "{panel_title} panel", "data-dock-panel": "{panel_slug(panel)}",
             if panel != PanelKind::Canvas {
                 header {
                     class: "panel-header",
                     title: "{panel_title} 패널 이동",
-                    onmousedown: move |_| dock_drag.set(Some(DockDrag { source: panel, hovered: None })),
+                    "data-dock-source": "{panel_slug(panel)}",
                     span { class: "panel-grip", aria_hidden: "true" }
                     h2 { "{panel_title}" }
                 }
@@ -716,61 +639,6 @@ fn DockPanel(
             div { class: "panel-content",
                 PanelContents { panel, workspace, ui_projection }
             }
-            if dock_drag.read().is_some_and(|drag| drag.source != panel) {
-                DockDropOverlay { target: panel, dock_drag }
-            }
-        }
-    }
-}
-
-#[component]
-fn DockDropOverlay(target: PanelKind, dock_drag: Signal<Option<DockDrag>>) -> Element {
-    rsx! {
-        div { class: "dock-drop-overlay", aria_label: "{panel_label(target)} 주변 도킹 위치",
-            DockDropZone { target, position: DockPosition::Left, class: "dock-zone zone-left", dock_drag }
-            DockDropZone { target, position: DockPosition::Top, class: "dock-zone zone-top", dock_drag }
-            DockDropZone { target, position: DockPosition::Right, class: "dock-zone zone-right", dock_drag }
-        }
-    }
-}
-
-#[component]
-fn DockDropZone(
-    target: PanelKind,
-    position: DockPosition,
-    class: &'static str,
-    dock_drag: Signal<Option<DockDrag>>,
-) -> Element {
-    let live_ink = use_context::<LiveInkBridge>();
-    let active = dock_drag
-        .read()
-        .is_some_and(|drag| drag.hovered == Some(DockDrop { target, position }));
-    let indicator = if matches!(position, DockPosition::Left | DockPosition::Right) {
-        "dock-insert vertical"
-    } else {
-        "dock-insert horizontal"
-    };
-    rsx! {
-        div {
-            class: if active { "{class} active" } else { "{class}" },
-            onmousemove: move |_| {
-                let current = *dock_drag.read();
-                if let Some(mut drag) = current {
-                    drag.hovered = Some(DockDrop { target, position });
-                    dock_drag.set(Some(drag));
-                }
-            },
-            onmouseup: move |_| {
-                let current = *dock_drag.read();
-                if let Some(drag) = current {
-                    send_dock_command(
-                        &live_ink,
-                        DockCommand::MovePanel { panel: drag.source, target, position },
-                    );
-                    dock_drag.set(None);
-                }
-            },
-            span { class: "{indicator}" }
         }
     }
 }

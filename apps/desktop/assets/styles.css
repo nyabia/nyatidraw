@@ -168,23 +168,7 @@ button:focus, [tabindex="0"]:focus { outline: 2px solid #9ee8ff; outline-offset:
 .command-error { padding: 4px 6px; color: #ffd3ca; font-size: 10px; }
 
 .dock-drag-source { opacity: .52; }
-.dock-drop-overlay { position: absolute; inset: 0; z-index: 50; background: rgba(12,32,46,.12); }
-.dock-zone { position: absolute; }
-.zone-left { left: 0; top: 24%; bottom: 24%; width: 28%; }
-.zone-right { right: 0; top: 24%; bottom: 24%; width: 28%; }
-.zone-top { top: 0; left: 28%; right: 28%; height: 26%; }
-.dock-insert { position: absolute; display: none; z-index: 51; background: #35bdf5; border: 1px solid #075ea9; box-shadow: 0 0 7px rgba(42,184,244,.8); }
-.dock-zone:hover .dock-insert, .dock-zone.active .dock-insert { display: block; }
-.dock-insert.vertical { top: 6px; bottom: 6px; width: 5px; }
-.zone-left .dock-insert { left: 2px; }
-.zone-right .dock-insert { right: 2px; }
-.dock-insert.horizontal { left: 6px; right: 6px; height: 5px; }
-.zone-top .dock-insert { top: 2px; }
-.dock-insert:before, .dock-insert:after { position: absolute; width: 7px; height: 7px; content: ""; background: #9ee8ff; border: 1px solid #075ea9; }
-.dock-insert.horizontal:before { top: -2px; left: -4px; }
-.dock-insert.horizontal:after { top: -2px; right: -4px; }
-.dock-insert.vertical:before { top: -4px; left: -2px; }
-.dock-insert.vertical:after { bottom: -4px; left: -2px; }
+
 .unsaved-dot { position: fixed; top: 4px; right: 8px; z-index: 80; color: #ffd28c; font-size: 18px; }
 .commandbar-error, .status-toast { position: fixed; right: 10px; z-index: 90; max-width: min(440px,calc(100vw - 20px)); padding: 6px 9px; border: 1px solid #7a2929; background: #3d2020; color: #ffe1dc; box-shadow: 0 3px 12px rgba(0,0,0,.35); }
 .commandbar-error { top: 48px; }
@@ -212,12 +196,18 @@ button:focus, [tabindex="0"]:focus { outline: 2px solid #9ee8ff; outline-offset:
 /* Toolbar entries share the dock authority with side panels. */
 .toolbar-dock { position: relative; flex-shrink: 0; }
 .toolbar-grip { cursor: grab; touch-action: none; }
-.toolbar-top-target { position: absolute; inset: 0; z-index: 5; }
-.toolbar-top-target.trailing { position: relative; align-self: stretch; min-width: 50px; flex: 1; }
-.toolbar-top-target .dock-insert { left: 0; top: 0; bottom: 0; }
-.toolbar-top-target:hover .dock-insert { display: block; }
+.toolbar-top-space { align-self: stretch; flex: 1; min-width: 40px; }
 .side-toolbar { display: flex; width: 100%; flex-direction: column; align-items: center; overflow: auto; padding: 4px; gap: 3px; }
 .side-toolbar .quick-colors { flex: 0 0 33px; }
 .side-toolbar .color-stack { flex: 0 0 36px; }
 
 .panel-header h2 { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+[data-dock-source] { touch-action: none; }
+.dock-capturing, .dock-capturing * { cursor: grabbing !important; }
+.dock-capture-marker { position: fixed; display: none; z-index: 2147483647; pointer-events: none; background: #35bdf5; border: 1px solid #075ea9; box-shadow: 0 0 7px rgba(42,184,244,.8); }
+.dock-capture-marker::before, .dock-capture-marker::after { position: absolute; width: 7px; height: 7px; content: ""; background: #9ee8ff; border: 1px solid #075ea9; }
+.dock-capture-marker.horizontal::before { top: -2px; left: -4px; }
+.dock-capture-marker.horizontal::after { top: -2px; right: -4px; }
+.dock-capture-marker.vertical::before { top: -4px; left: -2px; }
+.dock-capture-marker.vertical::after { bottom: -4px; left: -2px; }

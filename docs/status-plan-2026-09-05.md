@@ -525,3 +525,22 @@ release 설치 빌드가 통과했다. 단위 테스트는 추가하지 않았�
 [ADR-0020](decisions/ADR-0020-dockable-toolbar-entries.md)에 근거와 범위를 기록했다.
 다음은 pointer capture, 창/target 밖 release와 취소 처리다. 실제 최근 색상 이력과
 물리 펜 연속성·장시간 도킹 acceptance도 아직 완료로 판정하지 않는다.
+
+### 도킹 포인터 캡처와 취소
+
+도킹 handle이 pointer capture를 잡고 좌표·삽입 marker를 WebView 안에서 처리한다.
+드래그 중 Dioxus signal 갱신은 제거했고 놓을 때 현재 좌표로 대상을 다시 판정해
+시작 revision에 묶인 명령 하나만 보낸다. Esc/창 blur/pointercancel/capture loss 등은
+배치 변경 없이 취소한다. 버튼의 일반 포커스 이동을 창 blur로 오인하던 문제도
+설치판에서 발견해 수정했다.
+
+실제 드래그의 캔버스 횡단 이동, canvas 위 target에서 놓기, canvas 중앙·제목 표시줄
+release 취소, 일반 탭 클릭과 상단 순서 변경을 확인했다. Scratch 전용으로 네 취소
+신호를 주입한 연속 드래그는 설정 hash를 보존했고 그다음 새 드래그는 성공했다.
+취소 신호의 일부는 합성이며 실제 장치 capture loss나 창 전환의 증거로 취급하지
+않는다. 종료·별도 reopen의 작품 전체 타일/history/PNG 불변도 통과했다.
+
+전체 Clippy와 release 설치 빌드가 통과했으며 단위 테스트는 추가하지 않았다.
+[ADR-0021](decisions/ADR-0021-dock-pointer-capture.md)에 근거와 남은 수동 범위를
+기록했다. 실제 최근 색상 이력, 도킹 중 marker의 직접 시각 확인·장시간/물리 펜
+acceptance와 나머지 기본 편집·성능 계측은 계속 열려 있다.

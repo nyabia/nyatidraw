@@ -144,7 +144,7 @@ texture tip, stabilizer는 Sprint 4 범위다.
 | 색상 | current/recent color와 brush snapshot 연결; 큰 wheel 표면은 OS color picker를 연다 | wheel/SV/value 직접 조작과 recent history |
 | 레이어 | 선택, visibility, opacity, 흰 배경, raster/group 추가·삭제, 이름 변경, group 접기, session-only Solo, durable Reference/thumbnail, metadata Undo, drag reorder/위·아래 이동 연결 | 물리 drag·스크롤 중 끌기 실사용 |
 | 히스토리 | 현재 branch ancestry와 active cursor를 최대 64행으로 투영; 상단 undo/redo 연결 | 분기 탐색 UI와 history panel 직접 이동 |
-| 도킹 | 독립 toolbar의 top/left/right 배치·상단 순서, 좌우 stack/fill, v1→v2 layout 재시작 복원을 설치판에서 확인; bottom target 없음 | pointer capture·창/target 밖 release·취소, 장시간/물리 펜 연속성 acceptance |
+| 도킹 | 독립 toolbar의 top/left/right·상단 순서, 좌우 stack/fill, layout 복원, 실제 mouse capture·target 밖 release와 controlled cancel 확인; bottom target 없음 | held-drag marker 시각 확인, 실제 OS/장치 capture loss, 장시간/물리 펜 연속성 acceptance |
 
 시작 창은 커서가 놓인 모니터의 작업 영역을 기준으로 최대화를 시도한다. 이는 Windows
 parent HWND와 최소 Win32 모니터 조회를 사용하는 best-effort 경로이며, 다중 모니터와
