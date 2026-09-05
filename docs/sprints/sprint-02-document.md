@@ -129,6 +129,16 @@ destination replacement를 거부한다.
   fail-closed한다. 종료로 display owner가 retire된 경우에만 disposable GPU completion을
   생략하며 durable CPU replay/commit은 계속한다.
 
+### 2026-09-05 레이어 history 연결
+
+추가·이름·visibility·opacity·순서·삭제는 immutable tree와 tile snapshot을 함께
+commit하며 Undo/Redo에서 함께 복원한다. 그룹 삭제는 하위 raster pixels를 새
+snapshot에서 제거하고 과거 snapshot에는 보존한다. 마지막 raster 삭제는 빈 raster를
+생성하고 active를 유지 가능한 raster로 맞춘다. Solo는 session 상태다. 설치 release의
+20 raster·2단계 중첩 fixture에서 metadata/삭제/분기/순서를 Save·재시작·reopen·PNG
+전체 픽셀로 검증했다. [구현 근거](../implementation.md#2026-09-05-desktop-layer-history)를
+따른다. Reference metadata, drag reorder UI 및 per-cursor page state는 남아 있다.
+
 ### 남은 engineering evidence
 
 - 화면 복원/present를 포함한 undo/redo p95, large database/repair, migration,

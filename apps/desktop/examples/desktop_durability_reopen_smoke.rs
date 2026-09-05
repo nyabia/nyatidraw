@@ -115,6 +115,13 @@ mod windows {
         require_log(&protocol, "layers=5 active=101 solo=true")?;
         let database = ProjectDb::open(project)?;
         verify_protocol_layer_tree(&database)?;
+        let protocol_snapshot = database
+            .load_reopened()?
+            .ok_or("missing layer history")?
+            .current_snapshot();
+        if protocol_snapshot.0 <= first_snapshot.0 {
+            return Err("layer changes did not create durable history".into());
+        }
         drop(database);
 
         let second = run_desktop(
@@ -133,7 +140,7 @@ mod windows {
         let second_reopen = database
             .load_reopened()?
             .ok_or("second desktop run lost the durable snapshot")?;
-        if second_reopen.current_snapshot() != first_snapshot
+        if second_reopen.current_snapshot() != protocol_snapshot
             || second_reopen.current_tiles().root() != first_root
             || second_reopen.current_tiles().len() != first_tiles
         {

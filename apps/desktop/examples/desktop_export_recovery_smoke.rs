@@ -13,7 +13,10 @@ fn main() {
 
 #[cfg(windows)]
 mod windows_probe {
-    use nyatidraw_api::{CanvasSpec, HistoryNodeId, LayerId, SnapshotId};
+    use nyatidraw_api::{
+        CanvasSpec, ContentRootId, GroupId, HistoryNodeId, LayerId, LayerTreeNodeId, SnapshotId,
+    };
+    use nyatidraw_document::{GroupNode, LayerNode, LayerTree, LayerTreeNode};
     use nyatidraw_editor::HeadlessStrokeSession;
     use nyatidraw_project_redb::ProjectDb;
     use nyatidraw_tiles::{FlattenedRgba8, TILE_BYTE_LEN, TileKey, TileSnapshot};
@@ -75,6 +78,7 @@ mod windows_probe {
     }
 
     fn run_cases(executable: &Path, root: &Path) -> Result<()> {
+        layer_history_case(executable, &root.join("layer-history"))?;
         history_branches_case(executable, &root.join("history-branches"))?;
         initial_import_history_case(executable, &root.join("initial-history"))?;
         for sibling in ["absent", "zero-byte"] {
@@ -88,6 +92,153 @@ mod windows_probe {
         failed_close_case(executable, &root.join("failed-close"))?;
         println!(
             "desktop-export-recovery-smoke status=passed png_pair=absent-zero-valid-invalid activation=same-primary crash_boundaries=4 supersession=encoded-old-job-discarded failed_close=reopened-and-retried physical_pen_proof=false power_loss_proof=false"
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn layer_history_case(executable: &Path, directory: &Path) -> Result<()> {
+        let (project, _) = fixture(directory)?;
+        let canvas = CanvasSpec {
+            width_px: 4,
+            height_px: 4,
+            pixels_per_inch: 96,
+        };
+        let group = |id, children| {
+            LayerTreeNode::Group(GroupNode {
+                id: GroupId(id),
+                name: format!("Group{id}"),
+                visible: true,
+                opacity_u16: u16::MAX,
+                children,
+            })
+        };
+        let rasters = (1..=20)
+            .map(|id| {
+                LayerTreeNode::Raster(LayerNode {
+                    id: LayerId(id),
+                    name: format!("Layer{id}"),
+                    visible: true,
+                    locked: false,
+                    opacity_u16: u16::MAX,
+                    content_root: ContentRootId(0),
+                })
+            })
+            .collect();
+        let baseline = LayerTree::new(GroupNode {
+            id: GroupId(100),
+            name: "Root".into(),
+            visible: true,
+            opacity_u16: u16::MAX,
+            children: vec![group(10, vec![group(11, rasters)])],
+        })
+        .map_err(|error| format!("layer fixture: {error:?}"))?;
+        let all_tiles = TileSnapshot::from_tiles((1_u8..=20).map(|id| {
+            (
+                TileKey {
+                    layer: LayerId(u128::from(id)),
+                    mip: 0,
+                    x: 0,
+                    y: 0,
+                },
+                [id * 10, 0, 0, 255].repeat(TILE_BYTE_LEN / 4),
+            )
+        }))
+        .map_err(|error| format!("layer pixels: {error:?}"))?;
+        let db = ProjectDb::open(&project)?;
+        db.persist_canvas_spec(canvas)?;
+        db.persist_layer_tree(&baseline)?;
+        let session = HeadlessStrokeSession::new(SnapshotId(0), TileSnapshot::empty());
+        let batch = session
+            .prepare_structural_change(SnapshotId(1), HistoryNodeId(1), 1, all_tiles.clone())
+            .map_err(|error| format!("layer initial snapshot: {error:?}"))?;
+        db.commit_structural(&batch)?;
+        drop(db);
+        let mut renamed = baseline.clone();
+        renamed
+            .rename(LayerTreeNodeId::Raster(LayerId(1)), "Renamed layer")
+            .map_err(|error| format!("rename expectation: {error:?}"))?;
+        let mut restored = renamed.clone();
+        restored
+            .set_opacity(LayerTreeNodeId::Group(GroupId(10)), 32768)
+            .map_err(|error| format!("opacity expectation: {error:?}"))?;
+        let mut removed = restored.clone();
+        removed
+            .remove(LayerTreeNodeId::Raster(LayerId(1)))
+            .map_err(|error| format!("remove expectation: {error:?}"))?;
+        let mut reordered = restored.clone();
+        reordered
+            .reorder(LayerTreeNodeId::Raster(LayerId(1)), GroupId(100), 0)
+            .map_err(|error| format!("reorder expectation: {error:?}"))?;
+        let mut survivor = reordered.clone();
+        survivor
+            .remove(LayerTreeNodeId::Group(GroupId(10)))
+            .map_err(|error| format!("subtree expectation: {error:?}"))?;
+        for (probe, snapshot, count, expected_tree) in [
+            ("rename-r:1", 2, 20, Some(&renamed)),
+            ("opacity-g:10", 3, 20, Some(&restored)),
+            ("delete-r:1", 4, 19, Some(&removed)),
+            ("undo", 3, 20, Some(&restored)),
+            ("delete-g:10", 5, 0, None),
+            ("undo", 3, 20, Some(&restored)),
+            ("redo:5", 5, 0, None),
+            ("undo", 3, 20, Some(&restored)),
+            ("reorder-r:1", 6, 20, Some(&reordered)),
+            ("delete-g:10", 7, 1, Some(&survivor)),
+            ("undo", 6, 20, Some(&reordered)),
+        ] {
+            let mut app = Desktop::start_with_history(executable, &project, Some(probe))?;
+            app.until("event=history-probe-complete")?;
+            app.until("active_valid=true")?;
+            app.until("event=first-native-wgpu-present")?;
+            let window = find_window(app.child.id())?;
+            let child =
+                unsafe { FindWindowExW(Some(window), None, w!("NyatiDrawWgpuCanvas"), None) }?;
+            post(child, WM_KEYDOWN, usize::from(b'S'))?;
+            app.until("event=png-export-finished")?;
+            app.close()?;
+            let db = ProjectDb::open(&project)?;
+            let reopened = db.load_reopened()?.ok_or("missing layer history")?;
+            let tree = db.load_layer_tree()?.ok_or("missing layer tree")?;
+            if reopened.current_snapshot() != SnapshotId(snapshot)
+                || reopened.current_tiles().iter().count() != count
+            {
+                return Err(format!("{probe}: incorrect layer snapshot or tile count").into());
+            }
+            if let Some(expected) = expected_tree {
+                if &tree != expected {
+                    return Err(format!("{probe}: layer tree changed across restart").into());
+                }
+            } else if tree.root().children.len() != 1
+                || tree
+                    .ancestors(LayerTreeNodeId::Raster(LayerId(101)))
+                    .is_none()
+            {
+                return Err(format!(
+                    "{probe}: deleting last raster did not create a drawable fallback"
+                )
+                .into());
+            }
+            let expected_tiles = all_tiles
+                .with_replacements(
+                    all_tiles
+                        .iter()
+                        .filter(|(key, _)| {
+                            tree.ancestors(LayerTreeNodeId::Raster(key.layer)).is_none()
+                        })
+                        .map(|(key, _)| (key, vec![0; TILE_BYTE_LEN])),
+                )
+                .map_err(|error| format!("expected deletion tiles: {error:?}"))?;
+            if reopened.current_tiles() != &expected_tiles {
+                return Err(format!("{probe}: deleted or restored artwork is not exact").into());
+            }
+            let flattened =
+                nyatidraw_paint_cpu::flatten_layer_tree_rgba8(&expected_tiles, &tree, canvas)
+                    .map_err(|error| format!("expected layer composite: {error:?}"))?;
+            verify_png(&project.with_extension("png"), &flattened)?;
+        }
+        println!(
+            "desktop-layer-history status=passed rasters=20 nesting=2 metadata_undo=exact subtree_delete_undo_redo=exact last_layer_fallback=valid save_restart_reopen_png=exact"
         );
         Ok(())
     }

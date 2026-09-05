@@ -115,7 +115,7 @@ button:focus, [tabindex="0"]:focus { outline: 2px solid #9ee8ff; outline-offset:
 .layer-settings button { display: flex; height: 25px; align-items: center; gap: 4px; padding: 0 5px; border: 1px solid transparent; font-size: 10px; }
 .layer-color-chip { width: 14px; height: 14px; background: #43a9df; border: 1px solid #eee; }
 .layer-list { min-height: 0; flex: 1; padding: 0 4px; overflow-y: auto; background: #838383; }
-.layer-row { display: grid; grid-template-columns: 25px 22px 17px 54px minmax(0,1fr) 38px; align-items: center; min-height: 66px; border-bottom: 1px solid #9b9b9b; }
+.layer-row { display: grid; grid-template-columns: 25px 22px 17px 54px minmax(0,1fr) 38px 22px; align-items: center; min-height: 66px; border-bottom: 1px solid #9b9b9b; }
 .layer-row:hover { background: #797979; }
 .layer-row.active { background: #666; outline: 1px solid #ddd; outline-offset: -1px; }
 .layer-row.group { min-height: 58px; background: #787878; }
@@ -124,6 +124,7 @@ button:focus, [tabindex="0"]:focus { outline: 2px solid #9ee8ff; outline-offset:
 .eye-mark.hidden { opacity: .25; }
 .layer-solo { font-size: 12px; font-weight: 700; }
 .layer-solo.active { background: #3b7fa0; color: #fff; }
+.layer-delete { width: 22px; height: 28px; font-size: 17px; }
 .layer-tree { width: 17px; font-size: 16px; }
 .layer-tree .icon { width: 15px; height: 15px; }
 .layer-thumb { display: grid; width: 50px; height: 56px; place-items: center; overflow: hidden; border: 1px solid #4b4b4b; background: #fff; }

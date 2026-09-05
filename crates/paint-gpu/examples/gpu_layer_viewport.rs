@@ -195,6 +195,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "affine bottom-right",
     )?;
 
+    verify_tree_replacement(&mut scene, &device, &queue)?;
+
     println!(
         concat!(
             "{{\"event\":\"gpu_layer_viewport\",\"adapter_name\":{:?},",
@@ -204,7 +206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "\"visibility_group_tiles\":{},\"reorder_group_tiles\":{},",
             "\"affine_group_tiles\":{},\"allocation_guard\":{{",
             "\"required_bytes\":{},\"max_bytes\":{},\"surfaces\":{}}},",
-            "\"tolerance\":{},\"pass\":true}}"
+            "\"tree_delete_restore\":true,\"tolerance\":{},\"pass\":true}}"
         ),
         adapter_info.name,
         adapter_info.backend,
@@ -221,6 +223,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         allocation_guard.2,
         TOLERANCE,
     );
+    Ok(())
+}
+
+fn verify_tree_replacement(
+    scene: &mut GpuCompositeScene,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tree = fixture_tree().map_err(debug_error)?;
+    scene.replace_tree(tree.clone()).map_err(debug_error)?;
+    scene
+        .upload_layer_rgba8(BOTTOM, &solid([255, 0, 0, 255]))
+        .map_err(debug_error)?;
+    scene
+        .upload_layer_rgba8(TOP, &solid([0, 0, 255, 255]))
+        .map_err(debug_error)?;
+    let mut deleted = tree.clone();
+    deleted
+        .remove(LayerTreeNodeId::Group(OVERLAY_GROUP))
+        .map_err(debug_error)?;
+    scene.replace_tree(deleted).map_err(debug_error)?;
+    let identity = viewport(Point::default(), 1.0, 0.0);
+    scene.render_viewport(identity).map_err(debug_error)?;
+    require_pixel(
+        &readback(scene, device, queue)?,
+        64,
+        64,
+        [255, 0, 0, 255],
+        "deleted group retains underlying raster",
+    )?;
+    scene.replace_tree(tree).map_err(debug_error)?;
+    scene
+        .upload_closed_tile(
+            TileKey {
+                layer: TOP,
+                mip: 0,
+                x: 0,
+                y: 0,
+            },
+            &[0, 255, 0, 255].repeat(TILE_BYTE_LEN / 4),
+        )
+        .map_err(debug_error)?;
+    scene.render_viewport(identity).map_err(debug_error)?;
+    let restored = readback(scene, device, queue)?;
+    require_pixel(
+        &restored,
+        64,
+        64,
+        [127, 128, 0, 255],
+        "restored group and CPU tile",
+    )?;
+    require_pixel(
+        &restored,
+        192,
+        192,
+        [255, 0, 0, 255],
+        "deleted surface pixels do not leak into restoration",
+    )?;
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 # ADR-0010: Immutable layer state at history cursors
 
-- Status: Storage boundary accepted; desktop integration pending
+- Status: Accepted, including desktop layer deletion and metadata Undo
 - Date: 2026-09-05
 
 ## Problem and decision
@@ -45,7 +45,24 @@ compares both. Release runs passed on Windows 11 Home 10.0.26200 / Core Ultra 7
 or filesystem-cache durability proof. Logs: `target/layer-history-release-crash.log`,
 `target/layer-history-workspace-tests.log`, `target/layer-history-all-clippy.log`.
 
-No dependency was added or changed; redb remains exactly 2.6.3. This checkpoint
-does not enable desktop deletion or restore its GPU tree on Undo yet. Desktop
-commands, active-layer fallback, subtree tile removal, Reference metadata and
-per-cursor canvas/page state are subsequent work in the active Sprint 1–3 goal.
+Desktop artwork layer commands now commit through this boundary before publishing
+the candidate tree. Deletion removes all subtree tiles from the new snapshot;
+older snapshots retain them. Undo/Redo restores both tree and pixels, reconciles
+GPU surfaces on the existing device, and updates navigator/thumbnail publication.
+The active raster falls back to a surviving raster; deleting the last raster
+creates an empty one. Solo and active selection remain session state. A failed
+GPU adoption after durable acceptance latches a workspace error and prevents
+drawing until the saved project is reopened.
+
+The installed DX 0.7.9 release passes a 20-raster, two-level nested-group fixture:
+rename, opacity, raster/subtree deletion, last-raster fallback, cross-parent
+reorder, branch Undo/Redo, Save and process restart with exact tree/tile/PNG
+comparison. Existing installed durability and PNG crash/recovery cases also pass.
+Logs: `target/installed-layer-history.log`, `target/installed-layer-durability.log`.
+The existing core tree invariant was extended; the test count remains 60.
+
+No dependency was added or changed; redb remains exactly 2.6.3. Idle metadata and
+history requests still use synchronous worker replies, so this does not close
+the hot-path latency gate. Reference metadata, drag reorder UI and per-cursor
+canvas/page state remain subsequent work in the active Sprint 1–3 goal. Semantic
+probes do not establish direct UI interaction or physical-pen evidence.

@@ -310,6 +310,35 @@ These are semantic command and process-restart results; branch-button visual
 interaction, physical pen, visible-pixel latency, and per-snapshot layer metadata
 restoration are not established by this probe.
 
+## 2026-09-05 desktop layer history
+
+Layer artwork commands share the immediate structural/tree transaction described
+in [ADR-0010](decisions/ADR-0010-snapshot-layer-history.md). Subtree deletion removes
+its tile keys from the new snapshot, retaining older snapshots for Undo/Redo.
+GPU reconciliation preserves the device and surviving raster surfaces, clears
+composite/atlas caches, drops removed surfaces and uploads the target CPU tiles.
+Active selection always chooses a surviving raster, with a new empty raster if
+none remains. Navigator and thumbnails use the restored authoritative tree.
+Solo is session-only. Commands reject during pending stroke/export work; the
+idle request/reply remains synchronous and is not a latency-gate result.
+
+The installed Windows DX release passed 20-raster/two-level nested-group
+rename/opacity/delete/reorder and branch Undo/Redo through 11 process launches.
+Each step saves, closes and reopens with exact current tree, tile and cropped PNG
+comparison. Last-raster deletion and active fallback are checked. The existing
+durability/reopen and PNG pairing/crash/recovery probes also pass. Environment:
+Windows 11 Home 10.0.26200 / Core Ultra 7 155H / Intel Arc integrated / DX12.
+Logs: `target/installed-layer-history.log`, `target/installed-layer-durability.log`.
+Workspace invariant tests remain 60; all-feature/all-target Clippy passes.
+These probes exercise semantic commands, not direct deletion-button interaction.
+
+The existing `gpu_layer_viewport --release` probe also passed on the same Intel
+Arc adapter using Vulkan. At 256×256 it checks group deletion retaining the
+underlying raster, tree restoration with a CPU tile upload, and absence of stale
+deleted-surface pixels at a second coordinate, with RGBA8 channel tolerance 2.
+Log: `target/desktop-layer-gpu.log`. This is device readback evidence on that
+backend, not DX12 pixel equivalence, display latency or physical-pen proof.
+
 ## Test policy
 
 Automated tests target only core regressions that can corrupt artwork, lose

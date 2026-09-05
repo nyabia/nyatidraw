@@ -75,9 +75,39 @@ const INPUT_SAFETY_PROBE_ENV: &str = "NAYATI_INPUT_SAFETY_PROBE";
 static ACTIVE_PROBE_USED: AtomicBool = AtomicBool::new(false);
 static SAVE_PROBE_USED: AtomicBool = AtomicBool::new(false);
 
-fn history_probe_command() -> Option<nyatidraw_api::HistoryCommand> {
+fn history_probe_command() -> Option<EditorCommand> {
     use nyatidraw_api::HistoryCommand;
     let value = std::env::var(HISTORY_PROBE_ENV).ok()?;
+    let layer = match value.as_str() {
+        "rename-r:1" => Some(LayerCommand::Rename {
+            node: nyatidraw_api::LayerTreeNodeId::Raster(LayerId(1)),
+            name: "Renamed layer".into(),
+        }),
+        "opacity-g:10" => Some(LayerCommand::SetOpacity {
+            node: nyatidraw_api::LayerTreeNodeId::Group(GroupId(10)),
+            opacity_u16: 32_768,
+        }),
+        "reorder-r:1" => Some(LayerCommand::Reorder {
+            node: nyatidraw_api::LayerTreeNodeId::Raster(LayerId(1)),
+            new_parent: ROOT_GROUP,
+            index: 0,
+        }),
+        _ => value
+            .strip_prefix("delete-r:")
+            .and_then(|id| id.parse().ok())
+            .map(|id| LayerCommand::Delete(nyatidraw_api::LayerTreeNodeId::Raster(LayerId(id))))
+            .or_else(|| {
+                value
+                    .strip_prefix("delete-g:")
+                    .and_then(|id| id.parse().ok())
+                    .map(|id| {
+                        LayerCommand::Delete(nyatidraw_api::LayerTreeNodeId::Group(GroupId(id)))
+                    })
+            }),
+    };
+    if let Some(layer) = layer {
+        return Some(EditorCommand::Layer(layer));
+    }
     match value.as_str() {
         "undo" => Some(HistoryCommand::Undo),
         "redo" => Some(HistoryCommand::Redo),
@@ -95,6 +125,7 @@ fn history_probe_command() -> Option<nyatidraw_api::HistoryCommand> {
                     })
             }),
     }
+    .map(EditorCommand::History)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -606,7 +637,7 @@ struct ActiveCanvas {
     close_raw_probe_staged: bool,
     save_probe_step: u8,
     protocol_probe_step: Option<u8>,
-    history_probe: Option<(nyatidraw_api::HistoryCommand, bool)>,
+    history_probe: Option<(EditorCommand, bool)>,
     input_safety_probe_step: Option<u8>,
     synthetic_seed_enabled: bool,
     synthetic_seed_submitted: bool,
@@ -670,7 +701,7 @@ impl ActiveCanvas {
                     tree.ancestors(nyatidraw_api::LayerTreeNodeId::Raster(*layer))
                         .is_some()
                 })
-                .unwrap_or(LIVE_LAYER);
+                .unwrap_or_else(|| valid_active_layer(&tree, LIVE_LAYER));
             let view = RendererView::from_projection(authoritative.viewport);
             println!(
                 "native-canvas event=projection-restored revision={} source=protocol-mailbox",
@@ -690,7 +721,7 @@ impl ActiveCanvas {
                 .publish_editor_state(
                     project_location.title(),
                     false,
-                    Some(LIVE_LAYER),
+                    Some(valid_active_layer(&tree, LIVE_LAYER)),
                     &tree,
                     session_dock,
                     ViewportProjection {
@@ -705,7 +736,10 @@ impl ActiveCanvas {
                 },
                 Some(projection.current().clone()),
             );
-            (RendererView::default(), LIVE_LAYER)
+            (
+                RendererView::default(),
+                valid_active_layer(&tree, LIVE_LAYER),
+            )
         };
 
         let drawing = DrawingConfig::from_projection(projection.current());
@@ -859,7 +893,7 @@ impl ActiveCanvas {
     }
 
     fn advance_history_probe(&mut self) {
-        let Some((command, submitted)) = self.history_probe else {
+        let Some((command, submitted)) = self.history_probe.clone() else {
             return;
         };
         if submitted {
@@ -870,18 +904,21 @@ impl ActiveCanvas {
                 .map(|branch| branch.node.0)
                 .collect();
             println!(
-                "native-canvas event=history-probe-complete candidates={candidates:?} after={:?} more={} semantic_only=true",
+                "native-canvas event=history-probe-complete candidates={candidates:?} after={:?} more={} active={} layers={} active_valid={} semantic_only=true",
                 history.redo_page_after.map(|id| id.0),
                 history.has_more_redo_branches,
+                self.active_layer.0,
+                self.projection.current().layers.len(),
+                self.scene
+                    .tree()
+                    .ancestors(nyatidraw_api::LayerTreeNodeId::Raster(self.active_layer))
+                    .is_some(),
             );
             self.history_probe = None;
         } else if self
             .stroke
             .live_ink
-            .push_editor_command(
-                self.projection.current().revision,
-                EditorCommand::History(command),
-            )
+            .push_editor_command(self.projection.current().revision, command.clone())
             .is_ok()
         {
             self.history_probe = Some((command, true));
@@ -1363,116 +1400,6 @@ impl ActiveCanvas {
                 self.stroke.live_ink.set_admission_layer(layer);
                 Ok(false)
             }
-            EditorCommand::Layer(LayerCommand::AddWhiteBackground) => {
-                // A white background is real editable raster content. It is
-                // added beneath existing ink through one structural content
-                // transition; it never alters any non-background tile.
-                if self.scene.active_live_stroke().is_some()
-                    || self
-                        .cpu_tiles
-                        .keys()
-                        .any(|key| key.layer == BACKGROUND_LAYER)
-                {
-                    return Err(CommandRejectReason::UnsupportedCommand);
-                }
-                let tiles = opaque_white_background_tiles(self.canvas_spec);
-                let history = self
-                    .stroke
-                    .materializer
-                    .persist_white_background(tiles.clone())
-                    .map_err(|()| CommandRejectReason::CommandQueueBusy)?;
-                self.projection.stage_history(history);
-                for (key, tile) in tiles.iter() {
-                    self.scene
-                        .upload_closed_tile(key, tile.pixels())
-                        .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
-                    self.cpu_tiles.insert(key, tile.pixels().to_vec());
-                }
-                println!(
-                    "native-canvas event=white-background-materialized layer={} tiles={} durability=redb-immediate",
-                    BACKGROUND_LAYER.0,
-                    self.cpu_tiles.len(),
-                );
-                Ok(true)
-            }
-            EditorCommand::Layer(command @ (LayerCommand::AddRaster | LayerCommand::AddGroup)) => {
-                if self.scene.active_live_stroke().is_some() {
-                    return Err(CommandRejectReason::UnsupportedCommand);
-                }
-                let node_id = self.next_layer_node_id;
-                let next_id = node_id
-                    .checked_add(1)
-                    .ok_or(CommandRejectReason::RevisionExhausted)?;
-                let active_node = nyatidraw_api::LayerTreeNodeId::Raster(self.active_layer);
-                let (parent, index) = self.scene.tree().parent_and_index(active_node).map_or(
-                    (
-                        self.scene.tree().root_id(),
-                        self.scene.tree().root().children.len(),
-                    ),
-                    |(parent, index)| (parent, index.saturating_add(1)),
-                );
-                let (node, new_active) = match command {
-                    LayerCommand::AddRaster => {
-                        let id = LayerId(node_id);
-                        (
-                            LayerTreeNode::Raster(LayerNode {
-                                id,
-                                name: next_default_node_name(self.scene.tree(), false),
-                                visible: true,
-                                locked: false,
-                                opacity_u16: u16::MAX,
-                                content_root: ContentRootId(0),
-                            }),
-                            Some(id),
-                        )
-                    }
-                    LayerCommand::AddGroup => (
-                        LayerTreeNode::Group(GroupNode {
-                            id: GroupId(node_id),
-                            name: next_default_node_name(self.scene.tree(), true),
-                            visible: true,
-                            opacity_u16: u16::MAX,
-                            children: Vec::new(),
-                        }),
-                        None,
-                    ),
-                    _ => unreachable!("match arm only accepts add commands"),
-                };
-                let mut candidate = self.scene.tree().clone();
-                candidate
-                    .insert(parent, index, node.clone())
-                    .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
-                self.scene
-                    .validate_empty_node_insert(parent, index, &node)
-                    .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
-                self.stroke
-                    .materializer
-                    .try_persist_layer_tree(candidate)
-                    .map_err(|()| CommandRejectReason::CommandQueueBusy)?;
-                self.scene
-                    .insert_empty_node(parent, index, node)
-                    .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
-                self.next_layer_node_id = next_id;
-                if let Some(layer) = new_active {
-                    self.active_layer = layer;
-                    self.stroke.live_ink.set_admission_layer(layer);
-                }
-                Ok(true)
-            }
-            EditorCommand::Layer(LayerCommand::Rename { node, name }) => {
-                let mut candidate = self.scene.tree().clone();
-                candidate
-                    .rename(node, &name)
-                    .map_err(|_| CommandRejectReason::UnknownLayer)?;
-                self.stroke
-                    .materializer
-                    .try_persist_layer_tree(candidate)
-                    .map_err(|()| CommandRejectReason::CommandQueueBusy)?;
-                self.scene
-                    .rename(node, &name)
-                    .map_err(|_| CommandRejectReason::UnknownLayer)?;
-                Ok(true)
-            }
             EditorCommand::Layer(LayerCommand::ToggleSolo(node)) => {
                 let next = (self.projection.current().solo_node != Some(node)).then_some(node);
                 self.scene
@@ -1481,63 +1408,7 @@ impl ActiveCanvas {
                 self.projection.stage_solo(next);
                 Ok(false)
             }
-            EditorCommand::Layer(command) => {
-                let mut candidate = self.scene.tree().clone();
-                match command {
-                    LayerCommand::SetVisibility { node, visible } => candidate
-                        .set_visibility(node, visible)
-                        .map_err(|_| CommandRejectReason::UnknownLayer)?,
-                    LayerCommand::SetOpacity { node, opacity_u16 } => candidate
-                        .set_opacity(node, opacity_u16)
-                        .map_err(|_| CommandRejectReason::UnknownLayer)?,
-                    LayerCommand::Reorder {
-                        node,
-                        new_parent,
-                        index,
-                    } => candidate
-                        .reorder(node, new_parent, index)
-                        .map_err(|_| CommandRejectReason::InvalidLayerMove)?,
-                    LayerCommand::AddRaster
-                    | LayerCommand::AddGroup
-                    | LayerCommand::Rename { .. }
-                    | LayerCommand::ToggleSolo(_)
-                    | LayerCommand::AddWhiteBackground
-                    | LayerCommand::SetActive(_) => {
-                        unreachable!("handled above")
-                    }
-                };
-                self.stroke
-                    .materializer
-                    .try_persist_layer_tree(candidate)
-                    .map_err(|()| CommandRejectReason::CommandQueueBusy)?;
-                match command {
-                    LayerCommand::SetVisibility { node, visible } => self
-                        .scene
-                        .set_visibility(node, visible)
-                        .map_err(|_| CommandRejectReason::UnknownLayer)?,
-                    LayerCommand::SetOpacity { node, opacity_u16 } => self
-                        .scene
-                        .set_opacity(node, opacity_u16)
-                        .map_err(|_| CommandRejectReason::UnknownLayer)?,
-                    LayerCommand::Reorder {
-                        node,
-                        new_parent,
-                        index,
-                    } => self
-                        .scene
-                        .reorder(node, new_parent, index)
-                        .map_err(|_| CommandRejectReason::InvalidLayerMove)?,
-                    LayerCommand::AddRaster
-                    | LayerCommand::AddGroup
-                    | LayerCommand::Rename { .. }
-                    | LayerCommand::ToggleSolo(_)
-                    | LayerCommand::AddWhiteBackground
-                    | LayerCommand::SetActive(_) => {
-                        unreachable!("handled above")
-                    }
-                }
-                Ok(true)
-            }
+            EditorCommand::Layer(command) => self.apply_layer_command(command),
             EditorCommand::Dock(command) => {
                 let mut dock = self.projection.current().dock.clone();
                 match command {
@@ -1618,62 +1489,220 @@ impl ActiveCanvas {
                 Ok(false)
             }
             EditorCommand::History(command) => {
-                if self.scene.active_live_stroke().is_some() {
-                    return Err(CommandRejectReason::UnsupportedCommand);
-                }
-                // A history cursor must not overtake closed strokes retained
-                // outside the writer FIFO, or be overwritten by their late
-                // GPU completions after the cursor move.
-                if self.stroke.active.is_some()
-                    || !self.stroke.pending_materializations.is_empty()
-                    || self.stroke.materializer.pending.load(Ordering::Acquire) != 0
-                    || matches!(
-                        self.stroke.live_ink.export_status_snapshot(),
-                        ExportStatus::Queued { .. } | ExportStatus::Running { .. }
-                    )
-                {
-                    return Err(CommandRejectReason::CommandQueueBusy);
-                }
-                let based_on = self.projection.current().revision;
-                self.apply_materialized_tiles();
-                if self.projection.current().revision != based_on {
-                    return Err(CommandRejectReason::StaleProjection {
-                        based_on,
-                        current: self.projection.current().revision,
-                    });
-                }
+                self.ensure_artwork_command_idle()?;
                 let moved = self
                     .stroke
                     .materializer
                     .move_history(command)
                     .map_err(|()| CommandRejectReason::UnsupportedCommand)?;
-                self.projection.stage_history(moved.history);
-                let Some(snapshot) = moved.tiles else {
-                    return Ok(false);
-                };
-                let keys: std::collections::BTreeSet<_> = self
-                    .cpu_tiles
-                    .keys()
-                    .copied()
-                    .chain(snapshot.iter().map(|(key, _)| key))
-                    .collect();
-                for key in keys {
-                    let pixels = snapshot
-                        .get(key)
-                        .map_or_else(|| vec![0; TILE_BYTE_LEN], |tile| tile.pixels().to_vec());
-                    self.scene
-                        .upload_closed_tile(key, &pixels)
-                        .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
-                }
-                self.cpu_tiles.clear();
-                self.cpu_tiles.extend(
-                    snapshot
-                        .iter()
-                        .map(|(key, tile)| (key, tile.pixels().to_vec())),
-                );
-                Ok(true)
+                let changed = moved.tiles.is_some();
+                self.install_history_move(moved)?;
+                Ok(changed)
             }
         }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_layer_command(&mut self, command: LayerCommand) -> Result<bool, CommandRejectReason> {
+        self.ensure_artwork_command_idle()?;
+        let mut tree = self.scene.tree().clone();
+        let mut active = self.active_layer;
+        let mut next_id = self.next_layer_node_id;
+        let white = matches!(command, LayerCommand::AddWhiteBackground);
+        match command {
+            LayerCommand::AddRaster | LayerCommand::AddGroup => {
+                let is_group = matches!(command, LayerCommand::AddGroup);
+                let (parent, index) = tree
+                    .parent_and_index(nyatidraw_api::LayerTreeNodeId::Raster(active))
+                    .map_or(
+                        (tree.root_id(), tree.root().children.len()),
+                        |(parent, index)| (parent, index + 1),
+                    );
+                let name = next_default_node_name(&tree, is_group);
+                let node = if is_group {
+                    LayerTreeNode::Group(GroupNode {
+                        id: GroupId(next_id),
+                        name,
+                        visible: true,
+                        opacity_u16: u16::MAX,
+                        children: Vec::new(),
+                    })
+                } else {
+                    active = LayerId(next_id);
+                    LayerTreeNode::Raster(empty_raster(active, name))
+                };
+                next_id = next_id
+                    .checked_add(1)
+                    .ok_or(CommandRejectReason::RevisionExhausted)?;
+                tree.insert(parent, index, node)
+                    .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
+            }
+            LayerCommand::Delete(node) => {
+                tree.remove(node)
+                    .map_err(|_| CommandRejectReason::UnknownLayer)?;
+                if raster_layer_ids(&tree).is_empty() {
+                    active = LayerId(next_id);
+                    next_id = next_id
+                        .checked_add(1)
+                        .ok_or(CommandRejectReason::RevisionExhausted)?;
+                    tree.insert(
+                        tree.root_id(),
+                        tree.root().children.len(),
+                        LayerTreeNode::Raster(empty_raster(active, "레이어 1".into())),
+                    )
+                    .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
+                }
+                active = valid_active_layer(&tree, active);
+            }
+            LayerCommand::Rename { node, name } => {
+                tree.rename(node, &name)
+                    .map_err(|_| CommandRejectReason::UnknownLayer)?;
+            }
+            LayerCommand::SetVisibility { node, visible } => {
+                tree.set_visibility(node, visible)
+                    .map_err(|_| CommandRejectReason::UnknownLayer)?;
+            }
+            LayerCommand::SetOpacity { node, opacity_u16 } => {
+                tree.set_opacity(node, opacity_u16)
+                    .map_err(|_| CommandRejectReason::UnknownLayer)?;
+            }
+            LayerCommand::Reorder {
+                node,
+                new_parent,
+                index,
+            } => {
+                tree.reorder(node, new_parent, index)
+                    .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
+            }
+            LayerCommand::AddWhiteBackground => {
+                if self
+                    .cpu_tiles
+                    .keys()
+                    .any(|key| key.layer == BACKGROUND_LAYER)
+                {
+                    return Ok(false);
+                }
+                if tree
+                    .ancestors(nyatidraw_api::LayerTreeNodeId::Raster(BACKGROUND_LAYER))
+                    .is_none()
+                {
+                    tree.insert(
+                        tree.root_id(),
+                        0,
+                        LayerTreeNode::Raster(empty_raster(BACKGROUND_LAYER, "Background".into())),
+                    )
+                    .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
+                }
+            }
+            LayerCommand::SetActive(_) | LayerCommand::ToggleSolo(_) => {
+                unreachable!("session commands handled separately")
+            }
+        }
+        if &tree == self.scene.tree() && !white {
+            return Ok(false);
+        }
+        self.scene
+            .validate_tree_replacement(&tree)
+            .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
+        let moved = self
+            .stroke
+            .materializer
+            .commit_layer_tree(tree, white)
+            .map_err(|()| CommandRejectReason::WorkspaceFailed)?;
+        self.active_layer = active;
+        self.install_history_move(moved)?;
+        self.next_layer_node_id = self.next_layer_node_id.max(next_id);
+        Ok(true)
+    }
+
+    fn ensure_artwork_command_idle(&mut self) -> Result<(), CommandRejectReason> {
+        if self.scene.active_live_stroke().is_some()
+            || self.stroke.active.is_some()
+            || !self.stroke.pending_materializations.is_empty()
+            || self.stroke.materializer.pending.load(Ordering::Acquire) != 0
+            || matches!(
+                self.stroke.live_ink.export_status_snapshot(),
+                ExportStatus::Queued { .. } | ExportStatus::Running { .. }
+            )
+        {
+            return Err(CommandRejectReason::CommandQueueBusy);
+        }
+        let based_on = self.projection.current().revision;
+        self.apply_materialized_tiles();
+        if self.projection.current().revision != based_on {
+            return Err(CommandRejectReason::StaleProjection {
+                based_on,
+                current: self.projection.current().revision,
+            });
+        }
+        Ok(())
+    }
+
+    fn install_history_move(&mut self, moved: HistoryMove) -> Result<(), CommandRejectReason> {
+        let result = self.install_history_move_inner(moved);
+        if let Err(error) = result {
+            self.stroke.live_ink.publish_workspace_error(format!(
+                "Artwork was saved but the canvas could not adopt its history state: {error:?}; reopen the project before drawing"
+            ));
+        }
+        result
+    }
+
+    fn install_history_move_inner(
+        &mut self,
+        moved: HistoryMove,
+    ) -> Result<(), CommandRejectReason> {
+        self.projection.stage_history(moved.history);
+        let Some(snapshot) = moved.tiles else {
+            return Ok(());
+        };
+        if let Some(tree) = moved.tree {
+            self.scene
+                .replace_tree(tree)
+                .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
+        }
+        self.active_layer = valid_active_layer(self.scene.tree(), self.active_layer);
+        self.stroke.live_ink.set_admission_layer(self.active_layer);
+        self.next_layer_node_id = self.next_layer_node_id.max(
+            next_layer_node_id(self.scene.tree())
+                .map_err(|_| CommandRejectReason::RevisionExhausted)?,
+        );
+        if self
+            .projection
+            .current()
+            .solo_node
+            .is_some_and(|node| self.scene.tree().ancestors(node).is_none())
+        {
+            self.projection.stage_solo(None);
+        }
+        let keys: BTreeSet<_> = self
+            .cpu_tiles
+            .keys()
+            .copied()
+            .chain(snapshot.iter().map(|(key, _)| key))
+            .collect();
+        for key in keys {
+            if self
+                .scene
+                .tree()
+                .ancestors(nyatidraw_api::LayerTreeNodeId::Raster(key.layer))
+                .is_none()
+            {
+                continue;
+            }
+            let pixels = snapshot
+                .get(key)
+                .map_or_else(|| vec![0; TILE_BYTE_LEN], |tile| tile.pixels().to_vec());
+            self.scene
+                .upload_closed_tile(key, &pixels)
+                .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
+        }
+        self.cpu_tiles = snapshot
+            .iter()
+            .map(|(key, tile)| (key, tile.pixels().to_vec()))
+            .collect();
+        self.latest_preview_generation.clear();
+        Ok(())
     }
 
     fn advance_save_probe(&mut self) {
@@ -2188,6 +2217,31 @@ fn projection_rejection(error: ProjectionError) -> CommandRejectReason {
     match error {
         ProjectionError::RevisionExhausted => CommandRejectReason::RevisionExhausted,
         ProjectionError::UnknownActiveLayer(_) => CommandRejectReason::UnknownLayer,
+    }
+}
+
+fn empty_raster(id: LayerId, name: String) -> LayerNode {
+    LayerNode {
+        id,
+        name,
+        visible: true,
+        locked: false,
+        opacity_u16: u16::MAX,
+        content_root: ContentRootId(0),
+    }
+}
+
+fn valid_active_layer(tree: &LayerTree, preferred: LayerId) -> LayerId {
+    if tree
+        .ancestors(nyatidraw_api::LayerTreeNodeId::Raster(preferred))
+        .is_some()
+    {
+        preferred
+    } else {
+        raster_layer_ids(tree)
+            .first()
+            .copied()
+            .unwrap_or(LIVE_LAYER)
     }
 }
 
@@ -3014,7 +3068,11 @@ struct MaterializationBootstrap {
 
 enum WorkerRequest {
     Stroke(ClosedStrokeRequest),
-    PersistLayerTree(LayerTree),
+    CommitLayerTree {
+        tree: LayerTree,
+        white: bool,
+        reply: SyncSender<Result<HistoryMove, String>>,
+    },
     ExportPng {
         generation: u64,
         path: PathBuf,
@@ -3025,14 +3083,11 @@ enum WorkerRequest {
         command: nyatidraw_api::HistoryCommand,
         reply: SyncSender<Result<HistoryMove, String>>,
     },
-    PersistInitialBackground {
-        tiles: TileSnapshot,
-        reply: SyncSender<Result<HistoryProjection, String>>,
-    },
 }
 
 struct HistoryMove {
     tiles: Option<TileSnapshot>,
+    tree: Option<LayerTree>,
     history: HistoryProjection,
 }
 
@@ -3315,22 +3370,13 @@ impl MaterializationWorker {
         }
     }
 
-    fn try_persist_layer_tree(&self, tree: LayerTree) -> Result<(), ()> {
-        let Some(sender) = self.sender.as_ref() else {
-            return Err(());
-        };
-        sender
-            .try_send(WorkerRequest::PersistLayerTree(tree))
-            .map_err(|_| ())
-    }
-
-    fn persist_white_background(&self, tiles: TileSnapshot) -> Result<HistoryProjection, ()> {
+    fn commit_layer_tree(&self, tree: LayerTree, white: bool) -> Result<HistoryMove, ()> {
         let Some(sender) = self.sender.as_ref() else {
             return Err(());
         };
         let (reply, received) = sync_channel(0);
         sender
-            .try_send(WorkerRequest::PersistInitialBackground { tiles, reply })
+            .try_send(WorkerRequest::CommitLayerTree { tree, white, reply })
             .map_err(|_| ())?;
         received.recv().ok().and_then(Result::ok).ok_or(())
     }
@@ -3598,6 +3644,7 @@ fn materialization_loop(
                 if let nyatidraw_api::HistoryCommand::ShowRedoBranches { after } = command {
                     let _ = reply.send(Ok(HistoryMove {
                         tiles: None,
+                        tree: None,
                         history: session.history_projection_after(after),
                     }));
                     continue;
@@ -3623,13 +3670,19 @@ fn materialization_loop(
                         let tiles = db
                             .load_cursor_tiles(target)
                             .map_err(|error| format!("history-load:{error}"))?;
+                        let tree = db
+                            .load_cursor_layer_tree(target)
+                            .map_err(|error| format!("history-tree-load:{error}"))?
+                            .unwrap_or_else(default_layer_tree);
                         db.persist_history_cursor(target)
                             .map_err(|error| format!("history-persist:{error}"))?;
                         session
                             .accept_history_cursor_move(prepared, tiles.clone())
                             .map_err(|error| format!("history-accept:{error:?}"))?;
+                        preview_tree = tree.clone();
                         Ok(HistoryMove {
                             tiles: Some(tiles),
+                            tree: Some(tree),
                             history: session.history_projection(),
                         })
                     });
@@ -3654,46 +3707,69 @@ fn materialization_loop(
                 let _ = reply.send(result);
                 continue;
             }
-            WorkerRequest::PersistInitialBackground { tiles, reply } => {
-                let after = match session.tiles().with_replacements(
-                    tiles
-                        .iter()
-                        .map(|(key, tile)| (key, tile.pixels().to_vec())),
-                ) {
-                    Ok(after) => after,
-                    Err(error) => {
-                        let _ = reply.send(Err(format!("white background tiles: {error:?}")));
-                        continue;
+            WorkerRequest::CommitLayerTree { tree, white, reply } => {
+                let result = (|| -> Result<HistoryMove, String> {
+                    let next = next_id
+                        .checked_add(1)
+                        .ok_or("project identifier space exhausted")?;
+                    let kept: BTreeSet<_> = raster_layer_ids(&tree).into_iter().collect();
+                    let removed: BTreeSet<_> = raster_layer_ids(&preview_tree)
+                        .into_iter()
+                        .filter(|id| !kept.contains(id))
+                        .collect();
+                    let mut after = if removed.is_empty() {
+                        session.tiles().clone()
+                    } else {
+                        session
+                            .tiles()
+                            .with_replacements(
+                                session
+                                    .tiles()
+                                    .iter()
+                                    .filter(|(key, _)| removed.contains(&key.layer))
+                                    .map(|(key, _)| (key, vec![0; TILE_BYTE_LEN])),
+                            )
+                            .map_err(|error| format!("subtree tiles: {error:?}"))?
+                    };
+                    if white {
+                        after = after
+                            .with_replacements(
+                                opaque_white_background_tiles(preview_canvas)
+                                    .iter()
+                                    .map(|(key, tile)| (key, tile.pixels().to_vec())),
+                            )
+                            .map_err(|error| format!("background tiles: {error:?}"))?;
                     }
-                };
-                let Some(next) = next_id.checked_add(1) else {
-                    let _ = reply.send(Err("project identifier space is exhausted".to_owned()));
-                    continue;
-                };
-                let result = session
-                    .prepare_structural_change(
-                        SnapshotId(next_id),
-                        HistoryNodeId(next_id),
-                        system_timestamp_ns(),
-                        after,
-                    )
-                    .map_err(|error| format!("structural background: {error:?}"))
-                    .and_then(|batch| {
-                        let persisted = match sink {
-                            ProjectSink::UntitledRecovery { db, .. }
-                            | ProjectSink::ExplicitProject { db, .. } => {
-                                db.commit_structural(&batch)
-                            }
-                        };
-                        persisted.map_err(|error| error.to_string()).and_then(|()| {
-                            session
-                                .accept_structural_change(&batch)
-                                .map_err(|error| format!("session:{error:?}"))
-                                .map(|()| session.history_projection())
-                        })
-                    });
-                let failed = result.is_err();
-                if !failed {
+                    let batch = session
+                        .prepare_structural_change(
+                            SnapshotId(next_id),
+                            HistoryNodeId(next_id),
+                            system_timestamp_ns(),
+                            after.clone(),
+                        )
+                        .map_err(|error| format!("layer history prepare: {error:?}"))?;
+                    let db = match sink {
+                        ProjectSink::UntitledRecovery { db, .. }
+                        | ProjectSink::ExplicitProject { db, .. } => db,
+                    };
+                    db.commit_structural_with_layer_tree(&batch, &tree)
+                        .map_err(|error| format!("layer history commit: {error}"))?;
+                    session
+                        .accept_structural_change(&batch)
+                        .map_err(|error| format!("layer history accept: {error:?}"))?;
+                    next_id = next;
+                    preview_tree = tree.clone();
+                    Ok(HistoryMove {
+                        tiles: Some(after),
+                        tree: Some(tree),
+                        history: session.history_projection(),
+                    })
+                })();
+                if let Err(error) = &result {
+                    live_ink.publish_workspace_error(format!(
+                        "Layer change could not be saved: {error}"
+                    ));
+                } else {
                     publish_navigator_frame(
                         live_ink,
                         session.tiles(),
@@ -3705,49 +3781,20 @@ fn materialization_loop(
                         live_ink,
                         thumbnail_generation,
                         session.tiles(),
-                        [BACKGROUND_LAYER],
+                        raster_layer_ids(&preview_tree),
                         preview_canvas,
                     );
+                    println!(
+                        "native-canvas event=layer-tree-persisted mode=redb-immediate snapshot={} root={:032x} nodes=metadata",
+                        session.current_snapshot().0,
+                        session.tiles().root().id.0
+                    );
                 }
+                let failed = result.is_err();
                 let _ = reply.send(result);
                 if failed {
-                    live_ink.publish_workspace_error("White background could not be saved".into());
                     exit = WorkerExit::FailStop;
                     break;
-                }
-                next_id = next;
-                println!(
-                    "native-canvas event=white-background-persisted mode=redb-immediate tiles={}",
-                    session.tiles().len(),
-                );
-                continue;
-            }
-            WorkerRequest::PersistLayerTree(tree) => {
-                match sink {
-                    ProjectSink::UntitledRecovery { db, .. }
-                    | ProjectSink::ExplicitProject { db, .. } => {
-                        if let Err(error) = db.persist_layer_tree(&tree) {
-                            eprintln!(
-                                "native-canvas event=layer-tree-persist-failed error={error} worker=fail-stop"
-                            );
-                            live_ink.publish_workspace_error(format!(
-                                "Layer metadata could not be saved: {error}"
-                            ));
-                            exit = WorkerExit::FailStop;
-                            break;
-                        }
-                        println!(
-                            "native-canvas event=layer-tree-persisted mode=redb-immediate root={} nodes=metadata",
-                            tree.root().id.0,
-                        );
-                        preview_tree = tree;
-                        publish_navigator_frame(
-                            live_ink,
-                            session.tiles(),
-                            &preview_tree,
-                            preview_canvas,
-                        );
-                    }
                 }
                 continue;
             }

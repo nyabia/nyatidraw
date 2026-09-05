@@ -95,6 +95,7 @@ struct ActiveLiveStroke {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CompositeRenderError {
     InvalidDocumentSize,
+    LiveStrokeActive,
     AllocationBudgetExceeded {
         required_bytes: u64,
         max_bytes: u64,
@@ -452,6 +453,114 @@ pub struct GpuCompositeScene {
 }
 
 impl GpuCompositeScene {
+    /// Checks a history/structural tree replacement before durable acceptance.
+    ///
+    /// # Errors
+    /// Rejects active input and allocations beyond the scene plus atlas budget.
+    pub fn validate_tree_replacement(&self, tree: &LayerTree) -> Result<(), CompositeRenderError> {
+        self.replacement_atlas_slots(tree).map(|_| ())
+    }
+
+    fn replacement_atlas_slots(&self, tree: &LayerTree) -> Result<usize, CompositeRenderError> {
+        if self.live_stroke.is_some() {
+            return Err(CompositeRenderError::LiveStrokeActive);
+        }
+        let mut rasters = Vec::new();
+        let mut groups = vec![tree.root_id()];
+        collect_node_ids(tree.root(), &mut rasters, &mut groups);
+        let surfaces = rasters.len().saturating_add(groups.len()).saturating_add(1);
+        let page_bytes = u64::from(self.document_size[0])
+            .checked_mul(u64::from(self.document_size[1]))
+            .and_then(|size| size.checked_mul(u64::from(RGBA8_BYTES_PER_PIXEL)))
+            .and_then(|size| size.checked_mul(u64::try_from(surfaces).ok()?))
+            .unwrap_or(u64::MAX);
+        let required_bytes = page_bytes.saturating_add(TILE_BYTE_LEN as u64);
+        if required_bytes > MAX_PERSISTENT_SCENE_BYTES {
+            return Err(CompositeRenderError::AllocationBudgetExceeded {
+                required_bytes,
+                max_bytes: MAX_PERSISTENT_SCENE_BYTES,
+                surfaces,
+            });
+        }
+        Ok(self.sparse_atlas.slots.len().min(
+            usize::try_from((MAX_PERSISTENT_SCENE_BYTES - page_bytes) / TILE_BYTE_LEN as u64)
+                .unwrap_or(usize::MAX),
+        ))
+    }
+
+    /// Reconciles disposable surfaces with an authoritative history tree.
+    /// Existing raster surfaces survive; the caller uploads changed CPU tiles.
+    ///
+    /// # Errors
+    /// Returns the same checks as `validate_tree_replacement` before mutation.
+    pub fn replace_tree(&mut self, tree: LayerTree) -> Result<(), CompositeRenderError> {
+        let atlas_slots = self.replacement_atlas_slots(&tree)?;
+        if atlas_slots < self.sparse_atlas.slots.len() {
+            self.sparse_atlas = SparseAtlas::new(
+                &self.device,
+                u32::try_from(atlas_slots)
+                    .map_err(|_| CompositeRenderError::SparseAtlasExhausted)?,
+            );
+        }
+        let mut rasters = Vec::new();
+        let mut groups = vec![tree.root_id()];
+        collect_node_ids(tree.root(), &mut rasters, &mut groups);
+        let rasters: BTreeSet<_> = rasters.into_iter().collect();
+        let groups: BTreeSet<_> = groups.into_iter().collect();
+        self.rasters.retain(|id, _| rasters.contains(id));
+        self.groups.retain(|id, _| groups.contains(id));
+        for id in rasters {
+            self.rasters.entry(id).or_insert_with(|| {
+                CompositeSurface::new(
+                    create_document_texture(
+                        &self.device,
+                        &self.queue,
+                        self.document_size,
+                        "nayati-restored-raster",
+                    ),
+                    &self.device,
+                    &self.source_layout,
+                )
+            });
+        }
+        for id in groups {
+            self.groups.entry(id).or_insert_with(|| {
+                CompositeSurface::new(
+                    create_document_texture(
+                        &self.device,
+                        &self.queue,
+                        self.document_size,
+                        "nayati-restored-group",
+                    ),
+                    &self.device,
+                    &self.source_layout,
+                )
+            });
+        }
+        self.tree = tree;
+        if self
+            .solo_node
+            .is_some_and(|id| self.tree.ancestors(id).is_none())
+        {
+            self.solo_node = None;
+        }
+        self.cache.clear();
+        self.sparse_atlas.key_to_slot.clear();
+        self.sparse_atlas
+            .slots
+            .iter_mut()
+            .for_each(|slot| *slot = None);
+        self.sparse_closed_tiles
+            .retain(|key, _| self.rasters.contains_key(&key.layer));
+        self.sparse_preview_tiles.clear();
+        self.sparse_coordinates = self
+            .sparse_closed_tiles
+            .keys()
+            .map(|key| key.coordinate())
+            .collect();
+        Ok(())
+    }
+
     /// Allocates one persistent document texture per raster and group node.
     ///
     /// # Errors

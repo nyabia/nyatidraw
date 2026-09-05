@@ -286,3 +286,24 @@ snapshot의 호환 tree를 한 번 고정한다. 과거에 저장되지 않은 m
 근거를 기록했다. 이 체크포인트는 저장 경계이며 desktop 삭제 버튼이나 GPU tree
 Undo 연결까지 완료한 것은 아니다. 다음 작업은 이 transaction을 layer command에
 연결하고 삭제·active fallback·GPU/thumbnail/export 복원을 검증하는 것이다.
+
+### Desktop 레이어 삭제·metadata Undo 완료
+
+레이어 명령을 snapshot tree transaction에 연결했다. 삭제는 하위 raster의 모든
+tile을 새 snapshot에서 제거하며, Undo/Redo는 기존 tree와 pixels를 함께 복원한다.
+이름·visibility·opacity·추가·순서 변경도 history에 남는다. 살아 있는 raster를
+active로 선택하고, 마지막 raster 삭제 시 빈 raster 하나를 만든다. Solo와 active
+선택은 session 상태다. 저장된 상태를 GPU가 반영하지 못하면 workspace 오류로
+추가 그리기를 막고 reopen을 안내한다.
+
+설치 release에서 20 raster·2단계 중첩 그룹의 이름/opacity/삭제/순서 변경과 분기
+Undo/Redo를 11개 별도 프로세스로 실행했다. Save와 process restart 뒤 tree, tile,
+PNG 전체 픽셀이 일치했고 마지막 raster fallback도 유효했다. 기존 설치판
+durability/reopen 및 PNG crash/recovery runtime도 통과했다. 전체 core 테스트는
+60개를 유지하며 기존 tree 불변식만 보강했다. All-feature/all-target Clippy도 통과했다.
+실행 근거는 `target/installed-layer-history.log`, `target/installed-layer-durability.log`,
+`target/desktop-layers-tests.log`, `target/desktop-layers-clippy.log`에 있다.
+
+남은 레이어 작업은 Reference metadata와 drag reorder UI다. 기본 편집 도구,
+도킹/layout 복원과 synchronous metadata/history 요청의 hot-path 분리도 이어간다.
+물리 펜, 직접 UI 조작과 표시 지연 gate는 계속 미검증이다.

@@ -90,6 +90,7 @@ pub enum LayerCommand {
     AddRaster,
     /// Inserts one empty group immediately above the active raster.
     AddGroup,
+    Delete(LayerTreeNodeId),
     Rename {
         node: LayerTreeNodeId,
         name: String,

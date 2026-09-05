@@ -163,6 +163,18 @@ impl LayerTree {
         Ok(CompositeInvalidation::empty())
     }
 
+    /// Removes one raster or whole subtree. The caller retains the prior tree
+    /// and tiles in history before publishing this candidate.
+    ///
+    /// # Errors
+    /// Rejects the implicit root or unknown IDs without changing the tree.
+    pub fn remove(&mut self, node: LayerTreeNodeId) -> Result<LayerTreeNode, LayerTreeError> {
+        if node == LayerTreeNodeId::Group(self.root.id) {
+            return Err(LayerTreeError::CannotEditRoot);
+        }
+        remove_node(&mut self.root, node).ok_or(LayerTreeError::UnknownNode(node))
+    }
+
     /// Returns group ancestors from the immediate parent through the root.
     #[must_use]
     pub fn ancestors(&self, node: LayerTreeNodeId) -> Option<Vec<GroupId>> {
@@ -481,6 +493,21 @@ mod tests {
             tree.rename(LayerTreeNodeId::Raster(LayerId(2)), "   "),
             Err(LayerTreeError::InvalidName)
         );
+        assert_eq!(tree, renamed);
+        // Product risk: rejected deletion must not lose a subtree; accepted
+        // removal must retain the exact node for history reconstruction.
+        for invalid in [
+            LayerTreeNodeId::Group(GroupId(100)),
+            LayerTreeNodeId::Raster(LayerId(99)),
+        ] {
+            assert!(tree.remove(invalid).is_err());
+            assert_eq!(tree, renamed);
+        }
+        let removed = tree
+            .remove(LayerTreeNodeId::Raster(LayerId(2)))
+            .expect("remove existing node");
+        tree.insert(GroupId(100), 1, removed)
+            .expect("restore exact node");
         assert_eq!(tree, renamed);
     }
 }

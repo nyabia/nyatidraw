@@ -1130,6 +1130,7 @@ fn LayerRow(
     let rename_ink = live_ink.clone();
     let mut rename_error = error;
     let solo_ink = live_ink.clone();
+    let delete_ink = live_ink.clone();
     let id = layer.id;
     let is_active = matches!(id, LayerTreeNodeId::Raster(layer_id) if active == Some(layer_id));
     let is_group = layer.kind == LayerProjectionKind::Group;
@@ -1214,6 +1215,11 @@ fn LayerRow(
                 let opacity_u16 = if layer.opacity_u16 == u16::MAX { 32_768 } else { u16::MAX };
                 send_editor_command(&opacity_ink, EditorCommand::Layer(LayerCommand::SetOpacity { node: id, opacity_u16 }), error);
             }, "{opacity}%" }
+            button {
+                class: "layer-delete", title: "삭제 (Undo로 복원)", aria_label: "{layer.name} 삭제",
+                onclick: move |_| send_editor_command(&delete_ink, EditorCommand::Layer(LayerCommand::Delete(id)), error),
+                "×"
+            }
         }
     }
 }
