@@ -119,3 +119,15 @@ sRGB/명시적 gamma를 해석하고 미지원 ICC/cICP/색 원색은 오류로 
 원본 PNG는 여전히 첫 Save 전까지 바꾸지 않으며 valid `.ntdr`이 있으면 그
 프로젝트를 사용한다. Godot의 16-bit PNG 실제 import/watch 검증은 아직 남아 있다.
 [색상 결정과 근거](decisions/ADR-0029-srgb-boundaries.md)를 참조한다.
+
+## 2026-09-05 Godot 4.6.3 실제 import와 포커스 복귀 갱신
+
+색상 수정 설치판에서 저장한 16-bit PNG를 공식 Godot 4.6.3의 decoder와 일반
+Texture2D importer로 확인했다. 살아 있는 Godot editor의 Inspector에 단색 PNG를
+열어 두고 NyatiDraw에서 투명 그라데이션을 Save한 다음 Godot으로 돌아오자,
+수동 reimport 없이 같은 texture의 Inspector와 미리보기가 바뀌었다. 정상 종료
+뒤 별도 Godot process에서 기존 import cache의 불투명/반투명/투명 픽셀을 확인했다.
+이전에 미검증이었던 Godot 호환성과 이 focus-triggered 갱신 사례는 통과했다.
+장시간 background watcher, 다른 Godot 버전/backend, exported game은 범위가 아니다.
+[ADR-0030](decisions/ADR-0030-godot-png-acceptance.md)과
+[재현 도구](../tools/godot/README.md)를 참조한다. Addon이나 일반 설치는 추가하지 않았다.

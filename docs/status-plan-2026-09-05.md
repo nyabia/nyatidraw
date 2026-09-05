@@ -768,3 +768,23 @@ Redo의 별도 process reopen 및 legacy scratch tile/history 보존과 PNG 검�
 fill/gradient·일반 재시작 확인은 아직 미완료다. 열린 legacy scratch 앱은 유지했다.
 Godot 호환성 검증도 남아 있다. 다음에는 이 acceptance를 끝내고 기존 latency,
 startup/reopen/undo 및 장시간 UI gate를 이어간다.
+
+### 설치판 색상 재시작과 실제 Godot 자동 갱신 확인
+
+Windows 잠금 해제 후 legacy 작품을 설치판에서 Save/정상 Close/재시작하고 원본
+전체 타일·history·PNG를 다시 검증했다. 새 129×65 scratch에서는 UI #1AC7E8로
+채우기 후 재시작, Undo→전체 Wand 선택→x=10~110 투명 그라데이션→Save→재시작을
+진행했다. 별도 process oracle이 snapshot 2/history 2 및 snapshot 3/history 3,
+모든 page pixel과 바깥 영역 보존 및 PNG를 확인했다.
+
+검증용 공식 Godot 4.6.3 portable을 저장소 안에 hash 검증 후 준비했다. 16-bit
+PNG와 8-bit 미리보기의 실제 decoder/normal texture import가 통과했고, 실행 중인
+Godot에 단색 PNG를 열어 둔 상태에서 NyatiDraw Save 후 Godot으로 돌아오자 자동
+import와 그라데이션 Inspector 갱신이 확인됐다. 수동 reimport나 addon은 사용하지
+않았다. 종료 뒤 별도 Godot process에서도 기존 import cache의 비원색·반투명
+픽셀이 기대값과 일치했다. 한 번의 focus-triggered 갱신이며 장시간 watcher나
+가시 픽셀 지연의 증거는 아니다. [ADR-0030](decisions/ADR-0030-godot-png-acceptance.md)에
+정확한 도구 버전/hash/환경/순서/로그/남은 범위를 기록했다.
+
+색상 후속 acceptance는 새 색상의 실제 native brush와 absent-sibling 16-bit PNG
+bootstrap이다. 그 뒤 기존 latency 및 startup/reopen/undo·장시간 UI gate를 계속한다.

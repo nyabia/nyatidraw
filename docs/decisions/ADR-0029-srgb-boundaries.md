@@ -69,3 +69,15 @@ the Windows lock screen and could not activate the app. Normal UI Save/Close,
 reopen, new-color draw/fill/gradient acceptance and Godot compatibility remain
 pending. The running scratch app was left intact; the user-owned download was
 not inspected or altered. Do not promote locked-screen startup logs to UI proof.
+
+## Installed and Godot acceptance update
+
+After unlock, installed legacy Save/normal Close/restart passed exact original
+artwork/history verification. New-color fill and transparent gradient passed
+installed Save/restart and independent whole-page/outside-artwork PNG checks.
+Official Godot 4.6.3 decoded the PNGs, imported normal textures, and refreshed a
+live editor Inspector automatically on focus return after NyatiDraw Save.
+A separate process verified that editor cache's non-primary translucent pixels.
+See [ADR-0030](ADR-0030-godot-png-acceptance.md) for hashes, logs and scope.
+New-color native brush and fresh absent-sibling PNG bootstrap remain to verify;
+this update does not claim calibrated monitor color or latency gates.
