@@ -136,6 +136,30 @@ impl SelectionMask {
     pub fn contains(&self, x: u32, y: u32) -> bool {
         x < self.width && y < self.height && self.selected[pixel_index(self.width, x, y)] == 1
     }
+
+    /// Computes the selected pixel rectangle on the CPU editing worker.
+    /// The result is [left, top, width, height]; empty coverage has no bounds.
+    #[must_use]
+    pub fn bounds(&self) -> Option<[u32; 4]> {
+        if self.count == 0 {
+            return None;
+        }
+        let mut left = self.width;
+        let mut top = self.height;
+        let mut right = 0;
+        let mut bottom = 0;
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if self.contains(x, y) {
+                    left = left.min(x);
+                    top = top.min(y);
+                    right = right.max(x);
+                    bottom = bottom.max(y);
+                }
+            }
+        }
+        Some([left, top, right - left + 1, bottom - top + 1])
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

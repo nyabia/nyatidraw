@@ -465,15 +465,30 @@ impl GpuCompositeScene {
     }
 
     fn replacement_atlas_slots(&self, tree: &LayerTree) -> Result<usize, CompositeRenderError> {
+        self.replacement_atlas_slots_for(tree, self.document_size)
+    }
+
+    fn replacement_atlas_slots_for(
+        &self,
+        tree: &LayerTree,
+        size: [u32; 2],
+    ) -> Result<usize, CompositeRenderError> {
         if self.live_stroke.is_some() {
             return Err(CompositeRenderError::LiveStrokeActive);
+        }
+        if size.contains(&0)
+            || size
+                .iter()
+                .any(|value| *value > self.device.limits().max_texture_dimension_2d)
+        {
+            return Err(CompositeRenderError::InvalidDocumentSize);
         }
         let mut rasters = Vec::new();
         let mut groups = vec![tree.root_id()];
         collect_node_ids(tree.root(), &mut rasters, &mut groups);
         let surfaces = rasters.len().saturating_add(groups.len()).saturating_add(1);
-        let page_bytes = u64::from(self.document_size[0])
-            .checked_mul(u64::from(self.document_size[1]))
+        let page_bytes = u64::from(size[0])
+            .checked_mul(u64::from(size[1]))
             .and_then(|size| size.checked_mul(u64::from(RGBA8_BYTES_PER_PIXEL)))
             .and_then(|size| size.checked_mul(u64::try_from(surfaces).ok()?))
             .unwrap_or(u64::MAX);
@@ -489,6 +504,44 @@ impl GpuCompositeScene {
             usize::try_from((MAX_PERSISTENT_SCENE_BYTES - page_bytes) / TILE_BYTE_LEN as u64)
                 .unwrap_or(usize::MAX),
         ))
+    }
+
+    /// Preflights a page/history replacement against texture and scene budgets.
+    ///
+    /// # Errors
+    /// Rejects active input, invalid dimensions and excessive allocation.
+    pub fn validate_document_replacement(
+        &self,
+        size: [u32; 2],
+        tree: &LayerTree,
+    ) -> Result<(), CompositeRenderError> {
+        self.replacement_atlas_slots_for(tree, size).map(|_| ())
+    }
+
+    /// Replaces disposable page-sized surfaces, retaining the device, pipelines,
+    /// canvas owner and monotonic stroke identities. Caller reuploads CPU tiles.
+    ///
+    /// # Errors
+    /// Returns the same preflight errors before discarding any surface.
+    pub fn replace_document(
+        &mut self,
+        size: [u32; 2],
+        tree: LayerTree,
+    ) -> Result<(), CompositeRenderError> {
+        self.validate_document_replacement(size, &tree)?;
+        self.rasters.clear();
+        self.groups.clear();
+        self.sparse_closed_tiles.clear();
+        self.sparse_preview_tiles.clear();
+        self.sparse_coordinates.clear();
+        self.document_size = size;
+        self.live_backup = create_document_texture(
+            &self.device,
+            &self.queue,
+            size,
+            "nayati-resized-stroke-backup",
+        );
+        self.replace_tree(tree)
     }
 
     /// Reconciles disposable surfaces with an authoritative history tree.

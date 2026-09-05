@@ -4,7 +4,7 @@ use nyatidraw_document::LayerTree;
 use nyatidraw_editor::HeadlessStrokeSession;
 use nyatidraw_paint_cpu::{
     EditLimits, PremultipliedRgba8, SelectionMask, SelectionPaint, SelectionSource, WandRequest,
-    lasso_selection, paint_selection, transform_raster, wand_selection,
+    lasso_selection, paint_selection, transform_raster, translate_artwork, wand_selection,
 };
 use nyatidraw_project_redb::ProjectDb;
 use nyatidraw_tiles::TileSnapshot;
@@ -17,6 +17,7 @@ pub(crate) enum EditFailure {
 
 pub(crate) struct EditOutcome {
     pub(crate) tiles: Option<TileSnapshot>,
+    pub(crate) canvas: Option<CanvasSpec>,
     pub(crate) selection: Option<Arc<SelectionMask>>,
     pub(crate) history: nyatidraw_api::HistoryProjection,
 }
@@ -36,8 +37,51 @@ pub(crate) fn execute(
     let limits = EditLimits::default();
     let mut flood_mask = None;
     let mut transformed = None;
-    let clear_after_transform = matches!(command, EditCommand::Transform(_));
+    let mut changed_canvas = None;
+    let clear_after_transform = matches!(
+        command,
+        EditCommand::Transform(_)
+            | EditCommand::ResizePage { .. }
+            | EditCommand::CropPageToSelection
+    );
     let paint = match command {
+        EditCommand::ResizePage { size } => {
+            let next = CanvasSpec {
+                width_px: size[0],
+                height_px: size[1],
+                ..canvas
+            };
+            validate_page(next)?;
+            if next != canvas {
+                changed_canvas = Some(next);
+                transformed = Some(nyatidraw_paint_cpu::SelectionPaintResult {
+                    after: session.tiles().clone(),
+                    changed_tiles: Vec::new(),
+                });
+            }
+            None
+        }
+        EditCommand::CropPageToSelection => {
+            let [left, top, width_px, height_px] = selection
+                .as_ref()
+                .and_then(|mask| mask.bounds())
+                .ok_or_else(|| EditFailure::Rejected("선택 영역이 없습니다.".into()))?;
+            let next = CanvasSpec {
+                width_px,
+                height_px,
+                ..canvas
+            };
+            validate_page(next)?;
+            let offset = [left, top].map(|v| i32::try_from(v).map(|v| -v));
+            let [Ok(x), Ok(y)] = offset else {
+                return Err(EditFailure::Rejected("Crop coordinate overflow".into()));
+            };
+            transformed = Some(translate_artwork(session.tiles(), [x, y], limits).map_err(reject)?);
+            if next != canvas {
+                changed_canvas = Some(next);
+            }
+            None
+        }
         EditCommand::Transform(transform) => {
             transformed = Some(
                 transform_raster(
@@ -147,7 +191,7 @@ pub(crate) fn execute(
         );
     }
     if let Some(painted) = transformed
-        && !painted.changed_tiles.is_empty()
+        && (!painted.changed_tiles.is_empty() || changed_canvas.is_some())
     {
         let next = next_id
             .checked_add(1)
@@ -160,7 +204,11 @@ pub(crate) fn execute(
                 painted.after.clone(),
             )
             .map_err(|error| EditFailure::Fatal(format!("edit prepare: {error:?}")))?;
-        db.commit_structural(&batch)
+        changed_canvas
+            .map_or_else(
+                || db.commit_structural(&batch),
+                |canvas| db.commit_structural_with_canvas(&batch, canvas),
+            )
             .map_err(|error| EditFailure::Fatal(format!("edit commit: {error}")))?;
         session
             .accept_structural_change(&batch)
@@ -173,9 +221,22 @@ pub(crate) fn execute(
     }
     Ok(EditOutcome {
         tiles,
+        canvas: changed_canvas,
         selection: selection.clone(),
         history: session.history_projection(),
     })
+}
+
+fn validate_page(canvas: CanvasSpec) -> Result<(), EditFailure> {
+    if canvas.validate().is_err()
+        || u64::from(canvas.width_px) * u64::from(canvas.height_px)
+            > nyatidraw_tiles::MAX_FLATTENED_PIXELS
+    {
+        return Err(EditFailure::Rejected(
+            "페이지 크기가 출력 한도를 넘거나 잘못되었습니다.".into(),
+        ));
+    }
+    Ok(())
 }
 
 // A scratch-only acceptance barrier proves Save/Close behavior while real work
@@ -229,7 +290,12 @@ pub(crate) fn pause_artwork_probe(kind: &str) -> Result<(), String> {
     let Some(project) = std::env::args_os().nth(1).map(std::path::PathBuf::from) else {
         return Ok(());
     };
-    if project.file_name().and_then(|name| name.to_str()) != Some("edit-source-scratch.ntdr")
+    let expected_name = if kind == "page" {
+        "page-scratch.ntdr"
+    } else {
+        "edit-source-scratch.ntdr"
+    };
+    if project.file_name().and_then(|name| name.to_str()) != Some(expected_name)
         || !project
             .parent()
             .is_some_and(|parent| parent.join(".nyatidraw-scratch-artwork-probe").is_file())

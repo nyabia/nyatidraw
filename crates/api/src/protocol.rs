@@ -32,6 +32,13 @@ pub enum EditSource {
 /// Completed document-space gestures; raw pointer samples never enter this lane.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EditCommand {
+    /// Change the output extent, preserving every signed artwork pixel.
+    ResizePage {
+        size: [u32; 2],
+    },
+    /// Rebase all artwork to the selection bounds' top-left and use its extent
+    /// as the new output page. Pixels outside that rectangle are retained.
+    CropPageToSelection,
     /// Cut the selection (or whole active raster when absent), then transform
     /// and composite it back. Successful completion clears the selection.
     Transform(RasterTransform),
@@ -368,6 +375,7 @@ impl HistoryProjection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UiProjection {
     pub revision: Revision,
+    pub canvas: crate::CanvasSpec,
     pub document_title: String,
     pub dirty: bool,
     pub workspace: WorkspaceProjection,
@@ -402,6 +410,7 @@ impl UiProjection {
     pub fn empty() -> Self {
         Self {
             revision: Revision::default(),
+            canvas: crate::CanvasSpec::DEFAULT,
             document_title: String::new(),
             dirty: false,
             workspace: WorkspaceProjection::Empty,

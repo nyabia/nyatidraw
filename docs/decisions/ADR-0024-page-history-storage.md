@@ -1,7 +1,8 @@
 # ADR-0024: Page dimensions share the artwork/history transaction
 
 Status: storage boundary accepted by recovery tests. Desktop page resize/crop
-commands, rendering/export adoption and installed-app acceptance remain pending.
+commands, rendering/export adoption and installed-app acceptance subsequently
+passed in [ADR-0025](ADR-0025-page-resize-crop.md).
 
 ## Decision
 

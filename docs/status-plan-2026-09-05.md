@@ -634,3 +634,26 @@ initial Undo 복원, 선택 stroke의 v4 유지, missing/checksum/orphan/zero/cu
 현재 변경은 page resize/crop의 저장 기반이다. 실제 명령·writer/renderer page 채택,
 PNG의 최신 page 사용, UI와 설치판 Save/process restart/reopen 검증은 계속 진행할
 작업이며 아직 페이지 크기 기능 전체 완료로 판정하지 않는다.
+
+### 출력 페이지 크기 변경·선택 경계 crop 완료
+
+상단 페이지 버튼에 폭/높이 변경과 선택 경계에 맞추기를 연결했다. 크기 변경은
+출력 범위만 바꾸며, crop은 모든 래스터 좌표를 함께 옮겨 잠긴/숨긴 레이어와 페이지
+밖 픽셀도 보존한다. 페이지와 픽셀은 하나의 history transaction으로 저장된다.
+Undo/Redo는 두 상태를 함께 복원하고 renderer는 필요한 page surface만 재생성한다.
+Save/Close PNG는 대기열에 들어간 renderer의 옛 크기가 아니라 writer의 최신 크기를
+사용한다. 새 핵심 테스트는 좌표 이동·경계·한도 실패 위험을 묶은 1개만 추가했다.
+
+전체 75개 테스트, all-target/all-feature Clippy, release 설치가 통과했다.
+Windows 설치판을 실제 조작해 16×16 → 선택 crop 2×2 → 확장 16×12 → 축소 1×1,
+재시작 뒤 Undo 세 번으로 원본 복원, 다시 재시작 뒤 Redo crop을 확인했다.
+각 저장/정상 종료 뒤 별도 fixture 프로세스가 전체 타일·잠금/숨김/음수 영역·PPI·
+history와 독립 PNG 기대값을 정확히 비교했다. 축소 작업은 scratch writer를 의도적으로
+대기시킨 상태에서 실제 Save/Close를 누르고, 저장 진행 화면을 확인한 뒤 해제했다.
+renderer가 새 크기를 채택하기 전에 종료해도 최종 1×1 PNG와 snapshot 4가 일치했다.
+
+근거는 `target/page-ui/`의 `crop-verify.log`, `grow-verify.log`, `pending-verify.log`,
+`undo-verify.log`, `redo-verify.log` 및 [ADR-0025](decisions/ADR-0025-page-resize-crop.md)에
+기록했다. 작은 fixture의 기능/내구성 확인이므로 대형 장면 성능 통과로 해석하지
+않는다. 다음 우선순위는 현행 설치 shell의 projection/hot-path 및 대형 장면 release
+계측과 남은 Sprint 1~3 gate 근거 감사다.

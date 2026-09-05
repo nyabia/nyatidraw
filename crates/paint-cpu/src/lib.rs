@@ -13,7 +13,7 @@ pub use selection::{
     EditError, EditLimits, SelectionMask, SelectionPaint, SelectionPaintResult, SelectionSource,
     WandRequest, lasso_selection, paint_selection, wand_selection,
 };
-pub use transform::transform_raster;
+pub use transform::{transform_raster, translate_artwork};
 
 use nyatidraw_brush::BrushDab;
 use nyatidraw_document::{GroupNode, LayerTree, LayerTreeNode};

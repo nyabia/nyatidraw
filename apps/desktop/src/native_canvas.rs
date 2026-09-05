@@ -699,7 +699,8 @@ impl ActiveCanvas {
             }
         }
 
-        let (authoritative, latest_event) = live_ink.protocol_snapshot();
+        let (mut authoritative, latest_event) = live_ink.protocol_snapshot();
+        authoritative.canvas = canvas_spec;
         let restoring_projection = latest_event.is_some();
         let mut projection = ProjectionState::new(DockTree::safe_default());
         let (view, active_layer) = if restoring_projection {
@@ -1913,10 +1914,29 @@ impl ActiveCanvas {
         let Some(snapshot) = moved.tiles else {
             return Ok(());
         };
-        if let Some(tree) = moved.tree {
+        let clear_selection = moved.tree.is_some() || moved.canvas.is_some();
+        let tree = moved.tree.unwrap_or_else(|| self.scene.tree().clone());
+        if let Some(canvas) = moved.canvas {
+            let size = [canvas.width_px, canvas.height_px];
+            if size == self.scene.document_size() {
+                self.scene
+                    .replace_tree(tree)
+                    .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
+            } else {
+                self.scene
+                    .replace_document(size, tree)
+                    .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
+            }
+            self.canvas_spec = canvas;
+            let mut current = self.projection.current().clone();
+            current.canvas = canvas;
+            self.projection.install_authoritative(current);
+        } else if clear_selection {
             self.scene
                 .replace_tree(tree)
                 .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
+        }
+        if clear_selection {
             self.selection = None;
             self.stroke.selection = None;
             self.painter.set_selection_mask(None);
@@ -1977,6 +1997,11 @@ impl ActiveCanvas {
         command: nyatidraw_api::EditCommand,
     ) -> Result<bool, CommandRejectReason> {
         self.ensure_artwork_command_idle()?;
+        if let EditCommand::ResizePage { size } = &command {
+            self.scene
+                .validate_document_replacement(*size, self.scene.tree())
+                .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
+        }
         if !self.stroke.live_ink.try_pause_for_edit() {
             return Err(CommandRejectReason::CommandQueueBusy);
         }
@@ -2064,6 +2089,7 @@ impl ActiveCanvas {
                     && self
                         .install_history_move(HistoryMove {
                             tiles: outcome.tiles,
+                            canvas: outcome.canvas,
                             tree: None,
                             history: outcome.history,
                         })
@@ -2188,7 +2214,7 @@ impl ActiveCanvas {
         match self
             .stroke
             .materializer
-            .enqueue_export(generation, path, self.canvas_spec, false)
+            .enqueue_export(generation, path, false)
         {
             Ok(()) => {
                 self.pending_save = None;
@@ -3427,7 +3453,7 @@ impl Drop for ActiveCanvas {
                 && self
                     .stroke
                     .materializer
-                    .enqueue_export(generation, path, self.canvas_spec, true)
+                    .enqueue_export(generation, path, true)
                     .is_err()
             {
                 self.stroke
@@ -3615,7 +3641,6 @@ enum WorkerRequest {
     ExportPng {
         generation: u64,
         path: PathBuf,
-        canvas: CanvasSpec,
     },
     MoveHistory {
         command: nyatidraw_api::HistoryCommand,
@@ -3635,6 +3660,7 @@ struct ArtworkJob {
 
 struct HistoryMove {
     tiles: Option<TileSnapshot>,
+    canvas: Option<CanvasSpec>,
     tree: Option<LayerTree>,
     history: HistoryProjection,
 }
@@ -3939,18 +3965,13 @@ impl MaterializationWorker {
         &self,
         generation: u64,
         path: PathBuf,
-        canvas: CanvasSpec,
         shutdown: bool,
     ) -> Result<(), ExportEnqueueError> {
         let sender = self
             .sender
             .as_ref()
             .ok_or(ExportEnqueueError::Disconnected)?;
-        let request = WorkerRequest::ExportPng {
-            generation,
-            path,
-            canvas,
-        };
+        let request = WorkerRequest::ExportPng { generation, path };
         // Never hold the replacement gate while waiting on worker capacity:
         // an older encoder may need it before it can free that capacity.
         if shutdown {
@@ -4087,7 +4108,7 @@ fn materialization_loop(
     pending: &AtomicUsize,
     mut session: HeadlessStrokeSession,
     mut preview_tree: LayerTree,
-    preview_canvas: CanvasSpec,
+    mut preview_canvas: CanvasSpec,
     mut next_id: u128,
     sink: &ProjectSink,
     live_ink: &LiveInkBridge,
@@ -4105,6 +4126,11 @@ fn materialization_loop(
         // canvas even when this work only changes metadata or exports a PNG.
         live_ink.request_redraw();
         let probe = match &work {
+            WorkerRequest::Edit {
+                command: EditCommand::ResizePage { .. } | EditCommand::CropPageToSelection,
+                reply,
+                ..
+            } => Some(("page", reply)),
             WorkerRequest::MoveHistory { reply, .. } => Some(("history", reply)),
             WorkerRequest::CommitLayerTree { reply, .. } => Some(("layer", reply)),
             _ => None,
@@ -4141,6 +4167,9 @@ fn materialization_loop(
                 let failed = matches!(result, Err(EditFailure::Fatal(_)));
                 match &result {
                     Ok(outcome) if outcome.tiles.is_some() => {
+                        if let Some(canvas) = outcome.canvas {
+                            preview_canvas = canvas;
+                        }
                         publish_navigator_frame(
                             live_ink,
                             session.tiles(),
@@ -4177,11 +4206,7 @@ fn materialization_loop(
                 }
                 continue;
             }
-            WorkerRequest::ExportPng {
-                generation,
-                path,
-                canvas,
-            } => {
+            WorkerRequest::ExportPng { generation, path } => {
                 let current = export_generations
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4202,7 +4227,7 @@ fn materialization_loop(
                     &path,
                     session.tiles(),
                     &preview_tree,
-                    canvas,
+                    preview_canvas,
                     generation,
                     export_generations,
                 ) {
@@ -4239,6 +4264,7 @@ fn materialization_loop(
                 if let nyatidraw_api::HistoryCommand::ShowRedoBranches { after } = command {
                     let _ = reply.send(Ok(ArtworkOutcome::History(HistoryMove {
                         tiles: None,
+                        canvas: None,
                         tree: None,
                         history: session.history_projection_after(after),
                     })));
@@ -4272,6 +4298,9 @@ fn materialization_loop(
                                 EditFailure::Fatal(format!("history-tree-load:{error}"))
                             })?
                             .unwrap_or_else(default_layer_tree);
+                        let canvas = db.load_cursor_canvas_spec(target).map_err(|error| {
+                            EditFailure::Fatal(format!("history-page-load:{error}"))
+                        })?;
                         db.persist_history_cursor(target).map_err(|error| {
                             EditFailure::Fatal(format!("history-persist:{error}"))
                         })?;
@@ -4281,9 +4310,11 @@ fn materialization_loop(
                                 EditFailure::Fatal(format!("history-accept:{error:?}"))
                             })?;
                         preview_tree = tree.clone();
+                        preview_canvas = canvas;
                         selection = None;
                         Ok(HistoryMove {
                             tiles: Some(tiles),
+                            canvas: Some(canvas),
                             tree: Some(tree),
                             history: session.history_projection(),
                         })
@@ -4373,6 +4404,7 @@ fn materialization_loop(
                     selection = None;
                     Ok(HistoryMove {
                         tiles: Some(after),
+                        canvas: None,
                         tree: Some(tree),
                         history: session.history_projection(),
                     })

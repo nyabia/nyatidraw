@@ -191,6 +191,73 @@ fn inverse_pixel(
     [x, y]
 }
 
+/// Rebase all raster coordinates without clipping to a page or resampling.
+/// Layer locks/visibility do not alter this document-wide coordinate change.
+///
+/// # Errors
+/// Rejects unsupported mips, coordinate overflow and bounded work/memory limits.
+/// No partial replacement escapes on failure.
+pub fn translate_artwork(
+    snapshot: &TileSnapshot,
+    offset: [i32; 2],
+    limits: EditLimits,
+) -> Result<SelectionPaintResult, EditError> {
+    let limits = limits.bounded();
+    require_pixels(snapshot.len() as u64 * u64::from(TILE_EDGE).pow(2), limits)?;
+    if snapshot.iter().any(|(key, _)| key.mip != 0) {
+        return Err(EditError::InvalidTransform);
+    }
+    if offset == [0, 0] {
+        return Ok(SelectionPaintResult {
+            after: snapshot.clone(),
+            changed_tiles: Vec::new(),
+        });
+    }
+    let mut tiles: BTreeMap<TileKey, Vec<u8>> = BTreeMap::new();
+    // Include zero replacements removing old keys, new objects and map copies.
+    let base_bytes = snapshot.len() as u64 * (TILE_BYTE_LEN as u64 * 2 + 256);
+    if base_bytes > limits.max_workspace_bytes {
+        return Err(EditError::LimitExceeded);
+    }
+    for (key, tile) in snapshot.iter() {
+        for (index, color) in tile.pixels().chunks_exact(4).enumerate() {
+            if color == [0; 4] {
+                continue;
+            }
+            let point = point_at(key, index);
+            let point = [
+                point[0] + i64::from(offset[0]),
+                point[1] + i64::from(offset[1]),
+            ];
+            if point.iter().any(|&v| i32::try_from(v).is_err()) {
+                return Err(EditError::CoordinateOutOfRange);
+            }
+            let (destination, at) = pixel_address(key.layer, point);
+            if !tiles.contains_key(&destination) {
+                let bytes =
+                    base_bytes + (tiles.len() as u64 + 1) * (TILE_BYTE_LEN as u64 * 2 + 256);
+                if bytes > limits.max_workspace_bytes {
+                    return Err(EditError::LimitExceeded);
+                }
+            }
+            tiles
+                .entry(destination)
+                .or_insert_with(|| vec![0; TILE_BYTE_LEN])[at..at + 4]
+                .copy_from_slice(color);
+        }
+    }
+    for (key, _) in snapshot.iter() {
+        tiles.entry(key).or_insert_with(|| vec![0; TILE_BYTE_LEN]);
+    }
+    Replacements {
+        before: snapshot,
+        tiles,
+        baseline_bytes: base_bytes,
+        limits,
+    }
+    .finish()
+}
+
 /// Cuts selected pixels (or all active-layer pixels), applies the integer
 /// transform around the source bounds' top-left and pastes source-over. Reads
 /// always use `snapshot`, so overlapping moves neither smear nor double-blend.
@@ -330,6 +397,58 @@ mod tests {
                 .copy_from_slice(&color);
         }
         TileSnapshot::from_tiles(tiles).unwrap()
+    }
+
+    #[test]
+    fn page_rebase_preserves_all_layers_and_off_page_pixels_or_rejects_atomically() {
+        // The disconnected mask must crop to its full rectangle, including gaps.
+        let mask = SelectionMask::from_packed_bits(4, 3, &[0x20, 0x08]).unwrap();
+        assert_eq!(mask.bounds(), Some([1, 1, 3, 2]));
+        let points = [
+            (1, [-129, -1], [7, 7, 7, 255]),
+            (1, [1, 1], [128, 0, 0, 128]),
+            (1, [3, 2], [0, 255, 0, 255]),
+            (2, [128, 129], [0, 0, 64, 64]),
+            (2, [1, 1], [9, 9, 9, 255]),
+        ];
+        let before = fixture(points);
+        let limits = EditLimits::default();
+        for offset in [[-1, -1], [-128, -129], [129, 127]] {
+            let after = translate_artwork(&before, offset, limits).unwrap().after;
+            let expected = fixture(
+                points.map(|(layer, [x, y], color)| (layer, [x + offset[0], y + offset[1]], color)),
+            );
+            assert_eq!(after, expected);
+            assert_eq!(
+                translate_artwork(&after, offset.map(|v| -v), limits)
+                    .unwrap()
+                    .after,
+                before
+            );
+        }
+        for small in [
+            EditLimits {
+                max_pixels: 1,
+                ..limits
+            },
+            EditLimits {
+                max_workspace_bytes: 1024,
+                ..limits
+            },
+        ] {
+            assert_eq!(
+                translate_artwork(&before, [-1, -1], small).unwrap_err(),
+                EditError::LimitExceeded
+            );
+            assert_eq!(before, fixture(points));
+        }
+        for (position, delta) in [(i32::MIN, -1), (i32::MAX, 1)] {
+            let edge = fixture([(1, [position, 0], [1, 0, 0, 255])]);
+            assert_eq!(
+                translate_artwork(&edge, [delta, 0], limits).unwrap_err(),
+                EditError::CoordinateOutOfRange
+            );
+        }
     }
 
     #[test]
