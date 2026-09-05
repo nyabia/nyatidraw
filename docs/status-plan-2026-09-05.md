@@ -387,3 +387,18 @@ Core 위험 검사 두 개를 추가했다. Release의 10개 별도 child proces
 reader가 새 파일을 거부하고 원본 바이트를 보존하는 것도 확인했다.
 [ADR-0014](decisions/ADR-0014-selected-stroke-replay.md)에 형식과 근거를 기록했다.
 다음은 같은 마스크를 GPU 경로에 적용하고 native 선택 제스처/표시를 연결하는 것이다.
+
+### 선택 브러시·지우개 GPU 및 설치판 연결
+
+동일한 불변 선택 마스크를 GPU brush/eraser와 닫힌 stroke 저장 경로에 연결했다.
+선택이 있는 동안에도 그릴 수 있으며 선택 밖 픽셀은 그대로 유지한다. History와
+레이어 변경은 입력 admission을 원자적으로 잠근 뒤 CPU/GPU 선택을 함께 해제한다.
+
+Windows Intel Arc의 DX12/Vulkan release 비교에서 선택 밖·음수 타일·경계 패딩과
+Cancel 복원이 정확히 일치했다. 선택 안 GPU/CPU 채널 오차는 brush 최대 2, eraser
+최대 1이다. 컴퓨터 사용으로 설치판에서 경계 brush, eraser, Save/정상 종료,
+재실행과 Undo/Redo를 조작하고 별도 프로세스로 저장 기록·픽셀·PNG를 검증했다.
+[ADR-0015](decisions/ADR-0015-gpu-selected-painting.md)에 근거와 제한을 기록했다.
+
+추가 단위 테스트 없이 전체 68개 검사와 Clippy를 통과했다. Native 선택 제스처와
+선택 경계 표시, 일반 편집 도구 활성화, metadata/history의 renderer 격리가 남았다.

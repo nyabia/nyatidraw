@@ -8,6 +8,13 @@ struct VertexOutput {
 @group(0) @binding(0)
 var<uniform> brush_color: vec4<f32>;
 
+struct SelectionCoordinates {
+    dimensions: vec4<u32>, // enabled, width, height, reserved
+    origin: vec4<i32>,
+};
+@group(1) @binding(0) var<uniform> selection: SelectionCoordinates;
+@group(1) @binding(1) var<storage, read> selection_bits: array<u32>;
+
 const QUAD: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
     vec2<f32>(-1.0, -1.0),
     vec2<f32>( 1.0, -1.0),
@@ -44,6 +51,12 @@ fn vertex_main(
 
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    if selection.dimensions.x != 0u {
+        let point = vec2<i32>(floor(input.position.xy)) + selection.origin.xy;
+        if any(point < vec2<i32>(0)) || any(point >= vec2<i32>(selection.dimensions.yz)) { discard; }
+        let index = u32(point.y) * selection.dimensions.y + u32(point.x);
+        if ((selection_bits[index / 32u] >> (index % 32u)) & 1u) == 0u { discard; }
+    }
     let pixel_origin = input.position.xy - vec2<f32>(0.5, 0.5);
     let radius_squared = input.radius_px * input.radius_px;
     var covered = 0.0;

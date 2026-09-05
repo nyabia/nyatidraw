@@ -370,7 +370,7 @@ impl LiveInkBridge {
     }
 
     /// Atomically excludes an in-flight or newly admitted stroke before a CPU edit.
-    /// A selection retains this pause until brush clipping is connected.
+    /// Resume only after CPU/GPU selection state is ready for the next Begin.
     pub(crate) fn try_pause_for_edit(&self) -> bool {
         let mut raw = self.raw_input();
         if self.is_closing()

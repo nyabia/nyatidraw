@@ -6,6 +6,8 @@
 //! queue, surface, or persistent CPU readback buffer.
 
 mod compositor;
+mod selection;
+pub use selection::{GpuSelectionError, GpuSelectionMask};
 
 pub use compositor::{
     CompositeRenderError, CompositeRenderStats, GpuCompositeScene, LayerUploadError,
@@ -290,6 +292,7 @@ impl ReadbackLayout {
 
 /// Instanced round-dab renderer for one or more persistent working textures.
 pub struct GpuRoundDabPainter {
+    selection: selection::SelectionBinding,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
@@ -340,6 +343,7 @@ impl GpuRoundDabPainter {
             label: Some("nayati-round-dab-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("round_dab.wgsl").into()),
         });
+        let selection = selection::SelectionBinding::new(device);
         let brush_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("nayati-round-dab-color"),
             contents: &encode_f32s(&brush_rgba),
@@ -368,7 +372,7 @@ impl GpuRoundDabPainter {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("nayati-round-dab-pipeline-layout"),
-            bind_group_layouts: &[&brush_layout],
+            bind_group_layouts: &[&brush_layout, &selection.layout],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -431,6 +435,7 @@ impl GpuRoundDabPainter {
 
         Self {
             device: device.clone(),
+            selection,
             queue: queue.clone(),
             pipeline,
             brush_buffer,
@@ -445,6 +450,23 @@ impl GpuRoundDabPainter {
     pub fn set_brush_rgba(&self, brush_rgba: [f32; 4]) {
         self.queue
             .write_buffer(&self.brush_buffer, 0, &encode_f32s(&brush_rgba));
+    }
+
+    /// Uploads canonical packed binary coverage once for both painter bindings.
+    ///
+    /// # Errors
+    /// Rejects empty/oversized dimensions and noncanonical coverage.
+    pub fn create_selection_mask(
+        &self,
+        dimensions: [u32; 2],
+        packed: &[u8],
+    ) -> Result<GpuSelectionMask, GpuSelectionError> {
+        GpuSelectionMask::new(&self.device, dimensions, packed)
+    }
+
+    /// Changes semantic coverage between strokes; no mask upload occurs per dab.
+    pub fn set_selection_mask(&mut self, mask: Option<&GpuSelectionMask>) {
+        self.selection.replace(&self.device, &self.queue, mask);
     }
 
     /// Allocates and clears one persistent working texture.
@@ -572,7 +594,19 @@ impl GpuRoundDabPainter {
         tile: &GpuWorkingTile,
         prepared: &PreparedDabs,
     ) -> PaintSubmission {
+        self.apply_prepared_at_origin(tile, prepared, [0, 0])
+    }
+
+    pub(crate) fn apply_prepared_at_origin(
+        &mut self,
+        tile: &GpuWorkingTile,
+        prepared: &PreparedDabs,
+        origin: [i64; 2],
+    ) -> PaintSubmission {
         if prepared.bytes.is_empty() {
+            return PaintSubmission::default();
+        }
+        if !self.selection.set_origin(&self.queue, origin) {
             return PaintSubmission::default();
         }
 
@@ -603,6 +637,7 @@ impl GpuRoundDabPainter {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.brush_bind_group, &[]);
+            pass.set_bind_group(1, &self.selection.group, &[]);
             pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
             pass.draw(0..6, 0..prepared.count);
         }

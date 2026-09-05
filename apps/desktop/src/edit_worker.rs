@@ -124,7 +124,10 @@ pub(crate) fn execute(
 // A scratch-only acceptance barrier proves Save/Close behavior while real work
 // is pending, without putting a timing sleep on the native input/render thread.
 pub(crate) fn probe_project() -> Option<std::path::PathBuf> {
-    if std::env::var("NAYATI_EDIT_PROBE").ok().as_deref() != Some("paused-fill") {
+    if !matches!(
+        std::env::var("NAYATI_EDIT_PROBE").ok().as_deref(),
+        Some("paused-fill" | "selected-brush")
+    ) {
         return None;
     }
     let project = std::path::PathBuf::from(std::env::args_os().nth(1)?);
@@ -139,6 +142,9 @@ pub(crate) fn probe_project() -> Option<std::path::PathBuf> {
 }
 
 fn pause_scratch_probe() -> Result<(), EditFailure> {
+    if std::env::var("NAYATI_EDIT_PROBE").ok().as_deref() != Some("paused-fill") {
+        return Ok(());
+    }
     let Some(project) = probe_project() else {
         return Ok(());
     };

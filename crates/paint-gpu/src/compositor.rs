@@ -847,7 +847,16 @@ impl GpuCompositeScene {
         dabs: &[BrushDab],
     ) -> Result<PaintSubmission, LiveStrokeError> {
         self.validate_live_token(token)?;
-        let batch_keys = signed_dab_keys(token.layer, dabs);
+        let mut batch_keys = signed_dab_keys(token.layer, dabs);
+        if let Some([width, height]) = painter.selection.dimensions() {
+            batch_keys.retain(|key| {
+                let (x, y) = key.pixel_origin();
+                x < i64::from(width)
+                    && y < i64::from(height)
+                    && x + i64::from(TILE_EDGE) > 0
+                    && y + i64::from(TILE_EDGE) > 0
+            });
+        }
         if batch_keys.is_empty() {
             return Ok(PaintSubmission::default());
         }
@@ -947,7 +956,8 @@ impl GpuCompositeScene {
                     .surface(SparseSurfaceKey::Raster(key))
                     .expect("sparse raster ensured above");
                 let prepared = GpuRoundDabPainter::prepare_live(&surface.tile, &translated);
-                painter.apply_prepared(&surface.tile, &prepared)
+                let (x, y) = key.pixel_origin();
+                painter.apply_prepared_at_origin(&surface.tile, &prepared, [x, y])
             };
             submission.dab_count = submission
                 .dab_count
@@ -1080,6 +1090,46 @@ impl GpuCompositeScene {
     #[must_use]
     pub fn active_live_stroke(&self) -> Option<LiveStrokeToken> {
         self.live_stroke.as_ref().map(|stroke| stroke.token)
+    }
+
+    /// Synchronous diagnostic readback of a resident base-mip raster tile.
+    /// Includes sparse boundary padding. Never called by the input/render loop.
+    /// Missing/evicted raster tiles return None rather than fabricated pixels.
+    ///
+    /// # Errors
+    /// Returns device-copy or mapping failures from the readback operation.
+    pub fn readback_resident_raster_tile(
+        &self,
+        key: TileKey,
+    ) -> Result<Option<crate::Rgba8Readback>, crate::GpuReadbackError> {
+        if key.mip != 0 {
+            return Ok(None);
+        }
+        if tile_requires_sparse(key.coordinate(), self.document_size) {
+            return self
+                .sparse_atlas
+                .surface(SparseSurfaceKey::Raster(key))
+                .map(|surface| surface.tile.readback_rgba8(&self.device, &self.queue))
+                .transpose();
+        }
+        let Some(surface) = self.rasters.get(&key.layer) else {
+            return Ok(None);
+        };
+        let Some((origin, extent)) = tile_region(key.coordinate(), self.document_size) else {
+            return Ok(None);
+        };
+        let tile = GpuWorkingTile {
+            texture: surface.tile.texture.clone(),
+            view: surface.tile.view.clone(),
+            copy_origin: wgpu::Origin3d {
+                x: origin[0],
+                y: origin[1],
+                z: 0,
+            },
+            width: extent[0],
+            height: extent[1],
+        };
+        tile.readback_rgba8(&self.device, &self.queue).map(Some)
     }
 
     fn validate_live_token(&self, token: LiveStrokeToken) -> Result<(), LiveStrokeError> {

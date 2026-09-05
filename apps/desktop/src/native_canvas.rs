@@ -951,6 +951,28 @@ impl ActiveCanvas {
         let Some(step) = self.edit_probe_step else {
             return;
         };
+        if std::env::var("NAYATI_EDIT_PROBE").ok().as_deref() == Some("selected-brush") {
+            if step == 0 {
+                let command = EditorCommand::Edit(EditCommand::SelectLasso {
+                    vertices: vec![[0, 0], [64, 0], [64, 65], [0, 65]],
+                });
+                if self
+                    .stroke
+                    .live_ink
+                    .push_editor_command(self.projection.current().revision, command)
+                    .is_ok()
+                {
+                    self.edit_probe_step = Some(1);
+                }
+            } else if self.edit_job.is_none() && self.selection.is_some() {
+                println!(
+                    "native-canvas event=selected-brush-probe-ready selected_pixels={} input=native-only",
+                    self.projection.current().edit.selected_pixels
+                );
+                self.edit_probe_step = None;
+            }
+            return;
+        }
         let command = match step {
             0 => EditorCommand::Edit(EditCommand::SelectWand {
                 seed: [0, 0],
@@ -1486,7 +1508,15 @@ impl ActiveCanvas {
                 self.projection.stage_solo(next);
                 Ok(false)
             }
-            EditorCommand::Layer(command) => self.apply_layer_command(command),
+            EditorCommand::Layer(command) => {
+                self.ensure_artwork_command_idle()?;
+                if !self.stroke.live_ink.try_pause_for_edit() {
+                    return Err(CommandRejectReason::CommandQueueBusy);
+                }
+                let result = self.apply_layer_command(command);
+                self.stroke.live_ink.resume_after_edit();
+                result
+            }
             EditorCommand::Dock(command) => {
                 let mut dock = self.projection.current().dock.clone();
                 match command {
@@ -1568,21 +1598,27 @@ impl ActiveCanvas {
             }
             EditorCommand::History(command) => {
                 self.ensure_artwork_command_idle()?;
-                let moved = self
-                    .stroke
-                    .materializer
-                    .move_history(command)
-                    .map_err(|()| CommandRejectReason::UnsupportedCommand)?;
-                let changed = moved.tiles.is_some();
-                self.install_history_move(moved)?;
-                Ok(changed)
+                if !self.stroke.live_ink.try_pause_for_edit() {
+                    return Err(CommandRejectReason::CommandQueueBusy);
+                }
+                let result = (|| {
+                    let moved = self
+                        .stroke
+                        .materializer
+                        .move_history(command)
+                        .map_err(|()| CommandRejectReason::UnsupportedCommand)?;
+                    let changed = moved.tiles.is_some();
+                    self.install_history_move(moved)?;
+                    Ok(changed)
+                })();
+                self.stroke.live_ink.resume_after_edit();
+                result
             }
         }
     }
 
     #[allow(clippy::too_many_lines)]
     fn apply_layer_command(&mut self, command: LayerCommand) -> Result<bool, CommandRejectReason> {
-        self.ensure_artwork_command_idle()?;
         let mut tree = self.scene.tree().clone();
         let mut active = self.active_layer;
         let mut next_id = self.next_layer_node_id;
@@ -1739,13 +1775,16 @@ impl ActiveCanvas {
         let Some(snapshot) = moved.tiles else {
             return Ok(());
         };
-        self.selection = None;
-        self.projection
-            .stage_edit(nyatidraw_api::EditProjection::default());
         if let Some(tree) = moved.tree {
             self.scene
                 .replace_tree(tree)
                 .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
+            self.selection = None;
+            self.stroke.selection = None;
+            self.painter.set_selection_mask(None);
+            self.eraser.set_selection_mask(None);
+            self.projection
+                .stage_edit(nyatidraw_api::EditProjection::default());
         }
         self.active_layer = valid_active_layer(self.scene.tree(), self.active_layer);
         self.stroke.live_ink.set_admission_layer(self.active_layer);
@@ -1815,9 +1854,7 @@ impl ActiveCanvas {
             .as_ref()
             .is_some_and(|sender| sender.try_send(request).is_ok());
         if !queued {
-            if self.selection.is_none() {
-                self.stroke.live_ink.resume_after_edit();
-            }
+            self.stroke.live_ink.resume_after_edit();
             return Err(CommandRejectReason::CommandQueueBusy);
         }
         self.edit_job = Some(received);
@@ -1855,7 +1892,10 @@ impl ActiveCanvas {
                 {
                     return;
                 }
-                self.selection = outcome.selection;
+                if let Err(error) = self.install_selection(outcome.selection) {
+                    self.stroke.live_ink.publish_workspace_error(error);
+                    return;
+                }
                 if changed {
                     let mut current = self.projection.current().clone();
                     current.dirty = true;
@@ -1881,15 +1921,37 @@ impl ActiveCanvas {
             selected_pixels,
             error,
         });
-        // Until selection-clipped brush replay is connected, prevent brush input
-        // from silently painting outside an existing selection.
-        if self.selection.is_none() {
-            self.stroke.live_ink.resume_after_edit();
-        }
+        self.stroke.live_ink.resume_after_edit();
         self.async_publication_base_revision
             .get_or_insert(self.projection.current().revision);
         self.publish_committed_history();
         println!("native-canvas event=edit-adopted selected_pixels={selected_pixels} pending=0");
+    }
+
+    fn install_selection(
+        &mut self,
+        selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
+    ) -> Result<(), String> {
+        let unchanged = match (&self.selection, &selection) {
+            (Some(current), Some(next)) => Arc::ptr_eq(current, next),
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            let mask = selection
+                .as_ref()
+                .map(|mask| {
+                    self.painter
+                        .create_selection_mask(mask.dimensions(), &mask.packed_bits())
+                })
+                .transpose()
+                .map_err(|error| format!("Selection could not be adopted by the GPU: {error:?}"))?;
+            self.painter.set_selection_mask(mask.as_ref());
+            self.eraser.set_selection_mask(mask.as_ref());
+        }
+        self.stroke.selection = selection.clone();
+        self.selection = selection;
+        Ok(())
     }
 
     fn advance_save_probe(&mut self) {
@@ -2593,6 +2655,7 @@ fn input_probe_sample(sequence: u64, phase: PointerPhase) -> StylusSample {
 }
 
 struct StrokePipeline {
+    selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     live_ink: LiveInkBridge,
     evaluator: RoundBrushEvaluator,
     active: Option<LiveStroke>,
@@ -2626,6 +2689,7 @@ impl StrokePipeline {
         let materialization_backlog_capacity = live_ink.maximum_drain_len();
         Self {
             live_ink,
+            selection: None,
             evaluator: RoundBrushEvaluator::new(0x4e41_5941_5449),
             active: None,
             queued: Vec::with_capacity(materialization_backlog_capacity),
@@ -2753,6 +2817,7 @@ impl StrokePipeline {
                         brush: BrushSnapshot { preset: brush },
                         color,
                         eraser,
+                        selection: self.selection.clone(),
                     });
                 }
                 PointerPhase::Move => {
@@ -2819,6 +2884,7 @@ impl StrokePipeline {
                                 samples: active.samples,
                                 brush: active.brush,
                                 color: active.color,
+                                selection: active.selection,
                                 end_timestamp_ns: sample.timestamp_ns,
                                 enqueued_at: Instant::now(),
                             };
@@ -3006,6 +3072,7 @@ impl StrokePipeline {
             samples: active.samples,
             brush: active.brush,
             color: active.color,
+            selection: active.selection,
             end_timestamp_ns: end.timestamp_ns,
             enqueued_at: Instant::now(),
         };
@@ -3101,6 +3168,7 @@ impl Drop for ActiveCanvas {
 }
 
 struct LiveStroke {
+    selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     token: RoundBrushStroke,
     generation: u64,
     layer: LayerId,
@@ -3182,6 +3250,7 @@ impl LiveStroke {
 }
 
 struct ClosedStrokeRequest {
+    selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     ordinal: u64,
     stroke_generation: u64,
     layer: LayerId,
@@ -4062,7 +4131,7 @@ fn materialization_loop(
         let started_at = Instant::now();
         let queue_wait_micros = started_at.duration_since(request.enqueued_at).as_micros();
         let snapshot_id = SnapshotId(next_id);
-        let result = session.prepare_round_stroke(
+        let result = session.prepare_round_stroke_with_selection(
             snapshot_id,
             HistoryNodeId(next_id),
             request.end_timestamp_ns,
@@ -4071,6 +4140,7 @@ fn materialization_loop(
             request.recorded,
             request.color,
             request.samples,
+            request.selection,
         );
         let keep_running = match result {
             Ok(batch) => {
@@ -4733,6 +4803,7 @@ mod tests {
             let mut token = begin_round_stroke(&mut evaluator, &LIVE_BRUSH, begin, &mut dabs);
             evaluator.push(&mut token, &[end], &mut dabs);
             ClosedStrokeRequest {
+                selection: None,
                 ordinal,
                 stroke_generation: ordinal,
                 layer: LIVE_LAYER,
