@@ -140,3 +140,57 @@ projection, CPU replay/commit, navigator/thumbnail, export 단계를 분리한�
 배선만 확인한 결과이며 성능 합격이나 4K export 간섭 결과로 사용하지 않는다.
 현재 환경의 Windows/WMI는 120 Hz 설정을 보고하지만 실제 frame cadence나 첫
 가시 픽셀을 입증하지 않는다. 사용자 영상 다운로드가 병행 중인 환경임도 기록했다.
+
+## 2026-09-05 installed 4K foreground / export comparison
+
+Windows 11 Home 10.0.26200, Core Ultra 7 155H, Intel Arc/DX12 Mailbox,
+Dioxus CLI 0.7.9 release, surface 2096×1458/scale 2에서 각 모드를 3번 실행했다.
+창을 전면으로 가져와 확인한 뒤 시작 marker를 만들었다. 3840×2160 페이지의
+잠긴 배경+잉크 2개 레이어, 64px round brush, 32개 직선 stroke에 각각 121개
+sample을 명목 240Hz로 보냈다. 매 stroke의 durable history 채택을 기다린다.
+export 모드는 각 stroke 시작 전 실제 4K PNG의 Running을 확인하고 입력을 보낸다.
+상세 절차는 [ADR-0027](decisions/ADR-0027-paced-desktop-performance.md)에 있다.
+
+아래는 입력 묶음의 앱 admission → present API 반환 시간이다. 각 percentile은
+histogram **상한**, 단위는 ms이며 실행 간 percentile을 평균하지 않았다.
+export 실행의 inactive 행도 보고하여 한 실행의 일부만 골라 비교하지 않는다.
+
+| 실행 | export 구간 | 입력 묶음 수 | p50 상한 | p95 상한 | p99 상한 | 관측 max |
+|---|---|---:|---:|---:|---:|---:|
+| baseline 1 | inactive | 1483 | 21.503 | 31.743 | 34.815 | 45.950 |
+| baseline 2 | inactive | 1319 | 22.527 | 34.815 | 40.959 | 99.998 |
+| baseline 3 | inactive | 1520 | 21.503 | 31.743 | 34.815 | 40.535 |
+| export 1 | inactive | 777 | 23.551 | 32.767 | 38.911 | 40.575 |
+| export 1 | active | 504 | 24.575 | 34.815 | 38.911 | 47.098 |
+| export 2 | inactive | 752 | 23.551 | 34.815 | 38.911 | 49.479 |
+| export 2 | active | 490 | 24.575 | 34.815 | 40.959 | 41.693 |
+| export 3 | inactive | 735 | 22.527 | 34.815 | 38.911 | 47.698 |
+| export 3 | active | 509 | 29.695 | 34.815 | 43.007 | 46.731 |
+
+기준 실행의 surface acquire p95 상한은 모두 15.871ms였고, GPU paint
+encode/submit은 0.607~0.639ms였다. Export active의 surface acquire p95는
+16.383~17.407ms였다. Committed-history projection publication p95는
+14~61µs 범위였다. 다만 이는 WebView 전체 비용을 측정한 값이 아니다.
+baseline 2의 drain/brush max 91.013ms도 남아 있어 surface만으로 모든 hitch를
+설명하지 않는다. 해당 span은 stroke 종료/대기열 전달도 포함한다.
+
+모든 실행에서 32×121개 sample의 sequence와 phase 종료, snapshot 33/history 33,
+전체 타일과 PNG의 별도 프로세스 재생 일치 및 정상 writer join을 확인했다.
+최종 프로젝트를 계측/입력 드라이버 없이 다시 실행해 복원 화면을 확인한 뒤
+동일 검증도 재통과했다. 새 단위 테스트는 추가하지 않았다.
+
+**성능 gate는 통과하지 않았다.** 일부 비교에서 p95 상한 차이가 3.072ms이며,
+histogram 구간과 실행 변동까지 있어 export 악화 ≤2ms를 입증하지 못한다.
+OS event/physical pen/첫 가시 픽셀은 측정하지 않았다. 입력 driver의 최대
+schedule lateness는 실행별 0.848~4.852ms였다. 사용자 영상 다운로드와 다른
+desktop 작업은 통제하지 않았고 warmup도 제외하지 않았다. 3회/모드 결과를
+장시간 p99나 CI baseline으로 승격하지 않는다. 이 장면은 위의 8px 단일 레이어
+표준 장면과도 다르다.
+
+[전체 JSON 결과](measurements/desktop-4k-foreground-2026-09-05.json)에 hardware,
+OS/backend/profile/설치 EXE hash/소스 commit/표본 수와 모든 단계의 분포를 보존했다.
+원본은 `target/performance-foreground/{baseline,export}-{1,2,3}/`의
+`out.log`, `err.log`, `verify.log`이며 최종 재실행은 `export-3/reopen-*.log`다.
+입력 전에 전면 상태를 맞추지 못했던 `target/performance-paced/`의 두 탐색 실행은
+이 비교에서 제외했다. 다음 조사 대상은 surface 대기와 stroke 종료 시 일시적
+hitch, 반복 reopen/undo 및 장시간 UI/입력이다.

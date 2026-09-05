@@ -673,3 +673,23 @@ mouse 주입·Undo·Save·Close를 수행해 단계별 로그를 확보했고, �
 통과했으며 해당 세션의 performance 로그는 0개였다. 입력 묶음 3개인 연결 검사이므로
 성능 gate는 계속 열려 있다. [ADR-0026](decisions/ADR-0026-bounded-desktop-timing.md)의
 정의를 기준으로 반복 startup/reopen/undo 및 4K export 동시 드로잉을 측정한다.
+
+### 4K 설치판 전면 입력·PNG export 반복 측정
+
+Scratch 전용 합성 입력 driver와 별도 process 검증/JSON 수집 도구를 추가했다.
+명시적 marker와 fresh history를 요구하며 정상 앱 실행에서는 꺼져 있다.
+설치 release를 전면으로 가져온 뒤 4K/2 raster/64px/명목 240Hz의 32개 stroke를
+baseline 및 실제 PNG export 중 각각 3회 실행했다. 6회 모두 3,872개 입력,
+snapshot 33/history 33, 전체 타일·PNG의 offline replay 일치와 writer join을
+통과했다. 최종 정상 앱 재시작 화면과 종료 후 검사도 통과했다. Clippy와
+release 설치를 통과했고 UI/측정용 단위 테스트나 의존성은 추가하지 않았다.
+
+기준 실행의 admission→present API 반환 p95 상한은 31.743~34.815ms,
+export active는 34.815ms였다. Surface acquire 대기가 크고 한 기준 실행에
+약 100ms input hitch도 있었다. 따라서 성능 gate와 export 악화 ≤2ms는
+통과로 처리하지 않는다. 사용자 다운로드는 보존했으며 통제되지 않은 병행
+부하로 기록했다. 실제 pen/OS event/visible pixel/120Hz cadence는 이 측정의
+범위가 아니다. [성능 결과](performance.md)와
+[ADR-0027](decisions/ADR-0027-paced-desktop-performance.md)에 재현 조건,
+전체 JSON 및 한계를 기록했다. 다음은 surface/종료 hitch 조사, startup/reopen/
+undo와 장시간 UI 검증 및 아직 고정 목록인 최근 브러시 크기의 실제 상태 연결이다.
