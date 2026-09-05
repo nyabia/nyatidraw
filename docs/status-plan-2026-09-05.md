@@ -352,3 +352,25 @@ tile별 처리로 468.531ms에서 220.761ms가 됐지만 입력 스레드에 두
 이번 체크포인트는 CPU 편집 기반이며 desktop 도구는 아직 비활성이다. 다음은
 native gesture, bounded 비동기 edit worker, 선택 영역 표시 및 durable 결과
 adoption을 연결하는 것이다. 선택 중 brush/eraser clipping 계약도 별도로 완성해야 한다.
+
+### 비동기 선택·채우기 worker 연결
+
+선택·채우기 semantic 명령을 기존 project writer에 연결했다. 활성 편집 한 개와
+buffered 응답 한 개로 제한하고 renderer는 완료를 nonblocking으로 받는다.
+진행 중인 stroke와 새 Begin을 원자적으로 구분하며, 편집 중 시작된 제스처의
+나머지 입력이 이후 stroke로 잘못 이어지지 않게 했다. 필요한 core 검사 한 개만
+추가해 전체 66개다. 상태창에는 처리 중·선택 개수·실패와 선택 해제를 표시한다.
+
+Windows 컴퓨터 사용 도구로 설치판을 직접 제어했다. Scratch fill worker를
+대기시킨 동안 Save 유지, 확대 버튼 반응, 정상 종료 진행창을 확인했다. 이후
+작업 완료·PNG 생성·writer join과 별도 프로세스의 픽셀/tree/history/PNG 비교가
+통과했다. [ADR-0013](decisions/ADR-0013-asynchronous-selection-edit.md)에 근거와
+제한을 기록했다. 실제 물리 펜이나 표시 지연 근거로 확대 해석하지 않는다.
+
+Native 선택 제스처와 overlay, 선택 영역에 맞춘 brush/eraser 처리는 아직 남았다.
+그 계약이 연결되기 전까지 일반 선택·채우기 도구 버튼은 비활성이며, semantic
+경로로 만들어진 선택이 있는 동안은 선택 해제 전까지 brush 입력을 막는다.
+
+최종 설치판에서 일반 완료 후 GPU 표시, 선택 해제, UI Undo → 저장/종료 → 별도
+검증, 재실행 후 UI Redo → 저장/종료 → 별도 검증까지 통과했다. 페이지 밖 데이터와
+history 두 노드는 유지됐다. All-target/all-feature Clippy와 전체 66개 테스트도 통과했다.

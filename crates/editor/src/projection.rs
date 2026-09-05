@@ -71,6 +71,10 @@ impl ProjectionState {
         self.current.history = history;
     }
 
+    pub fn stage_edit(&mut self, edit: nyatidraw_api::EditProjection) {
+        self.current.edit = edit;
+    }
+
     /// Publishes document metadata at one monotonically increasing revision.
     ///
     /// # Errors

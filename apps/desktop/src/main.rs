@@ -1,6 +1,7 @@
 #[cfg(windows)]
 mod desktop_canvas;
 mod desktop_shell;
+mod edit_worker;
 mod layer_drag;
 mod live_ink;
 mod native_canvas;
@@ -106,6 +107,8 @@ fn app() -> Element {
     let export_status = live_ink.export_status_snapshot();
     let close_status = live_ink.close_status();
     let activation_notice = live_ink.activation_notice_snapshot();
+    let edit = ui_projection.read().edit.clone();
+    let clear_edit_ink = live_ink.clone();
     let dock_drop_ink = live_ink.clone();
     let shortcut_ink = live_ink.clone();
     let navigator_move_ink = shortcut_ink.clone();
@@ -187,6 +190,20 @@ fn app() -> Element {
                 DockNodeView { node: dock.root().clone(), ui_projection, dock_drag }
             }
             if dirty { span { class: "unsaved-dot", title: "저장되지 않은 변경", "•" } }
+            if edit.busy || edit.has_selection || edit.error.is_some() {
+                aside { class: "edit-status", role: "status", aria_live: "polite",
+                    if edit.busy { span { "선택·채우기 처리 중…" } }
+                    else {
+                        span { "선택 {edit.selected_pixels} px" }
+                        button { onclick: move |_| {
+                            let (current, _) = clear_edit_ink.protocol_snapshot();
+                            let _ = clear_edit_ink.push_editor_command(current.revision,
+                                EditorCommand::Edit(nyatidraw_api::EditCommand::ClearSelection));
+                        }, "선택 해제" }
+                    }
+                    if let Some(reason) = &edit.error { span { role: "alert", "편집 실패: {reason}" } }
+                }
+            }
             if let Some((command, reason)) = rejection {
                 span { class: "status-toast error", role: "alert", "명령 #{command.0}: {reject_label(reason)}" }
             }

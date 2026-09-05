@@ -37,6 +37,7 @@ use nyatidraw_stroke::{MAX_SAMPLES_PER_STROKE, StrokeColor};
 use nyatidraw_tiles::{TILE_BYTE_LEN, TILE_EDGE, TileKey, TileSnapshot};
 
 use crate::{
+    edit_worker::{EditFailure, EditOutcome},
     elapsed_since_launch,
     live_ink::{AdmittedSample, CloseStatus, ExportStatus, InputDiscontinuity, LiveInkBridge},
     preview::{
@@ -630,6 +631,8 @@ struct ActiveCanvas {
     project_title: String,
     project_export_path: Option<PathBuf>,
     pending_save: Option<u64>,
+    edit_job: Option<Receiver<Result<EditOutcome, EditFailure>>>,
+    selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     canvas_spec: CanvasSpec,
     drawing: DrawingConfig,
     projection: ProjectionState,
@@ -637,11 +640,12 @@ struct ActiveCanvas {
     latest_preview_generation: BTreeMap<TileKey, u64>,
     deferred_completions: Vec<ClosedStrokeCompletion>,
     gpu_live_generation: Option<(u64, LiveStrokeToken, bool)>,
-    closed_stroke_dirty_base_revision: Option<Revision>,
+    async_publication_base_revision: Option<Revision>,
     close_raw_probe_staged: bool,
     save_probe_step: u8,
     protocol_probe_step: Option<u8>,
     history_probe: Option<(EditorCommand, bool)>,
+    edit_probe_step: Option<u8>,
     input_safety_probe_step: Option<u8>,
     synthetic_seed_enabled: bool,
     synthetic_seed_submitted: bool,
@@ -713,6 +717,8 @@ impl ActiveCanvas {
             );
             projection.install_authoritative(authoritative);
             projection.stage_history(initial_history.clone());
+            projection.stage_edit(nyatidraw_api::EditProjection::default());
+            live_ink.resume_after_edit();
             (view, active_layer)
         } else {
             // Project activation clears semantic document fields but preserves
@@ -765,6 +771,8 @@ impl ActiveCanvas {
             project_title: project_location.title(),
             project_export_path: project_location.export_path(),
             pending_save: None,
+            edit_job: None,
+            selection: None,
             canvas_spec,
             drawing,
             projection,
@@ -772,7 +780,7 @@ impl ActiveCanvas {
             latest_preview_generation: BTreeMap::new(),
             deferred_completions: Vec::new(),
             gpu_live_generation: None,
-            closed_stroke_dirty_base_revision: None,
+            async_publication_base_revision: None,
             close_raw_probe_staged: false,
             save_probe_step: if std::env::var_os(SAVE_PROBE_ENV).is_some()
                 && !SAVE_PROBE_USED.swap(true, Ordering::Relaxed)
@@ -783,6 +791,7 @@ impl ActiveCanvas {
             },
             protocol_probe_step: std::env::var_os(PROTOCOL_PROBE_ENV).map(|_| 0),
             history_probe: history_probe_command().map(|command| (command, false)),
+            edit_probe_step: crate::edit_worker::probe_project().map(|_| 0),
             input_safety_probe_step: std::env::var_os(INPUT_SAFETY_PROBE_ENV).map(|_| 0),
             synthetic_seed_enabled: std::env::var_os("NAYATI_SYNTHETIC_INK").is_some(),
             synthetic_seed_submitted: false,
@@ -790,7 +799,9 @@ impl ActiveCanvas {
             gpu_batches: 0,
             gpu_batch_logs_remaining: 16,
         };
-        if !restoring_projection {
+        if restoring_projection {
+            canvas.publish_committed_history();
+        } else {
             canvas.enqueue_initial_commands(live_ink);
         }
         live_ink.set_admission_layer(active_layer);
@@ -935,6 +946,55 @@ impl ActiveCanvas {
         }
     }
 
+    fn advance_edit_probe(&mut self) {
+        use nyatidraw_api::{EditCommand, EditSource};
+        let Some(step) = self.edit_probe_step else {
+            return;
+        };
+        let command = match step {
+            0 => EditorCommand::Edit(EditCommand::SelectWand {
+                seed: [0, 0],
+                tolerance: 0,
+                source: EditSource::ActiveLayer,
+            }),
+            1 if self.edit_job.is_none() && self.selection.is_some() => {
+                EditorCommand::Edit(EditCommand::FillSelection {
+                    color: [0, 255, 0, 255],
+                })
+            }
+            2 if self.edit_job.is_some() => {
+                for (sequence, phase) in
+                    [(80_001, PointerPhase::Begin), (80_002, PointerPhase::End)]
+                {
+                    assert_eq!(
+                        self.stroke
+                            .live_ink
+                            .push(input_probe_sample(sequence, phase)),
+                        Err(nyatidraw_input_queue::PushError::AdmissionPaused)
+                    );
+                }
+                println!(
+                    "native-canvas event=edit-probe-busy raw_gesture=not-admitted save=next-frame"
+                );
+                EditorCommand::Project(ProjectCommand::Save)
+            }
+            3 if self.pending_save.is_some() && self.edit_job.is_some() => {
+                println!("native-canvas event=edit-probe-save-retained worker_busy=true");
+                self.edit_probe_step = None;
+                return;
+            }
+            _ => return,
+        };
+        if self
+            .stroke
+            .live_ink
+            .push_editor_command(self.projection.current().revision, command)
+            .is_ok()
+        {
+            self.edit_probe_step = Some(step + 1);
+        }
+    }
+
     fn advance_input_safety_probe_before_drain(&mut self) -> bool {
         if self.input_safety_probe_step != Some(0) {
             return false;
@@ -1073,6 +1133,7 @@ impl ActiveCanvas {
             return None;
         }
 
+        self.poll_edit();
         // Native samples already carry the renderer-published document
         // coordinates from their admission moment. Consume their End and put
         // its closed stroke in the writer FIFO before accepting same-frame UI
@@ -1100,6 +1161,7 @@ impl ActiveCanvas {
         // command have run, so the next command uses their resulting revision.
         self.advance_protocol_probe();
         self.advance_history_probe();
+        self.advance_edit_probe();
         if self.advance_input_safety_probe_before_drain() {
             return None;
         }
@@ -1206,10 +1268,10 @@ impl ActiveCanvas {
         for envelope in commands {
             self.apply_command(envelope, width, height, scale);
         }
-        // This one-frame compatibility is only for a Save that was queued by
-        // the UI just before native input closed a stroke. Later commands must
+        // This one-frame compatibility is only for a Save queued just before
+        // native stroke closure or async edit publication. Later commands must
         // observe the new semantic revision normally.
-        self.closed_stroke_dirty_base_revision = None;
+        self.async_publication_base_revision = None;
     }
 
     fn apply_command(&mut self, envelope: CommandEnvelope, width: u32, height: u32, scale: f64) {
@@ -1218,12 +1280,12 @@ impl ActiveCanvas {
             self.reject_command(command_id, CommandRejectReason::WorkspaceFailed);
             return;
         }
-        let save_queued_before_closed_stroke = matches!(
+        let save_queued_before_publication = matches!(
             &envelope.command,
             EditorCommand::Project(ProjectCommand::Save)
-        ) && self.closed_stroke_dirty_base_revision
+        ) && self.async_publication_base_revision
             == Some(envelope.based_on);
-        let revision_validation = if save_queued_before_closed_stroke {
+        let revision_validation = if save_queued_before_publication {
             Ok(())
         } else {
             self.projection.validate_command_revision(envelope.based_on)
@@ -1280,7 +1342,13 @@ impl ActiveCanvas {
         height: u32,
         scale: f64,
     ) -> Result<bool, CommandRejectReason> {
+        if self.edit_job.is_some()
+            && matches!(command, EditorCommand::Layer(_) | EditorCommand::History(_))
+        {
+            return Err(CommandRejectReason::CommandQueueBusy);
+        }
         match command {
+            EditorCommand::Edit(command) => self.enqueue_edit(command),
             EditorCommand::Viewport(command) => {
                 let previous = self.view;
                 match command {
@@ -1630,7 +1698,8 @@ impl ActiveCanvas {
     }
 
     fn ensure_artwork_command_idle(&mut self) -> Result<(), CommandRejectReason> {
-        if self.scene.active_live_stroke().is_some()
+        if self.edit_job.is_some()
+            || self.scene.active_live_stroke().is_some()
             || self.stroke.active.is_some()
             || !self.stroke.pending_materializations.is_empty()
             || self.stroke.materializer.pending.load(Ordering::Acquire) != 0
@@ -1670,6 +1739,9 @@ impl ActiveCanvas {
         let Some(snapshot) = moved.tiles else {
             return Ok(());
         };
+        self.selection = None;
+        self.projection
+            .stage_edit(nyatidraw_api::EditProjection::default());
         if let Some(tree) = moved.tree {
             self.scene
                 .replace_tree(tree)
@@ -1716,7 +1788,108 @@ impl ActiveCanvas {
             .map(|(key, tile)| (key, tile.pixels().to_vec()))
             .collect();
         self.latest_preview_generation.clear();
+        if self.edit_job.is_none() {
+            self.stroke.live_ink.resume_after_edit();
+        }
         Ok(())
+    }
+
+    fn enqueue_edit(
+        &mut self,
+        command: nyatidraw_api::EditCommand,
+    ) -> Result<bool, CommandRejectReason> {
+        self.ensure_artwork_command_idle()?;
+        if !self.stroke.live_ink.try_pause_for_edit() {
+            return Err(CommandRejectReason::CommandQueueBusy);
+        }
+        let (reply, received) = sync_channel(1);
+        let request = WorkerRequest::Edit {
+            command,
+            target: self.active_layer,
+            reply,
+        };
+        let queued = self
+            .stroke
+            .materializer
+            .sender
+            .as_ref()
+            .is_some_and(|sender| sender.try_send(request).is_ok());
+        if !queued {
+            if self.selection.is_none() {
+                self.stroke.live_ink.resume_after_edit();
+            }
+            return Err(CommandRejectReason::CommandQueueBusy);
+        }
+        self.edit_job = Some(received);
+        let mut edit = self.projection.current().edit.clone();
+        edit.busy = true;
+        edit.error = None;
+        self.projection.stage_edit(edit);
+        println!("native-canvas event=edit-queued pending=1 response_capacity=1 wait=nonblocking");
+        Ok(false)
+    }
+
+    fn poll_edit(&mut self) {
+        let Some(job) = &self.edit_job else {
+            return;
+        };
+        let result = match job.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(EditFailure::Fatal("Edit worker disconnected".into()))
+            }
+        };
+        let mut error = None;
+        match result {
+            Ok(outcome) => {
+                let changed = outcome.tiles.is_some();
+                if changed
+                    && self
+                        .install_history_move(HistoryMove {
+                            tiles: outcome.tiles,
+                            tree: None,
+                            history: outcome.history,
+                        })
+                        .is_err()
+                {
+                    return;
+                }
+                self.selection = outcome.selection;
+                if changed {
+                    let mut current = self.projection.current().clone();
+                    current.dirty = true;
+                    self.projection.install_authoritative(current);
+                }
+            }
+            Err(EditFailure::Rejected(reason)) => {
+                error = Some(reason);
+            }
+            Err(EditFailure::Fatal(reason)) => {
+                self.stroke.live_ink.publish_workspace_error(reason);
+                return;
+            }
+        }
+        self.edit_job = None;
+        let selected_pixels = self
+            .selection
+            .as_ref()
+            .map_or(0, |mask| mask.selected_pixels());
+        self.projection.stage_edit(nyatidraw_api::EditProjection {
+            busy: false,
+            has_selection: self.selection.is_some(),
+            selected_pixels,
+            error,
+        });
+        // Until selection-clipped brush replay is connected, prevent brush input
+        // from silently painting outside an existing selection.
+        if self.selection.is_none() {
+            self.stroke.live_ink.resume_after_edit();
+        }
+        self.async_publication_base_revision
+            .get_or_insert(self.projection.current().revision);
+        self.publish_committed_history();
+        println!("native-canvas event=edit-adopted selected_pixels={selected_pixels} pending=0");
     }
 
     fn advance_save_probe(&mut self) {
@@ -1747,7 +1920,10 @@ impl ActiveCanvas {
         let Some(generation) = self.pending_save else {
             return;
         };
-        if self.stroke.active.is_some() || !self.stroke.pending_materializations.is_empty() {
+        if self.edit_job.is_some()
+            || self.stroke.active.is_some()
+            || !self.stroke.pending_materializations.is_empty()
+        {
             return;
         }
         let Some(path) = self.project_export_path.clone() else {
@@ -1820,7 +1996,8 @@ impl ActiveCanvas {
         );
         match publish {
             Ok(event) => {
-                self.closed_stroke_dirty_base_revision = Some(previous_revision);
+                self.async_publication_base_revision
+                    .get_or_insert(previous_revision);
                 self.stroke
                     .live_ink
                     .publish_editor_event(event, Some(self.projection.current().clone()));
@@ -3084,6 +3261,11 @@ struct MaterializationBootstrap {
 
 enum WorkerRequest {
     Stroke(ClosedStrokeRequest),
+    Edit {
+        command: nyatidraw_api::EditCommand,
+        target: LayerId,
+        reply: SyncSender<Result<EditOutcome, EditFailure>>,
+    },
     CommitLayerTree {
         tree: LayerTree,
         white: bool,
@@ -3591,12 +3773,72 @@ fn materialization_loop(
     // publication than the frame currently visible in Dioxus.
     let mut thumbnail_generation = 1_u64;
     let mut exit = WorkerExit::Drained;
+    let mut selection = None;
     while let Ok(work) = receiver.recv() {
         // Dequeue freed a bounded writer slot. Wake a Save retained by the
         // canvas even when this work only changes metadata or exports a PNG.
         live_ink.request_redraw();
         let request = match work {
             WorkerRequest::Stroke(request) => request,
+            WorkerRequest::Edit {
+                command,
+                target,
+                reply,
+            } => {
+                let started = Instant::now();
+                let db = match sink {
+                    ProjectSink::UntitledRecovery { db, .. }
+                    | ProjectSink::ExplicitProject { db, .. } => db,
+                };
+                let result = crate::edit_worker::execute(
+                    command,
+                    target,
+                    preview_canvas,
+                    &preview_tree,
+                    &mut selection,
+                    &mut session,
+                    &mut next_id,
+                    db,
+                );
+                let failed = matches!(result, Err(EditFailure::Fatal(_)));
+                match &result {
+                    Ok(outcome) if outcome.tiles.is_some() => {
+                        publish_navigator_frame(
+                            live_ink,
+                            session.tiles(),
+                            &preview_tree,
+                            preview_canvas,
+                        );
+                        thumbnail_generation = thumbnail_generation.saturating_add(1);
+                        publish_layer_thumbnail_frames(
+                            live_ink,
+                            thumbnail_generation,
+                            session.tiles(),
+                            raster_layer_ids(&preview_tree),
+                            preview_canvas,
+                        );
+                    }
+                    Err(EditFailure::Fatal(reason)) => {
+                        live_ink.publish_workspace_error(reason.clone());
+                    }
+                    Err(EditFailure::Rejected(reason)) => {
+                        eprintln!("native-canvas event=edit-rejected reason={reason}");
+                    }
+                    Ok(_) => {}
+                }
+                println!(
+                    "native-canvas event=edit-finished elapsed_us={} snapshot={} fatal={failed}",
+                    started.elapsed().as_micros(),
+                    session.current_snapshot().0
+                );
+                let _ = reply.send(result);
+                live_ink.request_redraw();
+                if failed {
+                    exit = WorkerExit::FailStop;
+                    break;
+                }
+                continue;
+            }
             WorkerRequest::ExportPng {
                 generation,
                 path,
@@ -3696,6 +3938,7 @@ fn materialization_loop(
                             .accept_history_cursor_move(prepared, tiles.clone())
                             .map_err(|error| format!("history-accept:{error:?}"))?;
                         preview_tree = tree.clone();
+                        selection = None;
                         Ok(HistoryMove {
                             tiles: Some(tiles),
                             tree: Some(tree),
@@ -3775,6 +4018,7 @@ fn materialization_loop(
                         .map_err(|error| format!("layer history accept: {error:?}"))?;
                     next_id = next;
                     preview_tree = tree.clone();
+                    selection = None;
                     Ok(HistoryMove {
                         tiles: Some(after),
                         tree: Some(tree),
@@ -4208,7 +4452,7 @@ fn add_synthetic_background(output: &mut Vec<BrushDab>) {
     }
 }
 
-fn system_timestamp_ns() -> u64 {
+pub(crate) fn system_timestamp_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| {

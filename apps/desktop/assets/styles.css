@@ -187,6 +187,7 @@ button:focus, [tabindex="0"]:focus { outline: 2px solid #9ee8ff; outline-offset:
 .commandbar-error, .status-toast { position: fixed; right: 10px; z-index: 90; max-width: min(440px,calc(100vw - 20px)); padding: 6px 9px; border: 1px solid #7a2929; background: #3d2020; color: #ffe1dc; box-shadow: 0 3px 12px rgba(0,0,0,.35); }
 .commandbar-error { top: 48px; }
 .status-toast { bottom: 10px; }
+.edit-status { position: fixed; right: 10px; bottom: 40px; z-index: 85; display: flex; gap: 8px; align-items: center; padding: 6px 9px; background: #233a3d; color: #e2fcff; border: 1px solid #558b93; }
 
 @media (max-width: 1280px) {
     .command-label { display: none; }

@@ -10,11 +10,11 @@ pub use dock::{
     DockNode, DockPosition, DockTree, PanelKind,
 };
 pub use protocol::{
-    CommandEnvelope, CommandRejectReason, DockCommand, DrawingTool, EditorCommand, EditorEvent,
-    EventEnvelope, HISTORY_PROJECTION_MAX_ENTRIES, HistoryBranchProjection, HistoryCommand,
-    HistoryEntryProjection, HistoryOperationLabel, HistoryProjection, LayerCommand,
-    LayerProjection, LayerProjectionKind, ProjectCommand, ToolCommand, UiProjection,
-    ViewportCommand, ViewportProjection, WorkspaceProjection,
+    CommandEnvelope, CommandRejectReason, DockCommand, DrawingTool, EditCommand, EditProjection,
+    EditSource, EditorCommand, EditorEvent, EventEnvelope, HISTORY_PROJECTION_MAX_ENTRIES,
+    HistoryBranchProjection, HistoryCommand, HistoryEntryProjection, HistoryOperationLabel,
+    HistoryProjection, LayerCommand, LayerProjection, LayerProjectionKind, ProjectCommand,
+    ToolCommand, UiProjection, ViewportCommand, ViewportProjection, WorkspaceProjection,
 };
 
 macro_rules! id_type {

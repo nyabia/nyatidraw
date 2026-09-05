@@ -14,11 +14,52 @@ pub struct CommandEnvelope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EditorCommand {
     History(HistoryCommand),
+    Edit(EditCommand),
     Project(ProjectCommand),
     Tool(ToolCommand),
     Layer(LayerCommand),
     Dock(DockCommand),
     Viewport(ViewportCommand),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditSource {
+    ActiveLayer,
+    ReferenceLayers,
+    AllVisible,
+}
+
+/// Completed document-space gestures; raw pointer samples never enter this lane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EditCommand {
+    SelectWand {
+        seed: [i32; 2],
+        tolerance: u8,
+        source: EditSource,
+    },
+    /// Admission rejects payloads outside 3..=4096 vertices.
+    SelectLasso {
+        vertices: Vec<[i32; 2]>,
+    },
+    ClearSelection,
+    /// Colors are premultiplied linear RGBA8, matching durable tile pixels.
+    FillSelection {
+        color: [u8; 4],
+    },
+    GradientSelection {
+        start: [i32; 2],
+        end: [i32; 2],
+        start_color: [u8; 4],
+        end_color: [u8; 4],
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EditProjection {
+    pub busy: bool,
+    pub has_selection: bool,
+    pub selected_pixels: u64,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -278,6 +319,7 @@ pub struct UiProjection {
     pub solo_node: Option<LayerTreeNodeId>,
     pub layers: Vec<LayerProjection>,
     pub history: HistoryProjection,
+    pub edit: EditProjection,
     pub dock: DockTree,
     pub viewport: ViewportProjection,
     pub drawing_tool: DrawingTool,
@@ -308,6 +350,7 @@ impl UiProjection {
             solo_node: None,
             layers: Vec::new(),
             history: HistoryProjection::initial(),
+            edit: EditProjection::default(),
             dock: DockTree::safe_default(),
             viewport: ViewportProjection {
                 zoom_ppm: 1_000_000,

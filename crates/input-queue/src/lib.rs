@@ -31,6 +31,8 @@ impl QueuedSample {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PushError {
     TransitionQueueFull,
+    /// The owner declined a whole gesture before Begin, until a clean Begin.
+    AdmissionPaused,
 }
 
 /// Lifetime accounting for a bounded input queue.

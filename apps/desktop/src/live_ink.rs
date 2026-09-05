@@ -226,6 +226,9 @@ struct RawInputState {
     transition_capacity: usize,
     begin_layers: VecDeque<(u64, LayerId)>,
     admission_layer: LayerId,
+    admitted_active: bool,
+    edit_paused: bool,
+    skipped_edit_gesture: bool,
     discontinuity: Option<InputDiscontinuity>,
     stats: InputSafetyStats,
 }
@@ -263,6 +266,9 @@ impl LiveInkBridge {
                     transition_capacity: capacity,
                     begin_layers: VecDeque::with_capacity(capacity.saturating_mul(2)),
                     admission_layer: initial_layer,
+                    admitted_active: false,
+                    edit_paused: false,
+                    skipped_edit_gesture: false,
                     discontinuity: None,
                     stats: InputSafetyStats::default(),
                 }),
@@ -311,6 +317,22 @@ impl LiveInkBridge {
             return Err(PushError::TransitionQueueFull);
         }
 
+        if raw.edit_paused {
+            if sample.phase == PointerPhase::Begin {
+                raw.skipped_edit_gesture = true;
+                eprintln!(
+                    "native-input event=gesture-not-admitted reason=selection-edit sequence={} resume=clean-begin",
+                    sample.sequence
+                );
+            }
+            return Err(PushError::AdmissionPaused);
+        }
+        if raw.skipped_edit_gesture {
+            if sample.phase != PointerPhase::Begin {
+                return Err(PushError::AdmissionPaused);
+            }
+            raw.skipped_edit_gesture = false;
+        }
         let admission_layer = raw.admission_layer;
         match raw.queue.push(sample) {
             Ok(()) => {}
@@ -337,11 +359,35 @@ impl LiveInkBridge {
             Err(error) => return Err(error),
         }
         if sample.phase == PointerPhase::Begin {
+            raw.admitted_active = true;
             raw.begin_layers
                 .push_back((sample.sequence, admission_layer));
+        } else if matches!(sample.phase, PointerPhase::End | PointerPhase::Cancel) {
+            raw.admitted_active = false;
         }
         drop(raw);
         Ok(self.request_redraw())
+    }
+
+    /// Atomically excludes an in-flight or newly admitted stroke before a CPU edit.
+    /// A selection retains this pause until brush clipping is connected.
+    pub(crate) fn try_pause_for_edit(&self) -> bool {
+        let mut raw = self.raw_input();
+        if self.is_closing()
+            || self.inner.fatal_input_quarantine.load(Ordering::Acquire)
+            || raw.admitted_active
+            || !raw.queue.is_empty()
+            || !raw.pending_transitions.is_empty()
+            || raw.discontinuity.is_some()
+        {
+            return false;
+        }
+        raw.edit_paused = true;
+        true
+    }
+
+    pub(crate) fn resume_after_edit(&self) {
+        self.raw_input().edit_paused = false;
     }
 
     /// Enqueues one versioned semantic command. This bounded lane cannot carry
@@ -351,6 +397,10 @@ impl LiveInkBridge {
         based_on: Revision,
         command: EditorCommand,
     ) -> Result<CommandId, CanvasCommandQueueFull> {
+        if matches!(&command, EditorCommand::Edit(nyatidraw_api::EditCommand::SelectLasso { vertices }) if !(3..=4096).contains(&vertices.len()))
+        {
+            return Err(CanvasCommandQueueFull);
+        }
         if self.workspace_failed() {
             return Err(CanvasCommandQueueFull);
         }
@@ -469,6 +519,9 @@ impl LiveInkBridge {
             raw.pending_transitions.clear();
             raw.begin_layers.clear();
             raw.discontinuity = None;
+            raw.admitted_active = false;
+            raw.edit_paused = false;
+            raw.skipped_edit_gesture = false;
         }
         self.inner
             .editor_commands
@@ -911,6 +964,7 @@ impl LiveInkBridge {
         }
         let discontinuity = raw.discontinuity.take();
         if discontinuity.is_some() {
+            raw.admitted_active = false;
             raw.stats.discontinuities_acknowledged =
                 raw.stats.discontinuities_acknowledged.saturating_add(1);
         }
@@ -1072,6 +1126,50 @@ fn invalidate_origin(viewport: &mut CanvasViewportSnapshot) {
 mod tests {
     use super::*;
     use nyatidraw_input::PenButtons;
+
+    #[test]
+    fn edit_admission_never_splits_a_stroke_or_adopts_a_paused_gesture_tail() {
+        let bridge = LiveInkBridge::with_capacity(8, LayerId(7));
+        let mut received = Vec::new();
+        bridge.push(sample(1, PointerPhase::Begin)).unwrap();
+        bridge.drain_into(&mut received);
+        assert!(
+            !bridge.try_pause_for_edit(),
+            "an empty queue can still have an active stroke"
+        );
+        bridge.push(sample(2, PointerPhase::End)).unwrap();
+        assert!(
+            !bridge.try_pause_for_edit(),
+            "queued End must be consumed before editing"
+        );
+        bridge.drain_into(&mut received);
+        assert!(bridge.try_pause_for_edit());
+        for (sequence, phase) in [(3, PointerPhase::Begin), (4, PointerPhase::Move)] {
+            assert_eq!(
+                bridge.push(sample(sequence, phase)),
+                Err(PushError::AdmissionPaused)
+            );
+        }
+        bridge.resume_after_edit();
+        assert_eq!(
+            bridge.push(sample(5, PointerPhase::End)),
+            Err(PushError::AdmissionPaused)
+        );
+        bridge.push(sample(6, PointerPhase::Begin)).unwrap();
+        bridge.push(sample(7, PointerPhase::End)).unwrap();
+        assert!(bridge.drain_into(&mut received).is_none());
+        assert_eq!(
+            received
+                .iter()
+                .map(|item| item.queued.sample.sequence)
+                .collect::<Vec<_>>(),
+            [1, 2, 6, 7],
+            "only complete admitted gestures reach replay"
+        );
+        assert!(bridge.try_pause_for_edit());
+        bridge.reset_for_project_activation();
+        bridge.push(sample(8, PointerPhase::Begin)).unwrap();
+    }
 
     #[test]
     fn close_boundary_preserves_admitted_input_and_rejects_late_artwork() {
