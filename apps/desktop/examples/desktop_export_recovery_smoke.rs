@@ -120,6 +120,7 @@ mod windows_probe {
                     name: format!("Layer{id}"),
                     visible: true,
                     locked: false,
+                    reference: false,
                     opacity_u16: u16::MAX,
                     content_root: ContentRootId(0),
                 })
@@ -174,6 +175,10 @@ mod windows_probe {
         survivor
             .remove(LayerTreeNodeId::Group(GroupId(10)))
             .map_err(|error| format!("subtree expectation: {error:?}"))?;
+        let mut reference = reordered.clone();
+        reference
+            .set_reference(LayerId(1), true)
+            .map_err(|error| format!("reference expectation: {error:?}"))?;
         for (probe, snapshot, count, expected_tree) in [
             ("rename-r:1", 2, 20, Some(&renamed)),
             ("opacity-g:10", 3, 20, Some(&restored)),
@@ -186,10 +191,18 @@ mod windows_probe {
             ("reorder-r:1", 6, 20, Some(&reordered)),
             ("delete-g:10", 7, 1, Some(&survivor)),
             ("undo", 6, 20, Some(&reordered)),
+            ("reference-r:1", 8, 20, Some(&reference)),
+            ("undo", 6, 20, Some(&reordered)),
+            ("redo:8", 8, 20, Some(&reference)),
         ] {
             let mut app = Desktop::start_with_history(executable, &project, Some(probe))?;
             app.until("event=history-probe-complete")?;
             app.until("active_valid=true")?;
+            app.until(if snapshot == 8 {
+                "reference_count=1"
+            } else {
+                "reference_count=0"
+            })?;
             app.until("event=first-native-wgpu-present")?;
             let window = find_window(app.child.id())?;
             let child =
@@ -232,8 +245,11 @@ mod windows_probe {
             if reopened.current_tiles() != &expected_tiles {
                 return Err(format!("{probe}: deleted or restored artwork is not exact").into());
             }
+            // Reference toggles must export exactly the same pixels as the
+            // preceding unmarked tree, including after Undo/restart/Redo.
+            let export_tree = if snapshot == 8 { &reordered } else { &tree };
             let flattened =
-                nyatidraw_paint_cpu::flatten_layer_tree_rgba8(&expected_tiles, &tree, canvas)
+                nyatidraw_paint_cpu::flatten_layer_tree_rgba8(&expected_tiles, export_tree, canvas)
                     .map_err(|error| format!("expected layer composite: {error:?}"))?;
             verify_png(&project.with_extension("png"), &flattened)?;
         }

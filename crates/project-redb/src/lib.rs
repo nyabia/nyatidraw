@@ -1523,6 +1523,7 @@ mod tests {
                 name: name.into(),
                 visible: true,
                 locked: false,
+                reference: false,
                 opacity_u16: u16::MAX,
                 content_root: ContentRootId(id + 100),
             })
@@ -1569,6 +1570,9 @@ mod tests {
             .prepare_structural_change(SnapshotId(3), HistoryNodeId(4), 50, session.tiles().clone())
             .expect("metadata-only history node");
         let mut changed = baseline.clone();
+        changed
+            .set_reference(LayerId(20), true)
+            .expect("reference source");
         changed
             .rename(LayerTreeNodeId::Raster(LayerId(20)), "Renamed")
             .expect("rename");

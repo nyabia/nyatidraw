@@ -13,6 +13,8 @@ pub struct LayerNode {
     pub name: String,
     pub visible: bool,
     pub locked: bool,
+    /// Selection/fill source membership; never changes ordinary composition.
+    pub reference: bool,
     pub opacity_u16: u16,
     pub content_root: ContentRootId,
 }
@@ -161,6 +163,22 @@ impl LayerTree {
             None => return Err(LayerTreeError::UnknownNode(node)),
         }
         Ok(CompositeInvalidation::empty())
+    }
+
+    /// Changes a raster's selection/fill source membership without invalidating
+    /// ordinary composition. The caller persists this metadata through history.
+    ///
+    /// # Errors
+    /// Rejects an unknown raster ID without changing the tree.
+    pub fn set_reference(&mut self, id: LayerId, reference: bool) -> Result<(), LayerTreeError> {
+        let node = LayerTreeNodeId::Raster(id);
+        match find_node_mut(&mut self.root, node) {
+            Some(LayerTreeNode::Raster(layer)) => {
+                layer.reference = reference;
+                Ok(())
+            }
+            _ => Err(LayerTreeError::UnknownNode(node)),
+        }
     }
 
     /// Removes one raster or whole subtree. The caller retains the prior tree
@@ -454,6 +472,7 @@ mod tests {
             name: format!("Layer {id}"),
             visible: true,
             locked: false,
+            reference: false,
             opacity_u16: u16::MAX,
             content_root: ContentRootId(0),
         })

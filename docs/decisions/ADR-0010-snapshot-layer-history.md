@@ -29,7 +29,9 @@ cursor, including branches outside current ancestry. It rejects orphan/missing
 records, bad layer envelopes and a current tree that differs from its snapshot.
 Existing bounds apply: 100,000 history nodes and 5 MiB maximum layer record.
 Migration keeps one shared legacy tree rather than duplicating it for every
-old node. Record envelope and layer payload versions remain 1.
+old node. Record envelope remains 1. The original layer payload was version 1;
+[ADR-0011](ADR-0011-reference-layer-metadata.md) adds backward-readable version 2
+for raster Reference membership.
 
 ## Evidence and limits
 
@@ -63,6 +65,6 @@ The existing core tree invariant was extended; the test count remains 60.
 
 No dependency was added or changed; redb remains exactly 2.6.3. Idle metadata and
 history requests still use synchronous worker replies, so this does not close
-the hot-path latency gate. Reference metadata, drag reorder UI and per-cursor
+the hot-path latency gate. Drag reorder UI and per-cursor
 canvas/page state remain subsequent work in the active Sprint 1–3 goal. Semantic
 probes do not establish direct UI interaction or physical-pen evidence.

@@ -8,6 +8,7 @@ fn raster(id: u128) -> LayerTreeNode {
         name: format!("Layer {id}"),
         visible: true,
         locked: false,
+        reference: false,
         opacity_u16: u16::MAX,
         content_root: ContentRootId(id),
     })

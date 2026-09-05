@@ -321,6 +321,7 @@ fn raster(id: LayerId, name: &str) -> LayerTreeNode {
         name: name.into(),
         visible: true,
         locked: false,
+        reference: false,
         opacity_u16: u16::MAX,
         content_root: ContentRootId(0),
     })

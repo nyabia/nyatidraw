@@ -276,6 +276,7 @@ fn layer_fixture(changed: bool) -> Result<LayerTree, String> {
             .into(),
             visible: true,
             locked: false,
+            reference: false,
             opacity_u16: if changed { 20_000 } else { u16::MAX },
             content_root: ContentRootId(0),
         })],

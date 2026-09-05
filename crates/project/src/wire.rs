@@ -17,7 +17,7 @@ const RECORD_MAGIC: [u8; 8] = *b"NYREC001";
 const RECORD_SCHEMA_VERSION: u16 = 1;
 const ROOT_ENTRY_ENCODED_LEN: usize = 57;
 const SAMPLE_MIN_ENCODED_LEN: usize = 61;
-const LAYER_TREE_WIRE_VERSION: u16 = 1;
+const LAYER_TREE_WIRE_VERSION: u16 = 2;
 const MAX_LAYER_TREE_NODES: usize = 4_096;
 const MAX_LAYER_TREE_DEPTH: usize = 64;
 const MAX_LAYER_NAME_BYTES: usize = 1_024;
@@ -345,11 +345,12 @@ pub fn encode_layer_tree(tree: &LayerTree) -> Result<Vec<u8>, WireError> {
 /// properties.
 pub fn decode_layer_tree(bytes: &[u8]) -> Result<LayerTree, WireError> {
     let mut decoder = Decoder::new(bytes);
-    if decoder.u16()? != LAYER_TREE_WIRE_VERSION {
+    let version = decoder.u16()?;
+    if !(1..=LAYER_TREE_WIRE_VERSION).contains(&version) {
         return Err(WireError::InvalidData("unsupported layer tree version"));
     }
     let mut node_count = 0_usize;
-    let root = decode_group_node(&mut decoder, 0, &mut node_count)?;
+    let root = decode_group_node(&mut decoder, 0, &mut node_count, version)?;
     decoder.finish()?;
     LayerTree::new(root).map_err(|_| WireError::InvalidData("invalid layer tree hierarchy"))
 }
@@ -394,6 +395,7 @@ fn encode_raster_node(
     encode_layer_name(output, &layer.name)?;
     output.push(u8::from(layer.visible));
     output.push(u8::from(layer.locked));
+    output.push(u8::from(layer.reference));
     output.extend_from_slice(&layer.opacity_u16.to_le_bytes());
     output.extend_from_slice(&layer.content_root.0.to_le_bytes());
     Ok(())
@@ -422,6 +424,7 @@ fn decode_group_node(
     decoder: &mut Decoder<'_>,
     depth: usize,
     node_count: &mut usize,
+    version: u16,
 ) -> Result<GroupNode, WireError> {
     if depth > MAX_LAYER_TREE_DEPTH {
         return Err(WireError::InvalidData("layer tree exceeds depth limit"));
@@ -442,12 +445,13 @@ fn decode_group_node(
     for _ in 0..child_count {
         match decoder.peek_u8()? {
             1 => children.push(LayerTreeNode::Raster(decode_raster_node(
-                decoder, node_count,
+                decoder, node_count, version,
             )?)),
             2 => children.push(LayerTreeNode::Group(decode_group_node(
                 decoder,
                 depth + 1,
                 node_count,
+                version,
             )?)),
             _ => return Err(WireError::InvalidEnum),
         }
@@ -464,6 +468,7 @@ fn decode_group_node(
 fn decode_raster_node(
     decoder: &mut Decoder<'_>,
     node_count: &mut usize,
+    version: u16,
 ) -> Result<LayerNode, WireError> {
     count_layer_node(node_count)?;
     if decoder.u8()? != 1 {
@@ -474,6 +479,7 @@ fn decode_raster_node(
         name: decoder.bounded_string(MAX_LAYER_NAME_BYTES, "layer name exceeds byte limit")?,
         visible: decoder.boolean()?,
         locked: decoder.boolean()?,
+        reference: version >= 2 && decoder.boolean()?,
         opacity_u16: decoder.u16()?,
         content_root: ContentRootId(decoder.u128()?),
     })
@@ -1057,6 +1063,47 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod project_head_compatibility_tests {
     use super::*;
+
+    #[test]
+    fn reference_metadata_preserves_legacy_layers_and_rejects_malformed_membership() {
+        // Product risk: a new source flag must not reinterpret existing layer
+        // bytes or silently select the wrong pixels in later selection/fill.
+        // This v1 fixture uses explicit fields, independently of the encoder.
+        let mut legacy = vec![1, 0, 2];
+        legacy.extend_from_slice(&100_u128.to_le_bytes());
+        legacy.extend_from_slice(&1_u64.to_le_bytes());
+        legacy.extend_from_slice(b"R");
+        legacy.extend_from_slice(&[1, 255, 255]);
+        legacy.extend_from_slice(&1_u64.to_le_bytes());
+        legacy.push(1);
+        legacy.extend_from_slice(&7_u128.to_le_bytes());
+        legacy.extend_from_slice(&1_u64.to_le_bytes());
+        legacy.extend_from_slice(b"L");
+        legacy.extend_from_slice(&[1, 0, 255, 255]);
+        legacy.extend_from_slice(&0_u128.to_le_bytes());
+        let mut tree = decode_layer_tree(&legacy).expect("legacy layer remains readable");
+        let LayerTreeNode::Raster(layer) = &tree.root().children[0] else {
+            panic!("raster fixture")
+        };
+        assert!(!layer.reference);
+        assert_eq!(layer.id, LayerId(7));
+        let prior = tree.clone();
+        assert!(tree.set_reference(LayerId(99), true).is_err());
+        assert_eq!(tree, prior, "unknown source must preserve artwork metadata");
+        tree.set_reference(LayerId(7), true).expect("select source");
+        let current = encode_layer_tree(&tree).expect("v2 source encoding");
+        assert_eq!(&current[..2], &[2, 0]);
+        assert_eq!(decode_layer_tree(&current), Ok(tree));
+        let reference_offset = current.len() - 19;
+        for invalid in [2, 255] {
+            let mut corrupt = current.clone();
+            corrupt[reference_offset] = invalid;
+            assert_eq!(decode_layer_tree(&corrupt), Err(WireError::InvalidEnum));
+        }
+        let mut unsupported = current;
+        unsupported[..2].copy_from_slice(&3_u16.to_le_bytes());
+        assert!(decode_layer_tree(&unsupported).is_err());
+    }
 
     #[test]
     fn snapshot_head_decoder_preserves_legacy_stroke_and_new_structural_forms() {

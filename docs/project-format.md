@@ -45,7 +45,14 @@ metadata-history commit이 project marker를 1에서 2로 바꾸며, pixel/histo
 보존하고 Undo/Redo는 cursor와 current tree를 함께 복원한다. 기존 snapshot들은
 한 번 고정한 legacy tree를 참조한다. 과거에 저장하지 않은 레이어 상태를 복원한
 것은 아니다. 단순 open은 전환하지 않는다. 구 marker-1 writer는 marker 2를 거부한다.
-자세한 형식·검증·미연결 desktop 범위는 [ADR-0010](decisions/ADR-0010-snapshot-layer-history.md)을 따른다.
+자세한 형식·검증·desktop 연결 범위는 [ADR-0010](decisions/ADR-0010-snapshot-layer-history.md)을 따른다.
+
+Reference metadata의 layer payload version은 2다. Raster의 locked byte 뒤에
+canonical boolean 한 byte를 추가하며 일반 합성/export는 이를 무시한다. Decoder는
+version 1을 Reference 꺼짐으로 읽고 새 tree write만 version 2를 사용한다.
+열기만으로 파일을 다시 쓰지 않는다. Project history marker 2와 envelope version 1은
+유지하며 이전 reader는 알 수 없는 layer payload를 거부한다. 상세 호환성 및 실행
+근거는 [ADR-0011](decisions/ADR-0011-reference-layer-metadata.md)을 따른다.
 
 ### 유한 page와 signed sparse layer plane
 

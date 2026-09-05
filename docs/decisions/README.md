@@ -15,6 +15,8 @@
 | 확정 | [history branch와 root cursor를 보존](ADR-0006-branch-preserving-history.md) | 모든 child 보존·명시 redo 선택·4K pointer-only 측정 통과 |
 | 확정 | [validated layer/dock trees와 coordinate-scoped composite invalidation](ADR-0007-editor-layer-and-layout-model.md) | exact invalidation, versioned durable LayerTree, typed dispatcher와 dock-remount authority 수용성 통과 |
 | 확정 | [종료 중 창 유지와 PNG 복구](ADR-0009-close-and-export-recovery.md) | bounded admission 종료, 비동기 drain/join, 실패 시 durable reopen과 Save retry |
+| 확정 | [snapshot별 레이어 상태](ADR-0010-snapshot-layer-history.md) | tree/pixel 원자적 commit과 삭제·metadata Undo/reopen |
+| 확정 | [래스터 Reference metadata](ADR-0011-reference-layer-metadata.md) | 구버전 호환성, history 복원과 일반 PNG 불변 |
 | 검증 대기 | 128×128 tile | 64/128/256 latency·memory·metadata benchmark 필요 |
 | 검증 대기 | GPU→CPU materialization 방식 | readback, CPU replay, hybrid 비교 필요 |
 

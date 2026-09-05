@@ -279,6 +279,7 @@ fn initial_ui_projection() -> UiProjection {
             kind: LayerProjectionKind::Group,
             name: "Ink group".into(),
             visible: true,
+            reference: false,
             opacity_u16: u16::MAX,
         },
         LayerProjection {
@@ -288,6 +289,7 @@ fn initial_ui_projection() -> UiProjection {
             kind: LayerProjectionKind::Raster,
             name: "Ink".into(),
             visible: true,
+            reference: false,
             opacity_u16: u16::MAX,
         },
         LayerProjection {
@@ -297,6 +299,7 @@ fn initial_ui_projection() -> UiProjection {
             kind: LayerProjectionKind::Raster,
             name: "Background".into(),
             visible: true,
+            reference: false,
             opacity_u16: u16::MAX,
         },
     ];
@@ -1055,8 +1058,13 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
     let add_raster_ink = live_ink.clone();
     let add_group_ink = live_ink.clone();
     let white_ink = live_ink.clone();
+    let reference_ink = live_ink.clone();
+    let delete_ink = live_ink.clone();
     let layers = ui_projection.read().layers.clone();
     let active = ui_projection.read().active_layer;
+    let active_reference = layers.iter().any(|layer| {
+        layer.id == LayerTreeNodeId::Raster(active.unwrap_or(LayerId(0))) && layer.reference
+    });
     let solo_node = ui_projection.read().solo_node;
     let error = use_signal(|| Option::<String>::None);
     let collapsed_groups = use_signal(BTreeSet::<GroupId>::new);
@@ -1095,7 +1103,18 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
             }
             div { class: "layer-settings",
                 button { disabled: true, title: "레이어 색상화 (후속 구현)", span { class: "layer-color-chip" } "색상화" }
-                button { disabled: true, title: "참조 레이어 (후속 구현)", UiIcon { name: "reference" } "참조" }
+                button {
+                    disabled: active.is_none(), aria_pressed: "{active_reference}",
+                    title: "선택·채우기 참조 레이어 표시 (일반 PNG에는 영향 없음)",
+                    onclick: move |_| {
+                        if let Some(layer) = active {
+                            send_editor_command(&reference_ink, EditorCommand::Layer(LayerCommand::SetReference {
+                                layer, reference: !active_reference,
+                            }), error);
+                        }
+                    },
+                    UiIcon { name: "reference" } "참조"
+                }
             }
             div { class: "layer-list",
                 for layer in visible_layers {
@@ -1109,7 +1128,11 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
                 }
             }
             if let Some(message) = error.read().as_ref() { div { class: "command-error", role: "alert", "{message}" } }
-            div { class: "layers-footer", button { disabled: true, title: "선택 레이어 삭제 (후속 구현)", UiIcon { name: "trash" } } }
+            div { class: "layers-footer", button { disabled: active.is_none(), title: "선택 레이어 삭제 (Undo로 복원)", onclick: move |_| {
+                if let Some(layer) = active {
+                    send_editor_command(&delete_ink, EditorCommand::Layer(LayerCommand::Delete(LayerTreeNodeId::Raster(layer))), error);
+                }
+            }, UiIcon { name: "trash" } } }
         }
     }
 }
@@ -1209,7 +1232,10 @@ fn LayerRow(
                         }
                     }
                 }
-                span { class: "layer-detail", if is_group { "그룹" } else { "{opacity}%" } }
+                span { class: "layer-detail",
+                    if layer.reference { "참조 · " }
+                    if is_group { "그룹" } else { "{opacity}%" }
+                }
             }
             button { class: "layer-opacity", title: "불투명도 전환", onclick: move |_| {
                 let opacity_u16 = if layer.opacity_u16 == u16::MAX { 32_768 } else { u16::MAX };

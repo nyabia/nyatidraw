@@ -79,6 +79,10 @@ fn history_probe_command() -> Option<EditorCommand> {
     use nyatidraw_api::HistoryCommand;
     let value = std::env::var(HISTORY_PROBE_ENV).ok()?;
     let layer = match value.as_str() {
+        "reference-r:1" => Some(LayerCommand::SetReference {
+            layer: LayerId(1),
+            reference: true,
+        }),
         "rename-r:1" => Some(LayerCommand::Rename {
             node: nyatidraw_api::LayerTreeNodeId::Raster(LayerId(1)),
             name: "Renamed layer".into(),
@@ -904,7 +908,7 @@ impl ActiveCanvas {
                 .map(|branch| branch.node.0)
                 .collect();
             println!(
-                "native-canvas event=history-probe-complete candidates={candidates:?} after={:?} more={} active={} layers={} active_valid={} semantic_only=true",
+                "native-canvas event=history-probe-complete candidates={candidates:?} after={:?} more={} active={} layers={} active_valid={} reference_count={} semantic_only=true",
                 history.redo_page_after.map(|id| id.0),
                 history.has_more_redo_branches,
                 self.active_layer.0,
@@ -913,6 +917,12 @@ impl ActiveCanvas {
                     .tree()
                     .ancestors(nyatidraw_api::LayerTreeNodeId::Raster(self.active_layer))
                     .is_some(),
+                self.projection
+                    .current()
+                    .layers
+                    .iter()
+                    .filter(|layer| layer.reference)
+                    .count(),
             );
             self.history_probe = None;
         } else if self
@@ -1536,6 +1546,10 @@ impl ActiveCanvas {
                     .ok_or(CommandRejectReason::RevisionExhausted)?;
                 tree.insert(parent, index, node)
                     .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
+            }
+            LayerCommand::SetReference { layer, reference } => {
+                tree.set_reference(layer, reference)
+                    .map_err(|_| CommandRejectReason::UnknownLayer)?;
             }
             LayerCommand::Delete(node) => {
                 tree.remove(node)
@@ -2226,6 +2240,7 @@ fn empty_raster(id: LayerId, name: String) -> LayerNode {
         name,
         visible: true,
         locked: false,
+        reference: false,
         opacity_u16: u16::MAX,
         content_root: ContentRootId(0),
     }
@@ -2252,6 +2267,7 @@ fn default_layer_tree() -> LayerTree {
             name: name.into(),
             visible: true,
             locked: false,
+            reference: false,
             opacity_u16: u16::MAX,
             content_root: ContentRootId(0),
         })

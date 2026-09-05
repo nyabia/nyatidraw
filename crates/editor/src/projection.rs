@@ -200,6 +200,7 @@ fn project_children(group: &GroupNode, depth: u16, out: &mut Vec<LayerProjection
                 kind: LayerProjectionKind::Raster,
                 name: layer.name.clone(),
                 visible: layer.visible,
+                reference: layer.reference,
                 opacity_u16: layer.opacity_u16,
             }),
             LayerTreeNode::Group(child_group) => {
@@ -210,6 +211,7 @@ fn project_children(group: &GroupNode, depth: u16, out: &mut Vec<LayerProjection
                     kind: LayerProjectionKind::Group,
                     name: child_group.name.clone(),
                     visible: child_group.visible,
+                    reference: false,
                     opacity_u16: child_group.opacity_u16,
                 });
                 project_children(child_group, depth.saturating_add(1), out);

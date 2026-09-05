@@ -307,3 +307,13 @@ durability/reopen 및 PNG crash/recovery runtime도 통과했다. 전체 core �
 남은 레이어 작업은 Reference metadata와 drag reorder UI다. 기본 편집 도구,
 도킹/layout 복원과 synchronous metadata/history 요청의 hot-path 분리도 이어간다.
 물리 펜, 직접 UI 조작과 표시 지연 gate는 계속 미검증이다.
+
+### Reference metadata 완료
+
+래스터별 참조 표시를 저장·history·projection·toolbar에 연결했다. 기존 파일의
+layer payload version 1은 참조 꺼짐으로 읽으며 새 tree write는 version 2를 사용한다.
+일반 그리기 대상·visibility·PNG는 영향을 받지 않는다. 설치 release의 20-raster
+fixture에서 Reference 저장/재실행/Undo/Redo, 표시 개수와 기존 PNG 픽셀 불변을
+확인했다. 호환성 위험을 막는 core 검사 한 개만 추가해 전체 61개이며 Clippy도 통과했다.
+[ADR-0011](decisions/ADR-0011-reference-layer-metadata.md)에 형식과 한계를 기록했다.
+선택/채우기 도구의 참조 범위와 tolerance 계약, drag reorder UI는 이어서 구현한다.

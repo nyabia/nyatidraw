@@ -86,6 +86,10 @@ pub enum ProjectCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LayerCommand {
     SetActive(LayerId),
+    SetReference {
+        layer: LayerId,
+        reference: bool,
+    },
     /// Inserts one empty raster immediately above the active raster.
     AddRaster,
     /// Inserts one empty group immediately above the active raster.
@@ -191,6 +195,7 @@ pub struct LayerProjection {
     pub kind: LayerProjectionKind,
     pub name: String,
     pub visible: bool,
+    pub reference: bool,
     pub opacity_u16: u16,
 }
 
