@@ -16,16 +16,17 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::HiDpi::GetDpiForWindow,
         UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, VK_SPACE},
+        UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         UI::WindowsAndMessaging::{
             CREATESTRUCTW, CS_HREDRAW, CS_OWNDC, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-            DestroyWindow, GWLP_USERDATA, GetClientRect, GetMessagePos, GetMessageTime,
-            GetWindowLongPtrW, HWND_TOP, IDC_ARROW, LoadCursorW, MSG, PostMessageW, RegisterClassW,
-            SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-            WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-            WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-            WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_POINTERCAPTURECHANGED,
-            WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SIZE, WNDCLASSW, WS_CHILD,
-            WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+            DestroyWindow, GWLP_USERDATA, GetClientRect, GetMessagePos, GetMessageTime, GetParent,
+            GetWindowLongPtrW, HWND_TOP, IDC_ARROW, KillTimer, LoadCursorW, MSG, PostMessageW,
+            RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer, SetWindowLongPtrW,
+            SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE,
+            WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+            WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+            WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SIZE,
+            WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
         },
     },
     core::w,
@@ -33,16 +34,22 @@ use windows::{
 
 use crate::{
     elapsed_since_launch,
-    live_ink::{CanvasViewportSnapshot, LiveInkBridge},
+    live_ink::{CanvasViewportSnapshot, CloseStatus, LiveInkBridge},
     native_canvas::SharedGpuCanvas,
     single_instance::{ActivationInbox, PrimaryInstance},
 };
 
 const WM_NAYATI_REDRAW: u32 = WM_APP + 0x4e1;
+// 0x4e2 belongs to the single-instance activation inbox.
+const WM_NAYATI_CLOSE: u32 = WM_APP + 0x4e3;
+const WM_NAYATI_REOPEN: u32 = WM_APP + 0x4e4;
+const CLOSE_SUBCLASS: usize = 0x4e59;
+const CLOSE_TIMER: usize = 0x4e59;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct DesktopCanvasHandle {
     hwnd: HWND,
+    live_ink: LiveInkBridge,
 }
 
 impl DesktopCanvasHandle {
@@ -94,6 +101,22 @@ impl DesktopCanvasHandle {
         }
 
         state.activation.attach_windows(parent, hwnd);
+        let close = Box::into_raw(Box::new(CloseWindowState {
+            child: hwnd,
+            live_ink: live_ink.clone(),
+        }));
+        // SAFETY: the parent and child share this UI thread. The subclass owns
+        // the allocation until parent WM_NCDESTROY, independently of child state.
+        if !unsafe {
+            SetWindowSubclass(parent, Some(close_wnd_proc), CLOSE_SUBCLASS, close as usize)
+        }
+        .as_bool()
+        {
+            // SAFETY: failed installation did not transfer allocation ownership.
+            drop(unsafe { Box::from_raw(close) });
+            let _ = unsafe { DestroyWindow(hwnd) };
+            return Err("install parent close handler".into());
+        }
 
         let redraw_hwnd = hwnd.0 as isize;
         live_ink.set_redraw_notifier(Arc::new(move || {
@@ -113,17 +136,24 @@ impl DesktopCanvasHandle {
             "desktop-shell event=native-canvas-created elapsed_ms={} input=child-hwnd render=wgpu",
             elapsed_since_launch(),
         );
-        Ok(Self { hwnd })
+        Ok(Self {
+            hwnd,
+            live_ink: live_ink.clone(),
+        })
     }
 
     pub(crate) fn set_geometry(
-        self,
+        &self,
         x_css: f64,
         y_css: f64,
         width_css: f64,
         height_css: f64,
         scale: f64,
     ) {
+        if self.live_ink.is_closing() {
+            self.hide();
+            return;
+        }
         let values = [x_css, y_css, width_css, height_css, scale];
         if values.iter().any(|value| !value.is_finite()) || scale <= 0.0 {
             self.hide();
@@ -159,10 +189,56 @@ impl DesktopCanvasHandle {
         let _ = unsafe { ShowWindow(self.hwnd, SW_SHOWNA) };
     }
 
-    pub(crate) fn hide(self) {
+    pub(crate) fn hide(&self) {
         // SAFETY: hiding a live or already-destroyed child is harmless.
         let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
     }
+
+    pub(crate) fn reopen_after_close_failure(&self) {
+        // SAFETY: asynchronous, pointer-free message to the owned child.
+        let _ = unsafe { PostMessageW(Some(self.hwnd), WM_NAYATI_REOPEN, WPARAM(0), LPARAM(0)) };
+    }
+
+    pub(crate) fn confirm_failed_close(&self) {
+        if matches!(self.live_ink.close_status(), CloseStatus::Failed { .. }) {
+            self.live_ink.publish_close_status(CloseStatus::Ready);
+            // SAFETY: the child remains alive until the parent closes.
+            if let Ok(parent) = unsafe { GetParent(self.hwnd) } {
+                let _ = unsafe { PostMessageW(Some(parent), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            }
+        }
+    }
+}
+
+struct CloseWindowState {
+    child: HWND,
+    live_ink: LiveInkBridge,
+}
+
+unsafe extern "system" fn close_wnd_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    data: usize,
+) -> LRESULT {
+    if message == WM_NCDESTROY {
+        // SAFETY: remove our chain entry before reclaiming its unique allocation.
+        let _ = unsafe { RemoveWindowSubclass(hwnd, Some(close_wnd_proc), id) };
+        drop(unsafe { Box::from_raw(data as *mut CloseWindowState) });
+        return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    }
+    // SAFETY: only this parent subclass owns data, until WM_NCDESTROY above.
+    let state = unsafe { &*(data as *const CloseWindowState) };
+    if message == WM_CLOSE && state.live_ink.close_status() != CloseStatus::Ready {
+        if state.live_ink.begin_close() {
+            let _ =
+                unsafe { PostMessageW(Some(state.child), WM_NAYATI_CLOSE, WPARAM(0), LPARAM(0)) };
+        }
+        return LRESULT(0);
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -248,6 +324,10 @@ impl CanvasWindowState {
 
     fn render(&mut self, hwnd: HWND) {
         self.live_ink.begin_redraw();
+        if self.live_ink.is_closing() {
+            self.poll_close(hwnd);
+            return;
+        }
         if let Some(renderer) = self.renderer.as_mut()
             && let Err(error) = renderer.render(hwnd)
         {
@@ -258,6 +338,12 @@ impl CanvasWindowState {
 
     fn process_activations(&mut self) {
         while let Some(path) = self.activation.take_activation() {
+            if self.live_ink.is_closing() {
+                self.live_ink.publish_activation_notice(
+                    "저장 후 종료 중입니다. 종료가 끝난 뒤 파일을 다시 열어주세요".into(),
+                );
+                continue;
+            }
             let Some(renderer) = self.renderer.as_mut() else {
                 self.live_ink.publish_activation_notice(
                     "캔버스가 아직 준비되지 않아 파일을 열 수 없습니다".into(),
@@ -267,6 +353,39 @@ impl CanvasWindowState {
             if let Err(error) = renderer.activate_project(path) {
                 self.live_ink.publish_activation_notice(error);
             }
+        }
+    }
+
+    fn begin_close(&mut self, hwnd: HWND) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.canvas.begin_close(
+                renderer.config.width,
+                renderer.config.height,
+                renderer.scale,
+            );
+        } else {
+            self.live_ink.publish_close_status(CloseStatus::Ready);
+        }
+        // A UI timer observes thread completion without joining a live worker.
+        unsafe { SetTimer(Some(hwnd), CLOSE_TIMER, 50, None) };
+        self.poll_close(hwnd);
+    }
+
+    fn poll_close(&mut self, hwnd: HWND) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.canvas.poll_close();
+        }
+        match self.live_ink.close_status() {
+            CloseStatus::Ready => {
+                let _ = unsafe { KillTimer(Some(hwnd), CLOSE_TIMER) };
+                if let Ok(parent) = unsafe { GetParent(hwnd) } {
+                    let _ = unsafe { PostMessageW(Some(parent), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                }
+            }
+            CloseStatus::Failed { .. } => {
+                let _ = unsafe { KillTimer(Some(hwnd), CLOSE_TIMER) };
+            }
+            _ => {}
         }
     }
 
@@ -322,9 +441,37 @@ unsafe extern "system" fn canvas_wnd_proc(
 
     // SAFETY: the pointer was installed at WM_NCCREATE and remains owned by
     // this HWND until WM_NCDESTROY.
+    if message == WM_NAYATI_CLOSE {
+        // These calls may synchronously reenter the window procedure. Hide
+        // the native sibling and release capture before borrowing its state.
+        let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+        let _ = unsafe { ReleaseCapture() };
+    }
     let state = unsafe { canvas_state(hwnd) };
     if let Some(state) = state {
         match message {
+            WM_NAYATI_CLOSE => {
+                state.begin_close(hwnd);
+                return LRESULT(0);
+            }
+            WM_TIMER if wparam.0 == CLOSE_TIMER => {
+                state.poll_close(hwnd);
+                return LRESULT(0);
+            }
+            WM_NAYATI_REOPEN => {
+                if let Some(renderer) = state.renderer.as_mut() {
+                    renderer
+                        .canvas
+                        .reopen_after_close_failure(&renderer.device, &renderer.queue);
+                }
+                if !state.live_ink.is_closing() {
+                    state.render(hwnd);
+                    println!("native-canvas event=close-reopened authority=durable-project");
+                    // No state access after ShowWindow, which may reenter.
+                    let _ = unsafe { ShowWindow(hwnd, SW_SHOWNA) };
+                }
+                return LRESULT(0);
+            }
             WM_SIZE => {
                 state.resize(hwnd);
                 state.render(hwnd);
@@ -362,6 +509,9 @@ unsafe extern "system" fn canvas_wnd_proc(
             | WM_MOUSEHWHEEL
             | WM_KEYDOWN
             | WM_CAPTURECHANGED => {
+                if state.live_ink.is_closing() {
+                    return LRESULT(0);
+                }
                 let msg = current_message(hwnd, message, wparam, lparam);
                 if state.observe_viewport(hwnd, &msg) {
                     state.render(hwnd);

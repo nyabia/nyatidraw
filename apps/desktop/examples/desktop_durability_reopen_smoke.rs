@@ -28,10 +28,21 @@ mod windows {
     const PROJECT_PATH_ENV: &str = "NAYATI_PROJECT_PATH";
     const DURABILITY_PROBE_ENV: &str = "NAYATI_DESKTOP_DURABILITY_PROBE";
     const CLOSE_RAW_QUEUE_PROBE_ENV: &str = "NAYATI_CLOSE_RAW_QUEUE_PROBE";
+    const ACTIVE_CLOSE_PROBE_ENV: &str = "NAYATI_ACTIVE_CLOSE_PROBE";
+    const SAVE_PROBE_ENV: &str = "NAYATI_SAVE_PROBE";
     const PROTOCOL_PROBE_ENV: &str = "NAYATI_PROTOCOL_PROBE";
     const INPUT_SAFETY_PROBE_ENV: &str = "NAYATI_INPUT_SAFETY_PROBE";
     const WM_CLOSE: u32 = 0x0010;
     const RUN_TIMEOUT: Duration = Duration::from_secs(45);
+
+    #[derive(Clone, Copy)]
+    enum StrokeProbe {
+        None,
+        ClosedBatch,
+        Active,
+        ActiveSaveClose,
+        ActiveSaveEnd,
+    }
 
     pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
         let desktop = desktop_binary()?;
@@ -64,7 +75,7 @@ mod windows {
         let first = run_desktop(
             desktop,
             project,
-            true,
+            StrokeProbe::ClosedBatch,
             false,
             false,
             "event=raw-input-staged-before-drain",
@@ -93,7 +104,7 @@ mod windows {
         let protocol = run_desktop(
             desktop,
             project,
-            false,
+            StrokeProbe::None,
             true,
             false,
             "event=protocol-proof-complete",
@@ -109,7 +120,7 @@ mod windows {
         let second = run_desktop(
             desktop,
             project,
-            false,
+            StrokeProbe::None,
             false,
             false,
             "event=first-native-wgpu-present",
@@ -131,13 +142,14 @@ mod windows {
         drop(database);
 
         run_input_safety_smoke(desktop, input_safety_project)?;
+        run_active_close_cases(desktop, project)?;
 
         let invalid_bytes = b"not a Nayati project\0preserve exactly";
         fs::write(invalid_project, invalid_bytes)?;
         let invalid = run_desktop(
             desktop,
             invalid_project,
-            false,
+            StrokeProbe::None,
             false,
             false,
             "event=canvas-startup-failed",
@@ -186,6 +198,111 @@ mod windows {
         Ok(())
     }
 
+    fn run_active_close_cases(
+        desktop: &Path,
+        project: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (name, mode) in [
+            ("active-close.ntdr", StrokeProbe::Active),
+            ("active-save-close.ntdr", StrokeProbe::ActiveSaveClose),
+            ("active-save-end.ntdr", StrokeProbe::ActiveSaveEnd),
+        ] {
+            let active_project = project.with_file_name(name);
+            let active_result = run_active_close_smoke(desktop, &active_project, mode);
+            for path in [&active_project, &active_project.with_extension("png")] {
+                if path.exists() {
+                    fs::remove_file(path)?;
+                }
+            }
+            active_result?;
+        }
+        Ok(())
+    }
+
+    fn run_active_close_smoke(
+        desktop: &Path,
+        project: &Path,
+        mode: StrokeProbe,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let save = matches!(
+            mode,
+            StrokeProbe::ActiveSaveClose | StrokeProbe::ActiveSaveEnd
+        );
+        let policy_end = !matches!(mode, StrokeProbe::ActiveSaveEnd);
+        let close_after = match mode {
+            StrokeProbe::ActiveSaveClose => {
+                "event=project-save-requested export_generation=2 waiting_for_stroke=true"
+            }
+            StrokeProbe::ActiveSaveEnd => "event=png-export-finished generation=2",
+            _ => "event=raw-input-staged-before-drain",
+        };
+        let output = run_desktop(desktop, project, mode, false, false, close_after)?;
+        if policy_end {
+            require_log(
+                &output,
+                "event=active-stroke-close-sealed source=shutdown-policy synthetic_end=true samples=3 last_received_sequence=2",
+            )?;
+        }
+        require_log(&output, "mode=drained-and-joined")?;
+        let database = ProjectDb::open(project)?;
+        let first = database
+            .load_reopened()?
+            .ok_or("active stroke lost on close")?;
+        let stroke = &first.current().ok_or("active stroke has no commit")?.stroke;
+        let samples = stroke.samples();
+        if first.current_snapshot().0 != 1
+            || samples.len() != 3
+            || samples[1].position_document != samples[2].position_document
+            || samples[1].pressure.to_bits() != samples[2].pressure.to_bits()
+            || samples[1].timestamp_ns != samples[2].timestamp_ns
+        {
+            return Err("active close did not preserve the last received sample".into());
+        }
+        let expected = first.current_tiles().clone();
+        if save {
+            require_log(&output, "event=png-export-finished generation=2")?;
+            let canvas = database.load_canvas_spec()?;
+            // This fixture paints only the default, fully opaque raster layer.
+            // Its unedited default tree is implicit until a metadata command.
+            let expected_png = expected
+                .crop_base_layer_rgba8_to_canvas(nyatidraw_api::LayerId(1), canvas)
+                .map_err(|error| format!("expected canvas crop: {error:?}"))?;
+            let imported = nyatidraw_png_io::decode_png(
+                &project.with_extension("png"),
+                nyatidraw_api::LayerId(1),
+            )
+            .map_err(|error| format!("read saved PNG: {error:?}"))?;
+            let actual_png = imported
+                .tiles
+                .crop_base_layer_rgba8_to_canvas(nyatidraw_api::LayerId(1), imported.canvas)
+                .map_err(|error| format!("saved PNG crop: {error:?}"))?;
+            if expected_png != actual_png {
+                return Err("deferred Save exported pixels older than the final stroke".into());
+            }
+        }
+        drop(database);
+        let restarted = run_desktop(
+            desktop,
+            project,
+            StrokeProbe::None,
+            false,
+            false,
+            "event=first-native-wgpu-present",
+        )?;
+        require_log(&restarted, "event=project-open mode=durable-reopened")?;
+        let database = ProjectDb::open(project)?;
+        let second = database
+            .load_reopened()?
+            .ok_or("active stroke lost after process restart")?;
+        if second.current_tiles() != &expected || second.history().node_count() != 1 {
+            return Err("active-close pixels/history changed after process restart".into());
+        }
+        println!(
+            "desktop-active-close-smoke status=passed samples=3 policy_end={policy_end} deferred_save={save} reopen=process-restart exact_tiles=true physical-pen-proof=false"
+        );
+        Ok(())
+    }
+
     fn run_input_safety_smoke(
         desktop: &Path,
         project: &Path,
@@ -193,7 +310,7 @@ mod windows {
         let output = run_desktop(
             desktop,
             project,
-            false,
+            StrokeProbe::None,
             false,
             true,
             "event=input-safety-probe-complete",
@@ -221,7 +338,7 @@ mod windows {
     fn run_desktop(
         desktop: &Path,
         project: &Path,
-        inject_stroke: bool,
+        stroke_probe: StrokeProbe,
         protocol_probe: bool,
         input_safety_probe: bool,
         close_after: &str,
@@ -229,16 +346,34 @@ mod windows {
         let mut command = Command::new(desktop);
         command
             .env(PROJECT_PATH_ENV, project)
+            .env_remove(DURABILITY_PROBE_ENV)
+            .env_remove(ACTIVE_CLOSE_PROBE_ENV)
+            .env_remove(SAVE_PROBE_ENV)
+            .env_remove(CLOSE_RAW_QUEUE_PROBE_ENV)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if inject_stroke {
-            command
-                .env(DURABILITY_PROBE_ENV, "1")
-                .env(CLOSE_RAW_QUEUE_PROBE_ENV, "1");
-        } else {
-            command
-                .env_remove(DURABILITY_PROBE_ENV)
-                .env_remove(CLOSE_RAW_QUEUE_PROBE_ENV);
+        match stroke_probe {
+            StrokeProbe::ClosedBatch => {
+                command
+                    .env(DURABILITY_PROBE_ENV, "1")
+                    .env(CLOSE_RAW_QUEUE_PROBE_ENV, "1");
+            }
+            StrokeProbe::Active => {
+                command
+                    .env(ACTIVE_CLOSE_PROBE_ENV, "1")
+                    .env(CLOSE_RAW_QUEUE_PROBE_ENV, "1");
+            }
+            StrokeProbe::ActiveSaveClose | StrokeProbe::ActiveSaveEnd => {
+                command.env(ACTIVE_CLOSE_PROBE_ENV, "1").env(
+                    SAVE_PROBE_ENV,
+                    if matches!(stroke_probe, StrokeProbe::ActiveSaveEnd) {
+                        "end"
+                    } else {
+                        "close"
+                    },
+                );
+            }
+            StrokeProbe::None => {}
         }
         if protocol_probe {
             command.env(PROTOCOL_PROBE_ENV, "1");
@@ -349,6 +484,13 @@ mod windows {
     }
 
     fn desktop_binary() -> Result<PathBuf, Box<dyn std::error::Error>> {
+        if let Some(path) = std::env::var_os("NAYATI_DESKTOP_SMOKE_BINARY") {
+            let desktop = PathBuf::from(path).canonicalize()?;
+            if !desktop.is_file() {
+                return Err("NAYATI_DESKTOP_SMOKE_BINARY must name a desktop executable".into());
+            }
+            return Ok(desktop);
+        }
         let executable = std::env::current_exe()?;
         let profile = executable
             .parent()

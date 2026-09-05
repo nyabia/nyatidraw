@@ -175,3 +175,11 @@ button:focus, [tabindex="0"]:focus { outline: 2px solid #9ee8ff; outline-offset:
     .color-toolbar { display: none; }
     .canvas-panel { padding: 10px; }
 }
+
+.close-backdrop { position: fixed; inset: 0; z-index: 10000; display: grid; place-items: center; background: #111c; }
+.close-dialog { width: min(480px, 85vw); padding: 28px; border: 1px solid #555; border-radius: 12px; background: #252525; color: #eee; box-shadow: 0 16px 64px #0008; }
+.close-dialog h2 { margin: 0 0 16px; font-size: 20px; }
+.close-dialog p { line-height: 1.6; }
+.close-dialog .recovery-path { overflow-wrap: anywhere; color: #bbb; font-size: 12px; }
+.close-dialog button { margin: 12px 10px 0 0; padding: 10px 14px; }
+.close-dialog progress { width: 100%; accent-color: #57c7cf; }

@@ -138,6 +138,14 @@ pen viewport path에 연결했다. 마법봉/올가미/채우기/그라데이션
 
 ### 범위와 보존 규칙
 
+2026-09-05 후속 수정은 종료 시 display completion 포화로 일부 closed stroke만
+저장되던 결함과 discontinuity 뒤 semantic/GPU generation 혼동을 해결했다.
+정상 active stroke는 종료 시 마지막 수신 sample까지 보존하고, Save는 stroke
+경계까지 대기한다. 대기 중 Close도 이미 요청한 최신 export를 처리한다.
+검증 환경·실행 명령·남은 한계는 [구현 현황](../implementation.md)의 날짜 절에 기록한다.
+이후 close-progress/error UI와 scratch export process-kill/retry 검증도 연결했다.
+설치 앱/물리 펜, 실제 close-dialog focus/capture acceptance는 아직 남아 있다.
+
 닫힌 stroke는 CPU replay로 immutable tile/root로 materialize하고 redb에 durable
 commit할 수 있다. 그것은 Sprint 2 durability seam이며, GPU pixels만을 closed
 artwork의 권위로 쓰지 않는다. GPU readback/hybrid checkpoint strategy는 아직

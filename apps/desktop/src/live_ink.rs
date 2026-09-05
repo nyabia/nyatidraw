@@ -154,6 +154,20 @@ struct LiveInkInner {
     redraw_requested: AtomicBool,
     fatal_input_quarantine: AtomicBool,
     navigation_tool: AtomicBool,
+    closing: AtomicBool,
+    close_status: Mutex<CloseStatus>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CloseStatus {
+    Open,
+    SavingProject,
+    Exporting,
+    Failed {
+        project_saved: bool,
+        project_path: String,
+    },
+    Ready,
 }
 
 type Notifier = Arc<dyn Fn() + Send + Sync + 'static>;
@@ -170,6 +184,7 @@ struct ProtocolMailbox {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExportStatus {
     Idle,
+    Waiting { generation: u64 },
     Queued { generation: u64 },
     Running { generation: u64 },
     Current { generation: u64 },
@@ -180,7 +195,8 @@ impl ExportStatus {
     fn generation(self) -> Option<u64> {
         match self {
             Self::Idle => None,
-            Self::Queued { generation }
+            Self::Waiting { generation }
+            | Self::Queued { generation }
             | Self::Running { generation }
             | Self::Current { generation }
             | Self::Failed { generation } => Some(generation),
@@ -190,9 +206,10 @@ impl ExportStatus {
     fn progression(self) -> u8 {
         match self {
             Self::Idle => 0,
-            Self::Queued { .. } => 1,
-            Self::Running { .. } => 2,
-            Self::Current { .. } | Self::Failed { .. } => 3,
+            Self::Waiting { .. } => 1,
+            Self::Queued { .. } => 2,
+            Self::Running { .. } => 3,
+            Self::Current { .. } | Self::Failed { .. } => 4,
         }
     }
 }
@@ -269,6 +286,8 @@ impl LiveInkBridge {
                 redraw_requested: AtomicBool::new(false),
                 fatal_input_quarantine: AtomicBool::new(false),
                 navigation_tool: AtomicBool::new(false),
+                closing: AtomicBool::new(false),
+                close_status: Mutex::new(CloseStatus::Open),
             }),
         }
     }
@@ -276,6 +295,9 @@ impl LiveInkBridge {
     /// Enqueues one sample and reports whether the event loop needs one wake-up.
     pub(crate) fn push(&self, sample: StylusSample) -> Result<bool, PushError> {
         let mut raw = self.raw_input();
+        if self.is_closing() {
+            return Err(PushError::TransitionQueueFull);
+        }
         if self.inner.fatal_input_quarantine.load(Ordering::Acquire) {
             raw.stats.quarantined_after_fatal = raw.stats.quarantined_after_fatal.saturating_add(1);
             return Err(PushError::TransitionQueueFull);
@@ -340,6 +362,9 @@ impl LiveInkBridge {
             .editor_commands
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_closing() {
+            return Err(CanvasCommandQueueFull);
+        }
         if commands.len() >= self.inner.command_capacity {
             return Err(CanvasCommandQueueFull);
         }
@@ -561,7 +586,9 @@ impl LiveInkBridge {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match export.status {
-                ExportStatus::Queued { generation } | ExportStatus::Running { generation } => {
+                ExportStatus::Waiting { generation }
+                | ExportStatus::Queued { generation }
+                | ExportStatus::Running { generation } => {
                     export.status = ExportStatus::Failed { generation };
                     true
                 }
@@ -731,6 +758,52 @@ impl LiveInkBridge {
 
     pub(crate) fn workspace_failed(&self) -> bool {
         self.inner.fatal_input_quarantine.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        self.inner.closing.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn begin_close(&self) -> bool {
+        // Lock both admission lanes so the returned boundary includes every
+        // previously accepted sample/command, with no late admission behind it.
+        let raw = self.raw_input();
+        let commands = self
+            .inner
+            .editor_commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = !self.inner.closing.swap(true, Ordering::AcqRel);
+        drop(commands);
+        drop(raw);
+        if first {
+            self.publish_close_status(CloseStatus::SavingProject);
+        }
+        first
+    }
+
+    pub(crate) fn close_status(&self) -> CloseStatus {
+        self.inner
+            .close_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn publish_close_status(&self, status: CloseStatus) {
+        *self
+            .inner
+            .close_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
+        self.notify_ui();
+        self.request_redraw();
+    }
+
+    pub(crate) fn reopen_after_close_failure(&self) {
+        self.reset_for_project_activation();
+        self.inner.closing.store(false, Ordering::Release);
+        self.publish_close_status(CloseStatus::Open);
     }
 
     pub(crate) fn set_admission_layer(&self, layer: LayerId) {
@@ -1001,6 +1074,46 @@ mod tests {
     use nyatidraw_input::PenButtons;
 
     #[test]
+    fn close_boundary_preserves_admitted_input_and_rejects_late_artwork() {
+        let bridge = LiveInkBridge::with_capacity(2, LayerId(7));
+        bridge.push(sample(1, PointerPhase::Begin)).unwrap();
+        bridge.push(sample(2, PointerPhase::Move)).unwrap();
+        bridge
+            .push_editor_command(
+                Revision(0),
+                EditorCommand::Project(nyatidraw_api::ProjectCommand::Save),
+            )
+            .unwrap();
+        assert!(bridge.begin_close());
+        assert!(!bridge.begin_close());
+        assert!(bridge.push(sample(3, PointerPhase::End)).is_err());
+        assert!(
+            bridge
+                .push_editor_command(
+                    Revision(0),
+                    EditorCommand::Project(nyatidraw_api::ProjectCommand::Save)
+                )
+                .is_err()
+        );
+        let mut received = Vec::new();
+        assert!(bridge.drain_into(&mut received).is_none());
+        assert_eq!(
+            received
+                .iter()
+                .map(|entry| entry.queued.sample.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let mut commands = Vec::new();
+        bridge.drain_editor_commands(&mut commands);
+        assert_eq!(commands.len(), 1, "an admitted Save must survive Close");
+        assert!(
+            !bridge.workspace_failed(),
+            "intentional close is not input discontinuity"
+        );
+    }
+
+    #[test]
     fn fatal_workspace_latch_preserves_error_projection_and_quarantines_art_input() {
         let bridge = LiveInkBridge::with_capacity(2, LayerId(7));
         let mut ready = UiProjection::empty();
@@ -1072,6 +1185,17 @@ mod tests {
         assert_eq!(
             bridge.export_status_snapshot(),
             ExportStatus::Failed { generation: 5 }
+        );
+        bridge.publish_export_status(ExportStatus::Waiting { generation: 6 });
+        bridge.publish_export_status(ExportStatus::Current { generation: 5 });
+        assert_eq!(
+            bridge.export_status_snapshot(),
+            ExportStatus::Waiting { generation: 6 }
+        );
+        bridge.fail_incomplete_export();
+        assert_eq!(
+            bridge.export_status_snapshot(),
+            ExportStatus::Failed { generation: 6 }
         );
     }
 

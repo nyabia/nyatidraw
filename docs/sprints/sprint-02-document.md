@@ -71,7 +71,8 @@ Desktop Save는 writer thread의 immutable CPU snapshot과 layer tree를 finite 
 합성해 sibling temporary PNG를 기록·sync한 뒤 교체한다. Project commit과 PNG
 실패는 별도 경로다. 연속 Save는 monotonic generation을 부여해 시작 전 구세대
 작업을 건너뛰고, 인코딩 중 구세대도 최종 교체 직전 generation gate에서 폐기한다.
-UI의 queued/running/current/failed는 worker의 실제 단계만 반영한다.
+UI의 waiting은 active stroke/closed backlog를 기다리는 최신 Save 요청이며,
+queued/running/current/failed는 worker의 실제 단계만 반영한다.
 
 Navigator는 같은 durable CPU snapshot을 최대 160×160의 유한 page crop으로만
 저주파 합성해 Dioxus 전용 단일-frame mailbox로 보낸다. 따라서 signed page 밖
@@ -105,23 +106,32 @@ destination replacement를 거부한다.
 - RTX 3080/Vulkan probe는 closed CPU RGBA8 snapshot을 새 WGPU device에 upload하고
   exact readback 0 diff를 확인했다. Full GPU compositor/device-loss recovery 또는
   multi-layer project recovery evidence는 아니다.
-- Current desktop shutdown drains closed/materialization/export work and joins
-  its writer at teardown. End 전 active stroke는 durable하지 않고, export retry와
-  close-progress UI는 없다.
+- Desktop shutdown은 display completion 전달을 먼저 retire하고 closed/materialization
+  work를 drain한다. 정상 active stroke는 마지막 수신 sample에 semantic End를 붙여
+  보존하며 cancel/discontinuity stroke는 살리지 않는다. 명시적으로 요청한 pending Save도
+  stroke commit 뒤 처리하고 writer를 join한다. export retry 버튼은 구현돼 있으며
+  close-progress/error UI도 연결했다. 일반 Close는 창을 유지한 채 별도 thread에서
+  drain/join하고, 실패 시 durable project 다시 열기 또는 오류 확인 후 종료를 제공한다.
 - Windows release desktop smoke는 24 paint + 8 erase stroke를 close-drain하고,
   process restart 뒤 동일 snapshot/root/tile을 복구했다. 같은 smoke에서 새 raster와
   group의 ID, 이름, parent/index를 redb에서 다시 열어 확인했다.
 - 한 render wake에 함께 들어온 raw `End`는 GPU 종료와 materialization enqueue를 먼저
   수행한 뒤 Save export를 같은 writer FIFO에 넣는다. 닫힌 stroke 단위로만 dirty를
   게시하며 raw sample마다 Dioxus를 깨우지 않는다. 아직 `End`가 오지 않은 active stroke를
-  Save가 강제로 닫지는 않는다.
+  Save가 강제로 닫지는 않는다. 단일 최신 Save 요청을 보류했다가 stroke 종료와 기존
+  closed backlog의 FIFO admission 뒤 export를 예약한다. 요청 시 generation을 먼저
+  갱신하므로 대기 중에도 이전 export가 최신 요청을 덮어쓸 수 없다.
 - closed-stroke completion payload도 writer request와 같은 4-entry bounded lane이며,
   포화/단절은 조용히 tile을 잃지 않고 durable CPU authority를 남긴 채 workspace를
-  fail-closed한다.
+  fail-closed한다. 종료로 display owner가 retire된 경우에만 disposable GPU completion을
+  생략하며 durable CPU replay/commit은 계속한다.
 
 ### 남은 engineering evidence
 
 - 화면 복원/present를 포함한 undo/redo p95, large database/repair, migration,
   compaction, last-valid-head recovery.
-- active stroke를 포함하는 Save 정책, export retry와 사용자에게
-  보이는 close-progress/error 상태.
+- 실제 close-dialog focus/capture·접근성, 설치 앱 retry 실사용, process-kill 범위를
+  넘어선 power-loss/filesystem-cache 보장. Scratch 교체 경계 4곳의 process-kill,
+  구세대 export 폐기 및 실제 파일 잠금 실패 후 durable reopen/Save retry는 검증했다.
+- 2026-09-05 active Close/Save 검증과 환경은 [구현 현황](../implementation.md)의
+  해당 날짜 절을 따른다. 합성 입력 검증은 물리 펜·표시 지연 증거가 아니다.

@@ -109,6 +109,151 @@ closed strokes remain in the bounded semantic backlog.
   fixed a missing `COPY_DST` flag on the live brush-colour uniform and a redraw
   latch that previously suppressed later asynchronous wakeups.
 
+## 2026-09-05 shutdown, deferred Save, and discontinuity recovery
+
+The current-host desktop smoke exposed a shutdown regression: 32 already-closed
+scratch strokes entered the native lane, but only five were committed because
+the four-entry GPU completion lane filled after its display owner stopped
+consuming it. The pipeline now explicitly retires display delivery before its
+blocking shutdown admission/drain. CPU replay and immediate project commits
+still run for every closed stroke. A full/disconnected completion lane while
+the display is live still latches a workspace failure and quarantines input.
+
+The same acceptance run exposed a separate assumption that a semantic stroke
+generation equals the GPU token ordinal. Discontinuity recovery can discard a
+Begin before GPU submission, so those counters diverge. Preview retirement now
+uses semantic generations throughout; GPU tokens remain device-local handles.
+The protocol and input-safety probes also now stage their commands after the
+startup Fit command has established the current revision.
+
+Close now seals a healthy active stroke with a semantic End that preserves the
+last received position, pressure and timestamp. Cancelled/discontinuous strokes
+remain discarded; recording-limit and sequence exhaustion explicitly fail.
+That End is a shutdown policy action, never a native input sample or physical
+pen claim. Project durability remains independent from whether Save was requested.
+
+Save reserves its export generation immediately and waits in one latest-only
+slot for the active stroke and older closed backlog. A newer request invalidates
+older PNG replacement even while waiting. Normal End admits the latest export
+behind the closed stroke; Close seals/drains first and then admits an already
+requested pending export before joining the writer. The UI exposes `Waiting`
+separately from worker `Queued`/`Running`/`Current`/`Failed`. Export admission is
+nonblocking while drawing; only shutdown may wait for a bounded writer slot,
+without holding the export replacement lock. Writer dequeue wakes retained work.
+New closed strokes now always follow existing retry backlog even when the worker
+frees capacity during the same input drain, preserving paint/erase ordering.
+
+Windows 11 Home build 26200, Intel Core Ultra 7 155H / Intel Arc integrated GPU,
+DX12, both debug and DX-bundled release profiles: the corrected desktop smoke committed all 32 strokes,
+restarted the process, and retained snapshot 32, six tiles and exact root
+`a69ad4bb36e3b6392a8ea72f80afacdd`. It also checked layer metadata reopen,
+stale-command rejection, clean-Begin recovery after an explicit discontinuity,
+and non-empty invalid-file preservation. Three further process-restart cases
+cover raw Begin/Move followed by Close, two Saves during a stroke followed by
+Close, and two Saves followed by a normal End. They verify exact reopened
+samples/history/tiles and compare the saved PNG's full canvas pixels with the
+final one-layer fixture. The workspace's 55 automated tests and Clippy for all
+targets passed. New regression coverage checks 32-stroke shutdown, healthy vs
+cancelled/invalid active close, and ordering across writer backpressure; live
+completion saturation still fails closed as required.
+
+Reproduction commands and local logs:
+
+```powershell
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked
+cargo build -p nyatidraw-desktop --locked
+cargo run -p nyatidraw-desktop --example desktop_durability_reopen_smoke --locked
+dx build --release --windows --renderer webview --package nyatidraw-desktop --locked
+$env:NAYATI_DESKTOP_SMOKE_BINARY = (Resolve-Path target/dx/nyatidraw-desktop/release/windows/app/nyatidraw-desktop.exe).Path
+cargo run -p nyatidraw-desktop --example desktop_durability_reopen_smoke --locked
+Remove-Item Env:NAYATI_DESKTOP_SMOKE_BINARY
+```
+
+The harness uses its adjacent profile executable by default; the explicit
+override runs the actual DX bundle with the same acceptance cases. Logs are
+under ignored `target/`: `tests-after-recovery.log`, `clippy-after-recovery.log`,
+`desktop-durability-before.log`, `desktop-durability-after.log`,
+`dx-release-after-recovery.log`, and `desktop-durability-release-after.log`.
+DX returned success and emitted a release executable/assets, but installed CLI
+0.7.5 reports incompatibility with Dioxus 0.7.9; resolving that tooling mismatch
+remains open. No dependencies, file associations or installed app were changed.
+
+This is synthetic-input functional acceptance, not release performance,
+physical pen, or first-visible-pixel evidence; p50/p95/p99 were not measured.
+The subsequent Close and process-kill work below closes the corresponding
+software acceptance items; manual interaction and hardware evidence remain separate.
+
+## 2026-09-05 responsive Close and PNG recovery
+
+The parent Windows subclass now retains the shell when Close starts. Both
+bounded admission lanes stop at an explicit boundary; previously admitted input
+and Save commands still drain. The native child hides for a WebView progress
+dialog. One close thread owns the retiring canvas, seals healthy active input,
+processes pending Save, and joins the project writer. The window thread uses a
+50 ms completion timer. Repeated Close cannot bypass pending work or dismiss a
+failure. Unexpected native destruction retains the blocking final join fallback.
+
+Success closes automatically. A failed project commit or PNG export keeps the
+window and recovery path visible, distinguishing whether the project was saved.
+The user can reopen the last durable project and retry Save, or acknowledge the
+error and close. Reopen does not claim to reconstruct uncommitted failed work.
+New file activation during closing is rejected with a notice. Input, painting,
+and semantic editor state stay outside the UI's progress mailbox.
+
+PNG encoding now explicitly calls `finish`: previously, Drop could ignore an
+IEND or buffered flush failure and report an incomplete export as successful.
+Sync and generation-checked replacement now require successful encoder completion.
+The 57 workspace tests include regressions for final flush failure and for
+preserving admitted work while rejecting late input/commands at Close.
+
+`desktop_export_recovery_smoke` exercises the actual desktop on owned scratch
+projects. It pauses after encoding, after sync, and immediately before/after
+replacement, then kills only its spawned process. Previous PNG bytes must survive
+the first three boundaries; after replacement the latest full canvas pixels must
+match the durable stroke. Separate-process reopen retains exactly snapshot 1 and
+its tiles/history and never promotes the interrupted temporary file or rewrites
+the PNG automatically. A second case holds generation 2 after encoding, accepts
+Save generation 3, and verifies the old encoded file is discarded before replacement.
+
+An actual Windows sharing lock also denies PNG replacement. The probe checks
+that the closing window stays visible and answers `WM_NULL`, the WebView dialog
+mounts, failure retains the window, the project remains durable and the old PNG
+is unchanged. It releases the lock, invokes the same child handler as the dialog's
+reopen action, and retries through the ordinary native Save keyboard route.
+No startup stroke or Save probe is replayed during recovery. The final PNG pixels
+and reopened project are exact. This establishes functional wiring and message
+responsiveness, not visual layout, screen-reader, real keyboard/pen acceptance,
+power-loss, or filesystem-cache guarantees.
+
+Additional reproduction:
+
+On the same Windows 11 / Core Ultra 7 155H / Intel Arc DX12 host, both debug and
+DX-bundled release passed the export recovery probe. The final release bundle
+also passed the full durability/reopen probe. All 57 tests and all-target Clippy
+with `-D warnings` passed; no latency percentiles were measured.
+
+```powershell
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build -p nyatidraw-desktop --locked
+cargo run -p nyatidraw-desktop --example desktop_export_recovery_smoke --locked
+dx build --release --windows --renderer webview --package nyatidraw-desktop --locked
+$env:NAYATI_DESKTOP_SMOKE_BINARY = (Resolve-Path target/dx/nyatidraw-desktop/release/windows/app/nyatidraw-desktop.exe).Path
+cargo run -p nyatidraw-desktop --example desktop_durability_reopen_smoke --locked
+cargo run -p nyatidraw-desktop --example desktop_export_recovery_smoke --locked
+Remove-Item Env:NAYATI_DESKTOP_SMOKE_BINARY
+```
+
+The scratch pause requires both opt-in environment values and a sentinel in the
+matching temporary directory; it times out after 30 seconds if not killed/released.
+Interrupted temporary files can remain, but reopen does not treat them as artwork.
+Local logs: `target/close-tests.log`, `close-clippy.log`, `close-durability.log`,
+`export-recovery-debug.log`, `close-release-build.log`, `close-durability-release.log`,
+and `export-recovery-release.log`. The DX 0.7.5 / Dioxus 0.7.9 mismatch remains a
+tooling gate despite the emitted bundle. See [ADR-0009](decisions/ADR-0009-close-and-export-recovery.md)
+for ownership and exact dependency details.
+
 ## Still-open release gates
 
 - Physical Windows pen acceptance through the live canvas mapping, including
@@ -122,11 +267,13 @@ closed strokes remain in the bounded semantic backlog.
   z-order need post-migration manual acceptance. The earlier Dioxus Native
   acceptance remains historical evidence for the semantic command protocol,
   not for the current shell.
-- Close-progress UI and crash-point export recovery remain open. A failed PNG
-  export now exposes a compact retry action that queues Save again. Save queues a
+- Manual Close dialog layout, focus/accessibility, real capture release, and
+  installed-shell acceptance remain open. The scratch process-kill/retry checks
+  above do not establish power-loss or arbitrary filesystem-cache recovery.
+- A failed PNG export exposes a retry action that queues Save again. Save queues a
   CPU layer-tree PNG export behind the latest durable project work, writes a
   sibling temporary file, syncs it, and performs a Windows atomic replacement.
-  UI observes separate `Idle`/`Queued`/`Running`/`Current`/`Failed` completion
+  UI observes separate `Idle`/`Waiting`/`Queued`/`Running`/`Current`/`Failed` completion
   status; a generation gate rejects queued stale work and rechecks an encoded
   stale job immediately before replacement.
 

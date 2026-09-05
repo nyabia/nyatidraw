@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
     thread::{self, JoinHandle},
@@ -38,7 +38,7 @@ use nyatidraw_tiles::{TILE_BYTE_LEN, TILE_EDGE, TileKey, TileSnapshot};
 
 use crate::{
     elapsed_since_launch,
-    live_ink::{AdmittedSample, ExportStatus, InputDiscontinuity, LiveInkBridge},
+    live_ink::{AdmittedSample, CloseStatus, ExportStatus, InputDiscontinuity, LiveInkBridge},
     preview::{
         LAYER_THUMBNAIL_MAX_HEIGHT, LAYER_THUMBNAIL_MAX_WIDTH, MAX_LAYER_THUMBNAILS,
         NAVIGATOR_MAX_HEIGHT, NAVIGATOR_MAX_WIDTH, NavigatorViewport, layer_thumbnail_frame,
@@ -67,8 +67,12 @@ const CLOSED_STROKE_COMPLETION_QUEUE_CAPACITY: usize = MATERIALIZATION_QUEUE_CAP
 const PROJECT_PATH_ENV: &str = "NAYATI_PROJECT_PATH";
 const DURABILITY_PROBE_ENV: &str = "NAYATI_DESKTOP_DURABILITY_PROBE";
 const CLOSE_RAW_QUEUE_PROBE_ENV: &str = "NAYATI_CLOSE_RAW_QUEUE_PROBE";
+const ACTIVE_CLOSE_PROBE_ENV: &str = "NAYATI_ACTIVE_CLOSE_PROBE";
+const SAVE_PROBE_ENV: &str = "NAYATI_SAVE_PROBE";
 const PROTOCOL_PROBE_ENV: &str = "NAYATI_PROTOCOL_PROBE";
 const INPUT_SAFETY_PROBE_ENV: &str = "NAYATI_INPUT_SAFETY_PROBE";
+static ACTIVE_PROBE_USED: AtomicBool = AtomicBool::new(false);
+static SAVE_PROBE_USED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug)]
 struct DrawingConfig {
@@ -295,6 +299,7 @@ pub(crate) struct SharedGpuCanvas {
     project_location: ProjectLocation,
     state: CanvasState,
     rendered_frames: u64,
+    close_worker: Option<JoinHandle<()>>,
 }
 
 impl SharedGpuCanvas {
@@ -304,6 +309,7 @@ impl SharedGpuCanvas {
             project_location: ProjectLocation::from_environment_or_args(),
             state: CanvasState::Suspended,
             rendered_frames: 0,
+            close_worker: None,
         }
     }
 
@@ -342,9 +348,105 @@ impl SharedGpuCanvas {
 
     /// Drops presentation-device state while preserving no UI-framework handles.
     pub(crate) fn suspend(&mut self) {
+        // Emergency destruction still joins owned work. Ordinary Close keeps
+        // this owner and its window alive until poll_close observes completion.
+        if let Some(worker) = self.close_worker.take() {
+            let _ = worker.join();
+        }
         self.live_ink.invalidate_canvas_viewport();
         println!("native-shell event=gpu-canvas-suspend");
         self.state = CanvasState::Suspended;
+    }
+
+    pub(crate) fn begin_close(&mut self, width: u32, height: u32, scale: f64) {
+        if self.close_worker.is_some() {
+            return;
+        }
+        let state = std::mem::replace(&mut self.state, CanvasState::Suspended);
+        let CanvasState::Active(mut canvas) = state else {
+            self.live_ink.publish_close_status(CloseStatus::Ready);
+            return;
+        };
+        // Honor semantic requests admitted before Close, especially Save.
+        // Raw samples stay in their bounded native lane for shutdown drain.
+        canvas.apply_commands(width, height, scale);
+        match thread::Builder::new()
+            .name("nyatidraw-close".into())
+            .spawn(move || drop(canvas))
+        {
+            Ok(worker) => self.close_worker = Some(worker),
+            Err(error) => {
+                self.live_ink
+                    .publish_workspace_error(format!("Close worker could not start: {error}"));
+                self.publish_close_result();
+            }
+        }
+        println!("native-canvas event=close-started admission=stopped wait=background");
+    }
+
+    pub(crate) fn poll_close(&mut self) {
+        if self
+            .close_worker
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            if self
+                .close_worker
+                .take()
+                .expect("finished close worker")
+                .join()
+                .is_err()
+            {
+                self.live_ink
+                    .publish_workspace_error("Close worker panicked before completion".into());
+            }
+            self.publish_close_result();
+        }
+    }
+
+    fn publish_close_result(&self) {
+        let project_saved = !self.live_ink.workspace_failed();
+        let export_failed = matches!(
+            self.live_ink.export_status_snapshot(),
+            ExportStatus::Failed { .. }
+        );
+        if !project_saved || export_failed {
+            let path = match &self.project_location {
+                ProjectLocation::Explicit { path, .. }
+                | ProjectLocation::UntitledRecovery(path) => path,
+            };
+            self.live_ink.publish_close_status(CloseStatus::Failed {
+                project_saved,
+                project_path: path.display().to_string(),
+            });
+            println!(
+                "native-canvas event=close-failed project_saved={project_saved} export_failed={export_failed} window=retained"
+            );
+        } else {
+            self.live_ink.publish_close_status(CloseStatus::Ready);
+            println!("native-canvas event=close-ready writer=joined");
+        }
+    }
+
+    pub(crate) fn reopen_after_close_failure(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        if !matches!(self.live_ink.close_status(), CloseStatus::Failed { .. })
+            || self.close_worker.is_some()
+        {
+            return;
+        }
+        self.live_ink.reopen_after_close_failure();
+        match ActiveCanvas::new(device, queue, &self.live_ink, &self.project_location) {
+            Ok(canvas) => self.state = CanvasState::Active(Box::new(canvas)),
+            Err(error) => {
+                self.live_ink.publish_workspace_error(error);
+                self.live_ink.begin_close();
+                self.publish_close_result();
+            }
+        }
     }
 
     /// Replaces the durable document only on the child HWND's UI thread.
@@ -469,15 +571,17 @@ struct ActiveCanvas {
     next_layer_node_id: u128,
     project_title: String,
     project_export_path: Option<PathBuf>,
+    pending_save: Option<u64>,
     canvas_spec: CanvasSpec,
     drawing: DrawingConfig,
     projection: ProjectionState,
     cpu_tiles: BTreeMap<TileKey, Vec<u8>>,
-    latest_gpu_ordinal: BTreeMap<TileKey, u64>,
+    latest_preview_generation: BTreeMap<TileKey, u64>,
     deferred_completions: Vec<ClosedStrokeCompletion>,
     gpu_live_generation: Option<(u64, LiveStrokeToken, bool)>,
     closed_stroke_dirty_base_revision: Option<Revision>,
     close_raw_probe_staged: bool,
+    save_probe_step: u8,
     protocol_probe_step: Option<u8>,
     input_safety_probe_step: Option<u8>,
     synthetic_seed_enabled: bool,
@@ -521,6 +625,15 @@ impl ActiveCanvas {
         let stroke = StrokePipeline::new(live_ink.clone(), materialization.worker);
         if std::env::var_os(DURABILITY_PROBE_ENV).is_some() {
             enqueue_synthetic_durability_probe(live_ink)?;
+        }
+        if std::env::var_os(ACTIVE_CLOSE_PROBE_ENV).is_some()
+            && !ACTIVE_PROBE_USED.swap(true, Ordering::Relaxed)
+        {
+            for (sequence, phase) in [(1, PointerPhase::Begin), (2, PointerPhase::Move)] {
+                live_ink
+                    .push(input_probe_sample(sequence, phase))
+                    .map_err(|error| format!("active-close-probe-input:{error:?}"))?;
+            }
         }
 
         let (authoritative, latest_event) = live_ink.protocol_snapshot();
@@ -589,15 +702,23 @@ impl ActiveCanvas {
             next_layer_node_id,
             project_title: project_location.title(),
             project_export_path: project_location.export_path(),
+            pending_save: None,
             canvas_spec,
             drawing,
             projection,
             cpu_tiles,
-            latest_gpu_ordinal: BTreeMap::new(),
+            latest_preview_generation: BTreeMap::new(),
             deferred_completions: Vec::new(),
             gpu_live_generation: None,
             closed_stroke_dirty_base_revision: None,
             close_raw_probe_staged: false,
+            save_probe_step: if std::env::var_os(SAVE_PROBE_ENV).is_some()
+                && !SAVE_PROBE_USED.swap(true, Ordering::Relaxed)
+            {
+                0
+            } else {
+                3
+            },
             protocol_probe_step: std::env::var_os(PROTOCOL_PROBE_ENV).map(|_| 0),
             input_safety_probe_step: std::env::var_os(INPUT_SAFETY_PROBE_ENV).map(|_| 0),
             synthetic_seed_enabled: std::env::var_os("NAYATI_SYNTHETIC_INK").is_some(),
@@ -801,6 +922,12 @@ impl ActiveCanvas {
                 assert_eq!(stats.quarantined_after_discontinuity, 2);
                 assert_eq!(self.stroke.recovery_quarantined, 2);
                 assert!(!self.stroke.awaiting_clean_begin);
+                assert!(
+                    self.latest_preview_generation
+                        .values()
+                        .all(|generation| *generation == self.stroke.next_generation - 1),
+                    "preview retirement must use the recovered semantic generation, not a device-local token"
+                );
                 println!(
                     "native-canvas event=input-safety-probe-complete discontinuities={} acknowledged={} producer_quarantined={} consumer_quarantined={} active_cancelled=true cancelled_layer={} recovery_layer={} clean_begin_recovered=true materialized_closed_strokes=1",
                     stats.discontinuities_latched,
@@ -821,10 +948,6 @@ impl ActiveCanvas {
         if width == 0 || height == 0 {
             return None;
         }
-        self.advance_protocol_probe();
-        if self.advance_input_safety_probe_before_drain() {
-            return None;
-        }
         self.view.ensure_initialized(
             width,
             height,
@@ -836,8 +959,13 @@ impl ActiveCanvas {
         if std::env::var_os(CLOSE_RAW_QUEUE_PROBE_ENV).is_some() {
             if !self.close_raw_probe_staged {
                 self.close_raw_probe_staged = true;
+                let strokes = if std::env::var_os(ACTIVE_CLOSE_PROBE_ENV).is_some() {
+                    1
+                } else {
+                    32
+                };
                 println!(
-                    "native-canvas event=raw-input-staged-before-drain strokes=32 shutdown-drop-must-drain=true"
+                    "native-canvas event=raw-input-staged-before-drain strokes={strokes} shutdown-drop-must-drain=true"
                 );
             }
             return None;
@@ -862,6 +990,14 @@ impl ActiveCanvas {
         self.apply_materialized_tiles();
         self.apply_commands(width, height, scale);
         if self.synchronize_workspace_failure() {
+            return None;
+        }
+        self.advance_save_probe();
+        self.flush_pending_save();
+        // Advance only after startup's queued Fit and the previous probe
+        // command have run, so the next command uses their resulting revision.
+        self.advance_protocol_probe();
+        if self.advance_input_safety_probe_before_drain() {
             return None;
         }
         self.advance_input_safety_probe_after_drain();
@@ -1366,30 +1502,20 @@ impl ActiveCanvas {
                 Ok(false)
             }
             EditorCommand::Project(ProjectCommand::Save) => {
-                let Some(path) = self.project_export_path.clone() else {
+                if self.project_export_path.is_none() {
                     return Err(CommandRejectReason::UnsupportedCommand);
-                };
-                // A retained closed stroke is not in the worker's FIFO yet.
-                // Do not allow an export to use a newly freed slot ahead of
-                // it; the next render retries the bounded closed-stroke lane
-                // first and then accepts Save.
-                self.stroke.flush_pending_materializations();
-                if !self.stroke.pending_materializations.is_empty() {
-                    return Err(CommandRejectReason::CommandQueueBusy);
                 }
                 let generation = self
                     .stroke
                     .materializer
-                    .export_png(path, self.scene.tree().clone(), self.canvas_spec)
+                    .reserve_export()
                     .map_err(|()| CommandRejectReason::CommandQueueBusy)?;
-                // The project is already immediately durable. `dirty` means
-                // its sibling PNG is stale, so accepting its current export
-                // clears it even though PNG completion remains asynchronous.
-                let mut saved = self.projection.current().clone();
-                saved.dirty = false;
-                self.projection.install_authoritative(saved);
+                // One latest-only semantic request waits for the current
+                // stroke and retained closed work. Raw input never blocks.
+                self.pending_save = Some(generation);
                 println!(
-                    "native-canvas event=project-save-accepted export_generation={generation} project_durability=independent export=queued",
+                    "native-canvas event=project-save-requested export_generation={generation} waiting_for_stroke={} bounded_pending=1",
+                    self.stroke.active.is_some(),
                 );
                 Ok(false)
             }
@@ -1471,6 +1597,69 @@ impl ActiveCanvas {
         }
     }
 
+    fn advance_save_probe(&mut self) {
+        let Ok(mode) = std::env::var(SAVE_PROBE_ENV) else {
+            return;
+        };
+        if self.save_probe_step < 2 {
+            self.stroke
+                .live_ink
+                .push_editor_command(
+                    self.projection.current().revision,
+                    EditorCommand::Project(ProjectCommand::Save),
+                )
+                .expect("scratch Save probe command fits bounded lane");
+            self.save_probe_step += 1;
+        } else if self.save_probe_step == 2 && mode == "end" && self.pending_save.is_some() {
+            let mut end = input_probe_sample(2, PointerPhase::End);
+            end.sequence = 3;
+            self.stroke
+                .live_ink
+                .push(end)
+                .expect("scratch End fits bounded lane");
+            self.save_probe_step = 3;
+        }
+    }
+
+    fn flush_pending_save(&mut self) {
+        let Some(generation) = self.pending_save else {
+            return;
+        };
+        if self.stroke.active.is_some() || !self.stroke.pending_materializations.is_empty() {
+            return;
+        }
+        let Some(path) = self.project_export_path.clone() else {
+            return;
+        };
+        match self.stroke.materializer.enqueue_export(
+            generation,
+            path,
+            self.scene.tree().clone(),
+            self.canvas_spec,
+            false,
+        ) {
+            Ok(()) => {
+                self.pending_save = None;
+                // The FIFO now includes every closed stroke represented by
+                // this export. Completion remains a separate worker status.
+                let mut saved = self.projection.current().clone();
+                saved.dirty = false;
+                self.projection.install_authoritative(saved);
+                self.publish_committed_history();
+                println!(
+                    "native-canvas event=project-save-accepted export_generation={generation} project_durability=independent export=queued"
+                );
+            }
+            Err(ExportEnqueueError::Busy) => {}
+            Err(ExportEnqueueError::Disconnected) => {
+                self.pending_save = None;
+                self.stroke
+                    .live_ink
+                    .publish_export_status(ExportStatus::Failed { generation });
+            }
+        }
+    }
+
     fn reject_command(&self, command: nyatidraw_api::CommandId, reason: CommandRejectReason) {
         eprintln!(
             "native-canvas event=semantic-command-rejected command={} reason={reason:?}",
@@ -1489,6 +1678,7 @@ impl ActiveCanvas {
         let (authoritative, _) = self.stroke.live_ink.protocol_snapshot();
         self.projection.install_authoritative(authoritative);
         self.stroke.fail_closed("workspace-error-latched");
+        self.stroke.live_ink.fail_incomplete_export();
         true
     }
 
@@ -1539,9 +1729,9 @@ impl ActiveCanvas {
             for (key, pixels) in completion.tiles {
                 self.cpu_tiles.insert(key, pixels.clone());
                 let newer_preview = self
-                    .latest_gpu_ordinal
+                    .latest_preview_generation
                     .get(&key)
-                    .is_some_and(|ordinal| *ordinal > completion.gpu_ordinal);
+                    .is_some_and(|generation| *generation > completion.stroke_generation);
                 if newer_preview {
                     continue;
                 }
@@ -1551,8 +1741,10 @@ impl ActiveCanvas {
                 }
                 match self.scene.upload_closed_tile(key, &pixels) {
                     Ok(()) => {
-                        if self.latest_gpu_ordinal.get(&key) == Some(&completion.gpu_ordinal) {
-                            self.latest_gpu_ordinal.remove(&key);
+                        if self.latest_preview_generation.get(&key)
+                            == Some(&completion.stroke_generation)
+                        {
+                            self.latest_preview_generation.remove(&key);
                         }
                     }
                     Err(LayerUploadError::LiveStrokeActive(_)) => remaining.push((key, pixels)),
@@ -1565,7 +1757,7 @@ impl ActiveCanvas {
             if !remaining.is_empty() {
                 deferred.push(ClosedStrokeCompletion {
                     ordinal: completion.ordinal,
-                    gpu_ordinal: completion.gpu_ordinal,
+                    stroke_generation: completion.stroke_generation,
                     tiles: remaining,
                     history: None,
                 });
@@ -1620,11 +1812,15 @@ impl ActiveCanvas {
                     }
                     match self.scene.replace_live_stroke(layer) {
                         Ok(replacement) => {
-                            if let Some(cancelled) = replacement.cancelled {
-                                self.latest_gpu_ordinal
-                                    .retain(|_, ordinal| *ordinal != cancelled.token.ordinal());
+                            if replacement.cancelled.is_some()
+                                && let Some((previous_generation, _, _)) = self.gpu_live_generation
+                            {
+                                self.latest_preview_generation
+                                    .retain(|_, latest| *latest != previous_generation);
                             }
-                            debug_assert_eq!(replacement.active.ordinal(), generation);
+                            // A discontinuity can discard an admitted Begin
+                            // before GPU submission. Semantic generations and
+                            // device-local tokens therefore need not coincide.
                             self.gpu_live_generation =
                                 Some((generation, replacement.active, eraser));
                         }
@@ -1650,7 +1846,7 @@ impl ActiveCanvas {
                         Ok(submission) => {
                             if let Some(dirty) = submission.document_dirty {
                                 for key in paint_dirty_tiles(token.layer(), dirty) {
-                                    self.latest_gpu_ordinal.insert(key, token.ordinal());
+                                    self.latest_preview_generation.insert(key, generation);
                                 }
                             }
                             if submission.dab_count > 0 {
@@ -1689,9 +1885,9 @@ impl ActiveCanvas {
                         continue;
                     }
                     match self.scene.finish_live_stroke(token, disposition) {
-                        Ok(outcome) if disposition == LiveStrokeDisposition::Cancel => {
-                            self.latest_gpu_ordinal
-                                .retain(|_, ordinal| *ordinal != outcome.token.ordinal());
+                        Ok(_) if disposition == LiveStrokeDisposition::Cancel => {
+                            self.latest_preview_generation
+                                .retain(|_, preview_generation| *preview_generation != generation);
                         }
                         Ok(_) => {}
                         Err(error) => {
@@ -1719,10 +1915,13 @@ impl ActiveCanvas {
         let token = failed_token
             .or_else(|| self.gpu_live_generation.map(|(_, token, _)| token))
             .or_else(|| self.scene.active_live_stroke());
+        let failed_generation = self
+            .gpu_live_generation
+            .map_or(generation, |(active, _, _)| active);
         self.gpu_live_generation = None;
         if let Some(token) = token {
-            self.latest_gpu_ordinal
-                .retain(|_, ordinal| *ordinal != token.ordinal());
+            self.latest_preview_generation
+                .retain(|_, preview_generation| *preview_generation != failed_generation);
             if let Err(cancel_error) = self
                 .scene
                 .finish_live_stroke(token, LiveStrokeDisposition::Cancel)
@@ -2082,6 +2281,7 @@ struct StrokePipeline {
     last_discontinued_layer: Option<LayerId>,
     last_closed_layer: Option<LayerId>,
     fatal: bool,
+    shutdown_prepared: bool,
     materializer: MaterializationWorker,
 }
 
@@ -2118,6 +2318,7 @@ impl StrokePipeline {
             last_discontinued_layer: None,
             last_closed_layer: None,
             fatal: false,
+            shutdown_prepared: false,
             materializer,
         }
     }
@@ -2282,7 +2483,7 @@ impl StrokePipeline {
                             });
                             let request = ClosedStrokeRequest {
                                 ordinal: self.closed_strokes,
-                                gpu_ordinal: active.generation,
+                                stroke_generation: active.generation,
                                 layer: active.layer,
                                 recorded: record,
                                 samples: active.samples,
@@ -2291,22 +2492,7 @@ impl StrokePipeline {
                                 end_timestamp_ns: sample.timestamp_ns,
                                 enqueued_at: Instant::now(),
                             };
-                            match self.materializer.try_enqueue(request) {
-                                TryEnqueueStatus::Enqueued(outcome) => println!(
-                                    "live-ink event=stroke-materialization-enqueued source=native-input count={} queue_full=false stroke_end_block_us=0 pending={}",
-                                    self.closed_strokes, outcome.pending,
-                                ),
-                                TryEnqueueStatus::Full(request) => {
-                                    self.defer_materialization(request);
-                                }
-                                TryEnqueueStatus::Disconnected(request) => {
-                                    self.defer_materialization(request);
-                                    eprintln!(
-                                        "live-ink event=stroke-materialization-stalled source=native-input count={} reason=worker-disconnected retained=true",
-                                        self.closed_strokes,
-                                    );
-                                }
-                            }
+                            self.queue_closed_stroke(request);
                             artwork_closed = true;
                         }
                     } else {
@@ -2397,6 +2583,29 @@ impl StrokePipeline {
         );
     }
 
+    fn queue_closed_stroke(&mut self, request: ClosedStrokeRequest) {
+        // A worker may free capacity during a native drain. New strokes must
+        // still follow the older semantic backlog, especially paint/erase.
+        if !self.pending_materializations.is_empty() {
+            self.defer_materialization(request);
+            return;
+        }
+        let ordinal = request.ordinal;
+        match self.materializer.try_enqueue(request) {
+            TryEnqueueStatus::Enqueued(outcome) => println!(
+                "live-ink event=stroke-materialization-enqueued source=native-input count={ordinal} queue_full=false stroke_end_block_us=0 pending={}",
+                outcome.pending,
+            ),
+            TryEnqueueStatus::Full(request) => self.defer_materialization(request),
+            TryEnqueueStatus::Disconnected(request) => {
+                self.defer_materialization(request);
+                eprintln!(
+                    "live-ink event=stroke-materialization-stalled source=native-input count={ordinal} reason=worker-disconnected retained=true"
+                );
+            }
+        }
+    }
+
     fn flush_pending_materializations(&mut self) {
         while let Some(request) = self.pending_materializations.pop_front() {
             let ordinal = request.ordinal;
@@ -2426,10 +2635,76 @@ impl StrokePipeline {
             self.materialization_backlog_capacity,
         );
     }
+
+    /// Preserves a healthy in-progress stroke at its last received sample when
+    /// its owner is closing. The semantic End is explicitly synthetic; it is
+    /// never sent through the native recorder or counted as physical pen input.
+    fn seal_active_for_shutdown(&mut self) {
+        let Some(mut active) = self.active.take() else {
+            return;
+        };
+        if self.fatal || self.awaiting_clean_begin {
+            return;
+        }
+        let mut end = *active.samples.last().expect("active stroke has a Begin");
+        let Some(sequence) = end.sequence.checked_add(1).filter(|_| {
+            !active.sample_limit_exceeded && active.samples.len() < MAX_SAMPLES_PER_STROKE
+        }) else {
+            self.live_ink.publish_workspace_error(
+                "The active stroke exceeded its safe recording limits and could not be sealed on close".into(),
+            );
+            eprintln!(
+                "live-ink event=active-stroke-close-rejected reason=recording-limit materialized=false"
+            );
+            return;
+        };
+        end.sequence = sequence;
+        end.phase = PointerPhase::End;
+        active.samples.push(end);
+        self.scratch_dabs.clear();
+        self.evaluator
+            .push(&mut active.token, &[end], &mut self.scratch_dabs);
+        let recorded = self.evaluator.end(active.token, &mut self.scratch_dabs);
+        self.scratch_dabs.clear();
+        self.closed_strokes = self.closed_strokes.saturating_add(1);
+        let sample_count = recorded.sample_count;
+        let request = ClosedStrokeRequest {
+            ordinal: self.closed_strokes,
+            stroke_generation: active.generation,
+            layer: active.layer,
+            recorded,
+            samples: active.samples,
+            brush: active.brush,
+            color: active.color,
+            end_timestamp_ns: end.timestamp_ns,
+            enqueued_at: Instant::now(),
+        };
+        if self.materializer.enqueue_for_shutdown(request).is_err() {
+            self.live_ink.publish_workspace_error(
+                "The project writer stopped before the active stroke could be saved on close"
+                    .into(),
+            );
+            eprintln!("live-ink event=active-stroke-close-rejected reason=worker-disconnected");
+        } else {
+            println!(
+                "live-ink event=active-stroke-close-sealed source=shutdown-policy synthetic_end=true samples={} last_received_sequence={} physical-pen-proof=false",
+                sample_count,
+                sequence - 1,
+            );
+        }
+    }
 }
 
-impl Drop for StrokePipeline {
-    fn drop(&mut self) {
+impl StrokePipeline {
+    fn prepare_shutdown(&mut self) {
+        if self.shutdown_prepared {
+            return;
+        }
+        self.shutdown_prepared = true;
+        // The owner will never consume another GPU retirement payload. Retire
+        // that disposable display before blocking on any writer admission;
+        // otherwise its bounded completion lane can stop the durable drain.
+        self.materializer.retire_display();
         while let Some(request) = self.pending_materializations.pop_front() {
             if self.materializer.enqueue_for_shutdown(request).is_err() {
                 break;
@@ -2454,6 +2729,42 @@ impl Drop for StrokePipeline {
                     "live-ink event=stroke-materialization-close-drain-failed reason=worker-disconnected"
                 );
                 break;
+            }
+        }
+        self.seal_active_for_shutdown();
+    }
+}
+
+impl Drop for StrokePipeline {
+    fn drop(&mut self) {
+        self.prepare_shutdown();
+    }
+}
+
+impl Drop for ActiveCanvas {
+    fn drop(&mut self) {
+        self.stroke.prepare_shutdown();
+        if let Some(generation) = self.pending_save.take() {
+            if self.stroke.live_ink.workspace_failed() {
+                self.stroke.live_ink.fail_incomplete_export();
+                return;
+            }
+            if let Some(path) = self.project_export_path.clone()
+                && self
+                    .stroke
+                    .materializer
+                    .enqueue_export(
+                        generation,
+                        path,
+                        self.scene.tree().clone(),
+                        self.canvas_spec,
+                        true,
+                    )
+                    .is_err()
+            {
+                self.stroke
+                    .live_ink
+                    .publish_export_status(ExportStatus::Failed { generation });
             }
         }
     }
@@ -2542,7 +2853,7 @@ impl LiveStroke {
 
 struct ClosedStrokeRequest {
     ordinal: u64,
-    gpu_ordinal: u64,
+    stroke_generation: u64,
     layer: LayerId,
     recorded: RecordedStroke,
     samples: Vec<StylusSample>,
@@ -2568,8 +2879,14 @@ struct MaterializationWorker {
     completed: Receiver<ClosedStrokeCompletion>,
     handle: Option<JoinHandle<WorkerExit>>,
     pending: Arc<AtomicUsize>,
+    display_retired: Arc<AtomicBool>,
     export_generations: Arc<Mutex<ExportGenerationGate>>,
     live_ink: LiveInkBridge,
+}
+
+enum ExportEnqueueError {
+    Busy,
+    Disconnected,
 }
 
 /// Serializes export admission with the final replacement. Holding this gate
@@ -2837,6 +3154,8 @@ impl MaterializationWorker {
         let (completed_sender, completed) = sync_channel(CLOSED_STROKE_COMPLETION_QUEUE_CAPACITY);
         let pending = Arc::new(AtomicUsize::new(0));
         let worker_pending = Arc::clone(&pending);
+        let display_retired = Arc::new(AtomicBool::new(false));
+        let worker_display_retired = Arc::clone(&display_retired);
         let export_generations = Arc::new(Mutex::new(ExportGenerationGate::default()));
         let worker_export_generations = Arc::clone(&export_generations);
         let worker_preview_tree = initial_tree.clone();
@@ -2848,6 +3167,7 @@ impl MaterializationWorker {
                     materialization_loop(
                         &receiver,
                         &completed_sender,
+                        worker_display_retired.as_ref(),
                         worker_pending.as_ref(),
                         session,
                         worker_preview_tree,
@@ -2878,6 +3198,7 @@ impl MaterializationWorker {
                 completed,
                 handle: Some(handle),
                 pending,
+                display_retired,
                 export_generations,
                 live_ink,
             },
@@ -2931,33 +3252,56 @@ impl MaterializationWorker {
         received.recv().ok().and_then(Result::ok).ok_or(())
     }
 
-    fn export_png(&self, path: PathBuf, tree: LayerTree, canvas: CanvasSpec) -> Result<u64, ()> {
-        let Some(sender) = self.sender.as_ref() else {
-            return Err(());
-        };
-        // Submission and the final replace share this gate. The worker cannot
-        // pass its current-generation check between a successful newer send
-        // and recording that newer generation.
+    fn reserve_export(&self) -> Result<u64, ()> {
+        // Acceptance supersedes older work even while this request waits for
+        // an active stroke. Final replacement uses the same generation gate.
         let generation = {
             let mut generations = self
                 .export_generations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let generation = generations.next_generation()?;
-            sender
-                .try_send(WorkerRequest::ExportPng {
-                    generation,
-                    path,
-                    tree,
-                    canvas,
-                })
-                .map_err(|_| ())?;
             generations.accept_submission(generation);
             generation
         };
         self.live_ink
-            .publish_export_status(ExportStatus::Queued { generation });
+            .publish_export_status(ExportStatus::Waiting { generation });
         Ok(generation)
+    }
+
+    fn enqueue_export(
+        &self,
+        generation: u64,
+        path: PathBuf,
+        tree: LayerTree,
+        canvas: CanvasSpec,
+        shutdown: bool,
+    ) -> Result<(), ExportEnqueueError> {
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(ExportEnqueueError::Disconnected)?;
+        let request = WorkerRequest::ExportPng {
+            generation,
+            path,
+            tree,
+            canvas,
+        };
+        // Never hold the replacement gate while waiting on worker capacity:
+        // an older encoder may need it before it can free that capacity.
+        if shutdown {
+            sender
+                .send(request)
+                .map_err(|_| ExportEnqueueError::Disconnected)?;
+        } else {
+            sender.try_send(request).map_err(|error| match error {
+                TrySendError::Full(_) => ExportEnqueueError::Busy,
+                TrySendError::Disconnected(_) => ExportEnqueueError::Disconnected,
+            })?;
+        }
+        self.live_ink
+            .publish_export_status(ExportStatus::Queued { generation });
+        Ok(())
     }
 
     fn move_history(&self, command: nyatidraw_api::HistoryCommand) -> Result<HistoryMove, ()> {
@@ -2969,6 +3313,12 @@ impl MaterializationWorker {
             .try_send(WorkerRequest::MoveHistory { command, reply })
             .map_err(|_| ())?;
         received.recv().ok().and_then(Result::ok).ok_or(())
+    }
+
+    /// Only the retiring canvas owner may waive display delivery. Closed
+    /// strokes still pass through CPU replay and the immediate transaction.
+    fn retire_display(&self) {
+        self.display_retired.store(true, Ordering::Release);
     }
 
     fn enqueue_for_shutdown(&self, request: ClosedStrokeRequest) -> Result<(), ()> {
@@ -2990,6 +3340,7 @@ impl MaterializationWorker {
 
 impl Drop for MaterializationWorker {
     fn drop(&mut self) {
+        self.retire_display();
         drop(self.sender.take());
         let Some(handle) = self.handle.take() else {
             return;
@@ -3001,6 +3352,11 @@ impl Drop for MaterializationWorker {
             Ok(WorkerExit::Panicked) | Err(_) => ("panicked", "not-established"),
         };
         let pending_after_join = self.pending.load(Ordering::Relaxed);
+        if status != "drained-and-joined" || pending_after_join != 0 {
+            self.live_ink.publish_workspace_error(
+                "The project writer stopped before all accepted artwork was saved".into(),
+            );
+        }
         println!(
             "live-ink event=materialization-worker-shutdown mode={status} pending_before_join={pending_before_join} pending_after_join={pending_after_join} close_guarantee={close_guarantee}"
         );
@@ -3009,7 +3365,7 @@ impl Drop for MaterializationWorker {
 
 struct ClosedStrokeCompletion {
     ordinal: u64,
-    gpu_ordinal: u64,
+    stroke_generation: u64,
     tiles: Vec<(TileKey, Vec<u8>)>,
     history: Option<HistoryProjection>,
 }
@@ -3018,19 +3374,35 @@ struct ClosedStrokeCompletion {
 ///
 /// This must never wait: a saturated UI-facing lane can occur while the event
 /// loop is closing, and waiting here would prevent the writer from exiting and
-/// `Drop` from joining it. A full or disconnected lane therefore makes the
-/// current display unsafe to continue, latches the workspace error (which also
-/// quarantines input), and has the caller fail-stop the worker.
+/// `Drop` from joining it. Once the owner explicitly retires the display, CPU
+/// durability no longer depends on delivering its disposable GPU payload.
+/// While the display is live, a full/disconnected lane still quarantines input
+/// and fail-stops the worker rather than silently losing a preview update.
 fn publish_closed_completion(
     completed: &SyncSender<ClosedStrokeCompletion>,
+    display_retired: &AtomicBool,
     live_ink: &LiveInkBridge,
     completion: ClosedStrokeCompletion,
 ) -> bool {
     let ordinal = completion.ordinal;
     let tile_count = completion.tiles.len();
+    if display_retired.load(Ordering::Acquire) {
+        println!(
+            "live-ink event=closed-tile-completion-retired stroke={ordinal} tiles={tile_count} reason=display-owner-shutdown durable-cpu-authority=true"
+        );
+        return true;
+    }
     match completed.try_send(completion) {
         Ok(()) => {
             live_ink.request_redraw();
+            true
+        }
+        Err(_) if display_retired.load(Ordering::Acquire) => {
+            // Shutdown may race the non-blocking send. A retired display
+            // cannot turn an otherwise successful commit into a drain failure.
+            println!(
+                "live-ink event=closed-tile-completion-retired stroke={ordinal} tiles={tile_count} reason=display-owner-shutdown durable-cpu-authority=true"
+            );
             true
         }
         Err(TrySendError::Full(_)) => {
@@ -3058,6 +3430,7 @@ fn publish_closed_completion(
 fn materialization_loop(
     receiver: &Receiver<WorkerRequest>,
     completed: &SyncSender<ClosedStrokeCompletion>,
+    display_retired: &AtomicBool,
     pending: &AtomicUsize,
     mut session: HeadlessStrokeSession,
     mut preview_tree: LayerTree,
@@ -3074,6 +3447,9 @@ fn materialization_loop(
     let mut thumbnail_generation = 1_u64;
     let mut exit = WorkerExit::Drained;
     while let Ok(work) = receiver.recv() {
+        // Dequeue freed a bounded writer slot. Wake a Save retained by the
+        // canvas even when this work only changes metadata or exports a PNG.
+        live_ink.request_redraw();
         let request = match work {
             WorkerRequest::Stroke(request) => request,
             WorkerRequest::ExportPng {
@@ -3095,6 +3471,9 @@ fn materialization_loop(
                     continue;
                 }
                 live_ink.publish_export_status(ExportStatus::Running { generation });
+                if live_ink.is_closing() {
+                    live_ink.publish_close_status(CloseStatus::Exporting);
+                }
                 match export_current_png(
                     &path,
                     session.tiles(),
@@ -3357,10 +3736,11 @@ fn materialization_loop(
                         );
                         let completion_delivered = publish_closed_completion(
                             completed,
+                            display_retired,
                             live_ink,
                             ClosedStrokeCompletion {
                                 ordinal: request.ordinal,
-                                gpu_ordinal: request.gpu_ordinal,
+                                stroke_generation: request.stroke_generation,
                                 tiles: closed_tiles,
                                 history: Some(session.history_projection()),
                             },
@@ -3534,6 +3914,7 @@ fn export_current_png(
         let _ = std::fs::remove_file(&temporary);
         return Err(format!("encode:{error}"));
     }
+    export_probe_boundary(path, "encoded");
     if let Err(error) = std::fs::OpenOptions::new()
         .write(true)
         .open(&temporary)
@@ -3542,6 +3923,7 @@ fn export_current_png(
         let _ = std::fs::remove_file(&temporary);
         return Err(format!("sync:{}:{error}", temporary.display()));
     }
+    export_probe_boundary(path, "synced");
     // This lock pairs the immediately-preceding check with replacement. A
     // successful Save cannot interleave after the check and before MoveFileExW
     // to let an obsolete encoded file become the final PNG.
@@ -3554,11 +3936,51 @@ fn export_current_png(
         let _ = std::fs::remove_file(&temporary);
         return Ok(ExportPngOutcome::Superseded { latest });
     }
+    export_probe_boundary(path, "before-replace");
     if let Err(error) = replace_file(&temporary, path) {
         let _ = std::fs::remove_file(&temporary);
         return Err(format!("replace:{}:{error}", path.display()));
     }
+    export_probe_boundary(path, "after-replace");
     Ok(ExportPngOutcome::Replaced)
+}
+
+/// Opt-in, scratch-only acceptance boundary. The harness may terminate its own
+/// child here or release it; ordinary user projects cannot enable this by name.
+fn export_probe_boundary(path: &std::path::Path, stage: &str) {
+    use std::io::Write as _;
+
+    if std::env::var("NAYATI_EXPORT_PAUSE").as_deref() != Ok(stage) {
+        return;
+    }
+    let Some(directory) = std::env::var_os("NAYATI_EXPORT_PROBE_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let Ok(directory) = directory.canonicalize() else {
+        return;
+    };
+    let Ok(temp_root) = std::env::temp_dir().canonicalize() else {
+        return;
+    };
+    if !directory.starts_with(temp_root)
+        || path
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .as_ref()
+            != Some(&directory)
+        || std::fs::read(directory.join(".nyatidraw-scratch-export-probe"))
+            .ok()
+            .as_deref()
+            != Some(b"scratch-only")
+    {
+        return;
+    }
+    println!("native-canvas event=export-probe-paused stage={stage} scratch_only=true");
+    let _ = std::io::stdout().flush();
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    while Instant::now() < deadline && !directory.join("release-export").exists() {
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[cfg(windows)]
@@ -3742,7 +4164,7 @@ mod tests {
         sender
             .try_send(ClosedStrokeCompletion {
                 ordinal: 1,
-                gpu_ordinal: 1,
+                stroke_generation: 1,
                 tiles: Vec::new(),
                 history: None,
             })
@@ -3750,10 +4172,11 @@ mod tests {
 
         assert!(!publish_closed_completion(
             &sender,
+            &AtomicBool::new(false),
             &live_ink,
             ClosedStrokeCompletion {
                 ordinal: 2,
-                gpu_ordinal: 2,
+                stroke_generation: 2,
                 tiles: Vec::new(),
                 history: None,
             },
@@ -3766,6 +4189,191 @@ mod tests {
                 .ordinal,
             1
         );
+    }
+
+    #[test]
+    fn shutdown_preserves_all_closed_artwork_beyond_display_completion_capacity() {
+        // Product risk: closing the canvas must not lose pending closed
+        // strokes merely because nobody can consume GPU completions anymore.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "nyatidraw-close-drain-test-{}-{nonce}.ntdr",
+            std::process::id(),
+        ));
+        let location = ProjectLocation::UntitledRecovery(path.clone());
+        let live_ink = LiveInkBridge::with_capacity(512, LIVE_LAYER);
+        let bootstrap = MaterializationWorker::start(live_ink.clone(), &location)
+            .expect("scratch writer starts");
+        let pending = Arc::clone(&bootstrap.worker.pending);
+        enqueue_synthetic_durability_probe(&live_ink).expect("32 closed strokes fit native lane");
+        drop(StrokePipeline::new(live_ink.clone(), bootstrap.worker));
+
+        assert!(
+            !live_ink.workspace_failed(),
+            "retired display cannot stop persistence"
+        );
+        assert_eq!(
+            pending.load(Ordering::Relaxed),
+            0,
+            "every accepted stroke drained"
+        );
+        let database = ProjectDb::open(&path).expect("shutdown released writer lock");
+        let reopened = database
+            .load_reopened()
+            .expect("valid durable project")
+            .expect("closed artwork persisted");
+        assert_eq!(reopened.current_snapshot(), SnapshotId(32));
+        assert_eq!(reopened.history().node_count(), 32);
+        assert!(!reopened.current_tiles().is_empty());
+        drop(database);
+        std::fs::remove_file(path).expect("remove owned scratch project");
+    }
+
+    #[test]
+    fn close_preserves_received_samples_without_resurrecting_cancelled_or_invalid_strokes() {
+        let nonce = system_timestamp_ns();
+        for case in [
+            "tap",
+            "line",
+            "cancel",
+            "discontinuity",
+            "limit",
+            "sequence",
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "nyatidraw-active-close-{}-{nonce}-{case}.ntdr",
+                std::process::id(),
+            ));
+            let live_ink = LiveInkBridge::with_capacity(8, LIVE_LAYER);
+            let bootstrap = MaterializationWorker::start(
+                live_ink.clone(),
+                &ProjectLocation::UntitledRecovery(path.clone()),
+            )
+            .expect("scratch writer");
+            let mut pipeline = StrokePipeline::new(live_ink.clone(), bootstrap.worker);
+            let mut received = vec![sample(1, PointerPhase::Begin, -4.0, 12.0)];
+            if case != "tap" {
+                received.push(sample(2, PointerPhase::Move, 150.0, 120.0));
+            }
+            for sample in &received {
+                live_ink.push(*sample).expect("bounded fixture admission");
+            }
+            pipeline.drain(LIVE_LAYER, pipeline.drawing);
+            match case {
+                "cancel" => {
+                    live_ink
+                        .push(sample(3, PointerPhase::Cancel, 150.0, 120.0))
+                        .unwrap();
+                }
+                "discontinuity" => pipeline.consume_discontinuity(InputDiscontinuity {
+                    first_lost_sequence: 3,
+                    first_lost_phase: PointerPhase::End,
+                    quarantined_before_ack: 0,
+                }),
+                "limit" => pipeline.active.as_mut().unwrap().sample_limit_exceeded = true,
+                "sequence" => {
+                    pipeline
+                        .active
+                        .as_mut()
+                        .unwrap()
+                        .samples
+                        .last_mut()
+                        .unwrap()
+                        .sequence = u64::MAX;
+                }
+                _ => {}
+            }
+            drop(pipeline);
+            let database = ProjectDb::open(&path).expect("closed writer unlocked project");
+            let reopened = database.load_reopened().expect("valid recovery state");
+            if matches!(case, "tap" | "line") {
+                let reopened = reopened.expect("healthy active stroke was saved");
+                let saved = reopened.current().unwrap().stroke.samples();
+                let mut end = *received.last().unwrap();
+                end.sequence += 1;
+                end.phase = PointerPhase::End;
+                received.push(end);
+                assert_eq!(
+                    saved, received,
+                    "{case}: every received sample and last position survive"
+                );
+                assert_eq!(reopened.history().node_count(), 1);
+                assert!(!reopened.current_tiles().is_empty());
+            } else {
+                assert!(
+                    reopened.is_none(),
+                    "{case}: shutdown must not resurrect unsafe artwork"
+                );
+            }
+            assert_eq!(
+                live_ink.workspace_failed(),
+                matches!(case, "limit" | "sequence")
+            );
+            drop(database);
+            std::fs::remove_file(path).expect("remove owned scratch project");
+        }
+    }
+
+    #[test]
+    fn freed_writer_capacity_cannot_reorder_closed_strokes_ahead_of_the_semantic_backlog() {
+        // Product risk: swapping queued paint/erase operations changes artwork.
+        // The real bounded channel is empty, but an older semantic request
+        // still owns the next writer position.
+        let request = |ordinal| {
+            let begin = sample(ordinal * 2, PointerPhase::Begin, 10.0, 10.0);
+            let end = sample(ordinal * 2 + 1, PointerPhase::End, 12.0, 10.0);
+            let mut evaluator = RoundBrushEvaluator::new(1);
+            let mut dabs = Vec::new();
+            let mut token = begin_round_stroke(&mut evaluator, &LIVE_BRUSH, begin, &mut dabs);
+            evaluator.push(&mut token, &[end], &mut dabs);
+            ClosedStrokeRequest {
+                ordinal,
+                stroke_generation: ordinal,
+                layer: LIVE_LAYER,
+                recorded: evaluator.end(token, &mut dabs),
+                samples: vec![begin, end],
+                brush: BrushSnapshot { preset: LIVE_BRUSH },
+                color: LIVE_BRUSH_COLOR,
+                end_timestamp_ns: end.timestamp_ns,
+                enqueued_at: Instant::now(),
+            }
+        };
+        let live_ink = LiveInkBridge::with_capacity(2, LIVE_LAYER);
+        let (sender, receiver) = sync_channel(2);
+        let (_completed_sender, completed) = sync_channel(2);
+        let worker = MaterializationWorker {
+            sender: Some(sender),
+            completed,
+            handle: None,
+            pending: Arc::new(AtomicUsize::new(0)),
+            display_retired: Arc::new(AtomicBool::new(false)),
+            export_generations: Arc::new(Mutex::new(ExportGenerationGate::default())),
+            live_ink: live_ink.clone(),
+        };
+        let mut pipeline = StrokePipeline::new(live_ink, worker);
+        pipeline.defer_materialization(request(1));
+        pipeline.queue_closed_stroke(request(2));
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "a newly free slot must not admit the newer stroke first"
+        );
+        pipeline.flush_pending_materializations();
+        for expected in [1, 2] {
+            let WorkerRequest::Stroke(actual) = receiver.try_recv().expect("closed request") else {
+                panic!("unexpected worker request");
+            };
+            assert_eq!(
+                actual.ordinal, expected,
+                "semantic order must survive backpressure"
+            );
+        }
+        assert!(pipeline.pending_materializations.is_empty());
     }
 
     #[test]

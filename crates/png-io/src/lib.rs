@@ -133,7 +133,10 @@ fn encode_png_writer(writer: impl Write, surface: &FlattenedRgba8) -> Result<(),
     let straight = unpremultiply(&surface.pixels);
     writer
         .write_image_data(&straight)
-        .map_err(PngIoError::Encode)
+        .map_err(PngIoError::Encode)?;
+    // Drop ignores IEND and buffered flush errors. A caller must never replace
+    // the last good export after an incomplete encoding was reported as success.
+    writer.finish().map_err(PngIoError::Encode)
 }
 
 fn to_premultiplied_rgba(source: &[u8], color: png::ColorType) -> Result<Vec<u8>, PngIoError> {
@@ -241,6 +244,30 @@ fn unpremultiply(pixels: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_png_flush_failure_cannot_report_a_complete_artwork_export() {
+        struct FailsOnFlush;
+        impl Write for FailsOnFlush {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("final write failed"))
+            }
+        }
+        let surface = FlattenedRgba8 {
+            origin_x: 0,
+            origin_y: 0,
+            width: 1,
+            height: 1,
+            pixels: vec![32, 16, 8, 255],
+        };
+        assert!(
+            encode_png_writer(FailsOnFlush, &surface).is_err(),
+            "a truncated PNG must not replace the last complete artwork"
+        );
+    }
 
     #[test]
     fn png_round_trip_preserves_valid_premultiplied_artwork() {

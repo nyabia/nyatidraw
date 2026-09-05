@@ -14,7 +14,7 @@ use std::{
 };
 
 use dioxus::prelude::*;
-use live_ink::{ExportStatus, LiveInkBridge};
+use live_ink::{CloseStatus, ExportStatus, LiveInkBridge};
 use nyatidraw_api::{
     CommandRejectReason, DockAxis, DockCommand, DockNode, DockPosition, DrawingTool, EditorCommand,
     EditorEvent, EventEnvelope, GroupId, HistoryCommand, HistoryOperationLabel, LayerCommand,
@@ -103,6 +103,7 @@ fn app() -> Element {
     let dirty = ui_projection.read().dirty;
     let document_title = ui_projection.read().document_title.clone();
     let export_status = live_ink.export_status_snapshot();
+    let close_status = live_ink.close_status();
     let activation_notice = live_ink.activation_notice_snapshot();
     let dock_drop_ink = live_ink.clone();
     let shortcut_ink = live_ink.clone();
@@ -190,6 +191,49 @@ fn app() -> Element {
             }
             if let Some(notice) = activation_notice {
                 span { class: "status-toast error activation-notice", role: "alert", "파일 열기 실패: {notice}" }
+            }
+            CloseProgress { status: close_status }
+        }
+    }
+}
+
+#[component]
+fn CloseProgress(status: CloseStatus) -> Element {
+    #[cfg(windows)]
+    let host = try_use_context::<desktop_canvas::DesktopCanvasHandle>();
+    #[cfg(windows)]
+    let reopen_host = host.clone();
+    if matches!(status, CloseStatus::Open | CloseStatus::Ready) {
+        return rsx! {};
+    }
+    let title = match &status {
+        CloseStatus::Exporting => "PNG 저장을 마친 뒤 종료합니다",
+        CloseStatus::Failed { .. } => "저장을 확인해주세요",
+        _ => "작품을 저장하고 있습니다",
+    };
+    rsx! {
+        div { class: "close-backdrop",
+            section { class: "close-dialog", role: "dialog", aria_modal: "true", aria_label: "{title}",
+                onmounted: move |_| println!("native-shell event=close-dialog-mounted"),
+                h2 { "{title}" }
+                if let CloseStatus::Failed { project_saved, project_path } = status {
+                    p { role: "alert",
+                        if project_saved { "프로젝트는 저장됐지만 PNG 저장에 실패했습니다. 프로젝트를 다시 열고 저장을 재시도할 수 있습니다." }
+                        else { "일부 변경이 저장되지 않았을 수 있습니다. 다시 열면 마지막으로 저장된 작품을 확인할 수 있습니다." }
+                    }
+                    p { class: "recovery-path", "{project_path}" }
+                    button { autofocus: true, onclick: move |_| {
+                        #[cfg(windows)]
+                        if let Some(host) = &reopen_host { host.reopen_after_close_failure(); }
+                    }, "프로젝트 다시 열기" }
+                    button { onclick: move |_| {
+                        #[cfg(windows)]
+                        if let Some(host) = &host { host.confirm_failed_close(); }
+                    }, "오류를 확인하고 종료" }
+                } else {
+                    p { role: "status", aria_live: "polite", "저장이 끝나면 자동으로 종료됩니다." }
+                    progress { aria_label: "저장 중" }
+                }
             }
         }
     }
@@ -1152,7 +1196,7 @@ fn SharedCanvas() -> Element {
 
     #[cfg(windows)]
     use_effect(move || {
-        let canvas_host = canvas_host;
+        let canvas_host = canvas_host.clone();
         spawn(async move {
             let mut observer = document::eval(
                 r"
@@ -1320,6 +1364,7 @@ fn protocol_status(event: Option<&EventEnvelope>) -> String {
 fn export_status_label(status: ExportStatus) -> String {
     match status {
         ExportStatus::Idle => String::new(),
+        ExportStatus::Waiting { .. } => "저장 요청 대기".to_owned(),
         ExportStatus::Queued { .. } => "PNG 대기".to_owned(),
         ExportStatus::Running { .. } => "PNG 저장 중".to_owned(),
         ExportStatus::Current { .. } => "PNG ✓".to_owned(),
