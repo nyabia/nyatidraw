@@ -731,3 +731,17 @@ PNG 검증을 통과했다. 전체 Clippy와 pinned-DX release 설치가 통과�
 입증하지 못했다. 성능 gate는 계속 열려 있다. 테스트/의존성 추가 없이
 [ADR-0028](decisions/ADR-0028-windows-paint-wakeup.md)과 [측정 결과](performance.md)에
 구조적 변경, 전후 분포, 실제 입력과 합성 driver의 범위 차이를 기록했다.
+
+### 색상 경계의 실제 PNG 불일치 확인
+
+기존 linear-light RGBA8 계약과 달리 UI 색·PNG 입출력은 transfer 변환 없이
+premultiply/unpremultiply만 수행하고 있었다. 설치판 4K PNG를 독립 parser로
+읽어 선형 배경 byte 32가 올바른 sRGB8 99 대신 그대로 32로 저장되고 color tag도
+없는 것을 확인했다. 이전 순색/동일 encoder fixture의 통과를 색상 정확성 gate
+통과로 해석하지 않는다. 프로젝트 타일/히스토리 변경은 하지 않았다.
+
+[색상 경계 감사와 수정 계획](color-boundary-audit-2026-09-05.md)에 실제 파일 근거,
+전 유효 channel/alpha 32,896쌍의 8/16-bit transport 정밀도 실험과 다음 acceptance를
+기록했다. 다음 구현은 UI와 CPU/GPU의 canonical 색 일치, PNG metadata/변환과
+재가져오기 정밀도이며, 기존 파일 보존·실제 재시작·독립 PNG pixel 검증을 요구한다.
+이 소프트웨어 gap은 미완료다. 물리 펜이나 다운로드 상태와 무관하게 진행 가능하다.

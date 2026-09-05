@@ -1,0 +1,33 @@
+{
+  "path": "target\\paint-redraw\\export-3\\performance-scratch.png",
+  "dimensions": [
+    3840,
+    2160
+  ],
+  "bit_depth": 8,
+  "color_type": 6,
+  "chunks": [
+    "IHDR",
+    "IDAT",
+    "IEND"
+  ],
+  "raw_first_pixel": [
+    32,
+    32,
+    32,
+    255
+  ],
+  "independent_fixture_linear_first_pixel": [
+    32,
+    32,
+    32,
+    255
+  ],
+  "expected_srgb8_first_pixel": [
+    99,
+    99,
+    99,
+    255
+  ],
+  "result": "Current installed exporter emits linear RGB bytes without an sRGB/gAMA tag; this is a reproduced boundary mismatch, not a screenshot color measurement."
+}

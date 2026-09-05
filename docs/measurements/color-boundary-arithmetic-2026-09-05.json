@@ -1,0 +1,29 @@
+{
+  "scope": "Independent Python scalar arithmetic experiment; not production PNG, GPU, color-profile or Godot acceptance. Round-half-up; sRGB piecewise transfer; alpha is linear. All valid premultiplied RGBA8 channel/alpha pairs enumerated.",
+  "source": "https://www.w3.org/Graphics/Color/srgb",
+  "source_commit": "ed6e2ca",
+  "linear_128_encoded_srgb8": 188,
+  "srgb_128_decoded_linear8": 55,
+  "roundtrip": [
+    {
+      "png_bits": 8,
+      "valid_channel_alpha_pairs": 32896,
+      "changed_pairs": 4122,
+      "maximum_linear_byte_error": 1,
+      "first_mismatch": {
+        "channel": 111,
+        "alpha": 121,
+        "encoded": 246,
+        "restored": 112
+      }
+    },
+    {
+      "png_bits": 16,
+      "valid_channel_alpha_pairs": 32896,
+      "changed_pairs": 0,
+      "maximum_linear_byte_error": 0,
+      "first_mismatch": null
+    }
+  ],
+  "limits": "16-bit result assumes precision retained until inverse transfer and premultiplication; current STRIP_16 decoder does not do that. This does not restore precision already lost when importing arbitrary sRGB8 into linear8 tiles."
+}
