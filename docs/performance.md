@@ -194,3 +194,44 @@ OS/backend/profile/설치 EXE hash/소스 commit/표본 수와 모든 단계의 
 입력 전에 전면 상태를 맞추지 못했던 `target/performance-paced/`의 두 탐색 실행은
 이 비교에서 제외했다. 다음 조사 대상은 surface 대기와 stroke 종료 시 일시적
 hitch, 반복 reopen/undo 및 장시간 UI/입력이다.
+
+## 2026-09-05 WM_PAINT redraw comparison
+
+[ADR-0028](decisions/ADR-0028-windows-paint-wakeup.md)의 입력 메시지 내 직접
+렌더링 제거 및 WM_PAINT 합성을 설치 release에서 같은 전면 시작 절차로 비교했다.
+하드웨어, 4K 장면, 32×121 direct-admission 입력, 모드별 3회 조건은 위와 같다.
+아래 admission→present API 반환 percentile은 실행별 histogram 상한(ms)이다.
+
+| 실행 | export 구간 | 입력 묶음 수 | p50 상한 | p95 상한 | p99 상한 | 관측 max |
+|---|---|---:|---:|---:|---:|---:|
+| baseline 1 | inactive | 1537 | 18.431 | 32.767 | 34.815 | 46.275 |
+| baseline 2 | inactive | 1440 | 21.503 | 31.743 | 34.815 | 50.119 |
+| baseline 3 | inactive | 1313 | 23.551 | 32.767 | 36.863 | 46.872 |
+| export 1 | inactive | 736 | 23.551 | 32.767 | 34.815 | 40.918 |
+| export 1 | active | 526 | 29.695 | 34.815 | 38.911 | 50.105 |
+| export 2 | inactive | 788 | 22.527 | 32.767 | 34.815 | 41.131 |
+| export 2 | active | 532 | 23.551 | 34.815 | 40.959 | 51.965 |
+| export 3 | inactive | 783 | 22.527 | 32.767 | 34.815 | 41.121 |
+| export 3 | active | 525 | 23.551 | 34.815 | 38.911 | 50.957 |
+
+변경 전 기준 p95 31.743~34.815ms와 변경 후 31.743~32.767ms는 겹친다.
+Export active p95는 전후 모두 34.815ms다. 실행 간 percentile을 평균하거나
+차이를 개선율로 해석하지 않는다. 변경 후 기준 surface acquire p95는
+15.359~15.871ms, export active는 15.359ms이며 여전히 큰 대기다.
+이 6회에는 앞서 관측한 약 100ms hitch가 없었지만 해결을 입증하지 않는다.
+UI thread와 렌더링을 분리한 것은 아니며, 합성 driver는 Win32 입력 dispatch를
+우회하므로 제거한 per-input 직접 렌더링의 효과를 직접 측정하지도 않는다.
+**지연 및 export 악화 ≤2ms gate는 계속 미통과다.**
+
+6회 모두 입력 sequence/phase 종료, snapshot 33/history 33, 전체 tile/PNG의
+별도 process replay 일치와 정상 writer join을 통과했다. 마지막 파일을 계측과
+입력 driver 없이 재시작해 복원 화면을 확인하고 다시 닫아 동일 검증을 통과했다.
+Driver 최대 schedule lateness는 실행별 0.903~4.704ms였다. 사용자 다운로드를
+그대로 유지한 통제되지 않은 desktop 부하, warmup 미제외, 실제 pen/가시 픽셀/
+120Hz cadence 미측정이라는 한계도 동일하다. 새 테스트나 의존성은 없다.
+
+[전체 JSON 결과](measurements/desktop-4k-paint-redraw-2026-09-05.json)에 설치
+hash와 소스 commit, 모든 단계 분포를 보존했다. 원본은
+`target/paint-redraw/{baseline,export}-{1,2,3}/{out,err,verify}.log`, 최종 정상
+재시작은 `export-3/reopen-*.log`다. 실제 UI 입력·Undo·pan·Fit 검증은 ADR-0028을
+참조한다. 구조적 중복 렌더링 제거는 유지하되 성능 gate 해결과 구분한다.

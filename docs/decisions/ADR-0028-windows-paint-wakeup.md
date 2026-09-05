@@ -49,4 +49,4 @@ dimensions/PPI, snapshot 1/history 2 and independent PNG exactly. Logs are in
 Paced 4K before/after measurements use fresh folders under `target/paint-redraw/`
 via `start-desktop-performance.ps1 -Campaign paint-redraw`, preserving the
 foreground-before-start protocol and the user-owned background download.
-Results and remaining risks are recorded in `docs/performance.md` when complete.
+All six runs passed exact tile/PNG replay verification and normal writer join; the final ordinary restart also passed. Results in `docs/performance.md` overlap the earlier latency distribution, so latency and export-interference gates remain open.

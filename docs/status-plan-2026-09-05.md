@@ -715,3 +715,19 @@ activation 뒤 최근 120px 재선택, Color 위로 패널 재도킹 뒤 최근 
 `one-final-verify.log`, `two-final-verify.log`다. 전체 Clippy와 release 설치가
 통과했다(`target/recent-sizes-clippy.log`, `recent-sizes-install-final.log`).
 새 단위 테스트나 의존성은 추가하지 않았다. 성능 개선과 나머지 gate 감사는 계속한다.
+
+### Windows paint 합성과 같은 4K 장면 재측정
+
+입력·viewport 메시지 안의 직접 렌더링을 idempotent redraw 요청으로 바꾸고,
+사용자 redraw 메시지는 WM_PAINT를 예약하도록 변경했다. 입력 transition을
+합치는 것이 아니며 기존 bounded queue와 discontinuity 처리는 그대로다.
+실제 설치판 mouse stroke·Undo·pan·Fit·Save·정상 Close와 별도 process 원본 tile/
+PNG 검증을 통과했다. 전체 Clippy와 pinned-DX release 설치가 통과했다.
+
+같은 4K 전면 장면을 baseline/export 각 3회 다시 실행해 전 입력과 33개 history,
+전체 tile/PNG 및 정상 writer join을 검증했다. 마지막 일반 앱 재시작도 통과했다.
+기준 p95 상한 31.743~32.767ms는 변경 전 범위와 겹치며 export active는 이전과
+같은 34.815ms다. UI thread의 surface 대기가 남아 있고 약 100ms hitch 해결도
+입증하지 못했다. 성능 gate는 계속 열려 있다. 테스트/의존성 추가 없이
+[ADR-0028](decisions/ADR-0028-windows-paint-wakeup.md)과 [측정 결과](performance.md)에
+구조적 변경, 전후 분포, 실제 입력과 합성 driver의 범위 차이를 기록했다.
