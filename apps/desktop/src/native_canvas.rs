@@ -951,6 +951,10 @@ impl ActiveCanvas {
         let Some(step) = self.edit_probe_step else {
             return;
         };
+        if std::env::var("NAYATI_EDIT_PROBE").ok().as_deref() == Some("close-native-fill") {
+            self.advance_close_edit_probe(step);
+            return;
+        }
         if std::env::var("NAYATI_EDIT_PROBE").ok().as_deref() == Some("lasso-guide") {
             self.advance_lasso_guide_probe(step);
             return;
@@ -1018,6 +1022,35 @@ impl ActiveCanvas {
             .is_ok()
         {
             self.edit_probe_step = Some(step + 1);
+        }
+    }
+
+    fn advance_close_edit_probe(&mut self, step: u8) {
+        if step == 0 {
+            if self
+                .stroke
+                .live_ink
+                .push_editor_command(
+                    self.projection.current().revision,
+                    EditorCommand::Tool(ToolCommand::Select(DrawingTool::Fill)),
+                )
+                .is_ok()
+            {
+                self.edit_probe_step = Some(1);
+            }
+        } else if step == 1 && self.drawing.tool == DrawingTool::Fill {
+            for (sequence, phase) in [(20_000, PointerPhase::Begin), (20_001, PointerPhase::End)] {
+                let mut sample = input_probe_sample(sequence, phase);
+                sample.position_document = Point { x: 20.0, y: 20.0 };
+                sample.viewport_revision = self.stroke.live_ink.canvas_viewport_snapshot().revision;
+                if self.stroke.live_ink.push(sample).is_err() {
+                    return;
+                }
+            }
+            self.edit_probe_step = Some(2);
+            println!(
+                "native-canvas event=close-edit-probe-staged input=synthetic raw_samples=2 tool=fill before-next-drain=true"
+            );
         }
     }
 
@@ -1195,6 +1228,15 @@ impl ActiveCanvas {
             [self.canvas_spec.width_px, self.canvas_spec.height_px],
         );
         self.apply_materialized_tiles();
+
+        if self.edit_probe_step == Some(2)
+            && std::env::var("NAYATI_EDIT_PROBE").ok().as_deref() == Some("close-native-fill")
+        {
+            // Scratch-only boundary: keep admitted raw End for the close drain,
+            // while allowing the real UI Save request to enter semantic state.
+            self.apply_commands(width, height, scale);
+            return self.scene.display_texture();
+        }
 
         if std::env::var_os(CLOSE_RAW_QUEUE_PROBE_ENV).is_some() {
             if !self.close_raw_probe_staged {
@@ -3301,6 +3343,11 @@ impl Drop for StrokePipeline {
 
 impl Drop for ActiveCanvas {
     fn drop(&mut self) {
+        // Semantic controls can change after the last render drain. Pending
+        // Begin samples must use those accepted controls even if Close wins
+        // the race with the next frame (for example Fill selected after Brush).
+        self.stroke.selected_layer = self.active_layer;
+        self.stroke.drawing = self.drawing;
         self.stroke.prepare_shutdown();
         // A native End received before Close must reach the writer FIFO before
         // export. Blocking here is confined to the dedicated close worker.

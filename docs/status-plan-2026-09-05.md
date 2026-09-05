@@ -432,3 +432,19 @@ Esc 취소 뒤 늦은 End도 작품·history·PNG를 바꾸지 않았다. 이는
 
 추가 단위 테스트 없이 기존 69개 검사와 Clippy를 통과했다. 다음은 참조/오차 UI,
 완료된 편집 입력의 종료 경계와 metadata/history renderer 격리다.
+
+### 종료 직전 도구 변경의 입력 오해석 수정
+
+채우기를 선택한 직후 Begin/End를 넣고 다음 renderer drain 전에 Save/Close하는
+scratch 재현에서, 종료 경로가 이전 Brush 설정을 재사용해 채우기 대신 점을 저장했다.
+종료 drain에 최신 승인된 도구·레이어 설정을 전달하도록 수정했다.
+
+같은 설치판 재현을 수정 전후 비교했다. 수정 전 독립 픽셀 검사는 실패했고, 수정 후
+snapshot 2 / history 2와 전체 8385개 페이지 픽셀, 페이지 밖 데이터, PNG가 정확히
+일치했다. Edit commit → PNG export → writer join 순서도 확인했다. 입력은 종료 경계를
+고정하는 합성 입력이며 Save/Close는 컴퓨터 사용 UI로 실행했다. 근거는
+`target/close-native-edit-before/`, `target/close-native-edit-after/`에 있다.
+
+새 단위 테스트 없이 기존 종료 시 작품 보존 검사와 전체 Clippy를 통과했다.
+`close-native-fill` probe는 표시된 scratch project에서만 작동한다. 참조/오차 UI와
+metadata/history renderer 격리는 계속 진행한다.
