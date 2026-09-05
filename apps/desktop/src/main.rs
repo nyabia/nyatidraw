@@ -11,6 +11,8 @@ mod live_ink;
 mod native_canvas;
 mod page_panel;
 mod performance;
+mod performance_probe;
+mod performance_workload;
 mod preview;
 #[cfg(windows)]
 mod single_instance;

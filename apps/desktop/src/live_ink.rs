@@ -193,7 +193,7 @@ pub(crate) enum ExportStatus {
 }
 
 impl ExportStatus {
-    fn generation(self) -> Option<u64> {
+    pub(crate) fn generation(self) -> Option<u64> {
         match self {
             Self::Idle => None,
             Self::Waiting { generation }

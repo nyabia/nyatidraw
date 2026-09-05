@@ -360,6 +360,7 @@ pub(crate) struct SharedGpuCanvas {
     state: CanvasState,
     rendered_frames: u64,
     close_worker: Option<JoinHandle<()>>,
+    performance_probe: Option<crate::performance_probe::PerformanceProbe>,
 }
 
 impl SharedGpuCanvas {
@@ -370,6 +371,7 @@ impl SharedGpuCanvas {
             state: CanvasState::Suspended,
             rendered_frames: 0,
             close_worker: None,
+            performance_probe: None,
         }
     }
 
@@ -419,6 +421,7 @@ impl SharedGpuCanvas {
     }
 
     pub(crate) fn begin_close(&mut self, width: u32, height: u32, scale: f64) {
+        self.performance_probe.take();
         if self.close_worker.is_some() {
             return;
         }
@@ -527,6 +530,7 @@ impl SharedGpuCanvas {
             return Ok(());
         }
         preflight_project_activation(&target)?;
+        self.performance_probe.take();
         let previous = self.project_location.clone();
         println!(
             "native-canvas event=activation-quiescing current={} target={}",
@@ -601,6 +605,10 @@ impl SharedGpuCanvas {
         self.rendered_frames = self.rendered_frames.saturating_add(1);
 
         if self.rendered_frames == 1 {
+            if let ProjectLocation::Explicit { path, .. } = &self.project_location {
+                self.performance_probe =
+                    crate::performance_probe::PerformanceProbe::start(&self.live_ink, path);
+            }
             println!(
                 "native-shell event=first-gpu-canvas-submit elapsed_ms={} width={} height={} scale={scale}",
                 elapsed_since_launch(),
