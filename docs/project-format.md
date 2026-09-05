@@ -16,8 +16,8 @@ portrait.png       colocated game-ready export target
   `Current`/`Failed` 상태를 UI에 별도 mailbox로 보인다. PNG 실패는 이미 durable인
   project 상태를 되돌리지 않는다.
 
-현재 구현된 CLI 산출물은 explicit PPM이며, 위의 colocated alpha PNG 계약은 Sprint
-1의 완료 조건이다.
+CLI 산출물은 explicit PPM이며, desktop은 colocated alpha PNG를 별도 worker로 저장한다.
+PNG activation/Save/restart와 export 실패 복구의 실행 근거는 구현 현황 문서에 기록한다.
 
 현재 native backend는 `redb 2.6.3`을 사용한다. 이 선택은 headless recovery
 slice에는 유효하지만 production format 안정화 선언은 아니다.
@@ -36,7 +36,16 @@ strokes/<hash>       sealed semantic stroke records
 snapshots/<id>       before/after roots, history, optional stroke reference
 history/<id>         operation nodes
 layer-tree           versioned raster/group hierarchy record
+snapshot_layers/<id> immutable hierarchy at a history cursor (project marker 2)
 ```
+
+2026-09-05 저장 경계에 `commit_structural_with_layer_tree`를 추가했다. 첫 명시적
+metadata-history commit이 project marker를 1에서 2로 바꾸며, pixel/history/cursor와
+레이어 트리를 같은 transaction에 기록한다. 이후 stroke도 현재 트리를 snapshot에
+보존하고 Undo/Redo는 cursor와 current tree를 함께 복원한다. 기존 snapshot들은
+한 번 고정한 legacy tree를 참조한다. 과거에 저장하지 않은 레이어 상태를 복원한
+것은 아니다. 단순 open은 전환하지 않는다. 구 marker-1 writer는 marker 2를 거부한다.
+자세한 형식·검증·미연결 desktop 범위는 [ADR-0010](decisions/ADR-0010-snapshot-layer-history.md)을 따른다.
 
 ### 유한 page와 signed sparse layer plane
 

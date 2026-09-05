@@ -271,3 +271,18 @@ all-target Clippy가 통과했다. 설치 release에서 66개 분기·페이지 
 명령과 한계를 기록했다. 작업 트리의 layer metadata는 아직 current 값으로 저장되므로,
 다음 단계는 삭제 및 metadata 변경을 history snapshot과 함께 복원하는 저장 구조다.
 UI 직접 선택/시각 검증과 synchronous history 요청의 hot-path 분리는 남아 있다.
+
+### 레이어 history 저장 경계 확보
+
+현재 tree 하나만 저장하던 경로에 immutable snapshot layer metadata를 추가했다.
+명시적 structural+tree commit, 이후 stroke의 tree 상속, cursor 이동과 current tree의
+원자적 복원이 가능하다. 최초 metadata commit에서만 marker 2로 전환하며 기존
+snapshot의 호환 tree를 한 번 고정한다. 과거에 저장되지 않은 metadata는 복원하지
+않는다. 누락/손상된 과거 레코드와 current tree/cursor 불일치는 원본을 보존하고 거부한다.
+
+필요한 core 테스트 두 개를 추가해 전체 60개 및 all-feature/all-target Clippy가
+통과했다. Release scratch child를 commit 전/후에 종료한 뒤 pixel root와 tree가
+함께 prior/new 상태로 복원되는 것을 확인했다. [ADR-0010](decisions/ADR-0010-snapshot-layer-history.md)에
+근거를 기록했다. 이 체크포인트는 저장 경계이며 desktop 삭제 버튼이나 GPU tree
+Undo 연결까지 완료한 것은 아니다. 다음 작업은 이 transaction을 layer command에
+연결하고 삭제·active fallback·GPU/thumbnail/export 복원을 검증하는 것이다.

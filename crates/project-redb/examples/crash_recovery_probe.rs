@@ -13,11 +13,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use nyatidraw_api::{HistoryNodeId, LayerId, SnapshotId};
+use nyatidraw_api::{ContentRootId, GroupId, HistoryNodeId, LayerId, SnapshotId};
 use nyatidraw_brush::{
     BrushEvaluator, BrushPreset, BrushPresetId, BrushSnapshot, ROUND_BRUSH_ENGINE_VERSION,
     RoundBrushEvaluator, begin_round_stroke,
 };
+use nyatidraw_document::{GroupNode, LayerNode, LayerTree, LayerTreeNode};
 use nyatidraw_editor::HeadlessStrokeSession;
 use nyatidraw_history::HistoryNode;
 use nyatidraw_input::{PenButtons, Point, PointerPhase, StylusSample};
@@ -70,12 +71,38 @@ fn run() -> Result<(), String> {
             &scratch.join("before-commit.stage"),
             DiagnosticCommitBoundary::BeforeCommit,
             &first,
+            false,
         )?;
         run_kill_case(
             &project,
             &scratch.join("after-durable-commit.stage"),
             DiagnosticCommitBoundary::AfterDurableCommit,
             &second,
+            false,
+        )?;
+        let layer_project = scratch.join("layer-recovery.redb");
+        let database =
+            ProjectDb::open(&layer_project).map_err(debug_error("initialize layer scratch"))?;
+        database
+            .persist_layer_tree(&layer_fixture(false)?)
+            .map_err(debug_error("baseline layer tree"))?;
+        database
+            .commit(&first)
+            .map_err(debug_error("baseline layer pixels"))?;
+        drop(database);
+        run_kill_case(
+            &layer_project,
+            &scratch.join("layers-before.stage"),
+            DiagnosticCommitBoundary::BeforeCommit,
+            &first,
+            true,
+        )?;
+        run_kill_case(
+            &layer_project,
+            &scratch.join("layers-after.stage"),
+            DiagnosticCommitBoundary::AfterDurableCommit,
+            &second,
+            true,
         )?;
         println!(
             concat!(
@@ -107,6 +134,7 @@ fn run_child(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<(), S
         "after-durable-commit" => DiagnosticCommitBoundary::AfterDurableCommit,
         value => return Err(format!("unknown diagnostic boundary {value:?}")),
     };
+    let layer_mode = args.next().as_deref() == Some(std::ffi::OsStr::new("layers"));
     if args.next().is_some() {
         return Err("unexpected child arguments".to_owned());
     }
@@ -120,6 +148,32 @@ fn run_child(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<(), S
     )?;
     let second = prepared_child_batch(&first, SnapshotId(3), HistoryNodeId(4), 84, 20)?;
     let database = ProjectDb::open(&project).map_err(debug_error("child open"))?;
+    if layer_mode {
+        let session = HeadlessStrokeSession::from_reopened(
+            database
+                .load_reopened()
+                .map_err(debug_error("load layer baseline"))?
+                .ok_or("missing layer baseline")?,
+        );
+        let batch = session
+            .prepare_structural_change(
+                second.snapshot_id,
+                second.history_node.id,
+                15_000,
+                second.materialized.after.clone(),
+            )
+            .map_err(|error| format!("prepare combined metadata/pixels: {error:?}"))?;
+        return database
+            .commit_layers_pausing_for_diagnostics(
+                &batch,
+                &layer_fixture(true)?,
+                DiagnosticCommitPause {
+                    boundary,
+                    stage_path: stage,
+                },
+            )
+            .map_err(debug_error("atomic layer diagnostic commit"));
+    }
     database
         .commit_pausing_for_diagnostics(
             &second,
@@ -136,6 +190,7 @@ fn run_kill_case(
     stage: &Path,
     boundary: DiagnosticCommitBoundary,
     expected: &ProjectCommitBatch,
+    layer_mode: bool,
 ) -> Result<(), String> {
     let mut child = Command::new(
         env::current_exe().map_err(|error| format!("current probe executable: {error}"))?,
@@ -144,6 +199,7 @@ fn run_kill_case(
     .arg(project)
     .arg(stage)
     .arg(boundary_name(boundary))
+    .args(layer_mode.then_some("layers"))
     .spawn()
     .map_err(|error| format!("spawn {boundary:?} child: {error}"))?;
     let pid = child.id();
@@ -161,20 +217,20 @@ fn run_kill_case(
     }
     let reopened = ProjectDb::open(project).map_err(debug_error("reopen after child kill"))?;
     let current = reopened
-        .load_current()
+        .load_reopened()
         .map_err(debug_error("load after child kill"))?
         .ok_or_else(|| "reopen lost every durable snapshot".to_owned())?;
-    if current.snapshot_id != expected.snapshot_id
-        || current.materialized.after.root() != expected.materialized.after.root()
+    if current.current_snapshot() != expected.snapshot_id
+        || current.current_tiles().root() != expected.materialized.after.root()
     {
         return Err(format!(
             "{boundary:?} kill reopened snapshot {} instead of durable snapshot {}",
-            current.snapshot_id.0, expected.snapshot_id.0
+            current.current_snapshot().0,
+            expected.snapshot_id.0
         ));
     }
     let flattened = current
-        .materialized
-        .after
+        .current_tiles()
         .flatten_base_layer_rgba8(LayerId(4))
         .map_err(|error| format!("flatten reopened snapshot: {error:?}"))?;
     let expected_flattened = expected
@@ -187,7 +243,44 @@ fn run_kill_case(
             "{boundary:?} kill changed flattened pixel semantics"
         ));
     }
+    if layer_mode {
+        let committed = boundary == DiagnosticCommitBoundary::AfterDurableCommit;
+        if reopened
+            .load_layer_tree()
+            .map_err(debug_error("reopen layer state"))?
+            != Some(layer_fixture(committed)?)
+        {
+            return Err("crash split layer tree from the durable pixels/history".into());
+        }
+        println!(
+            "layer-history-crash status=passed boundary={} pixels=exact metadata=exact migration=atomic",
+            boundary_name(boundary)
+        );
+    }
     Ok(())
+}
+
+fn layer_fixture(changed: bool) -> Result<LayerTree, String> {
+    LayerTree::new(GroupNode {
+        id: GroupId(1),
+        name: "Root".into(),
+        visible: true,
+        opacity_u16: u16::MAX,
+        children: vec![LayerTreeNode::Raster(LayerNode {
+            id: LayerId(4),
+            name: if changed {
+                "Renamed after edit"
+            } else {
+                "Legacy layer"
+            }
+            .into(),
+            visible: true,
+            locked: false,
+            opacity_u16: if changed { 20_000 } else { u16::MAX },
+            content_root: ContentRootId(0),
+        })],
+    })
+    .map_err(|error| format!("layer fixture: {error:?}"))
 }
 
 fn wait_for_stage(

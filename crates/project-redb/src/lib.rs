@@ -4,6 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod layer_history;
+
 #[cfg(feature = "diagnostic")]
 use std::{
     fs::{self, OpenOptions},
@@ -16,13 +18,13 @@ use nyatidraw_api::{CanvasSpec, ContentRootId, HistoryNodeId, SnapshotId};
 use nyatidraw_document::LayerTree;
 use nyatidraw_history::{History, HistoryNode};
 use nyatidraw_project::{
-    Envelope, MAX_LAYER_TREE_RECORD_BYTES, OpenMode, ProjectCommitBatch, ProjectHistoryCursor,
-    ProjectOpenError, ProjectRepository, ProjectStructuralBatch, RecordKind, ReopenedProject,
-    RootManifest, SCHEMA_VERSION, decode_history_cursor, decode_history_node,
-    decode_initial_history_cursor, decode_layer_tree, decode_project_head, decode_root_manifest,
-    decode_stroke_commit, encode_history_cursor, encode_history_node,
-    encode_initial_history_cursor, encode_layer_tree, encode_project_head, encode_root_manifest,
-    encode_stroke_commit, open_mode,
+    Envelope, LAYER_HISTORY_SCHEMA_VERSION, MAX_LAYER_TREE_RECORD_BYTES, OpenMode,
+    ProjectCommitBatch, ProjectHistoryCursor, ProjectOpenError, ProjectRepository,
+    ProjectStructuralBatch, RecordKind, ReopenedProject, RootManifest, SCHEMA_VERSION,
+    decode_history_cursor, decode_history_node, decode_initial_history_cursor, decode_layer_tree,
+    decode_project_head, decode_root_manifest, decode_stroke_commit, encode_history_cursor,
+    encode_history_node, encode_initial_history_cursor, encode_layer_tree, encode_project_head,
+    encode_root_manifest, encode_stroke_commit, open_mode,
 };
 use nyatidraw_stroke::{MaterializationStrategy, materialize_with_strategy};
 use nyatidraw_tiles::{ContentRoot, ObjectHash, TileSnapshot};
@@ -145,6 +147,7 @@ impl ProjectDb {
             this.load_canvas_spec()?;
             this.load_layer_tree()?;
             this.load_reopened()?;
+            this.validate_layer_history()?;
         }
         Ok(this)
     }
@@ -169,9 +172,34 @@ impl ProjectDb {
         &self,
         batch: &ProjectStructuralBatch,
     ) -> Result<(), ProjectOpenError> {
+        self.commit_structural_inner(batch, None, &CommitControl::Normal)
+    }
+
+    /// Commits artwork, layer hierarchy, history and current cursor atomically.
+    /// Legacy history inherits one frozen compatibility tree on first use.
+    ///
+    /// # Errors
+    /// Rejects invalid lineage/metadata or storage failure without publishing
+    /// a partial tree, pixel root or history cursor.
+    pub fn commit_structural_with_layer_tree(
+        &self,
+        batch: &ProjectStructuralBatch,
+        tree: &LayerTree,
+    ) -> Result<(), ProjectOpenError> {
+        self.commit_structural_inner(batch, Some(tree), &CommitControl::Normal)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn commit_structural_inner(
+        &self,
+        batch: &ProjectStructuralBatch,
+        tree: Option<&LayerTree>,
+        control: &CommitControl,
+    ) -> Result<(), ProjectOpenError> {
         self.validate_structural_lineage(batch)?;
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
         transaction.set_durability(Durability::Immediate);
+        self.capture_snapshot_layers(&transaction, batch.snapshot_id, SnapshotId(0), tree)?;
         {
             let mut objects = transaction
                 .open_table(OBJECTS)
@@ -257,7 +285,7 @@ impl ProjectDb {
                     .map_err(|error| self.io(error))?;
             }
         }
-        transaction.commit().map_err(|error| self.io(error))
+        self.finish_commit(transaction, control)
     }
 
     /// Commits a scratch fixture but pauses at one transaction boundary for an
@@ -281,6 +309,20 @@ impl ProjectDb {
         self.commit_inner(batch, &CommitControl::Pause(pause))
     }
 
+    /// Pauses a scratch-only atomic metadata/pixel transaction at a crash boundary.
+    ///
+    /// # Errors
+    /// Returns the same validation/storage errors as the normal structural commit.
+    #[cfg(feature = "diagnostic")]
+    pub fn commit_layers_pausing_for_diagnostics(
+        &self,
+        batch: &ProjectStructuralBatch,
+        tree: &LayerTree,
+        pause: DiagnosticCommitPause,
+    ) -> Result<(), ProjectOpenError> {
+        self.commit_structural_inner(batch, Some(tree), &CommitControl::Pause(pause))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn commit_inner(
         &self,
@@ -290,6 +332,12 @@ impl ProjectDb {
         self.validate_commit_lineage(batch)?;
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
         transaction.set_durability(Durability::Immediate);
+        self.capture_snapshot_layers(
+            &transaction,
+            batch.snapshot_id,
+            batch.stroke.parent_snapshot,
+            None,
+        )?;
 
         {
             let mut objects = transaction
@@ -391,6 +439,14 @@ impl ProjectDb {
             }
         }
 
+        self.finish_commit(transaction, control)
+    }
+
+    fn finish_commit(
+        &self,
+        transaction: redb::WriteTransaction,
+        control: &CommitControl,
+    ) -> Result<(), ProjectOpenError> {
         match control {
             #[cfg(test)]
             CommitControl::Failure(CommitFailurePoint::BeforeCommitAbort) => {
@@ -730,12 +786,24 @@ impl ProjectDb {
             Some(_) => self.validate_cursor_snapshot(cursor)?,
             None => self.validate_initial_cursor(cursor)?,
         }
+        let layers = self.cursor_layer_record(cursor)?;
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
         transaction.set_durability(Durability::Immediate);
         {
             let mut state = transaction
                 .open_table(STATE)
                 .map_err(|error| self.io(error))?;
+            if let Some(layers) = layers {
+                if layers.is_empty() {
+                    state
+                        .remove(CURRENT_LAYER_TREE)
+                        .map_err(|error| self.io(error))?;
+                } else {
+                    state
+                        .insert(CURRENT_LAYER_TREE, layers.as_slice())
+                        .map_err(|error| self.io(error))?;
+                }
+            }
             if let Some(history_head) = cursor.history_head {
                 state
                     .insert(
@@ -856,6 +924,9 @@ impl ProjectDb {
     ///
     /// Returns an encoding or storage error without changing the prior state.
     pub fn persist_layer_tree(&self, tree: &LayerTree) -> Result<(), ProjectOpenError> {
+        if self.layer_history_enabled()? {
+            return Err(self.io("layer history requires an atomic structural commit"));
+        }
         let payload = encode_layer_tree(tree)
             .map_err(|error| self.io(format!("layer tree cannot be encoded: {error}")))?;
         let bytes = Envelope::new(RecordKind::LayerTree, payload).encode();
@@ -1102,7 +1173,9 @@ impl ProjectDb {
         Ok(table
             .get("schema_version")
             .map_err(|error| self.io(error))?
-            .is_some_and(|value| value.value() == SCHEMA_VERSION))
+            .is_some_and(|value| {
+                matches!(value.value(), SCHEMA_VERSION | LAYER_HISTORY_SCHEMA_VERSION)
+            }))
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -1471,6 +1544,221 @@ mod tests {
             ],
         })
         .expect("fixture layer tree")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn immutable_layer_history_upgrades_atomically_and_restores_branch_metadata() {
+        // Product risk: Undo must restore metadata and pixels together, and a
+        // failed first metadata commit must not half-upgrade a legacy project.
+        let path = temp("layer-history-upgrade");
+        let database = ProjectDb::open(&path).expect("scratch project");
+        let baseline = layer_tree_fixture();
+        database
+            .persist_layer_tree(&baseline)
+            .expect("legacy hierarchy");
+        let first = prepared_batch();
+        database.commit(&first).expect("legacy stroke");
+        let reopened = database
+            .load_reopened()
+            .expect("load legacy")
+            .expect("legacy history");
+        let before = reopened.clone().into_parts().current_cursor;
+        let session = HeadlessStrokeSession::from_reopened(reopened);
+        let batch = session
+            .prepare_structural_change(SnapshotId(3), HistoryNodeId(4), 50, session.tiles().clone())
+            .expect("metadata-only history node");
+        let mut changed = baseline.clone();
+        changed
+            .rename(LayerTreeNodeId::Raster(LayerId(20)), "Renamed")
+            .expect("rename");
+        changed
+            .set_opacity(LayerTreeNodeId::Group(GroupId(2)), 20_000)
+            .expect("opacity");
+        assert!(
+            database
+                .commit_structural_inner(
+                    &batch,
+                    Some(&changed),
+                    &CommitControl::Failure(CommitFailurePoint::BeforeCommitAbort)
+                )
+                .is_err()
+        );
+        assert!(!database.layer_history_enabled().expect("version unchanged"));
+        assert_eq!(
+            database.load_layer_tree().expect("old tree"),
+            Some(baseline.clone())
+        );
+        assert_eq!(
+            database
+                .load_reopened()
+                .expect("old history")
+                .expect("old head")
+                .into_parts()
+                .current_cursor,
+            before
+        );
+        database
+            .commit_structural_with_layer_tree(&batch, &changed)
+            .expect("atomic upgrade");
+        assert!(database.layer_history_enabled().expect("v2 marker"));
+        assert!(
+            database.persist_layer_tree(&baseline).is_err(),
+            "out-of-band metadata must not bypass history"
+        );
+        let after = database
+            .load_reopened()
+            .expect("new history")
+            .expect("new head")
+            .into_parts()
+            .current_cursor;
+        // A normal stroke after the upgrade must inherit this snapshot tree.
+        let prepared = prepared_batch_from(
+            after.snapshot_id,
+            batch.after.clone(),
+            SnapshotId(4),
+            HistoryNodeId(5),
+            84,
+            20,
+        );
+        let stroke = ProjectCommitBatch::new(
+            prepared.snapshot_id,
+            prepared.before.clone(),
+            prepared.stroke.clone(),
+            prepared.materialized.clone(),
+            HistoryNode {
+                parent: after.history_head,
+                ..prepared.history_node.clone()
+            },
+        )
+        .expect("stroke after metadata");
+        database
+            .commit(&stroke)
+            .expect("inherit current metadata in stroke transaction");
+        let stroke_cursor = database
+            .load_reopened()
+            .expect("stroke reopen")
+            .expect("stroke head")
+            .into_parts()
+            .current_cursor;
+        drop(database);
+        for (cursor, tree) in [
+            (before, &baseline),
+            (after, &changed),
+            (stroke_cursor, &changed),
+            (before, &baseline),
+        ] {
+            let database = ProjectDb::open(&path).expect("validated reopen");
+            assert_eq!(
+                database
+                    .load_cursor_layer_tree(cursor)
+                    .expect("target tree")
+                    .as_ref(),
+                Some(tree)
+            );
+            database
+                .persist_history_cursor(cursor)
+                .expect("atomic cursor and tree move");
+            drop(database);
+            let reopened = ProjectDb::open(&path).expect("reopen selected branch");
+            assert_eq!(
+                reopened.load_layer_tree().expect("restored tree").as_ref(),
+                Some(tree)
+            );
+            assert_eq!(
+                reopened
+                    .load_reopened()
+                    .expect("restored history")
+                    .expect("head")
+                    .history()
+                    .node_count(),
+                3
+            );
+        }
+        std::fs::remove_file(path).expect("remove scratch project");
+    }
+
+    #[test]
+    fn broken_layer_history_records_reject_reopen_without_overwriting_artwork() {
+        // Product risk: missing/historically corrupt metadata or a split
+        // current-tree/cursor state must never reopen as apparently valid art.
+        for fault in ["missing", "historical-checksum", "current-mismatch"] {
+            let path = temp(fault);
+            let database = ProjectDb::open(&path).expect("scratch project");
+            let baseline = layer_tree_fixture();
+            database.persist_layer_tree(&baseline).expect("legacy tree");
+            let first = prepared_batch();
+            database.commit(&first).expect("legacy artwork");
+            let session = HeadlessStrokeSession::from_reopened(
+                database.load_reopened().expect("load").expect("head"),
+            );
+            let batch = session
+                .prepare_structural_change(
+                    SnapshotId(3),
+                    HistoryNodeId(4),
+                    50,
+                    session.tiles().clone(),
+                )
+                .expect("metadata history");
+            let mut changed = baseline.clone();
+            changed
+                .rename(LayerTreeNodeId::Raster(LayerId(20)), "Changed")
+                .expect("rename");
+            database
+                .commit_structural_with_layer_tree(&batch, &changed)
+                .expect("upgrade");
+            let transaction = database
+                .db
+                .begin_write()
+                .expect("inject scratch corruption");
+            if fault == "current-mismatch" {
+                let bytes = Envelope::new(
+                    RecordKind::LayerTree,
+                    encode_layer_tree(&baseline).expect("encode"),
+                )
+                .encode();
+                transaction
+                    .open_table(STATE)
+                    .expect("state")
+                    .insert(CURRENT_LAYER_TREE, bytes.as_slice())
+                    .expect("split metadata");
+            } else {
+                let mut table = transaction
+                    .open_table(super::layer_history::SNAPSHOT_LAYERS)
+                    .expect("layers");
+                if fault == "missing" {
+                    table
+                        .remove(3_u128.to_le_bytes().as_slice())
+                        .expect("missing snapshot metadata");
+                } else {
+                    let mut bytes = Envelope::new(
+                        RecordKind::LayerTree,
+                        encode_layer_tree(&baseline).expect("encode"),
+                    )
+                    .encode();
+                    *bytes.last_mut().expect("payload") ^= 1;
+                    table
+                        .insert(2_u128.to_le_bytes().as_slice(), bytes.as_slice())
+                        .expect("corrupt noncurrent branch");
+                }
+            }
+            transaction.commit().expect("publish corruption");
+            drop(database);
+            let bytes = std::fs::read(&path).expect("before open");
+            assert!(
+                matches!(
+                    ProjectDb::open(&path),
+                    Err(ProjectOpenError::Corrupt { .. })
+                ),
+                "{fault}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("after rejection"),
+                bytes,
+                "{fault}: preserve invalid original"
+            );
+            std::fs::remove_file(path).expect("remove scratch project");
+        }
     }
 
     #[test]
