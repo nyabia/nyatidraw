@@ -21,7 +21,9 @@
    command에 연결한다. tolerance와 Reference layer 참조 범위를 명시한다.
    CPU 선택/단색/gradient 결과 및 history/reopen/PNG는
    [ADR-0012](../decisions/ADR-0012-basic-selection-and-paint.md)에서 검증했다.
-   Desktop native gesture·비동기 실행·선택 표시·brush clipping은 연결 대기다.
+   Native gesture·비동기 실행·선택 표시·brush clipping을 연결했고 설치판 검증을 진행했다.
+   선택/레이어의 수치 이동·반전·90도 회전·최근접 크기 조절과 durable 왕복은
+   [ADR-0023](../decisions/ADR-0023-basic-raster-transforms.md)에 기록했다.
 4. 출력 page 크기 변경과 crop을 제공하되 page 밖 signed artwork를 자동 삭제하지
    않는다.
 5. 출력 페이지로 crop한 실제 layer thumbnail과 navigator composite/viewport box를

@@ -4,7 +4,7 @@ use nyatidraw_document::LayerTree;
 use nyatidraw_editor::HeadlessStrokeSession;
 use nyatidraw_paint_cpu::{
     EditLimits, PremultipliedRgba8, SelectionMask, SelectionPaint, SelectionSource, WandRequest,
-    lasso_selection, paint_selection, wand_selection,
+    lasso_selection, paint_selection, transform_raster, wand_selection,
 };
 use nyatidraw_project_redb::ProjectDb;
 use nyatidraw_tiles::TileSnapshot;
@@ -35,7 +35,23 @@ pub(crate) fn execute(
     let reject = |error| EditFailure::Rejected(format!("{error:?}"));
     let limits = EditLimits::default();
     let mut flood_mask = None;
+    let mut transformed = None;
+    let clear_after_transform = matches!(command, EditCommand::Transform(_));
     let paint = match command {
+        EditCommand::Transform(transform) => {
+            transformed = Some(
+                transform_raster(
+                    session.tiles(),
+                    tree,
+                    target,
+                    selection.as_deref(),
+                    transform,
+                    limits,
+                )
+                .map_err(reject)?,
+            );
+            None
+        }
         EditCommand::SelectWand {
             seed,
             tolerance,
@@ -126,28 +142,34 @@ pub(crate) fn execute(
             .as_ref()
             .or(selection.as_ref())
             .ok_or_else(|| EditFailure::Rejected("NoSelection".into()))?;
-        let painted =
-            paint_selection(session.tiles(), tree, target, mask, paint, limits).map_err(reject)?;
-        if !painted.changed_tiles.is_empty() {
-            let next = next_id
-                .checked_add(1)
-                .ok_or_else(|| EditFailure::Rejected("IdentifierExhausted".into()))?;
-            let batch = session
-                .prepare_structural_change(
-                    SnapshotId(*next_id),
-                    HistoryNodeId(*next_id),
-                    crate::native_canvas::system_timestamp_ns(),
-                    painted.after.clone(),
-                )
-                .map_err(|error| EditFailure::Fatal(format!("edit prepare: {error:?}")))?;
-            db.commit_structural(&batch)
-                .map_err(|error| EditFailure::Fatal(format!("edit commit: {error}")))?;
-            session
-                .accept_structural_change(&batch)
-                .map_err(|error| EditFailure::Fatal(format!("edit accept: {error:?}")))?;
-            *next_id = next;
-            tiles = Some(painted.after);
-        }
+        transformed = Some(
+            paint_selection(session.tiles(), tree, target, mask, paint, limits).map_err(reject)?,
+        );
+    }
+    if let Some(painted) = transformed
+        && !painted.changed_tiles.is_empty()
+    {
+        let next = next_id
+            .checked_add(1)
+            .ok_or_else(|| EditFailure::Rejected("IdentifierExhausted".into()))?;
+        let batch = session
+            .prepare_structural_change(
+                SnapshotId(*next_id),
+                HistoryNodeId(*next_id),
+                crate::native_canvas::system_timestamp_ns(),
+                painted.after.clone(),
+            )
+            .map_err(|error| EditFailure::Fatal(format!("edit prepare: {error:?}")))?;
+        db.commit_structural(&batch)
+            .map_err(|error| EditFailure::Fatal(format!("edit commit: {error}")))?;
+        session
+            .accept_structural_change(&batch)
+            .map_err(|error| EditFailure::Fatal(format!("edit accept: {error:?}")))?;
+        *next_id = next;
+        tiles = Some(painted.after);
+    }
+    if clear_after_transform {
+        *selection = None;
     }
     Ok(EditOutcome {
         tiles,

@@ -32,6 +32,9 @@ pub enum EditSource {
 /// Completed document-space gestures; raw pointer samples never enter this lane.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EditCommand {
+    /// Cut the selection (or whole active raster when absent), then transform
+    /// and composite it back. Successful completion clears the selection.
+    Transform(RasterTransform),
     SelectWand {
         seed: [i32; 2],
         tolerance: u8,
@@ -58,6 +61,19 @@ pub enum EditCommand {
         start_color: [u8; 4],
         end_color: [u8; 4],
     },
+}
+
+/// Integer pixel-art transform: source flips, clockwise quarter-turns, nearest
+/// pixel-center resize, then translation from the source bounds' top-left.
+/// No page clipping is applied to the resulting signed artwork.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RasterTransform {
+    pub offset: [i32; 2],
+    pub quarter_turns: u8,
+    pub flip_x: bool,
+    pub flip_y: bool,
+    /// Final dimensions after rotation. None preserves the rotated dimensions.
+    pub size: Option<[u32; 2]>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

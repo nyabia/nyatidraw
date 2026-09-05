@@ -589,3 +589,28 @@ Windows 설치판에서 실제 hue/SV/value 드래그와 키보드로 정확한 
 `reopen-verify.log`와 [ADR-0022](decisions/ADR-0022-direct-color-picker.md)에 있다.
 실제 held-drag 취소·장치 capture loss와 물리 펜/표시 지연을 검증한 것은 아니다.
 기본 변형·page 크기 변경과 projection/hot-path 계측 등 남은 gate를 계속 진행한다.
+
+
+### 선택 영역·레이어 기본 변형
+
+상단 변형 버튼에서 세부 도구 패널을 열어 정수 이동, 좌우/상하 반전, 90도 단위
+회전과 최근접 크기 조절을 적용할 수 있다. 선택이 있으면 해당 픽셀을 잘라 옮기고,
+없으면 활성 래스터의 페이지 밖 픽셀까지 포함한다. 원본 snapshot에서 읽어 겹치는
+이동의 번짐·중복 합성을 막는다. 적용이 성공하면 선택을 해제한다. 실패 시 작품과
+선택을 보존하며 기존 비동기 편집 worker와 durable structural history를 사용한다.
+
+CPU 핵심 불변식 테스트 3개를 추가했다. 9가지 회전/반전/크기 조합을 세 이동 위치에서
+검사하고 signed tile 경계·겹침·반투명 source-over·다른 레이어 보존 및 좌표/메모리
+한도 거부를 확인했다. 전체 72개 테스트와 all-target/all-feature Clippy가 통과했다.
+
+Windows 설치 release를 실제 조작하여 페이지 밖 픽셀이 포함된 2×3 그림의 회전+이동,
+재시작 후 Undo, 마법봉으로 고른 1픽셀 이동, 전체 레이어의 2배 확대를 각각 Save하고
+정상 종료했다. 각 단계마다 별도 fixture 프로세스가 명시적 좌표/색 기대값으로 전체
+타일·다른 레이어·signed 영역·history·page PNG를 정확히 비교했다. 변형 적용으로
+native canvas/GPU가 다시 생성되지 않았다. 근거는 `target/transform-ui/`의
+`rotate-verify.log`, `undo-verify.log`, `selection-verify.log`, `resize-verify.log`와
+[ADR-0023](decisions/ADR-0023-basic-raster-transforms.md)에 기록했다.
+
+이는 수치 입력으로 확정하는 기본 변형이다. 자유 각도·캔버스 위 transform handle과
+실시간 preview는 포함하지 않는다. 출력 page 크기/crop 및 release 성능 계측은 다음
+작업이며, 이 작은 fixture 결과를 대형 장면 성능 통과로 판정하지 않는다.

@@ -12,6 +12,7 @@ mod native_canvas;
 mod preview;
 #[cfg(windows)]
 mod single_instance;
+mod transform_panel;
 
 use std::time::{Duration, Instant};
 use std::{
@@ -96,6 +97,7 @@ fn app() -> Element {
         ui_projection.set(authoritative);
     }
     dock_drag::use_dock_drag(live_ink.clone());
+    use_context_provider(|| transform_panel::TransformPanelOpen(Signal::new(false)));
     let mut navigator_drag = use_context_provider(|| Signal::new(Option::<NavigatorDrag>::None));
     let projected_revision = ui_projection.read().revision.0;
     let dock = ui_projection.read().dock.clone();
@@ -401,13 +403,18 @@ fn ToolbarContents(panel: PanelKind, ui_projection: Signal<UiProjection>) -> Ele
 #[component]
 fn CanvasActions() -> Element {
     let live_ink = use_context::<LiveInkBridge>();
+    let transform_ink = live_ink.clone();
+    let transform_panel::TransformPanelOpen(mut transform_open) = use_context();
     let error = use_signal(|| Option::<String>::None);
     let white_ink = live_ink;
     rsx! {
                 button { class: "command", title: "흰 배경 추가", onclick: move |_| {
                     send_editor_command(&white_ink, EditorCommand::Layer(LayerCommand::AddWhiteBackground), error);
                 }, UiIcon { name: "white" } span { class: "command-label", "흰 배경" } }
-                button { class: "command", title: "변형 (후속 구현)", disabled: true,
+                button { class: "command", title: "선택 영역 또는 현재 레이어 변형", onclick: move |_| {
+                    transform_open.set(true);
+                    send_dock_command(&transform_ink, DockCommand::ActivatePanel(PanelKind::Brush));
+                },
                     UiIcon { name: "transform" } span { class: "command-label", "변형" }
                 }
     }
@@ -849,6 +856,10 @@ fn ToolButton(
 
 #[component]
 fn BrushPanel(ui_projection: Signal<UiProjection>) -> Element {
+    let transform_panel::TransformPanelOpen(transform_open) = use_context();
+    if transform_open() {
+        return rsx! { transform_panel::TransformPanel { ui_projection } };
+    }
     if ui_projection.read().drawing_tool.is_edit() {
         return rsx! { EditToolPanel { ui_projection } };
     }

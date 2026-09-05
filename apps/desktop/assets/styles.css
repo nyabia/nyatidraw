@@ -216,3 +216,12 @@ button:focus, [tabindex="0"]:focus { outline: 2px solid #9ee8ff; outline-offset:
 .dock-capture-marker.vertical::after { bottom: -4px; left: -2px; }
 
 .palette-caption { align-self: flex-start; flex-shrink: 0; padding-top: 4px; color: #f0f0f0; font-size: 10px; }
+
+.transform-properties { padding: 8px; font-size: 12px; overflow: auto; }
+.transform-properties h3, .transform-properties p { margin: 0 0 10px; overflow-wrap: anywhere; }
+.transform-properties label { display: grid; gap: 4px; margin-bottom: 10px; }
+.transform-properties input, .transform-properties select { width: 100%; min-width: 0; }
+.transform-properties .transform-check { display: flex; align-items: center; }
+.transform-properties .transform-check input { width: auto; }
+.transform-properties .transform-help { font-size: 10px; line-height: 1.5; }
+.transform-properties button { width: 100%; margin: 4px 0; padding: 5px; }

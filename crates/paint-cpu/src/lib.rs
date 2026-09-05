@@ -8,10 +8,12 @@
 //! amount and composited with source-over.
 
 mod selection;
+mod transform;
 pub use selection::{
     EditError, EditLimits, SelectionMask, SelectionPaint, SelectionPaintResult, SelectionSource,
     WandRequest, lasso_selection, paint_selection, wand_selection,
 };
+pub use transform::transform_raster;
 
 use nyatidraw_brush::BrushDab;
 use nyatidraw_document::{GroupNode, LayerTree, LayerTreeNode};

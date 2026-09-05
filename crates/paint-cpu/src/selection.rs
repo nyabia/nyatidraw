@@ -26,7 +26,7 @@ impl Default for EditLimits {
 
 impl EditLimits {
     // Callers can tighten limits for their task, never disable global bounds.
-    fn bounded(self) -> Self {
+    pub(crate) fn bounded(self) -> Self {
         let maximum = Self::default();
         Self {
             max_pixels: self.max_pixels.min(maximum.max_pixels),
@@ -63,6 +63,8 @@ pub enum EditError {
     InvalidPolygon,
     InvalidPaint,
     InvalidMask,
+    InvalidTransform,
+    CoordinateOutOfRange,
     LimitExceeded,
     Composite(CpuCompositeError),
     Tiles(TileSnapshotError),
@@ -559,7 +561,10 @@ fn selected_tiles(
     Ok(keys)
 }
 
-fn find_raster(group: &GroupNode, id: LayerId) -> Option<&nyatidraw_document::LayerNode> {
+pub(crate) fn find_raster(
+    group: &GroupNode,
+    id: LayerId,
+) -> Option<&nyatidraw_document::LayerNode> {
     group.children.iter().find_map(|node| match node {
         LayerTreeNode::Raster(layer) if layer.id == id => Some(layer),
         LayerTreeNode::Group(group) => find_raster(group, id),
