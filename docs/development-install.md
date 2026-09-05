@@ -23,7 +23,7 @@ game-project/art/player.png를 NyatiDraw로 열기
 
 `tools/install-dev.ps1`은 다음을 수행한다.
 
-1. `dx build --release --windows --renderer webview --package nyatidraw-desktop --locked`
+1. `tools/build-dev.ps1`로 버전을 확인한 뒤 locked release bundle 생성
 2. DX가 수집한 app과 assets를 `%LOCALAPPDATA%\Programs\NyatiDraw Development`의
    고정 경로에 설치
 3. 현재 사용자 범위에 `.ntdr` open handler와 아이콘 등록
@@ -32,6 +32,16 @@ game-project/art/player.png를 NyatiDraw로 열기
 
 관리자 권한은 요구하지 않는다. 설치 갱신은 실행 중인 프로세스를 확인하고 파일을
 반쯤 교체하지 않는다.
+
+처음에는 `tools/setup-dev.ps1`을 실행한다. `tools/dioxus-cli.version`의 **0.7.9**를
+프로젝트 내부 `.nyatidraw/toolchains`에 설치하며 전역 CLI와 PATH를 변경하지 않는다.
+`cargo-binstall`이 있으면 공식 release asset만 사용하고, 없으면 같은 exact 버전을
+`cargo install --locked`로 빌드한다. `tools/build-dev.ps1`은 workspace의 Dioxus 버전과
+CLI pin이 일치하는지 검사하고, 실제 CLI 버전이 다르면 빌드 전에 중단한다.
+
+2026-09-05에 기존 CLI 0.7.5 거부, 0.7.9 설치, setup 재실행, release bundle 성공을
+확인했다. 새 빌드에는 이전 버전 불일치 오류가 없다. 이 확인은 앱 runtime이나
+NSIS 설치 검증을 대신하지 않는다.
 
 앱 시작 시 Windows parent window는 현재 커서가 있는 모니터의 작업 영역을 기준으로
 최대화를 시도한다. Win32 모니터 조회나 위치 변경이 실패하면 오류를 로그에 남기고

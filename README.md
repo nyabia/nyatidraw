@@ -22,12 +22,14 @@ Windows 외 플랫폼·고급 브러시·애니메이션·벡터 기능은 후�
 
 ## 개발
 
-최신 stable Rust toolchain과 Dioxus CLI(`dx`)가 필요합니다.
+stable Rust toolchain과 프로젝트에 고정된 Dioxus CLI가 필요합니다.
+setup은 CLI를 저장소의 `.nyatidraw/toolchains/`에 설치합니다.
 
 ```powershell
+./tools/setup-dev.ps1
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked
-dx build --release --windows --renderer webview --package nyatidraw-desktop --locked
+./tools/build-dev.ps1
 ```
 
 개발판 설치와 파일 연결:

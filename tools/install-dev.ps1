@@ -137,8 +137,7 @@ if ($registrationExists) {
 if (-not $SkipBuild) {
     Push-Location $repositoryRoot
     try {
-        & dx build --release --windows --renderer webview --package nyatidraw-desktop --locked
-        if ($LASTEXITCODE -ne 0) { throw "dx build failed with exit code $LASTEXITCODE" }
+        & (Join-Path $PSScriptRoot 'build-dev.ps1')
     }
     finally {
         Pop-Location

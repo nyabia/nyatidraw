@@ -220,3 +220,10 @@ CLI 버전 불일치 메시지는 남아 있으며 실제 펜·시각적 UI 실�
 다음 우선순위는 DX 도구 버전 정리와 설치 앱/Explorer/Godot PNG pair 왕복이다.
 실제 펜, DPI·modal·capture 실사용, 표시 지연 gate는 아직 완료 처리하지 않는다.
 설계는 [ADR-0009](decisions/ADR-0009-close-and-export-recovery.md)를 따른다.
+
+### DX 버전 고정 완료
+
+프로젝트 전용 CLI 0.7.9 setup과 build wrapper를 추가하고 개발판 installer에
+연결했다. 0.7.5의 사전 거부, 공식 asset을 통한 설치, setup 재실행과 0.7.9 release
+bundle 성공을 확인했다. 전역 CLI와 PATH는 유지한다. 이전 DX 버전 불일치 항목은
+해결됐으며, 설치 앱 및 PNG pair 왕복 확인을 이어간다. 새 자동화 테스트는 추가하지 않았다.
