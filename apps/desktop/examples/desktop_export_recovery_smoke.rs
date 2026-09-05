@@ -1,4 +1,4 @@
-//! Scratch-only process-kill and failed-Close acceptance of the real desktop.
+//! Scratch-only PNG pairing, process-kill and failed-Close desktop acceptance.
 //! Set `NAYATI_DESKTOP_SMOKE_BINARY` to exercise the DX release bundle.
 
 #[cfg(windows)]
@@ -74,13 +74,17 @@ mod windows_probe {
     }
 
     fn run_cases(executable: &Path, root: &Path) -> Result<()> {
+        for sibling in ["absent", "zero-byte"] {
+            png_pair_case(executable, &root.join(sibling), sibling)?;
+        }
+        invalid_pair_case(executable, &root.join("invalid-pair"))?;
         for stage in ["encoded", "synced", "before-replace", "after-replace"] {
             crash_case(executable, &root.join(stage), stage)?;
         }
         superseded_case(executable, &root.join("superseded"))?;
         failed_close_case(executable, &root.join("failed-close"))?;
         println!(
-            "desktop-export-recovery-smoke status=passed crash_boundaries=4 supersession=encoded-old-job-discarded failed_close=reopened-and-retried physical_pen_proof=false power_loss_proof=false"
+            "desktop-export-recovery-smoke status=passed png_pair=absent-zero-valid-invalid activation=same-primary crash_boundaries=4 supersession=encoded-old-job-discarded failed_close=reopened-and-retried physical_pen_proof=false power_loss_proof=false"
         );
         Ok(())
     }
@@ -102,6 +106,93 @@ mod windows_probe {
         nyatidraw_png_io::encode_png(&project.with_extension("png"), &old)?;
         let bytes = fs::read(project.with_extension("png"))?;
         Ok((project, bytes))
+    }
+
+    fn png_pair_case(executable: &Path, directory: &Path, sibling: &str) -> Result<()> {
+        let (project, source_bytes) = fixture(directory)?;
+        let png = project.with_extension("png");
+        if sibling == "zero-byte" {
+            fs::write(&project, [])?;
+        }
+        let mut app = Desktop::start(executable, &png, false, None)?;
+        app.until("event=png-imported")?;
+        app.until("event=first-native-wgpu-present")?;
+        if fs::metadata(&project)?.len() == 0 || fs::read(&png)? != source_bytes {
+            return Err("PNG activation did not preserve source and bootstrap its project".into());
+        }
+        for activation in [&png, &project] {
+            app.seen.clear();
+            let mut secondary = Desktop::start(executable, activation, false, None)?;
+            secondary.until("event=activation-routed target=existing-primary")?;
+            secondary.success()?;
+            app.until("event=activation-reused-current-project")?;
+            if app.child.try_wait()?.is_some() {
+                return Err("same-pair activation lost its primary".into());
+            }
+        }
+        app.close()?;
+        let (imported_tiles, imported_pixels) = durable_artwork(&project)?;
+        verify_png(&png, &imported_pixels)?;
+        if fs::read(&png)? != source_bytes {
+            return Err("closing without Save changed the original PNG".into());
+        }
+
+        // Deliberately change the disposable PNG. A valid sibling must retain
+        // its durable pixels instead of silently reimporting this blue image.
+        let mut changed_png = imported_pixels.clone();
+        changed_png.pixels = [0, 0, 255, 255].repeat(4);
+        nyatidraw_png_io::encode_png(&png, &changed_png)?;
+        let mut reopened = Desktop::start(executable, &png, false, None)?;
+        reopened.until("event=project-open mode=durable-reopened")?;
+        reopened.until("event=first-native-wgpu-present")?;
+        verify_png(&png, &changed_png)?;
+        let window = find_window(reopened.child.id())?;
+        let child = unsafe { FindWindowExW(Some(window), None, w!("NyatiDrawWgpuCanvas"), None) }?;
+        post(child, WM_KEYDOWN, usize::from(b'S'))?;
+        reopened.until("event=png-export-finished")?;
+        reopened.close()?;
+        verify_png(&png, &imported_pixels)?;
+        if durable_artwork(&project)?.0 != imported_tiles {
+            return Err("valid PNG sibling was reimported or Save changed its artwork".into());
+        }
+
+        // The existing semantic stroke probe draws outside this 2x2 page.
+        // Its durable tiles must survive restart while PNG keeps the page crop.
+        let mut edited = Desktop::start(executable, &png, true, None)?;
+        edited.until("event=png-export-finished generation=2")?;
+        edited.close()?;
+        let (edited_tiles, edited_pixels) = durable_snapshot(&project, 2)?;
+        if edited_tiles == imported_tiles || edited_pixels != imported_pixels {
+            return Err("off-page stroke was lost or leaked into PNG page crop".into());
+        }
+        verify_png(&png, &edited_pixels)?;
+        let mut restarted = Desktop::start(executable, &png, false, None)?;
+        restarted.until("event=first-native-wgpu-present")?;
+        restarted.close()?;
+        if durable_snapshot(&project, 2)?.0 != edited_tiles {
+            return Err("paired process restart lost off-page artwork".into());
+        }
+        println!(
+            "desktop-png-pair status=passed sibling={sibling}-then-valid source_before_save=exact restart=exact activation=same-primary off_page_artwork=durable png=page-cropped physical_pen_proof=false"
+        );
+        Ok(())
+    }
+
+    fn invalid_pair_case(executable: &Path, directory: &Path) -> Result<()> {
+        let (project, source_bytes) = fixture(directory)?;
+        let invalid = b"scratch non-empty invalid sibling must survive";
+        fs::write(&project, invalid)?;
+        let mut app = Desktop::start(executable, &project.with_extension("png"), false, None)?;
+        app.until("invalid-non-empty-preserved=true")?;
+        // Startup failure has no canvas close worker; Drop joins the owned PID.
+        drop(app);
+        if fs::read(&project)? != invalid
+            || fs::read(project.with_extension("png"))? != source_bytes
+        {
+            return Err("invalid PNG pair was overwritten or imported as a fallback".into());
+        }
+        println!("desktop-png-pair status=passed sibling=invalid project_and_png=byte-exact");
+        Ok(())
     }
 
     fn crash_case(executable: &Path, directory: &Path, stage: &str) -> Result<()> {
@@ -211,9 +302,15 @@ mod windows_probe {
     }
 
     fn durable_artwork(project: &Path) -> Result<(TileSnapshot, FlattenedRgba8)> {
+        durable_snapshot(project, 1)
+    }
+
+    fn durable_snapshot(project: &Path, expected: u128) -> Result<(TileSnapshot, FlattenedRgba8)> {
         let db = ProjectDb::open(project)?;
         let reopened = db.load_reopened()?.ok_or("missing durable stroke")?;
-        if reopened.current_snapshot().0 != 1 || reopened.history().node_count() != 1 {
+        if reopened.current_snapshot().0 != expected
+            || reopened.history().node_count() as u128 != expected
+        {
             return Err("accepted final stroke was not durable exactly once".into());
         }
         let tiles = reopened.current_tiles().clone();
@@ -261,7 +358,8 @@ mod windows_probe {
                 command.env_remove(name);
             }
             command
-                .env("NAYATI_PROJECT_PATH", project)
+                .env_remove("NAYATI_PROJECT_PATH")
+                .arg(project)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             if seed {
@@ -297,6 +395,11 @@ mod windows_probe {
                 lines,
                 seen: Vec::new(),
             })
+        }
+        fn close(&mut self) -> Result<()> {
+            post(find_window(self.child.id())?, WM_CLOSE, 0)?;
+            self.until("event=close-ready")?;
+            self.success()
         }
         fn until(&mut self, marker: &str) -> Result<()> {
             if self.seen.iter().any(|line| line.contains(marker)) {

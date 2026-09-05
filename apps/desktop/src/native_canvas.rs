@@ -1246,8 +1246,8 @@ impl ActiveCanvas {
                             scale,
                             [self.canvas_spec.width_px, self.canvas_spec.height_px],
                         );
-                        self.view.zoom =
-                            (self.view.zoom * 1.25_f64.powi(i32::from(steps))).clamp(0.1, 8.0);
+                        self.view.zoom = (self.view.zoom * 1.25_f64.powi(i32::from(steps)))
+                            .clamp(ViewportTransform::MIN_ZOOM, ViewportTransform::MAX_ZOOM);
                     }
                     ViewportCommand::ZoomAt {
                         steps,
@@ -1986,9 +1986,12 @@ impl RendererView {
     fn fit(&mut self, width: u32, height: u32, scale: f64, document_size: [u32; 2]) {
         let logical_width = f64::from(width) / scale;
         let logical_height = f64::from(height) / scale;
-        self.zoom = (logical_width / f64::from(document_size[0]))
+        // Tiny imported PNGs can otherwise fit above the input transform's
+        // maximum zoom and prevent the first canvas frame from rendering.
+        self.zoom = ((logical_width / f64::from(document_size[0]))
             .min(logical_height / f64::from(document_size[1]))
-            * 0.9;
+            * 0.9)
+            .clamp(ViewportTransform::MIN_ZOOM, ViewportTransform::MAX_ZOOM);
         self.pan = Point {
             x: (logical_width - f64::from(document_size[0]) * self.zoom) * 0.5,
             y: (logical_height - f64::from(document_size[1]) * self.zoom) * 0.5,
@@ -2011,7 +2014,8 @@ impl RendererView {
 
     fn zoom_at(&mut self, focus: Point, steps: i8) {
         let previous_zoom = self.zoom;
-        let next_zoom = (previous_zoom * 1.25_f64.powi(i32::from(steps))).clamp(0.1, 8.0);
+        let next_zoom = (previous_zoom * 1.25_f64.powi(i32::from(steps)))
+            .clamp(ViewportTransform::MIN_ZOOM, ViewportTransform::MAX_ZOOM);
         let x = focus.x - self.pan.x;
         let y = focus.y - self.pan.y;
         let (sin, cos) = self.rotation_radians.sin_cos();

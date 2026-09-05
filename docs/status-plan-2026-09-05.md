@@ -241,3 +241,17 @@ bundle 성공을 확인했다. 전역 CLI와 PATH는 유지한다. 이전 DX 버
 상세 근거는 [개발판 설치](development-install.md#2026-09-05-설치판-실행-근거)에 기록했다.
 다음은 positional PNG pair 및 Shell activation 왕복이고, Explorer 직접 조작과
 Godot reimport는 아직 미검증이다.
+
+### 설치판 PNG 왕복과 작은 이미지 Fit 수정
+
+기존 export recovery runtime에 positional PNG activation을 연결하자 2×2 이미지의
+Fit 배율이 입력 transform 상한을 넘어서 첫 canvas frame이 나오지 않는 문제가
+재현됐다. Fit·휠·버튼 확대의 범위를 `ViewportTransform::MIN_ZOOM/MAX_ZOOM`으로
+통일했다. 기존 unit test 수는 57개 그대로이며 전체 테스트와 all-target Clippy를
+통과했다. DX release를 다시 설치한 뒤 전체 PNG/export recovery runtime도 통과했다.
+
+없음·0-byte·정상·손상 sibling, Save 전 원본 보존, 기존 primary로 same-pair 전달,
+페이지 밖 stroke의 Save/restart/reopen 및 PNG crop을 확인했다.
+상세는 [PNG pair 실행 근거](godot-integration.md#2026-09-05-설치-release-png-pair-실행-근거)에
+기록했다. Explorer 메뉴 직접 조작, Godot reimport와 하드웨어 증거는 미검증으로 남긴다.
+이 환경에서 진행할 다음 구현은 레이어·히스토리의 남은 semantic/durable 기능이다.

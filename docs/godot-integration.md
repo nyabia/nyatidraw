@@ -79,6 +79,28 @@ Godot의 reimport 성공은 NyatiDraw project 저장의 일부가 아니다. God
   primary instance로 activation만 전달하고 종료한다. primary가 기존 window를
   foreground 요청하며, same pair는 reopen/second writer 없이 유지한다.
 
+## 2026-09-05 설치 release PNG pair 실행 근거
+
+실제 설치된 release `NyatiDraw.exe`를 positional PNG path로 실행했다.
+`desktop_export_recovery_smoke`의 scratch acceptance에 다음 왕복을 연결했다.
+
+- sibling 없음과 0-byte: 최초 import의 `.ntdr` 즉시 생성, Save 전 PNG bytes 보존.
+- 정상 sibling: 별도로 바꾼 PNG를 다시 import하지 않고 기존 project를 복원하며,
+  Save 시 durable pixels로 PNG를 교체.
+- 손상된 non-empty sibling: project와 PNG bytes 모두 보존, import fallback 없음.
+- PNG 및 같은 `.ntdr`로 두 번째 프로세스를 실행하면 기존 primary로 전달 후 code 0
+  종료, primary에서는 동일 project 재사용.
+- 2×2 page 밖 semantic stroke를 Save하고 별도 프로세스로 다시 열어 exact tiles와
+  history 복원. PNG에는 page crop만 남음.
+
+이 실행은 작은 PNG의 Fit 배율이 `ViewportTransform` 상한을 넘어서 첫 canvas frame을
+그리지 못하는 오류를 발견했다. Fit과 확대 명령을 같은 MIN/MAX zoom 범위로 제한한
+후 설치판에서 전체 왕복과 기존 export crash/recovery acceptance를 통과했다.
+환경은 Windows 11 Home 10.0.26200 / Core Ultra 7 155H / Intel Arc / DX12,
+DX 0.7.9 release이며 로그는 `target/installed-png-pair-fixed.log`다.
+이는 positional activation과 프로세스 왕복 증거다. Explorer Open with 직접 선택,
+Shell foreground 허용, Godot reimport, 물리 펜 또는 first-visible-pixel 증거는 아니다.
+
 ## 스프린트 밖 backlog
 
 Godot FileSystem의 `만들기`, `NyatiDraw로 편집`, 명시적 reimport 기능을 제공하는 editor
