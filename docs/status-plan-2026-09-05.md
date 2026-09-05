@@ -335,3 +335,20 @@ core 검사 한 개만 추가해 총 62개다. 전체 테스트와 Clippy가 통
 [실행 근거](implementation.md#2026-09-05-layer-dragdrop-and-depth-preservation)에 기록했다.
 실제 손으로 끌기·스크롤 중 drag와 표시 지연은 미검증이다. 다음 구현은 선택/채우기
 도구의 Reference 범위·tolerance 계약과 기본 편집 명령이다.
+
+### 기본 선택·채우기 CPU 결과 검증
+
+Active/Reference/AllVisible source, RGBA seed tolerance와 4-connected Wand,
+pixel-center even-odd Lasso, 단색 및 선형 gradient source-over를 CPU 모듈에 구현했다.
+선택 밖·다른 레이어·페이지 밖·경계 tile padding을 유지하고 자원 한계는 부분 변경
+없이 거부한다. 필요한 core invariant 세 개만 추가해 테스트 65개와 Clippy를 통과했다.
+
+Scratch project를 별도 프로세스로 6회 열어 Wand fill, Lasso gradient, Undo,
+새 fill branch와 기존 gradient branch Redo의 tile/tree/history 및 PNG를
+독립 기대 픽셀과 비교했다. Release 검증이 통과했다. 4K CPU Wand+fill p95는
+tile별 처리로 468.531ms에서 220.761ms가 됐지만 입력 스레드에 두기에는 길다.
+근거와 한계는 [ADR-0012](decisions/ADR-0012-basic-selection-and-paint.md)에 기록했다.
+
+이번 체크포인트는 CPU 편집 기반이며 desktop 도구는 아직 비활성이다. 다음은
+native gesture, bounded 비동기 edit worker, 선택 영역 표시 및 durable 결과
+adoption을 연결하는 것이다. 선택 중 brush/eraser clipping 계약도 별도로 완성해야 한다.

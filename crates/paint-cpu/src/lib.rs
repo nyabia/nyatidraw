@@ -7,6 +7,12 @@
 //! `coverage * dab.opacity * dab.flow`; source RGB is scaled by that same
 //! amount and composited with source-over.
 
+mod selection;
+pub use selection::{
+    EditError, EditLimits, SelectionMask, SelectionPaint, SelectionPaintResult, SelectionSource,
+    WandRequest, lasso_selection, paint_selection, wand_selection,
+};
+
 use nyatidraw_brush::BrushDab;
 use nyatidraw_document::{GroupNode, LayerTree, LayerTreeNode};
 use nyatidraw_input::Point;

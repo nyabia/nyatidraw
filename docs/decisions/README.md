@@ -17,6 +17,7 @@
 | 확정 | [종료 중 창 유지와 PNG 복구](ADR-0009-close-and-export-recovery.md) | bounded admission 종료, 비동기 drain/join, 실패 시 durable reopen과 Save retry |
 | 확정 | [snapshot별 레이어 상태](ADR-0010-snapshot-layer-history.md) | tree/pixel 원자적 commit과 삭제·metadata Undo/reopen |
 | 확정 | [래스터 Reference metadata](ADR-0011-reference-layer-metadata.md) | 구버전 호환성, history 복원과 일반 PNG 불변 |
+| 조건부 | [기본 선택·채우기 CPU 계약](ADR-0012-basic-selection-and-paint.md) | 독립 기대 픽셀·history·프로세스 reopen·PNG 통과; desktop 비동기 도구 연결 대기 |
 | 검증 대기 | 128×128 tile | 64/128/256 latency·memory·metadata benchmark 필요 |
 | 검증 대기 | GPU→CPU materialization 방식 | readback, CPU replay, hybrid 비교 필요 |
 

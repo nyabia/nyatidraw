@@ -15,6 +15,8 @@ restores membership, and subsequent stroke snapshots inherit it. Rejected unknow
 IDs leave the tree unchanged. This does not enable Wand/Fill or decide their
 tolerance, visibility filtering or empty-source fallback; those contracts must be
 specified with the tool implementation before activation.
+The subsequent CPU source/tolerance contract is now specified and verified in
+[ADR-0012](ADR-0012-basic-selection-and-paint.md); desktop activation remains pending.
 
 Layer payload version 2 adds one canonical boolean byte after each raster's
 locked byte. Group records and the outer record envelope are unchanged. The

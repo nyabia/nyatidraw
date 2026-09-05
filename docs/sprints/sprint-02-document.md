@@ -19,6 +19,9 @@
    일반 PNG 불변을 검증했다. [ADR-0011](../decisions/ADR-0011-reference-layer-metadata.md)을 따른다.
 3. Wand/Lasso 선택, Fill/Gradient와 selection/layer 기본 이동·변형을 실제 도구
    command에 연결한다. tolerance와 Reference layer 참조 범위를 명시한다.
+   CPU 선택/단색/gradient 결과 및 history/reopen/PNG는
+   [ADR-0012](../decisions/ADR-0012-basic-selection-and-paint.md)에서 검증했다.
+   Desktop native gesture·비동기 실행·선택 표시·brush clipping은 연결 대기다.
 4. 출력 page 크기 변경과 crop을 제공하되 page 밖 signed artwork를 자동 삭제하지
    않는다.
 5. 출력 페이지로 crop한 실제 layer thumbnail과 navigator composite/viewport box를

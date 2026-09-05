@@ -101,3 +101,27 @@ immediate redb commit을 수행한다.
 mouse/pen acceptance 후 OS event-to-visible p50/p95/p99와 frame interval을 측정해야
 목표를 통과한 것으로 기록한다. 짧은 stroke를 매우 빠르게 반복할 때 남는 hitch는
 CPU replay와 redb immediate commit service time을 각각 분리 계측한다.
+
+## 2026-09-05 basic selection and fill CPU measurement
+
+Windows 11 Home 10.0.26200 / Intel Core Ultra 7 155H에서 release CPU backend를
+사용했다. 투명 3840×2160 active layer 전체를 Wand로 선택하고 불투명 단색을
+source-over로 채우는 연속 작업이다. 각 버전은 warmup 1회 뒤 20회 측정했다.
+
+| 구현 | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| 픽셀마다 후보 tile map 조회 | 439.207 ms | 468.531 ms | 473.043 ms |
+| 선택된 tile별 순회 | 210.183 ms | 220.761 ms | 242.417 ms |
+
+두 구현 모두 같은 독립 기대 픽셀, process restart, history branch 및 PNG
+검증을 통과했다. 후보 tile budget도 실제 선택 tile을 기준으로 계산한다.
+이 수치는 메모리에서 source flatten/mask/fill/tile root를 만드는 CPU 시간이며
+redb commit, PNG encode, GPU upload, UI/입력/display 지연은 포함하지 않는다.
+20회 표본으로 관측한 percentile이고 안정적인 장시간 p99나 Sprint 3 gate
+통과를 주장하지 않는다. 다음 desktop 연결은 비동기 worker를 사용해야 한다.
+
+실행: `cargo run --locked -p nyatidraw-desktop --example basic_edit_reopen_probe --release -- --measure`.
+원본 로그는 `target/basic-edit-release-before-tile-loop.log`,
+`target/basic-edit-release.log`이며 CPU/OS를 함께 기록한 JSON artifact는
+`target/basic-edit-cpu-measure.json`이다. 현재 수치는 단일 host의 국소 비교이며
+CI latency baseline으로 채택한 것은 아니다.
