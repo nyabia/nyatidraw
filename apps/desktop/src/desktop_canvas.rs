@@ -561,6 +561,9 @@ impl WindowsViewportInput {
         match message.message {
             WM_KEYDOWN => {
                 let command = match message.wParam.0 {
+                    0x1b => Some(nyatidraw_api::EditorCommand::Tool(
+                        nyatidraw_api::ToolCommand::CancelGesture,
+                    )),
                     0x42 => Some(nyatidraw_api::EditorCommand::Tool(
                         nyatidraw_api::ToolCommand::CycleBrushFamily,
                     )),

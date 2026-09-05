@@ -259,7 +259,9 @@ fn CloseProgress(status: CloseStatus) -> Element {
 }
 
 fn handle_editor_shortcut(live_ink: &LiveInkBridge, key: &str, shift: bool) -> bool {
-    let command = if key.eq_ignore_ascii_case("b") {
+    let command = if key.eq_ignore_ascii_case("Escape") {
+        Some(EditorCommand::Tool(ToolCommand::CancelGesture))
+    } else if key.eq_ignore_ascii_case("b") {
         Some(EditorCommand::Tool(ToolCommand::CycleBrushFamily))
     } else if key.eq_ignore_ascii_case("g") {
         Some(EditorCommand::Tool(ToolCommand::Select(DrawingTool::Move)))

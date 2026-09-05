@@ -417,3 +417,18 @@ history/tree 및 PNG를 독립 기대값과 비교해 통과했다. 마우스 hi
 
 다음은 올가미/그라데이션 진행 중 경로 표시, 올가미 설치판 acceptance, 참조/오차와
 종료 경계 시나리오다. 기본 편집 전체 gate와 metadata/history 격리는 아직 열려 있다.
+
+### 편집 제스처 안내선과 Esc 취소
+
+올가미 진행 경로·닫히는 선과 그라데이션 방향선을 최종 viewport에만 표시한다.
+최대 4096점/64 KiB GPU buffer로 제한하며 작품·선택 데이터와 분리했다. Esc와
+PointerCancel은 미완성 제스처만 취소하고 이후 끝점이 선택을 되살리지 않게 한다.
+
+DX12/Vulkan의 실제 화면 readback에서 회전·DPI·음수 창 원점 하의 위치, 해제 후
+화면 복원과 작품 불변을 확인했다. 설치판에서는 합성 native 올가미 경로를 단계별로
+넣어 진행 표시 → 4050px 선택 → 실제 UI 채우기 → Save/종료/별도 reopen을 검증했다.
+Esc 취소 뒤 늦은 End도 작품·history·PNG를 바꾸지 않았다. 이는 합성 경로와 컴퓨터
+사용 UI 검증이며 물리 펜 근거는 아니다. [ADR-0017](decisions/ADR-0017-edit-gesture-guides.md).
+
+추가 단위 테스트 없이 기존 69개 검사와 Clippy를 통과했다. 다음은 참조/오차 UI,
+완료된 편집 입력의 종료 경계와 metadata/history renderer 격리다.

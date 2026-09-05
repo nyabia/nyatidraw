@@ -32,10 +32,10 @@ impl EditGesture {
             has_selection,
             viewport_revision: sample.viewport_revision,
             start,
-            vertices: if tool == DrawingTool::Lasso {
-                vec![start]
-            } else {
-                Vec::new()
+            vertices: match tool {
+                DrawingTool::Lasso => vec![start],
+                DrawingTool::Gradient => vec![start, start],
+                _ => Vec::new(),
             },
             error: point
                 .is_none()
@@ -62,6 +62,19 @@ impl EditGesture {
                 self.vertices.push(point);
             }
         }
+        if self.tool == DrawingTool::Gradient {
+            self.vertices[1] = point;
+        }
+    }
+
+    pub(crate) fn preview(&self) -> (&[[i32; 2]], bool) {
+        if self.error.is_some() {
+            return (&[], false);
+        }
+        (
+            &self.vertices,
+            self.tool == DrawingTool::Lasso && self.vertices.len() > 2,
+        )
     }
 
     pub(crate) fn finish(mut self, sample: StylusSample) -> Result<EditCommand, String> {

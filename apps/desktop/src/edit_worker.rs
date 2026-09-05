@@ -161,7 +161,7 @@ pub(crate) fn execute(
 pub(crate) fn probe_project() -> Option<std::path::PathBuf> {
     if !matches!(
         std::env::var("NAYATI_EDIT_PROBE").ok().as_deref(),
-        Some("paused-fill" | "selected-brush")
+        Some("paused-fill" | "selected-brush" | "lasso-guide")
     ) {
         return None;
     }

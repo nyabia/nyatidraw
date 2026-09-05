@@ -105,6 +105,8 @@ impl Default for EditSettings {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolCommand {
+    /// Cancels only an unfinished native edit gesture, leaving artwork intact.
+    CancelGesture,
     Select(DrawingTool),
     CycleBrushFamily,
     SetSizeTenths(u16),

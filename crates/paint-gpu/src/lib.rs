@@ -6,6 +6,7 @@
 //! queue, surface, or persistent CPU readback buffer.
 
 mod compositor;
+mod gesture_preview;
 mod selection;
 pub use selection::{GpuSelectionError, GpuSelectionMask};
 

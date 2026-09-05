@@ -439,6 +439,7 @@ pub struct GpuCompositeScene {
     viewport_pipeline: wgpu::RenderPipeline,
     selection_overlay: crate::selection::SelectionBinding,
     selection_pipeline: wgpu::RenderPipeline,
+    gesture_preview: crate::gesture_preview::GesturePreview,
     viewport_bind_group: wgpu::BindGroup,
     viewport_uniform: wgpu::Buffer,
     workspace_pipeline: wgpu::RenderPipeline,
@@ -675,6 +676,7 @@ impl GpuCompositeScene {
             viewport_pipeline,
             selection_overlay,
             selection_pipeline,
+            gesture_preview: crate::gesture_preview::GesturePreview::new(device),
             viewport_bind_group,
             viewport_uniform,
             workspace_pipeline,
@@ -730,6 +732,24 @@ impl GpuCompositeScene {
     pub fn set_selection_overlay(&mut self, mask: Option<&crate::GpuSelectionMask>) {
         self.selection_overlay
             .replace(&self.device, &self.queue, mask);
+    }
+
+    /// Replaces transient document-space guide lines; rejects over 4096 points.
+    pub fn set_gesture_preview(&mut self, points: &[[i32; 2]], closed: bool) -> bool {
+        self.gesture_preview.set(points, closed)
+    }
+
+    /// Synchronous acceptance-only readback; never call from input or present.
+    ///
+    /// # Errors
+    /// Returns GPU copy/mapping errors from the display texture readback.
+    pub fn readback_display(
+        &self,
+    ) -> Result<Option<crate::Rgba8Readback>, crate::GpuReadbackError> {
+        self.display
+            .as_ref()
+            .map(|display| display.readback_rgba8(&self.device, &self.queue))
+            .transpose()
     }
 
     /// Returns the current disposable display projection for bounded probes or
@@ -2036,6 +2056,12 @@ impl GpuCompositeScene {
             pass.set_bind_group(0, &self.selection_overlay.group, &[]);
             pass.set_bind_group(1, &self.viewport_bind_group, &[]);
             pass.draw(0..3, 0..1);
+            stats.display_passes = stats.display_passes.saturating_add(1);
+        }
+        if self
+            .gesture_preview
+            .render(&self.queue, &mut encoder, &display.view, viewport)
+        {
             stats.display_passes = stats.display_passes.saturating_add(1);
         }
         self.queue.submit([encoder.finish()]);

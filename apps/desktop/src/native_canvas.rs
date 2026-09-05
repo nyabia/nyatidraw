@@ -951,6 +951,10 @@ impl ActiveCanvas {
         let Some(step) = self.edit_probe_step else {
             return;
         };
+        if std::env::var("NAYATI_EDIT_PROBE").ok().as_deref() == Some("lasso-guide") {
+            self.advance_lasso_guide_probe(step);
+            return;
+        }
         if std::env::var("NAYATI_EDIT_PROBE").ok().as_deref() == Some("selected-brush") {
             if step == 0 {
                 let command = EditorCommand::Edit(EditCommand::SelectLasso {
@@ -1014,6 +1018,58 @@ impl ActiveCanvas {
             .is_ok()
         {
             self.edit_probe_step = Some(step + 1);
+        }
+    }
+
+    fn advance_lasso_guide_probe(&mut self, step: u8) {
+        let Some(project) = crate::edit_worker::probe_project() else {
+            return;
+        };
+        if step == 0 {
+            if self
+                .stroke
+                .live_ink
+                .push_editor_command(
+                    self.projection.current().revision,
+                    EditorCommand::Tool(ToolCommand::Select(DrawingTool::Lasso)),
+                )
+                .is_ok()
+            {
+                self.edit_probe_step = Some(1);
+            }
+            return;
+        }
+        if self.drawing.tool != DrawingTool::Lasso {
+            return;
+        }
+        if step == 5
+            && !project
+                .parent()
+                .is_some_and(|parent| parent.join(".gesture-release").is_file())
+        {
+            return;
+        }
+        let (phase, point) = match step {
+            1 => (PointerPhase::Begin, [10.0, 10.0]),
+            2 => (PointerPhase::Move, [100.0, 10.0]),
+            3 => (PointerPhase::Move, [100.0, 55.0]),
+            4 => (PointerPhase::Move, [10.0, 55.0]),
+            5 => (PointerPhase::End, [10.0, 10.0]),
+            _ => return,
+        };
+        let mut sample = input_probe_sample(10_000 + u64::from(step), phase);
+        sample.position_document = Point {
+            x: point[0],
+            y: point[1],
+        };
+        sample.viewport_revision = self.stroke.live_ink.canvas_viewport_snapshot().revision;
+        if self.stroke.live_ink.push(sample).is_ok() {
+            self.edit_probe_step = (step < 5).then_some(step + 1);
+            if step == 4 {
+                println!(
+                    "native-canvas event=lasso-guide-probe-held vertices=4 input=synthetic physical-pen-proof=false"
+                );
+            }
         }
     }
 
@@ -1255,6 +1311,12 @@ impl ActiveCanvas {
             zoom: self.view.zoom,
             rotation_radians: self.view.rotation_radians,
         };
+        let (guide, closed) = self
+            .stroke
+            .edit_gesture
+            .as_ref()
+            .map_or((&[][..], false), crate::edit_gesture::EditGesture::preview);
+        self.scene.set_gesture_preview(guide, closed);
         let stats = match self.scene.render_viewport(viewport) {
             Ok(stats) => stats,
             Err(error) => {
@@ -1558,6 +1620,11 @@ impl ActiveCanvas {
                 );
                 Ok(false)
             }
+            EditorCommand::Tool(ToolCommand::CancelGesture) => {
+                self.stroke.edit_gesture = None;
+                self.stroke.completed_edit = None;
+                Ok(false)
+            }
             EditorCommand::Tool(command) => {
                 if self.scene.active_live_stroke().is_some()
                     || self.stroke.edit_gesture.is_some()
@@ -1594,7 +1661,8 @@ impl ActiveCanvas {
                         ToolCommand::SetEditTolerance(tolerance) => {
                             self.drawing.edit_settings.tolerance = tolerance;
                         }
-                        ToolCommand::SetSizeTenths(_)
+                        ToolCommand::CancelGesture
+                        | ToolCommand::SetSizeTenths(_)
                         | ToolCommand::SetOpacityU16(_)
                         | ToolCommand::SetColor(_) => {
                             return Err(CommandRejectReason::UnsupportedCommand);
@@ -2828,7 +2896,10 @@ impl StrokePipeline {
                             gesture.push(sample);
                         }
                     }
-                    PointerPhase::End | PointerPhase::Cancel => {
+                    PointerPhase::Cancel => {
+                        self.edit_gesture = None;
+                    }
+                    PointerPhase::End => {
                         if let Some(gesture) = self.edit_gesture.take() {
                             let result = gesture.finish(sample);
                             self.completed_edit = Some(if self.completed_edit.is_none() {

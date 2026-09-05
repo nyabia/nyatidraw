@@ -170,10 +170,11 @@ fn verify_native_edit(project: &Path, stage: u128, nodes: usize, pattern: &str) 
     {
         return Err("native edit metadata mismatch".into());
     }
-    let color_at = |x: i64| -> Result<[u8; 4]> {
+    let color_at = |x: i64, y: i64| -> Result<[u8; 4]> {
         Ok(match pattern {
             "solid" => [26, 199, 232, 255],
-            "empty" => [0; 4],
+            "rectangle" if (10..100).contains(&x) && (10..55).contains(&y) => [26, 199, 232, 255],
+            "rectangle" | "empty" => [0; 4],
             // UI drag document x=10 -> 110. Independent rational interpolation
             // at pixel centers, with the current color fading to transparent.
             "gradient" => {
@@ -198,7 +199,7 @@ fn verify_native_edit(project: &Path, stage: u128, nodes: usize, pattern: &str) 
             let x = origin_x + i64::try_from(index % 128)?;
             let y = origin_y + i64::try_from(index / 128)?;
             let expected: &[u8] = if (0..129).contains(&x) && (0..65).contains(&y) {
-                &color_at(x)?
+                &color_at(x, y)?
             } else {
                 old.map_or(&[0; 4], |tile| &tile.pixels()[index * 4..index * 4 + 4])
             };
@@ -213,9 +214,9 @@ fn verify_native_edit(project: &Path, stage: u128, nodes: usize, pattern: &str) 
         }
     }
     let mut pixels = Vec::new();
-    for _y in 0..65 {
+    for y in 0..65 {
         for x in 0..129 {
-            pixels.extend_from_slice(&color_at(x)?);
+            pixels.extend_from_slice(&color_at(x, y)?);
         }
     }
     let golden = project.with_extension("expected.png");

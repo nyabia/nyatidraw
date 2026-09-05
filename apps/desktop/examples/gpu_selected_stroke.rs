@@ -95,6 +95,75 @@ fn compare(
     Ok(maximum)
 }
 
+#[allow(clippy::cast_possible_truncation)]
+fn verify_guide(scene: &mut GpuCompositeScene, before: &TileSnapshot) -> Result<()> {
+    let viewport = nyatidraw_input::ViewportTransform {
+        revision: 3,
+        window_origin_physical: Point {
+            x: -900.0,
+            y: 100.0,
+        },
+        physical_size: [384, 384],
+        dpi_scale: 1.5,
+        pan: Point { x: 80.0, y: 80.0 },
+        zoom: 0.8,
+        rotation_radians: 0.3,
+    };
+    scene.render_viewport(viewport).map_err(debug_error)?;
+    let baseline = scene
+        .readback_display()
+        .map_err(debug_error)?
+        .ok_or("display missing")?;
+    for closed in [false, true] {
+        if !scene.set_gesture_preview(&[[20, 20], [100, 20], [60, 80]], closed) {
+            return Err("guide rejected".into());
+        }
+        scene.render_viewport(viewport).map_err(debug_error)?;
+        let shown = scene
+            .readback_display()
+            .map_err(debug_error)?
+            .ok_or("display missing")?;
+        if shown.pixels == baseline.pixels {
+            return Err("guide invisible".into());
+        }
+        let midpoint = viewport
+            .document_to_window(Point { x: 60.0, y: 20.0 })
+            .ok_or("invalid projection")?;
+        let center = [
+            (midpoint.x - viewport.window_origin_physical.x).floor() as i32,
+            (midpoint.y - viewport.window_origin_physical.y).floor() as i32,
+        ];
+        let mut cyan = false;
+        for y in center[1] - 2..=center[1] + 2 {
+            for x in center[0] - 2..=center[0] + 2 {
+                let offset = (usize::try_from(y)? * 384 + usize::try_from(x)?) * 4;
+                let pixel = &shown.pixels[offset..offset + 4];
+                cyan |= pixel[0] < 40 && pixel[1] > 220 && pixel[2] == 255;
+            }
+        }
+        if !cyan {
+            return Err("guide projected to the wrong location".into());
+        }
+        compare(scene, before, None, 0)?;
+        scene.set_gesture_preview(&[], false);
+        scene.render_viewport(viewport).map_err(debug_error)?;
+        if scene
+            .readback_display()
+            .map_err(debug_error)?
+            .ok_or("display")?
+            .pixels
+            != baseline.pixels
+        {
+            return Err("guide did not clear exactly".into());
+        }
+    }
+    if scene.set_gesture_preview(&vec![[0, 0]; 4097], true) {
+        return Err("unbounded guide accepted".into());
+    }
+    println!("gpu-gesture-preview location=exact clear=exact artwork=exact bounded=true");
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let backend = match std::env::args().nth(1).as_deref() {
@@ -180,6 +249,7 @@ fn main() -> Result<()> {
                 })
                 .map_err(debug_error)?;
             compare(&scene, &before, None, 0)?;
+            verify_guide(&mut scene, &before)?;
             let samples = [
                 (PointerPhase::Begin, -8.0, 5.0, 0.4),
                 (PointerPhase::Move, 60.0, 75.0, 0.7),
