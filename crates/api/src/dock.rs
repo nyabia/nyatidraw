@@ -13,9 +13,22 @@ pub enum PanelKind {
     Brush,
     Color,
     History,
+    CanvasActions,
+    Viewport,
+    QuickColors,
 }
 
 impl PanelKind {
+    pub const TOOLBARS: [Self; 3] = [Self::CanvasActions, Self::Viewport, Self::QuickColors];
+
+    #[must_use]
+    pub const fn is_toolbar(self) -> bool {
+        matches!(
+            self,
+            Self::CanvasActions | Self::Viewport | Self::QuickColors
+        )
+    }
+
     const REQUIRED: [Self; 7] = [
         Self::Canvas,
         Self::Tools,
@@ -80,6 +93,7 @@ pub enum DockLayoutError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DockTree {
     root: DockNode,
+    top: Vec<PanelKind>,
 }
 
 impl DockTree {
@@ -92,12 +106,32 @@ impl DockTree {
     pub fn new(root: DockNode) -> Result<Self, DockLayoutError> {
         let mut panels = BTreeSet::new();
         validate_node(&root, 0, &mut panels)?;
-        for required in PanelKind::REQUIRED {
+        let top = PanelKind::TOOLBARS
+            .into_iter()
+            .filter(|panel| !panels.contains(panel))
+            .collect();
+        Self::with_top(root, top)
+    }
+
+    /// Validates workspace panels and the ordered top toolbar as one layout.
+    ///
+    /// # Errors
+    /// Rejects duplicate/missing entries and non-toolbar entries in the top row.
+    pub fn with_top(root: DockNode, top: Vec<PanelKind>) -> Result<Self, DockLayoutError> {
+        let mut panels = BTreeSet::new();
+        validate_node(&root, 0, &mut panels)?;
+        for panel in &top {
+            if !panel.is_toolbar() {
+                return Err(DockLayoutError::CorruptPayload);
+            }
+            insert_panel(*panel, &mut panels)?;
+        }
+        for required in PanelKind::REQUIRED.into_iter().chain(PanelKind::TOOLBARS) {
             if !panels.contains(&required) {
                 return Err(DockLayoutError::MissingPanel(required));
             }
         }
-        Ok(Self { root })
+        Ok(Self { root, top })
     }
 
     /// Converts either a decoded tree or a load failure into a usable layout.
@@ -147,12 +181,51 @@ impl DockTree {
                 }),
             }),
         };
-        Self { root }
+        Self {
+            root,
+            top: PanelKind::TOOLBARS.to_vec(),
+        }
     }
 
     #[must_use]
     pub const fn root(&self) -> &DockNode {
         &self.root
+    }
+
+    #[must_use]
+    pub fn top(&self) -> &[PanelKind] {
+        &self.top
+    }
+
+    /// Places a toolbar before another top entry, or at the end.
+    ///
+    /// # Errors
+    /// Rejects non-toolbar sources, self targets and absent top targets.
+    pub fn dock_toolbar_top(
+        &mut self,
+        panel: PanelKind,
+        before: Option<PanelKind>,
+    ) -> Result<(), DockMutationError> {
+        if !panel.is_toolbar() {
+            return Err(DockMutationError::TargetMissing(panel));
+        }
+        if before == Some(panel) {
+            return Err(DockMutationError::SamePanel);
+        }
+        let mut top = self.top.clone();
+        top.retain(|candidate| *candidate != panel);
+        let index = match before {
+            Some(target) => top
+                .iter()
+                .position(|p| *p == target)
+                .ok_or(DockMutationError::TargetMissing(target))?,
+            None => top.len(),
+        };
+        top.insert(index, panel);
+        let root = remove_panel(self.root.clone(), panel)
+            .ok_or(DockMutationError::TargetMissing(panel))?;
+        *self = Self::with_top(root, top).map_err(DockMutationError::LayoutInvalid)?;
+        Ok(())
     }
 
     /// Makes a panel visible in its containing tab set. Standalone panels are
@@ -189,8 +262,9 @@ impl DockTree {
         let Some(root) = insert_docked_panel(without_panel, panel, target, position) else {
             return Err(DockMutationError::TargetMissing(target));
         };
-        let next = Self::new(root).map_err(DockMutationError::LayoutInvalid)?;
-        self.root = next.root;
+        let mut top = self.top.clone();
+        top.retain(|candidate| *candidate != panel);
+        *self = Self::with_top(root, top).map_err(DockMutationError::LayoutInvalid)?;
         Ok(())
     }
 }

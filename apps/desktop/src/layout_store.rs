@@ -8,9 +8,9 @@ use std::{
     thread::JoinHandle,
 };
 
-const MAGIC: &[u8; 8] = b"NYDOCK01";
+const MAGIC: &[u8; 8] = b"NYDOCK02";
 const MAX_BYTES: usize = 4096;
-const PANELS: [PanelKind; 7] = [
+const PANELS: [PanelKind; 10] = [
     PanelKind::Canvas,
     PanelKind::Tools,
     PanelKind::Navigator,
@@ -18,6 +18,9 @@ const PANELS: [PanelKind; 7] = [
     PanelKind::Brush,
     PanelKind::Color,
     PanelKind::History,
+    PanelKind::CanvasActions,
+    PanelKind::Viewport,
+    PanelKind::QuickColors,
 ];
 
 pub(crate) fn encode(tree: &DockTree) -> Vec<u8> {
@@ -48,6 +51,10 @@ pub(crate) fn encode(tree: &DockTree) -> Vec<u8> {
         }
     }
     let mut bytes = MAGIC.to_vec();
+    bytes.push(u8::try_from(tree.top().len()).unwrap());
+    for panel in tree.top() {
+        bytes.push(u8::try_from(PANELS.iter().position(|p| p == panel).unwrap()).unwrap());
+    }
     node(tree.root(), &mut bytes);
     bytes
 }
@@ -98,15 +105,27 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DockTree, DockLayoutError> {
             _ => return Err(DockLayoutError::CorruptPayload),
         })
     }
-    if bytes.len() > MAX_BYTES || !bytes.starts_with(MAGIC) {
+    let legacy = bytes.starts_with(b"NYDOCK01");
+    if bytes.len() > MAX_BYTES || !(bytes.starts_with(MAGIC) || legacy) {
         return Err(DockLayoutError::CorruptPayload);
     }
     let mut remaining = &bytes[MAGIC.len()..];
+    let top = if legacy {
+        PanelKind::TOOLBARS.to_vec()
+    } else {
+        let len = usize::from(byte(&mut remaining)?);
+        if len > PanelKind::TOOLBARS.len() {
+            return Err(DockLayoutError::CorruptPayload);
+        }
+        (0..len)
+            .map(|_| panel(&mut remaining))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     let root = node(&mut remaining, 0)?;
     if !remaining.is_empty() {
         return Err(DockLayoutError::CorruptPayload);
     }
-    DockTree::new(root)
+    DockTree::with_top(root, top)
 }
 
 pub(crate) struct LayoutStore {

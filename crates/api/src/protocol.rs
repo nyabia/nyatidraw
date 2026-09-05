@@ -205,6 +205,10 @@ pub enum DockCommand {
         target: PanelKind,
         position: DockPosition,
     },
+    MoveToolbarToTop {
+        panel: PanelKind,
+        before: Option<PanelKind>,
+    },
     ResetToSafeDefault,
 }
 

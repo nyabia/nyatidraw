@@ -191,7 +191,7 @@ fn app() -> Element {
                     send_dock_command(&shortcut_ink, DockCommand::ActivatePanel(panel));
                 }
             },
-            ActionBar { ui_projection, export_status }
+            ActionBar { ui_projection, export_status, dock_drag }
             if let Some(notice) = layout_notice {
                 div { class: "layout-notice", role: "status", "{notice}" }
             }
@@ -352,7 +352,11 @@ fn initial_ui_projection() -> UiProjection {
 }
 
 #[component]
-fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -> Element {
+fn ActionBar(
+    ui_projection: Signal<UiProjection>,
+    export_status: ExportStatus,
+    dock_drag: Signal<Option<DockDrag>>,
+) -> Element {
     let live_ink = use_context::<LiveInkBridge>();
     let reset_layout_ink = live_ink.clone();
     let mut menu_open = use_signal(|| false);
@@ -360,17 +364,8 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
     let retry_ink = live_ink.clone();
     let undo_ink = live_ink.clone();
     let redo_ink = live_ink.clone();
-    let white_ink = live_ink.clone();
-    let fit_ink = live_ink.clone();
-    let zoom_out_ink = live_ink.clone();
-    let zoom_in_ink = live_ink.clone();
-    let rotate_ink = live_ink.clone();
     let error = use_signal(|| Option::<String>::None);
-    let viewport = ui_projection.read().viewport;
-    let zoom = viewport.zoom_ppm / 10_000;
-    let rotation = viewport.rotation_millidegrees / 1_000;
-    let current = ui_projection.read().brush_color;
-    let current_color = format!("#{:02X}{:02X}{:02X}", current[0], current[1], current[2]);
+    let top = ui_projection.read().dock.top().to_vec();
 
     rsx! {
         nav { class: "commandbar", aria_label: "주요 명령",
@@ -411,17 +406,54 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
                 send_editor_command(&redo_ink, EditorCommand::History(HistoryCommand::Redo), error);
             }, UiIcon { name: "redo" } span { class: "shortcut", "Shift Z" } }
 
-            div { class: "toolbar-dock", aria_label: "캔버스 작업",
-                span { class: "toolbar-grip", aria_hidden: "true" }
+            for panel in top {
+                TopToolbar { panel, ui_projection, dock_drag }
+            }
+            ToolbarTopTarget { before: None, dock_drag }
+            if let Some(message) = error.read().as_ref() {
+                span { class: "commandbar-error", role: "alert", "{message}" }
+            }
+        }
+    }
+}
+
+#[component]
+fn ToolbarContents(panel: PanelKind, ui_projection: Signal<UiProjection>) -> Element {
+    match panel {
+        PanelKind::CanvasActions => rsx! { CanvasActions {} },
+        PanelKind::Viewport => rsx! { ViewportActions { ui_projection } },
+        PanelKind::QuickColors => rsx! { QuickColors { ui_projection } },
+        _ => rsx! {},
+    }
+}
+
+#[component]
+fn CanvasActions() -> Element {
+    let live_ink = use_context::<LiveInkBridge>();
+    let error = use_signal(|| Option::<String>::None);
+    let white_ink = live_ink;
+    rsx! {
                 button { class: "command", title: "흰 배경 추가", onclick: move |_| {
                     send_editor_command(&white_ink, EditorCommand::Layer(LayerCommand::AddWhiteBackground), error);
                 }, UiIcon { name: "white" } span { class: "command-label", "흰 배경" } }
                 button { class: "command", title: "변형 (후속 구현)", disabled: true,
                     UiIcon { name: "transform" } span { class: "command-label", "변형" }
                 }
-            }
-            div { class: "toolbar-dock", aria_label: "보기",
-                span { class: "toolbar-grip", aria_hidden: "true" }
+    }
+}
+
+#[component]
+fn ViewportActions(ui_projection: Signal<UiProjection>) -> Element {
+    let live_ink = use_context::<LiveInkBridge>();
+    let error = use_signal(|| Option::<String>::None);
+    let fit_ink = live_ink.clone();
+    let zoom_out_ink = live_ink.clone();
+    let zoom_in_ink = live_ink.clone();
+    let rotate_ink = live_ink;
+    let viewport = ui_projection.read().viewport;
+    let zoom = viewport.zoom_ppm / 10_000;
+    let rotation = viewport.rotation_millidegrees / 1_000;
+    rsx! {
                 button { class: "command compact", title: "화면 맞춤", onclick: move |_| {
                     send_editor_command(&fit_ink, EditorCommand::Viewport(ViewportCommand::FitDocument), error);
                 }, UiIcon { name: "fit" } }
@@ -436,18 +468,62 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
                     send_editor_command(&rotate_ink, EditorCommand::Viewport(ViewportCommand::RotateQuarterSteps(1)), error);
                 }, UiIcon { name: "rotate" } }
                 span { class: "toolbar-value", "{rotation}°" }
-            }
-            div { class: "toolbar-dock color-toolbar", aria_label: "현재 색상과 최근 색상",
-                span { class: "toolbar-grip", aria_hidden: "true" }
+    }
+}
+
+#[component]
+fn QuickColors(ui_projection: Signal<UiProjection>) -> Element {
+    let current = ui_projection.read().brush_color;
+    let current_color = format!("#{:02X}{:02X}{:02X}", current[0], current[1], current[2]);
+    rsx! {
                 div { class: "color-stack", span { class: "color-chip back" } span { class: "color-chip front", style: "background:{current_color}" } }
                 div { class: "quick-colors",
                     for (color, rgba) in [("#e83030", [232,48,48,255]), ("#20b94a", [32,185,74,255]), ("#267be0", [38,123,224,255]), ("#f1c94a", [241,201,74,255]), ("#ffffff", [255,255,255,255]), ("#171717", [23,23,23,255]), ("#ef8ea0", [239,142,160,255]), ("#8f61c9", [143,97,201,255])] {
                         ToolbarColorButton { color, rgba }
                     }
                 }
+    }
+}
+
+#[component]
+fn TopToolbar(
+    panel: PanelKind,
+    ui_projection: Signal<UiProjection>,
+    mut dock_drag: Signal<Option<DockDrag>>,
+) -> Element {
+    rsx! {
+        div { class: "toolbar-dock", aria_label: "{panel_label(panel)}",
+            span { class: "toolbar-grip", title: "{panel_label(panel)} 이동",
+                onmousedown: move |_| dock_drag.set(Some(DockDrag { source: panel, hovered: None })),
             }
-            if let Some(message) = error.read().as_ref() {
-                span { class: "commandbar-error", role: "alert", "{message}" }
+            ToolbarContents { panel, ui_projection }
+            ToolbarTopTarget { before: Some(panel), dock_drag }
+        }
+    }
+}
+
+#[component]
+fn ToolbarTopTarget(before: Option<PanelKind>, mut dock_drag: Signal<Option<DockDrag>>) -> Element {
+    let live_ink = use_context::<LiveInkBridge>();
+    let enabled = dock_drag
+        .read()
+        .is_some_and(|drag| drag.source.is_toolbar() && Some(drag.source) != before);
+    rsx! {
+        if enabled {
+            div { class: if before.is_some() { "toolbar-top-target" } else { "toolbar-top-target trailing" },
+                onmouseenter: move |_| {
+                    let current = *dock_drag.read();
+                    if let Some(mut drag) = current { drag.hovered = None; dock_drag.set(Some(drag)); }
+                },
+                onmouseup: move |event| {
+                    event.stop_propagation();
+                    let current = *dock_drag.read();
+                    if let Some(drag) = current {
+                        send_dock_command(&live_ink, DockCommand::MoveToolbarToTop { panel: drag.source, before });
+                        dock_drag.set(None);
+                    }
+                },
+                span { class: "dock-insert vertical" }
             }
         }
     }
@@ -459,6 +535,42 @@ fn ToolbarColorButton(color: &'static str, rgba: [u8; 4]) -> Element {
     let error = use_signal(|| Option::<String>::None);
     rsx! {
         button { class: "quick-color", style: "background:{color}", title: "{color}", aria_label: "최근 색상 {color}", onclick: move |_| send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::SetColor(rgba)), error) }
+    }
+}
+
+// Side stacks use content-sized leading panels; only the trailing panel fills.
+// Splits containing the canvas retain their geometry ratios.
+fn dock_stack_height(node: &DockNode) -> Option<u16> {
+    match node {
+        DockNode::Panel(panel) => match panel {
+            PanelKind::Canvas => None,
+            PanelKind::Navigator => Some(200),
+            PanelKind::Color => Some(240),
+            PanelKind::CanvasActions | PanelKind::QuickColors => Some(110),
+            PanelKind::Viewport => Some(265),
+            PanelKind::Tools | PanelKind::Brush => Some(620),
+            PanelKind::Layers | PanelKind::History => Some(300),
+        },
+        DockNode::Tabs { panels, .. } => panels
+            .iter()
+            .map(|panel| dock_stack_height(&DockNode::Panel(*panel)))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|heights| heights.into_iter().max())
+            .map(|height| height + 24),
+        DockNode::Split {
+            axis,
+            first,
+            second,
+            ..
+        } => {
+            let first = dock_stack_height(first)?;
+            let second = dock_stack_height(second)?;
+            Some(if *axis == DockAxis::Vertical {
+                first.saturating_add(second).saturating_add(3)
+            } else {
+                first.max(second)
+            })
+        }
     }
 }
 
@@ -495,6 +607,15 @@ fn DockNodeView(
                 DockAxis::Horizontal => "dock-split dock-horizontal",
                 DockAxis::Vertical => "dock-split dock-vertical",
             };
+            if axis == DockAxis::Vertical
+                && dock_stack_height(&first).is_some()
+                && dock_stack_height(&second).is_some()
+            {
+                let mut nodes = Vec::new();
+                collect_side_stack(*first, &mut nodes);
+                collect_side_stack(*second, &mut nodes);
+                return rsx! { SideStack { nodes, ui_projection, dock_drag } };
+            }
             let first_style = format!("flex: {first_per_mille} 1 0;");
             let second_style = format!("flex: {} 1 0;", 1000_u16.saturating_sub(first_per_mille));
             rsx! {
@@ -505,6 +626,51 @@ fn DockNodeView(
                     div { class: "dock-child", style: "{second_style}",
                         DockNodeView { node: *second, ui_projection, dock_drag }
                     }
+                }
+            }
+        }
+    }
+}
+
+fn collect_side_stack(node: DockNode, nodes: &mut Vec<DockNode>) {
+    match node {
+        DockNode::Split {
+            axis: DockAxis::Vertical,
+            first,
+            second,
+            ..
+        } => {
+            collect_side_stack(*first, nodes);
+            collect_side_stack(*second, nodes);
+        }
+        node => nodes.push(node),
+    }
+}
+
+#[component]
+fn SideStack(
+    nodes: Vec<DockNode>,
+    ui_projection: Signal<UiProjection>,
+    dock_drag: Signal<Option<DockDrag>>,
+) -> Element {
+    let len = nodes.len();
+    let entries: Vec<_> = nodes
+        .into_iter()
+        .enumerate()
+        .map(|(index, node)| {
+            let style = if index + 1 == len {
+                "flex: 1 0 160px;".to_owned()
+            } else {
+                format!("flex: 0 1 {}px;", dock_stack_height(&node).unwrap_or(200))
+            };
+            (node, style)
+        })
+        .collect();
+    rsx! {
+        section { class: "dock-split dock-vertical side-stack",
+            for (node, style) in entries {
+                div { class: "dock-child", style,
+                    DockNodeView { node, ui_projection, dock_drag }
                 }
             }
         }
@@ -661,6 +827,9 @@ fn panel_ready_contents(panel: PanelKind, ui_projection: Signal<UiProjection>) -
         PanelKind::Brush => rsx! { BrushPanel { ui_projection } },
         PanelKind::Color => rsx! { ColorPanel { ui_projection } },
         PanelKind::History => rsx! { HistoryPanel { ui_projection } },
+        PanelKind::CanvasActions | PanelKind::Viewport | PanelKind::QuickColors => rsx! {
+            div { class: "side-toolbar", ToolbarContents { panel, ui_projection } }
+        },
     }
 }
 
@@ -1510,6 +1679,9 @@ fn panel_label(panel: PanelKind) -> &'static str {
         PanelKind::Brush => "세부 도구",
         PanelKind::Color => "색상",
         PanelKind::History => "히스토리",
+        PanelKind::CanvasActions => "캔버스 작업",
+        PanelKind::Viewport => "보기",
+        PanelKind::QuickColors => "현재 색상과 최근 색상",
     }
 }
 
@@ -1522,6 +1694,9 @@ fn panel_slug(panel: PanelKind) -> &'static str {
         PanelKind::Brush => "brush",
         PanelKind::Color => "color",
         PanelKind::History => "history",
+        PanelKind::CanvasActions => "canvas-actions",
+        PanelKind::Viewport => "viewport",
+        PanelKind::QuickColors => "quick-colors",
     }
 }
 

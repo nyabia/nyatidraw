@@ -505,3 +505,23 @@ snapshot/history와 PNG 불변이 통과했다. 전체 Clippy, 기존 API 검사
 설치 빌드가 통과했으며 단위 테스트를 추가하지 않았다.
 [ADR-0019](decisions/ADR-0019-workspace-layout-persistence.md)에 계약과 근거를 기록했다.
 도구막대 항목 도킹, 측면 stack/fill과 pointer capture는 아직 별도 작업으로 남아 있다.
+
+### 독립 도구막대 도킹과 측면 stack/fill
+
+캔버스 작업·보기·색상 도구막대를 authoritative layout의 독립 항목으로 연결했다.
+상단은 제목 없는 grip과 가로 control, 측면은 같은 기능의 세로 panel로 표시한다.
+고정 명령은 그대로 두고 상단 앞에 삽입·끝에 복귀·상단끼리 순서 변경이 가능하다.
+측면의 연속 세로 split은 한 목록으로 표시해 앞 패널을 위로 쌓고 마지막 패널이
+남은 높이를 채우게 했다. 여러 패널을 추가할 때 마지막 레이어 영역이 사라지던
+중첩 비율 문제도 이 방식으로 수정했다.
+
+설치판에서 세 항목을 좌우에 배치하고 확대·색상 변경을 실행한 뒤 종료·재시작해
+복원을 확인했다. 다시 상단으로 모두 복귀하고 색상/보기/캔버스 작업 순서로 바꾼
+배치도 별도 재시작에서 유지됐다. 기존 v1 설정은 읽고 새 배치는 v2로 저장한다.
+각 세션의 native canvas/GPU 생성은 한 번이었으며 종료 후 독립 reopen에서 작품
+8385픽셀·전체 타일·history·PNG 불변이 통과했다. 전체 Clippy, 기존 API 검사 2개,
+release 설치 빌드가 통과했다. 단위 테스트는 추가하지 않았다.
+
+[ADR-0020](decisions/ADR-0020-dockable-toolbar-entries.md)에 근거와 범위를 기록했다.
+다음은 pointer capture, 창/target 밖 release와 취소 처리다. 실제 최근 색상 이력과
+물리 펜 연속성·장시간 도킹 acceptance도 아직 완료로 판정하지 않는다.

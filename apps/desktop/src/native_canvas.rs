@@ -1653,6 +1653,9 @@ impl ActiveCanvas {
                     } => dock
                         .dock_panel(panel, target, position)
                         .map_err(|_| CommandRejectReason::InvalidLayout)?,
+                    DockCommand::MoveToolbarToTop { panel, before } => dock
+                        .dock_toolbar_top(panel, before)
+                        .map_err(|_| CommandRejectReason::InvalidLayout)?,
                     DockCommand::ResetToSafeDefault => dock = DockTree::safe_default(),
                 }
                 self.projection.stage_dock(dock);
