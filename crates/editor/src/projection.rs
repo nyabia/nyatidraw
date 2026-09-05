@@ -191,11 +191,12 @@ fn project_children(group: &GroupNode, depth: u16, out: &mut Vec<LayerProjection
     // Document children are stored bottom-to-top. The UI projection is
     // top-to-bottom, but a group must still precede its own descendants so
     // collapse/indent semantics remain structurally meaningful.
-    for child in group.children.iter().rev() {
+    for (index, child) in group.children.iter().enumerate().rev() {
         match child {
             LayerTreeNode::Raster(layer) => out.push(LayerProjection {
                 id: LayerTreeNodeId::Raster(layer.id),
                 parent: group.id,
+                index,
                 depth,
                 kind: LayerProjectionKind::Raster,
                 name: layer.name.clone(),
@@ -207,6 +208,7 @@ fn project_children(group: &GroupNode, depth: u16, out: &mut Vec<LayerProjection
                 out.push(LayerProjection {
                     id: LayerTreeNodeId::Group(child_group.id),
                     parent: group.id,
+                    index,
                     depth,
                     kind: LayerProjectionKind::Group,
                     name: child_group.name.clone(),

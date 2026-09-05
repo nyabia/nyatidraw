@@ -102,3 +102,19 @@ This is functional evidence, not a 20-layer timing result. The desktop has the
 typed dispatcher, durable LayerTree reopen, root-owned WGPU source, and actual
 explicit-control acceptance through revision r8. Physical pen and measured
 present latency remain open.
+
+## Desktop layer drag/drop and depth boundary (2026-09-05)
+
+HTML thumbnail drag/drop resolves top/bottom/inside destinations using the
+authoritative sibling index in `LayerProjection` and the drag-start revision.
+The existing semantic `Reorder` command handles the durable move. Candidate tree
+validation now rejects excessive resulting depth before adopting a move, fixing
+a path that could produce a hierarchy rejected by the project decoder.
+
+Installed Windows release acceptance exercised real DOM/Dioxus handlers using
+synthetic drag events, insertion marker geometry/CSS, same-parent index adjustment,
+cross-parent group extraction, cancellation and stale-drop rejection after a
+toolbar change. Each artwork change passed Save/process restart/reopen/PNG
+comparison. The depth risk adds one core test, for 62 total. Detailed evidence
+and limits are in [implementation](../implementation.md#2026-09-05-layer-dragdrop-and-depth-preservation).
+Actual physical drag and scrolling during drag remain unverified.

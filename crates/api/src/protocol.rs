@@ -191,6 +191,8 @@ pub enum LayerProjectionKind {
 pub struct LayerProjection {
     pub id: LayerTreeNodeId,
     pub parent: GroupId,
+    /// Bottom-to-top sibling index before a proposed move.
+    pub index: usize,
     pub depth: u16,
     pub kind: LayerProjectionKind,
     pub name: String,

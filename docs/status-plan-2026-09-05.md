@@ -317,3 +317,21 @@ fixture에서 Reference 저장/재실행/Undo/Redo, 표시 개수와 기존 PNG 
 확인했다. 호환성 위험을 막는 core 검사 한 개만 추가해 전체 61개이며 Clippy도 통과했다.
 [ADR-0011](decisions/ADR-0011-reference-layer-metadata.md)에 형식과 한계를 기록했다.
 선택/채우기 도구의 참조 범위와 tolerance 계약, drag reorder UI는 이어서 구현한다.
+
+### 레이어 drag reorder와 깊이 제한 완료
+
+썸네일을 끌어 행 위·아래 또는 그룹 안으로 이동하고 청록색 삽입 위치를 표시한다.
+위·아래 버튼도 기존 Reorder 명령에 연결했다. 드래그 시작 revision과 sibling index를
+사용해 source 제거 후 위치를 보정하며, 문서가 바뀐 뒤의 오래된 drop은 거부한다.
+Windows에서 HTML drag를 가로막던 기본 native file-drop handler를 해제했다.
+
+이동 후 깊이가 64를 넘어 저장 불가능한 tree가 될 수 있던 경로도 고쳤다. 후보를
+검증한 뒤 채택하므로 실패해도 원본 subtree를 유지한다. 이 작품 보존 위험을 막는
+core 검사 한 개만 추가해 총 62개다. 전체 테스트와 Clippy가 통과했다.
+
+설치 release WebView의 실제 DOM/handler에 합성 drag 이벤트를 보내 그룹 내부,
+위·아래, 그룹 추출, 취소와 toolbar 변경 뒤 stale drop 거부를 확인했다. 20 raster,
+21회 프로세스 실행의 Save/reopen/PNG 비교와 기존 export 복구 시나리오가 통과했다.
+[실행 근거](implementation.md#2026-09-05-layer-dragdrop-and-depth-preservation)에 기록했다.
+실제 손으로 끌기·스크롤 중 drag와 표시 지연은 미검증이다. 다음 구현은 선택/채우기
+도구의 Reference 범위·tolerance 계약과 기본 편집 명령이다.

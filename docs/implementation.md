@@ -339,6 +339,45 @@ deleted-surface pixels at a second coordinate, with RGBA8 channel tolerance 2.
 Log: `target/desktop-layer-gpu.log`. This is device readback evidence on that
 backend, not DX12 pixel equivalence, display latency or physical-pen proof.
 
+## 2026-09-05 layer drag/drop and depth preservation
+
+Raster and group thumbnails now start HTML drag/drop. The row's upper/lower
+zones move above/below the target; a group's center inserts at its topmost child
+position, including collapsed groups. Cyan lines or an outline show the selected
+destination. The layer action bar also moves the active raster one sibling step.
+Projection rows carry their authoritative bottom-to-top index. Drop adjusts that
+index after source removal and submits the existing `Reorder` command with the
+drag-start revision. Self/descendant/no-op destinations are not advertised;
+document changes during the drag reject its obsolete placement. Drag end/Escape
+clears session drag state. No raw stylus samples enter this path.
+
+Windows Dioxus configuration disables the native file-drop handler as required
+by its HTML drag/drop API. Positional PNG/project activation remains covered by
+the installed recovery probe. This does not introduce file-drop import.
+
+`LayerTree::reorder` now validates a candidate before adopting it. Previously a
+cross-parent move could exceed the persisted depth limit. One core risk test
+checks rejection at resulting depths 65/66 without detaching artwork and permits
+the depth-64 boundary. Workspace tests total 62; all-feature/all-target Clippy
+passes with `-D warnings`.
+
+The installed DX release runs synthetic browser drag events through its actual
+WebView DOM/Dioxus handlers, checks nonzero drop areas and active marker CSS, and
+verifies inside/below/above/group extraction, cancellation, and stale-drop
+rejection after a real toolbar handler changes order. The 20-raster/two-level
+fixture uses 21 process launches, Save and exact reopened tree/tile/PNG comparison;
+group extraction Undo also restores the prior composition. The full earlier
+PNG/crash/export recovery run passes as well. Evidence: `target/layer-drag-tests.log`,
+`target/layer-drag-clippy.log`, `target/installed-layer-drag.log`,
+`target/installed-layer-drag-final.log`. The final layer-only rerun uses
+`desktop_export_recovery_smoke -- --layers-only` to avoid repeating unrelated
+crash cases after adding the stale-drop acceptance case.
+
+Host: Windows 11 Home 10.0.26200 / Core Ultra 7 155H / Intel Arc integrated /
+DX12 release desktop. These checks prove DOM wiring and durable results, not
+physical pointer drag, OS drag-image behavior, scrolling while dragging, or
+input/display latency. No UI mock unit suite was added.
+
 ## Test policy
 
 Automated tests target only core regressions that can corrupt artwork, lose

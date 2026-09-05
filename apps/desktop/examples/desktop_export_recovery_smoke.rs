@@ -79,6 +79,9 @@ mod windows_probe {
 
     fn run_cases(executable: &Path, root: &Path) -> Result<()> {
         layer_history_case(executable, &root.join("layer-history"))?;
+        if std::env::args().any(|argument| argument == "--layers-only") {
+            return Ok(());
+        }
         history_branches_case(executable, &root.join("history-branches"))?;
         initial_import_history_case(executable, &root.join("initial-history"))?;
         for sibling in ["absent", "zero-byte"] {
@@ -179,6 +182,22 @@ mod windows_probe {
         reference
             .set_reference(LayerId(1), true)
             .map_err(|error| format!("reference expectation: {error:?}"))?;
+        let mut inside = reference.clone();
+        inside
+            .reorder(LayerTreeNodeId::Raster(LayerId(1)), GroupId(11), 19)
+            .map_err(|error| format!("drag inside expectation: {error:?}"))?;
+        let mut below = inside.clone();
+        below
+            .reorder(LayerTreeNodeId::Raster(LayerId(1)), GroupId(11), 0)
+            .map_err(|error| format!("drag below expectation: {error:?}"))?;
+        let mut extracted = inside.clone();
+        extracted
+            .reorder(LayerTreeNodeId::Group(GroupId(11)), GroupId(100), 0)
+            .map_err(|error| format!("drag group expectation: {error:?}"))?;
+        let mut stale = inside.clone();
+        stale
+            .reorder(LayerTreeNodeId::Raster(LayerId(1)), GroupId(11), 18)
+            .map_err(|error| format!("toolbar before stale drop expectation: {error:?}"))?;
         for (probe, snapshot, count, expected_tree) in [
             ("rename-r:1", 2, 20, Some(&renamed)),
             ("opacity-g:10", 3, 20, Some(&restored)),
@@ -194,15 +213,27 @@ mod windows_probe {
             ("reference-r:1", 8, 20, Some(&reference)),
             ("undo", 6, 20, Some(&reordered)),
             ("redo:8", 8, 20, Some(&reference)),
+            ("ui-drag:inside", 9, 20, Some(&inside)),
+            ("ui-drag:below", 10, 20, Some(&below)),
+            ("ui-drag:above", 11, 20, Some(&inside)),
+            ("ui-drag:group", 12, 20, Some(&extracted)),
+            ("undo", 11, 20, Some(&inside)),
+            ("ui-drag:cancel", 11, 20, Some(&inside)),
+            ("ui-drag:stale", 13, 20, Some(&stale)),
         ] {
             let mut app = Desktop::start_with_history(executable, &project, Some(probe))?;
-            app.until("event=history-probe-complete")?;
-            app.until("active_valid=true")?;
-            app.until(if snapshot == 8 {
-                "reference_count=1"
+            if probe.starts_with("ui-drag:") {
+                app.until("event=drag-probe-complete")?;
+                app.until("result=passed browser_events=synthetic")?;
             } else {
-                "reference_count=0"
-            })?;
+                app.until("event=history-probe-complete")?;
+                app.until("active_valid=true")?;
+                app.until(if snapshot >= 8 {
+                    "reference_count=1"
+                } else {
+                    "reference_count=0"
+                })?;
+            }
             app.until("event=first-native-wgpu-present")?;
             let window = find_window(app.child.id())?;
             let child =
@@ -696,6 +727,7 @@ mod windows_probe {
                 "NAYATI_EXPORT_PAUSE",
                 "NAYATI_EXPORT_PROBE_DIR",
                 "NAYATI_HISTORY_PROBE",
+                "NAYATI_LAYER_DRAG_PROBE",
             ] {
                 command.env_remove(name);
             }
@@ -710,7 +742,11 @@ mod windows_probe {
                     .env("NAYATI_SAVE_PROBE", "end");
             }
             if let Some(history) = history {
-                command.env("NAYATI_HISTORY_PROBE", history);
+                if let Some(mode) = history.strip_prefix("ui-drag:") {
+                    command.env("NAYATI_LAYER_DRAG_PROBE", mode);
+                } else {
+                    command.env("NAYATI_HISTORY_PROBE", history);
+                }
             }
             if let Some(stage) = pause {
                 command.env("NAYATI_EXPORT_PAUSE", stage).env(

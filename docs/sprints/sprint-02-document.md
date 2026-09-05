@@ -11,7 +11,8 @@
 1. raster layer 추가·삭제·이름 변경, group 추가·접기, cross-parent reorder를
    실제 LayerTree와 연결한다. Raster/group 추가, 이름 변경, group 접기와
    cross-parent reorder는 현재 실제 command, GPU composite surface, UI projection,
-   redb layer tree까지 연결됐다. 삭제와 metadata Undo도 연결됐고 drag reorder UI는 남아 있다.
+   redb layer tree까지 연결됐다. 삭제와 metadata Undo, 썸네일 drag reorder 및
+   위·아래 이동 버튼도 연결했다. 설치판 WebView 합성 drag와 durable 왕복을 검증했다.
 2. visibility, opacity, active layer, session-only Solo, durable Reference metadata를
    완성한다. Solo는 현재 GPU 합성에만 적용되고 durable visibility와 PNG export
    tree를 바꾸지 않는다. Reference는 raster별 durable metadata이며 Undo/reopen과
@@ -138,8 +139,8 @@ snapshot에서 제거하고 과거 snapshot에는 보존한다. 마지막 raster
 생성하고 active를 유지 가능한 raster로 맞춘다. Solo는 session 상태다. 설치 release의
 20 raster·2단계 중첩 fixture에서 metadata/삭제/분기/순서를 Save·재시작·reopen·PNG
 전체 픽셀로 검증했다. [구현 근거](../implementation.md#2026-09-05-desktop-layer-history)를
-따른다. Reference metadata는 ADR-0011에서 이어서 연결했다. Drag reorder UI 및
-per-cursor page state는 남아 있다.
+따른다. Reference metadata는 ADR-0011에서, drag reorder UI는 ADR-0007 후속 절에서
+이어 연결했다. Per-cursor page state와 물리 drag 실사용은 남아 있다.
 
 ### 남은 engineering evidence
 

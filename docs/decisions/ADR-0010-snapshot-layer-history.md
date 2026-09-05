@@ -65,6 +65,7 @@ The existing core tree invariant was extended; the test count remains 60.
 
 No dependency was added or changed; redb remains exactly 2.6.3. Idle metadata and
 history requests still use synchronous worker replies, so this does not close
-the hot-path latency gate. Drag reorder UI and per-cursor
-canvas/page state remain subsequent work in the active Sprint 1–3 goal. Semantic
+the hot-path latency gate. Per-cursor canvas/page state remains subsequent work
+in the active Sprint 1–3 goal. Drag reorder UI was subsequently connected as
+recorded in ADR-0007. Semantic
 probes do not establish direct UI interaction or physical-pen evidence.

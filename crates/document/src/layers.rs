@@ -295,7 +295,7 @@ impl LayerTree {
     /// # Errors
     ///
     /// Rejects unknown nodes, root moves, cycles, non-group destinations, and
-    /// out-of-range post-removal indices.
+    /// out-of-range post-removal indices or excessive resulting depth.
     pub fn reorder(
         &mut self,
         node: LayerTreeNodeId,
@@ -331,17 +331,21 @@ impl LayerTree {
             return Ok(CompositeInvalidation::empty());
         }
 
-        let moved = remove_node(&mut self.root, node).ok_or(LayerTreeError::UnknownNode(node))?;
-        find_group_mut(&mut self.root, new_parent)
+        let mut candidate = self.clone();
+        let moved =
+            remove_node(&mut candidate.root, node).ok_or(LayerTreeError::UnknownNode(node))?;
+        find_group_mut(&mut candidate.root, new_parent)
             .ok_or(LayerTreeError::DestinationNotGroup(new_parent))?
             .children
             .insert(index, moved);
+        let candidate = Self::new(candidate.root)?;
 
         let mut invalidation = invalidate_all(old_ancestors);
-        let new_ancestors = self
+        let new_ancestors = candidate
             .ancestors(node)
             .ok_or(LayerTreeError::UnknownNode(node))?;
         invalidation.extend(invalidate_all(new_ancestors));
+        *self = candidate;
         Ok(invalidation)
     }
 
@@ -476,6 +480,50 @@ mod tests {
             opacity_u16: u16::MAX,
             content_root: ContentRootId(0),
         })
+    }
+
+    #[test]
+    fn reorder_depth_overflow_preserves_artwork_and_boundary_moves_remain_valid() {
+        // Product risk: moving a valid subtree must not create a tree that the
+        // project decoder rejects on restart, or detach artwork on rejection.
+        let group = |id, children| GroupNode {
+            id: GroupId(id),
+            name: format!("Group {id}"),
+            visible: true,
+            opacity_u16: u16::MAX,
+            children,
+        };
+        let mut chain = group(64, vec![raster(1)]);
+        for id in (1..64).rev() {
+            chain = group(id, vec![LayerTreeNode::Group(chain)]);
+        }
+        let movable = group(200, vec![LayerTreeNode::Group(group(201, vec![raster(2)]))]);
+        let mut tree = LayerTree::new(group(
+            100,
+            vec![LayerTreeNode::Group(chain), LayerTreeNode::Group(movable)],
+        ))
+        .expect("valid depth-64 fixture");
+        let before = tree.clone();
+        for destination in [63, 64] {
+            assert_eq!(
+                tree.reorder(
+                    LayerTreeNodeId::Group(GroupId(200)),
+                    GroupId(destination),
+                    0
+                ),
+                Err(LayerTreeError::TooDeep)
+            );
+            assert_eq!(tree, before, "rejected depth must preserve the entire tree");
+        }
+        tree.reorder(LayerTreeNodeId::Group(GroupId(200)), GroupId(62), 0)
+            .expect("boundary depth remains supported");
+        assert_eq!(
+            tree.ancestors(LayerTreeNodeId::Group(GroupId(201)))
+                .expect("retained subtree")
+                .len(),
+            64
+        );
+        assert!(LayerTree::new(tree.root().clone()).is_ok());
     }
 
     #[test]

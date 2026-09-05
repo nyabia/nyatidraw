@@ -42,6 +42,8 @@ fn launch_with_instance(
     let live_ink = LiveInkBridge::with_capacity(INPUT_QUEUE_CAPACITY, INITIAL_ACTIVE_LAYER);
     let context_ink = live_ink.clone();
     let config = Config::new()
+        // Windows' native file-drop handler intercepts HTML layer drag/drop.
+        .with_disable_drag_drop_handler(true)
         .with_window(
             WindowBuilder::new()
                 .with_title("NyatiDraw")

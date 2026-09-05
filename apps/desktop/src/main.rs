@@ -1,6 +1,7 @@
 #[cfg(windows)]
 mod desktop_canvas;
 mod desktop_shell;
+mod layer_drag;
 mod live_ink;
 mod native_canvas;
 mod preview;
@@ -275,6 +276,7 @@ fn initial_ui_projection() -> UiProjection {
         LayerProjection {
             id: LayerTreeNodeId::Group(INK_GROUP),
             parent: ROOT_GROUP,
+            index: 1,
             depth: 1,
             kind: LayerProjectionKind::Group,
             name: "Ink group".into(),
@@ -285,6 +287,7 @@ fn initial_ui_projection() -> UiProjection {
         LayerProjection {
             id: LayerTreeNodeId::Raster(INK_LAYER),
             parent: INK_GROUP,
+            index: 0,
             depth: 2,
             kind: LayerProjectionKind::Raster,
             name: "Ink".into(),
@@ -295,6 +298,7 @@ fn initial_ui_projection() -> UiProjection {
         LayerProjection {
             id: LayerTreeNodeId::Raster(BACKGROUND_LAYER),
             parent: ROOT_GROUP,
+            index: 0,
             depth: 1,
             kind: LayerProjectionKind::Raster,
             name: "Background".into(),
@@ -1054,6 +1058,7 @@ fn RecentColorButton(color: &'static str, rgba: [u8; 4]) -> Element {
 
 #[component]
 fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
+    layer_drag::use_layer_drag_probe();
     let live_ink = use_context::<LiveInkBridge>();
     let add_raster_ink = live_ink.clone();
     let add_group_ink = live_ink.clone();
@@ -1068,6 +1073,7 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
     let solo_node = ui_projection.read().solo_node;
     let error = use_signal(|| Option::<String>::None);
     let collapsed_groups = use_signal(BTreeSet::<GroupId>::new);
+    let mut layer_drag = use_signal(|| Option::<layer_drag::LayerDrag>::None);
     let collapsed_snapshot = collapsed_groups.read().clone();
     let thumbnails = live_ink.layer_thumbnail_snapshot();
     let mut hidden_below = None;
@@ -1090,6 +1096,10 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
         .collect();
     rsx! {
         div { class: "layers-panel",
+            ondragend: move |_| layer_drag.set(None),
+            onkeydown: move |event| {
+                if event.key() == Key::Escape { layer_drag.set(None); }
+            },
             div { class: "layer-actions",
                 button { title: "래스터 레이어 추가", onclick: move |_| {
                     send_editor_command(&add_raster_ink, EditorCommand::Layer(LayerCommand::AddRaster), error);
@@ -1100,6 +1110,7 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
                 button { title: "흰 배경 추가", onclick: move |_| {
                     send_editor_command(&white_ink, EditorCommand::Layer(LayerCommand::AddWhiteBackground), error);
                 }, UiIcon { name: "white" } }
+                layer_drag::LayerMoveButtons { projection: ui_projection, error }
             }
             div { class: "layer-settings",
                 button { disabled: true, title: "레이어 색상화 (후속 구현)", span { class: "layer-color-chip" } "색상화" }
@@ -1123,7 +1134,7 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
                             LayerTreeNodeId::Raster(layer_id) => thumbnails.frame(layer_id),
                             LayerTreeNodeId::Group(_) => None,
                         };
-                        rsx! { LayerRow { key: "{layer.id:?}", layer, thumbnail, active, solo_node, error, collapsed_groups } }
+                        rsx! { LayerRow { key: "{layer.id:?}", layer, thumbnail, active, solo_node, error, collapsed_groups, layer_drag, ui_projection } }
                     }
                 }
             }
@@ -1145,6 +1156,8 @@ fn LayerRow(
     solo_node: Option<LayerTreeNodeId>,
     error: Signal<Option<String>>,
     mut collapsed_groups: Signal<BTreeSet<GroupId>>,
+    mut layer_drag: Signal<Option<layer_drag::LayerDrag>>,
+    ui_projection: Signal<UiProjection>,
 ) -> Element {
     let live_ink = use_context::<LiveInkBridge>();
     let active_ink = live_ink.clone();
@@ -1161,8 +1174,13 @@ fn LayerRow(
         matches!(id, LayerTreeNodeId::Group(group) if collapsed_groups.read().contains(&group));
     let opacity = u32::from(layer.opacity_u16) * 100 / u32::from(u16::MAX);
     let indent = u32::from(layer.depth.saturating_sub(1)) * 9;
+    let layer_key = match id {
+        LayerTreeNodeId::Raster(id) => format!("r-{}", id.0),
+        LayerTreeNodeId::Group(id) => format!("g-{}", id.0),
+    };
     rsx! {
         div { class: if is_group { "layer-row group" } else if is_active { "layer-row active" } else { "layer-row" }, style: "padding-left:{indent}px",
+            "data-layer-key": "{layer_key}", "data-parent": "{layer.parent.0}", "data-index": "{layer.index}",
             button { class: "layer-eye", title: "보기/숨기기", onclick: move |_| {
                 let visible = !layer.visible;
                 send_editor_command(&visibility_ink, EditorCommand::Layer(LayerCommand::SetVisibility { node: id, visible }), error);
@@ -1195,9 +1213,18 @@ fn LayerRow(
                 span { class: "layer-tree", if layer.depth > 1 { "└" } else { "" } }
             }
             span { class: if is_group { "layer-thumb group-thumb" } else { "layer-thumb raster-thumb" },
+                draggable: "true", title: "끌어서 레이어 순서 또는 그룹 변경",
+                ondragstart: move |_| {
+                    let current = ui_projection.read();
+                    if let Some(source) = current.layers.iter().find(|layer| layer.id == id) {
+                        layer_drag.set(Some(layer_drag::LayerDrag::begin(source, current.revision)));
+                    }
+                },
+                ondragend: move |_| layer_drag.set(None),
                 if let Some(thumbnail) = thumbnail {
                     img {
                         class: "layer-thumb-image",
+                        draggable: "false",
                         src: "{thumbnail.data_uri}",
                         width: "{thumbnail.width}",
                         height: "{thumbnail.height}",
@@ -1246,6 +1273,7 @@ fn LayerRow(
                 onclick: move |_| send_editor_command(&delete_ink, EditorCommand::Layer(LayerCommand::Delete(id)), error),
                 "×"
             }
+            layer_drag::LayerDropTargets { layer: layer.clone(), projection: ui_projection, drag: layer_drag, error }
         }
     }
 }
