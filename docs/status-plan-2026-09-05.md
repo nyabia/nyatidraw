@@ -255,3 +255,19 @@ Fit 배율이 입력 transform 상한을 넘어서 첫 canvas frame이 나오지
 상세는 [PNG pair 실행 근거](godot-integration.md#2026-09-05-설치-release-png-pair-실행-근거)에
 기록했다. Explorer 메뉴 직접 조작, Godot reimport와 하드웨어 증거는 미검증으로 남긴다.
 이 환경에서 진행할 다음 구현은 레이어·히스토리의 남은 semantic/durable 기능이다.
+
+### 명시적 redo 분기 선택 완료
+
+히스토리 패널에서 현재 cursor의 직접 자식 분기를 선택하는 `RedoTo`와 64개씩
+넘겨 보는 목록을 연결했다. 한 번에 전체 분기 목록을 만들지 않고 ID 순서의 bounded
+range를 사용한다. history 이동은 대기 중인 stroke/export를 추월하지 않으며,
+late completion을 처리하며 revision이 바뀌면 재시도를 요구한다.
+
+새 session에서 최초 cursor를 잃어 첫 작업을 바로 Undo할 수 없던 결함도 수정했다.
+이를 막는 core invariant 테스트 한 개만 추가해 총 58개이며, 전체 테스트와
+all-target Clippy가 통과했다. 설치 release에서 66개 분기·페이지 경계·잘못된/모호한
+선택 보존·67→Undo→2 선택·Save/restart/reopen/export, 첫 PNG import의 즉시 Undo와
+재실행 뒤 Redo가 통과했다. [구현 근거](implementation.md#2026-09-05-explicit-desktop-history-branches)에
+명령과 한계를 기록했다. 작업 트리의 layer metadata는 아직 current 값으로 저장되므로,
+다음 단계는 삭제 및 metadata 변경을 history snapshot과 함께 복원하는 저장 구조다.
+UI 직접 선택/시각 검증과 synchronous history 요청의 hot-path 분리는 남아 있다.

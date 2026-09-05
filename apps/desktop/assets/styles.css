@@ -138,6 +138,10 @@ button:focus, [tabindex="0"]:focus { outline: 2px solid #9ee8ff; outline-offset:
 .layers-footer { justify-content: flex-end; border-top: 1px solid #5d5d5d; border-bottom: 0; }
 
 .history-panel { width: 100%; padding: 4px; }
+.history-branches { display: flex; flex-direction: column; gap: 4px; padding: 6px; border-bottom: 1px solid #999; }
+.history-branches strong { font-size: 11px; color: #bfeeff; }
+.history-branch { text-align: left; padding: 5px 7px; }
+.history-branch-pages { display: flex; justify-content: space-between; gap: 6px; }
 .history-row { display: flex; height: 27px; padding: 6px 8px; border-bottom: 1px solid #999; color: #dedede; }
 .history-row.active { background: #666; color: #fff; }
 .history-operation { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -187,12 +187,23 @@ impl History {
     /// IDs are sorted ascending, independent of insertion or traversal order.
     #[must_use]
     pub fn redo_candidates(&self) -> Vec<HistoryNodeId> {
+        self.redo_candidates_after(None).collect()
+    }
+
+    /// Iterates direct children in stable ID order without allocating the
+    /// whole branch set. Callers can take a bounded page for UI projection.
+    pub fn redo_candidates_after(
+        &self,
+        after: Option<HistoryNodeId>,
+    ) -> impl Iterator<Item = HistoryNodeId> + '_ {
+        use std::ops::Bound::{Excluded, Unbounded};
         self.children
             .get(&self.head)
             .into_iter()
-            .flatten()
+            .flat_map(move |children| {
+                children.range((after.map_or(Unbounded, Excluded), Unbounded))
+            })
             .copied()
-            .collect()
     }
 
     /// Reapplies the only available child branch.

@@ -21,7 +21,10 @@
    않는다.
 5. 출력 페이지로 crop한 실제 layer thumbnail과 navigator composite/viewport box를
    제공한다.
-6. branch-preserving history 목록과 cursor를 UI projection에 연결한다.
+6. branch-preserving history 목록과 cursor를 UI projection에 연결한다. 2026-09-05에
+   직접 자식 분기 선택 `RedoTo`와 64개 단위 목록 페이지를 연결했다. 설치 release에서
+   66개 sibling의 목록·선택·Save/restart/reopen/export와 invalid/ambiguous 선택의
+   원본 보존을 확인했다. Layer metadata 자체의 history snapshot 복원은 남아 있다.
 7. 반복 Save 중 오래된 export가 최신 PNG를 덮지 못하게 하고 export 실패를 project
    저장 실패와 분리해 표시한다.
 8. 실제 Godot prototype 폴더에서 반복 PNG activation과 watcher 갱신을 확인한다.

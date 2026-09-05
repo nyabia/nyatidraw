@@ -70,9 +70,32 @@ const CLOSE_RAW_QUEUE_PROBE_ENV: &str = "NAYATI_CLOSE_RAW_QUEUE_PROBE";
 const ACTIVE_CLOSE_PROBE_ENV: &str = "NAYATI_ACTIVE_CLOSE_PROBE";
 const SAVE_PROBE_ENV: &str = "NAYATI_SAVE_PROBE";
 const PROTOCOL_PROBE_ENV: &str = "NAYATI_PROTOCOL_PROBE";
+const HISTORY_PROBE_ENV: &str = "NAYATI_HISTORY_PROBE";
 const INPUT_SAFETY_PROBE_ENV: &str = "NAYATI_INPUT_SAFETY_PROBE";
 static ACTIVE_PROBE_USED: AtomicBool = AtomicBool::new(false);
 static SAVE_PROBE_USED: AtomicBool = AtomicBool::new(false);
+
+fn history_probe_command() -> Option<nyatidraw_api::HistoryCommand> {
+    use nyatidraw_api::HistoryCommand;
+    let value = std::env::var(HISTORY_PROBE_ENV).ok()?;
+    match value.as_str() {
+        "undo" => Some(HistoryCommand::Undo),
+        "redo" => Some(HistoryCommand::Redo),
+        "page" => Some(HistoryCommand::ShowRedoBranches { after: None }),
+        _ => value
+            .strip_prefix("redo:")
+            .and_then(|id| id.parse().ok())
+            .map(|id| HistoryCommand::RedoTo(HistoryNodeId(id)))
+            .or_else(|| {
+                value
+                    .strip_prefix("page:")
+                    .and_then(|id| id.parse().ok())
+                    .map(|id| HistoryCommand::ShowRedoBranches {
+                        after: Some(HistoryNodeId(id)),
+                    })
+            }),
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct DrawingConfig {
@@ -583,6 +606,7 @@ struct ActiveCanvas {
     close_raw_probe_staged: bool,
     save_probe_step: u8,
     protocol_probe_step: Option<u8>,
+    history_probe: Option<(nyatidraw_api::HistoryCommand, bool)>,
     input_safety_probe_step: Option<u8>,
     synthetic_seed_enabled: bool,
     synthetic_seed_submitted: bool,
@@ -720,6 +744,7 @@ impl ActiveCanvas {
                 3
             },
             protocol_probe_step: std::env::var_os(PROTOCOL_PROBE_ENV).map(|_| 0),
+            history_probe: history_probe_command().map(|command| (command, false)),
             input_safety_probe_step: std::env::var_os(INPUT_SAFETY_PROBE_ENV).map(|_| 0),
             synthetic_seed_enabled: std::env::var_os("NAYATI_SYNTHETIC_INK").is_some(),
             synthetic_seed_submitted: false,
@@ -830,6 +855,36 @@ impl ActiveCanvas {
                 .is_ok()
         {
             self.protocol_probe_step = Some(step.saturating_add(1));
+        }
+    }
+
+    fn advance_history_probe(&mut self) {
+        let Some((command, submitted)) = self.history_probe else {
+            return;
+        };
+        if submitted {
+            let history = &self.projection.current().history;
+            let candidates: Vec<_> = history
+                .redo_branches
+                .iter()
+                .map(|branch| branch.node.0)
+                .collect();
+            println!(
+                "native-canvas event=history-probe-complete candidates={candidates:?} after={:?} more={} semantic_only=true",
+                history.redo_page_after.map(|id| id.0),
+                history.has_more_redo_branches,
+            );
+            self.history_probe = None;
+        } else if self
+            .stroke
+            .live_ink
+            .push_editor_command(
+                self.projection.current().revision,
+                EditorCommand::History(command),
+            )
+            .is_ok()
+        {
+            self.history_probe = Some((command, true));
         }
     }
 
@@ -997,6 +1052,7 @@ impl ActiveCanvas {
         // Advance only after startup's queued Fit and the previous probe
         // command have run, so the next command uses their resulting revision.
         self.advance_protocol_probe();
+        self.advance_history_probe();
         if self.advance_input_safety_probe_before_drain() {
             return None;
         }
@@ -1565,13 +1621,36 @@ impl ActiveCanvas {
                 if self.scene.active_live_stroke().is_some() {
                     return Err(CommandRejectReason::UnsupportedCommand);
                 }
+                // A history cursor must not overtake closed strokes retained
+                // outside the writer FIFO, or be overwritten by their late
+                // GPU completions after the cursor move.
+                if self.stroke.active.is_some()
+                    || !self.stroke.pending_materializations.is_empty()
+                    || self.stroke.materializer.pending.load(Ordering::Acquire) != 0
+                    || matches!(
+                        self.stroke.live_ink.export_status_snapshot(),
+                        ExportStatus::Queued { .. } | ExportStatus::Running { .. }
+                    )
+                {
+                    return Err(CommandRejectReason::CommandQueueBusy);
+                }
+                let based_on = self.projection.current().revision;
+                self.apply_materialized_tiles();
+                if self.projection.current().revision != based_on {
+                    return Err(CommandRejectReason::StaleProjection {
+                        based_on,
+                        current: self.projection.current().revision,
+                    });
+                }
                 let moved = self
                     .stroke
                     .materializer
                     .move_history(command)
                     .map_err(|()| CommandRejectReason::UnsupportedCommand)?;
                 self.projection.stage_history(moved.history);
-                let snapshot = moved.tiles;
+                let Some(snapshot) = moved.tiles else {
+                    return Ok(false);
+                };
                 let keys: std::collections::BTreeSet<_> = self
                     .cpu_tiles
                     .keys()
@@ -2953,7 +3032,7 @@ enum WorkerRequest {
 }
 
 struct HistoryMove {
-    tiles: TileSnapshot,
+    tiles: Option<TileSnapshot>,
     history: HistoryProjection,
 }
 
@@ -3516,9 +3595,22 @@ fn materialization_loop(
                 continue;
             }
             WorkerRequest::MoveHistory { command, reply } => {
+                if let nyatidraw_api::HistoryCommand::ShowRedoBranches { after } = command {
+                    let _ = reply.send(Ok(HistoryMove {
+                        tiles: None,
+                        history: session.history_projection_after(after),
+                    }));
+                    continue;
+                }
                 let prepared = match command {
                     nyatidraw_api::HistoryCommand::Undo => session.prepare_undo_cursor(),
                     nyatidraw_api::HistoryCommand::Redo => session.prepare_redo_cursor(),
+                    nyatidraw_api::HistoryCommand::RedoTo(candidate) => {
+                        session.prepare_redo_to_cursor(candidate)
+                    }
+                    nyatidraw_api::HistoryCommand::ShowRedoBranches { .. } => {
+                        unreachable!("handled above")
+                    }
                 };
                 let result = prepared
                     .map_err(|error| format!("history-prepare:{error:?}"))
@@ -3528,16 +3620,16 @@ fn materialization_loop(
                             ProjectSink::UntitledRecovery { db, .. }
                             | ProjectSink::ExplicitProject { db, .. } => db,
                         };
-                        db.persist_history_cursor(target)
-                            .map_err(|error| format!("history-persist:{error}"))?;
                         let tiles = db
                             .load_cursor_tiles(target)
                             .map_err(|error| format!("history-load:{error}"))?;
+                        db.persist_history_cursor(target)
+                            .map_err(|error| format!("history-persist:{error}"))?;
                         session
                             .accept_history_cursor_move(prepared, tiles.clone())
                             .map_err(|error| format!("history-accept:{error:?}"))?;
                         Ok(HistoryMove {
-                            tiles,
+                            tiles: Some(tiles),
                             history: session.history_projection(),
                         })
                     });
@@ -3788,7 +3880,7 @@ fn materialization_loop(
                 false
             }
         };
-        pending.fetch_sub(1, Ordering::Relaxed);
+        pending.fetch_sub(1, Ordering::Release);
         if !keep_running {
             exit = WorkerExit::FailStop;
             break;

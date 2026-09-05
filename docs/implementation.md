@@ -277,6 +277,39 @@ for ownership and exact dependency details.
   status; a generation gate rejects queued stale work and rechecks an encoded
   stale job immediately before replacement.
 
+## 2026-09-05 explicit desktop history branches
+
+The history panel now sends `RedoTo(HistoryNodeId)` for a direct child of the
+current cursor. The writer validates the branch, loads its immutable tiles,
+persists the cursor, then accepts it in the live session. Redo siblings remain
+in the database. `ShowRedoBranches` projects 64 candidates at a time from a
+stable BTree range; paging does not change artwork or the durable cursor.
+Ancestry rows also stay within their 64-entry bound, including the initial row.
+
+History commands reject while active/retained/pending strokes or PNG jobs are
+outstanding. Completed stroke payloads are drained before moving the cursor;
+if that changes the semantic revision the command is rejected as stale. This
+prevents a cursor move from overtaking the closed-stroke backlog or a late
+completion from repainting the old cursor. The existing synchronous request/reply
+for idle history operations remains; this is not proof of the Sprint 3 hot-path
+isolation/latency gate.
+
+Fresh sessions now retain their initial cursor, fixing first-edit Undo before
+reopen. One core regression test covers initial Undo and retained redo artwork;
+workspace tests total **58**, with all-target Clippy `-D warnings` passing.
+DX 0.7.9 release was installed and `desktop_export_recovery_smoke` passed using
+the installed binary on Windows 11 Home 10.0.26200 / Core Ultra 7 155H / Intel Arc
+integrated / DX12. The scratch fixture retains 66 siblings, pages beyond 64,
+selects branches 67 then 2 across restarts, preserves invalid/ambiguous selections,
+and compares saved pixels/export/cursor/node count. A fresh PNG import is undone
+before restart and explicitly redone after restart. Existing PNG/crash/export
+recovery cases also pass. Evidence: `target/installed-history-final.log`,
+`target/history-final-tests.log`, `target/history-final-clippy.log`.
+
+These are semantic command and process-restart results; branch-button visual
+interaction, physical pen, visible-pixel latency, and per-snapshot layer metadata
+restoration are not established by this probe.
+
 ## Test policy
 
 Automated tests target only core regressions that can corrupt artwork, lose

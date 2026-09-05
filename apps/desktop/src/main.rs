@@ -609,9 +609,52 @@ fn panel_ready_contents(panel: PanelKind, ui_projection: Signal<UiProjection>) -
 
 #[component]
 fn HistoryPanel(ui_projection: Signal<UiProjection>) -> Element {
+    let live_ink = use_context::<LiveInkBridge>();
+    let error = use_signal(|| Option::<String>::None);
     let history = ui_projection.read().history.clone();
     rsx! {
         div { class: "history-panel", aria_label: "현재 브랜치 히스토리",
+            if !history.redo_branches.is_empty() || history.redo_page_after.is_some() {
+                div { class: "history-branches", aria_label: "다시 실행할 분기 선택",
+                    strong { "다시 실행할 분기" }
+                    for branch in &history.redo_branches {
+                        button {
+                            class: "history-branch",
+                            key: "{branch.node.0}",
+                            onclick: {
+                                let live_ink = live_ink.clone();
+                                let node = branch.node;
+                                move |_| send_editor_command(&live_ink, EditorCommand::History(HistoryCommand::RedoTo(node)), error)
+                            },
+                            "{history_operation_label(branch.operation)} · 분기 {branch.node.0}"
+                        }
+                    }
+                    div { class: "history-branch-pages",
+                        if history.redo_page_after.is_some() {
+                            button {
+                                onclick: {
+                                    let live_ink = live_ink.clone();
+                                    move |_| send_editor_command(&live_ink, EditorCommand::History(HistoryCommand::ShowRedoBranches { after: None }), error)
+                                },
+                                "처음"
+                            }
+                        }
+                        if history.has_more_redo_branches {
+                            button {
+                                onclick: {
+                                    let live_ink = live_ink.clone();
+                                    let after = history.redo_branches.last().map(|branch| branch.node);
+                                    move |_| send_editor_command(&live_ink, EditorCommand::History(HistoryCommand::ShowRedoBranches { after }), error)
+                                },
+                                "다음"
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(message) = error() {
+                div { class: "command-error", role: "alert", "{message}" }
+            }
             if history.has_older_entries {
                 div { class: "history-truncated", "이전 작업은 생략됨" }
             }

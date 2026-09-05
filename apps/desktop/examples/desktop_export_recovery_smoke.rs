@@ -13,9 +13,10 @@ fn main() {
 
 #[cfg(windows)]
 mod windows_probe {
-    use nyatidraw_api::LayerId;
+    use nyatidraw_api::{CanvasSpec, HistoryNodeId, LayerId, SnapshotId};
+    use nyatidraw_editor::HeadlessStrokeSession;
     use nyatidraw_project_redb::ProjectDb;
-    use nyatidraw_tiles::{FlattenedRgba8, TileSnapshot};
+    use nyatidraw_tiles::{FlattenedRgba8, TILE_BYTE_LEN, TileKey, TileSnapshot};
     use std::{
         fs,
         io::{BufRead as _, BufReader},
@@ -74,6 +75,8 @@ mod windows_probe {
     }
 
     fn run_cases(executable: &Path, root: &Path) -> Result<()> {
+        history_branches_case(executable, &root.join("history-branches"))?;
+        initial_import_history_case(executable, &root.join("initial-history"))?;
         for sibling in ["absent", "zero-byte"] {
             png_pair_case(executable, &root.join(sibling), sibling)?;
         }
@@ -106,6 +109,118 @@ mod windows_probe {
         nyatidraw_png_io::encode_png(&project.with_extension("png"), &old)?;
         let bytes = fs::read(project.with_extension("png"))?;
         Ok((project, bytes))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn history_branches_case(executable: &Path, directory: &Path) -> Result<()> {
+        let (project, _) = fixture(directory)?;
+        let db = ProjectDb::open(&project)?;
+        let canvas = CanvasSpec {
+            width_px: 2,
+            height_px: 2,
+            pixels_per_inch: 96,
+        };
+        db.persist_canvas_spec(canvas)?;
+        let mut session = HeadlessStrokeSession::new(SnapshotId(0), TileSnapshot::empty());
+        let mut expected = Vec::new();
+        // 66 sibling branches exercise the bounded page boundary and ensure
+        // later branches remain selectable. No UI layout mocks are involved.
+        for id in 1_u8..=67 {
+            let tiles = TileSnapshot::from_tiles([(
+                TileKey {
+                    layer: LayerId(1),
+                    mip: 0,
+                    x: 0,
+                    y: 0,
+                },
+                [id, 0, 0, 255].repeat(TILE_BYTE_LEN / 4),
+            )])
+            .map_err(|error| format!("branch pixels: {error:?}"))?;
+            let batch = session
+                .prepare_structural_change(
+                    SnapshotId(u128::from(id)),
+                    HistoryNodeId(u128::from(id)),
+                    u64::from(id),
+                    tiles.clone(),
+                )
+                .map_err(|error| format!("branch prepare: {error:?}"))?;
+            db.commit_structural(&batch)?;
+            session
+                .accept_structural_change(&batch)
+                .map_err(|error| format!("branch accept: {error:?}"))?;
+            expected.push(tiles);
+            if id > 1 {
+                let undo = session
+                    .prepare_undo_cursor()
+                    .map_err(|error| format!("branch undo: {error:?}"))?;
+                let tiles = db.load_cursor_tiles(undo.target())?;
+                db.persist_history_cursor(undo.target())?;
+                session
+                    .accept_history_cursor_move(undo, tiles)
+                    .map_err(|error| format!("branch undo accept: {error:?}"))?;
+            }
+        }
+        drop(session);
+        drop(db);
+        for (probe, selected, marker) in [
+            ("page", 1, "more=true"),
+            (
+                "page:65",
+                1,
+                "candidates=[66, 67] after=Some(65) more=false",
+            ),
+            ("redo", 1, "history-prepare:History(AmbiguousRedo"),
+            (
+                "redo:999",
+                1,
+                "history-prepare:History(UnknownRedoCandidate",
+            ),
+            ("redo:67", 67, "event=history-probe-complete candidates=[]"),
+            ("undo", 1, "more=true"),
+            ("redo:2", 2, "event=history-probe-complete candidates=[]"),
+        ] {
+            let mut app = Desktop::start_with_history(executable, &project, Some(probe))?;
+            app.until(marker)?;
+            app.until("event=history-probe-complete")?;
+            app.until("event=first-native-wgpu-present")?;
+            let window = find_window(app.child.id())?;
+            let child =
+                unsafe { FindWindowExW(Some(window), None, w!("NyatiDrawWgpuCanvas"), None) }?;
+            post(child, WM_KEYDOWN, usize::from(b'S'))?;
+            app.until("event=png-export-finished")?;
+            app.close()?;
+            let db = ProjectDb::open(&project)?;
+            let reopened = db.load_reopened()?.ok_or("missing branch project")?;
+            if reopened.history().node_count() != 67
+                || reopened.history().head() != Some(HistoryNodeId(selected))
+                || reopened.current_tiles() != &expected[usize::try_from(selected - 1)?]
+            {
+                return Err(
+                    format!("{probe}: branch selection lost artwork, cursor or siblings").into(),
+                );
+            }
+            verify_png(
+                &project.with_extension("png"),
+                &reopened
+                    .current_tiles()
+                    .crop_base_layer_rgba8_to_canvas(LayerId(1), canvas)
+                    .map_err(|error| format!("branch export: {error:?}"))?,
+            )?;
+        }
+        let mut restarted = Desktop::start(executable, &project, false, None)?;
+        restarted.until("event=first-native-wgpu-present")?;
+        restarted.close()?;
+        let db = ProjectDb::open(&project)?;
+        let reopened = db.load_reopened()?.ok_or("missing restarted branch")?;
+        if reopened.history().head() != Some(HistoryNodeId(2))
+            || reopened.history().node_count() != 67
+        {
+            return Err("final process restart lost selected branch".into());
+        }
+        println!(
+            "desktop-history-branches status=passed siblings=66 page_size=64 selected=67-then-2 invalid_and_ambiguous=unchanged save_restart_reopen_export=exact"
+        );
+        Ok(())
     }
 
     fn png_pair_case(executable: &Path, directory: &Path, sibling: &str) -> Result<()> {
@@ -174,6 +289,49 @@ mod windows_probe {
         }
         println!(
             "desktop-png-pair status=passed sibling={sibling}-then-valid source_before_save=exact restart=exact activation=same-primary off_page_artwork=durable png=page-cropped physical_pen_proof=false"
+        );
+        Ok(())
+    }
+
+    fn initial_import_history_case(executable: &Path, directory: &Path) -> Result<()> {
+        let (project, _) = fixture(directory)?;
+        let png = project.with_extension("png");
+        for (probe, snapshot, expected_color) in
+            [("undo", 0, [0, 0, 0, 0]), ("redo:1", 1, [255, 0, 0, 255])]
+        {
+            let mut app = Desktop::start_with_history(executable, &png, Some(probe))?;
+            app.until("event=history-probe-complete")?;
+            app.until("event=first-native-wgpu-present")?;
+            let window = find_window(app.child.id())?;
+            let child =
+                unsafe { FindWindowExW(Some(window), None, w!("NyatiDrawWgpuCanvas"), None) }?;
+            post(child, WM_KEYDOWN, usize::from(b'S'))?;
+            app.until("event=png-export-finished")?;
+            app.close()?;
+            let db = ProjectDb::open(&project)?;
+            let reopened = db
+                .load_reopened()?
+                .ok_or("initial import history missing")?;
+            if reopened.current_snapshot() != SnapshotId(snapshot)
+                || reopened.history().node_count() != 1
+            {
+                return Err(
+                    "fresh import undo/redo did not retain its initial cursor and branch".into(),
+                );
+            }
+            verify_png(
+                &png,
+                &FlattenedRgba8 {
+                    origin_x: 0,
+                    origin_y: 0,
+                    width: 2,
+                    height: 2,
+                    pixels: expected_color.repeat(4),
+                },
+            )?;
+        }
+        println!(
+            "desktop-initial-history status=passed fresh_import_undo=initial redo_after_restart=exact artwork_and_branch=preserved"
         );
         Ok(())
     }
@@ -344,6 +502,22 @@ mod windows_probe {
             seed: bool,
             pause: Option<&str>,
         ) -> Result<Self> {
+            Self::start_options(executable, project, seed, pause, None)
+        }
+        fn start_with_history(
+            executable: &Path,
+            project: &Path,
+            history: Option<&str>,
+        ) -> Result<Self> {
+            Self::start_options(executable, project, false, None, history)
+        }
+        fn start_options(
+            executable: &Path,
+            project: &Path,
+            seed: bool,
+            pause: Option<&str>,
+            history: Option<&str>,
+        ) -> Result<Self> {
             let mut command = Command::new(executable);
             for name in [
                 "NAYATI_DESKTOP_DURABILITY_PROBE",
@@ -354,6 +528,7 @@ mod windows_probe {
                 "NAYATI_INPUT_SAFETY_PROBE",
                 "NAYATI_EXPORT_PAUSE",
                 "NAYATI_EXPORT_PROBE_DIR",
+                "NAYATI_HISTORY_PROBE",
             ] {
                 command.env_remove(name);
             }
@@ -366,6 +541,9 @@ mod windows_probe {
                 command
                     .env("NAYATI_ACTIVE_CLOSE_PROBE", "1")
                     .env("NAYATI_SAVE_PROBE", "end");
+            }
+            if let Some(history) = history {
+                command.env("NAYATI_HISTORY_PROBE", history);
             }
             if let Some(stage) = pause {
                 command.env("NAYATI_EXPORT_PAUSE", stage).env(

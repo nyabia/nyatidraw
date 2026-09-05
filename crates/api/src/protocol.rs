@@ -1,6 +1,6 @@
 use crate::{
-    CommandId, DockLayoutError, DockPosition, DockTree, GroupId, LayerId, LayerTreeNodeId,
-    PanelKind, Revision,
+    CommandId, DockLayoutError, DockPosition, DockTree, GroupId, HistoryNodeId, LayerId,
+    LayerTreeNodeId, PanelKind, Revision,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +71,11 @@ pub enum ViewportCommand {
 pub enum HistoryCommand {
     Undo,
     Redo,
+    RedoTo(HistoryNodeId),
+    /// Pages direct redo children without changing the durable cursor.
+    ShowRedoBranches {
+        after: Option<HistoryNodeId>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,8 +202,7 @@ pub const HISTORY_PROJECTION_MAX_ENTRIES: usize = 64;
 
 /// The semantic operation represented by a history row.
 ///
-/// This intentionally carries neither a content root nor a durable node ID:
-/// history selection is not a UI command in the current slice.
+/// Labels carry no artwork or content roots.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HistoryOperationLabel {
     Initial,
@@ -212,6 +216,14 @@ pub struct HistoryEntryProjection {
     pub operation: HistoryOperationLabel,
 }
 
+/// A direct child of the current cursor, eligible for explicit redo.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryBranchProjection {
+    pub node: HistoryNodeId,
+    pub operation: HistoryOperationLabel,
+    pub timestamp_ns: u64,
+}
+
 /// Current-cursor ancestry supplied by the project writer.
 ///
 /// Entries are newest first, including the initial state when the bounded
@@ -223,6 +235,9 @@ pub struct HistoryProjection {
     pub entries: Vec<HistoryEntryProjection>,
     pub current: usize,
     pub has_older_entries: bool,
+    pub redo_branches: Vec<HistoryBranchProjection>,
+    pub redo_page_after: Option<HistoryNodeId>,
+    pub has_more_redo_branches: bool,
 }
 
 impl HistoryProjection {
@@ -234,6 +249,9 @@ impl HistoryProjection {
             }],
             current: 0,
             has_older_entries: false,
+            redo_branches: Vec::new(),
+            redo_page_after: None,
+            has_more_redo_branches: false,
         }
     }
 }

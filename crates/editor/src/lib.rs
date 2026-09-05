@@ -7,8 +7,8 @@ mod projection;
 pub use projection::{ProjectionError, ProjectionState};
 
 use nyatidraw_api::{
-    HISTORY_PROJECTION_MAX_ENTRIES, HistoryEntryProjection, HistoryNodeId, HistoryOperationLabel,
-    HistoryProjection, LayerId, SnapshotId,
+    HISTORY_PROJECTION_MAX_ENTRIES, HistoryBranchProjection, HistoryEntryProjection, HistoryNodeId,
+    HistoryOperationLabel, HistoryProjection, LayerId, SnapshotId,
 };
 use nyatidraw_brush::{BrushSnapshot, RecordedStroke};
 use nyatidraw_history::{History, HistoryError, HistoryNode, OperationRecord};
@@ -106,7 +106,7 @@ impl HeadlessStrokeSession {
             history: History::new(tiles.root().id),
             tiles,
             current_cursor,
-            cursors: BTreeMap::new(),
+            cursors: BTreeMap::from([(None, current_cursor)]),
         }
     }
 
@@ -406,9 +406,15 @@ impl HeadlessStrokeSession {
 
     /// Produces a bounded current-branch ancestry for editor chrome directly
     /// from the already-open session. This does not enumerate storage and
-    /// deliberately exposes only operation labels, not history IDs or roots.
+    /// exposes only semantic labels and direct redo IDs, never artwork roots.
     #[must_use]
     pub fn history_projection(&self) -> HistoryProjection {
+        self.history_projection_after(None)
+    }
+
+    /// Projects one bounded page of redo candidates at the current cursor.
+    #[must_use]
+    pub fn history_projection_after(&self, after: Option<HistoryNodeId>) -> HistoryProjection {
         let mut entries = Vec::with_capacity(HISTORY_PROJECTION_MAX_ENTRIES);
         let mut cursor = self.history.head();
         while let Some(id) = cursor {
@@ -430,21 +436,80 @@ impl HeadlessStrokeSession {
             cursor = node.parent;
         }
 
-        let has_older_entries = cursor.is_some();
+        let has_older_entries = cursor.is_some() || entries.len() == HISTORY_PROJECTION_MAX_ENTRIES;
         if !has_older_entries {
             entries.push(HistoryEntryProjection {
                 operation: HistoryOperationLabel::Initial,
             });
         }
+        let mut candidates = self.history.redo_candidates_after(after);
+        let redo_branches = candidates
+            .by_ref()
+            .take(HISTORY_PROJECTION_MAX_ENTRIES)
+            .filter_map(|id| self.history.node(id))
+            .map(|node| HistoryBranchProjection {
+                node: node.id,
+                operation: match node.operation {
+                    OperationRecord::Stroke { .. } => HistoryOperationLabel::Stroke,
+                    OperationRecord::StructuralChange => HistoryOperationLabel::Structural,
+                },
+                timestamp_ns: node.timestamp_ns,
+            })
+            .collect();
         HistoryProjection {
             entries,
             current: 0,
             has_older_entries,
+            redo_branches,
+            redo_page_after: after,
+            has_more_redo_branches: candidates.next().is_some(),
         }
     }
 
     #[must_use]
     pub const fn tiles(&self) -> &TileSnapshot {
         &self.tiles
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nyatidraw_tiles::{TILE_BYTE_LEN, TileKey};
+
+    #[test]
+    fn first_edit_can_undo_to_initial_artwork_without_restarting() {
+        // Product risk: a fresh editor session must retain its initial cursor,
+        // or the first imported/background artwork cannot be undone until reopen.
+        let initial = TileSnapshot::empty();
+        let mut session = HeadlessStrokeSession::new(SnapshotId(0), initial.clone());
+        let painted = TileSnapshot::from_tiles([(
+            TileKey {
+                layer: LayerId(1),
+                mip: 0,
+                x: 0,
+                y: 0,
+            },
+            vec![255; TILE_BYTE_LEN],
+        )])
+        .expect("valid artwork tile");
+        let batch = session
+            .prepare_structural_change(SnapshotId(1), HistoryNodeId(1), 1, painted.clone())
+            .expect("first edit");
+        session
+            .accept_structural_change(&batch)
+            .expect("accept saved edit");
+        let undo = session
+            .prepare_undo_cursor()
+            .expect("initial cursor retained");
+        assert_eq!(undo.target().history_head, None);
+        assert_eq!(undo.target().root, initial.root());
+        session
+            .accept_history_cursor_move(undo, initial)
+            .expect("accept saved undo");
+        let redo = session
+            .prepare_redo_to_cursor(HistoryNodeId(1))
+            .expect("first edit branch retained");
+        assert_eq!(redo.target().root, painted.root());
     }
 }
