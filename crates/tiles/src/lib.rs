@@ -2,6 +2,8 @@
 
 //! Immutable, content-addressed RGBA8 tiles.
 
+pub mod color;
+
 use std::{collections::BTreeMap, sync::Arc};
 
 use nyatidraw_api::{

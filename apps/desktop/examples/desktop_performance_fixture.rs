@@ -77,7 +77,9 @@ fn expected() -> Result<TileSnapshot> {
                     preset: workload::BRUSH,
                 },
                 recorded,
-                StrokeColor(workload::COLOR),
+                StrokeColor(nyatidraw_tiles::color::srgb8_to_linear_premultiplied(
+                    workload::COLOR,
+                )),
                 samples,
             )
             .map_err(|e| format!("replay: {e:?}"))?;

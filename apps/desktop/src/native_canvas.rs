@@ -171,21 +171,24 @@ impl DrawingConfig {
     }
 
     fn stroke_color(self) -> StrokeColor {
-        let alpha = u16::from(self.color[3]);
-        let channel = |value: u8| {
-            u8::try_from((u16::from(value) * alpha + 127) / 255)
-                .expect("premultiplied color channel is bounded")
-        };
-        StrokeColor([
-            channel(self.color[0]),
-            channel(self.color[1]),
-            channel(self.color[2]),
-            self.color[3],
-        ])
+        StrokeColor(nyatidraw_tiles::color::srgb8_to_linear_premultiplied(
+            self.color,
+        ))
     }
 
     fn gpu_color(self) -> [f32; 4] {
-        self.color.map(|channel| f32::from(channel) / 255.0)
+        let color = self.stroke_color().0;
+        let alpha = f32::from(color[3]);
+        if color[3] == 0 {
+            return [0.0; 4];
+        }
+        // Match the canonical CPU color, including premultiplication rounding.
+        [
+            f32::from(color[0]) / alpha,
+            f32::from(color[1]) / alpha,
+            f32::from(color[2]) / alpha,
+            alpha / 255.0,
+        ]
     }
 }
 
