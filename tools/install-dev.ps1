@@ -5,6 +5,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'install-files.ps1')
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $programsRoot = [System.IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs'))
@@ -134,6 +135,9 @@ if ($registrationExists) {
     Write-Host 'Existing NyatiDraw development registration matched the exact owned shape; continuing.'
 }
 
+Assert-InstallFilePath $programsRoot $installPath
+if (Test-Path -LiteralPath $installPath) { Assert-UnchangedInstallation $installPath }
+
 if (-not $SkipBuild) {
     Push-Location $repositoryRoot
     try {
@@ -158,22 +162,40 @@ New-Item -ItemType Directory -Path $programsRoot -Force | Out-Null
 $nonce = [Guid]::NewGuid().ToString('N')
 $stagingPath = "$installPath.~staging-$nonce"
 $backupPath = "$installPath.~backup-$nonce"
+Assert-InstallFilePath $programsRoot $stagingPath
+Assert-InstallFilePath $programsRoot $backupPath
+# Reject source junctions before Copy-Item traverses the bundle.
+$null = @(Get-InstallFileInventory $sourcePath)
+if (Test-Path -LiteralPath (Join-Path $sourcePath $installManifestName)) {
+    throw 'Release bundle contains the reserved installation ownership manifest.'
+}
 New-Item -ItemType Directory -Path $stagingPath | Out-Null
 Copy-Item -Path (Join-Path $sourcePath '*') -Destination $stagingPath -Recurse -Force
 Rename-Item -LiteralPath (Join-Path $stagingPath 'nyatidraw-desktop.exe') -NewName 'NyatiDraw.exe'
+$ownedFiles = @(Get-InstallFileInventory $stagingPath)
+@{ Schema = 1; Owner = $installManifestOwner; Files = $ownedFiles } |
+    ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stagingPath $installManifestName) -Encoding UTF8
 
 try {
+    Assert-InstallFilePath $programsRoot $installPath
+    Assert-InstallFilePath $programsRoot $backupPath
     if (Test-Path -LiteralPath $installPath) {
-        Move-Item -LiteralPath $installPath -Destination $backupPath
+        Assert-UnchangedInstallation $installPath
+        [IO.Directory]::Move($installPath, $backupPath)
     }
-    Move-Item -LiteralPath $stagingPath -Destination $installPath
+    Assert-InstallFilePath $programsRoot $stagingPath
+    # Directory.Move refuses an existing destination instead of nesting the
+    # staging directory inside it if another installer wins the race.
+    [IO.Directory]::Move($stagingPath, $installPath)
     if (Test-Path -LiteralPath $backupPath) {
-        Remove-Item -LiteralPath $backupPath -Recurse -Force
+        Remove-OwnedInstallFiles $backupPath
     }
 }
 catch {
     if (-not (Test-Path -LiteralPath $installPath) -and (Test-Path -LiteralPath $backupPath)) {
-        Move-Item -LiteralPath $backupPath -Destination $installPath
+        Assert-InstallFilePath $programsRoot $backupPath
+        Assert-InstallFilePath $programsRoot $installPath
+        [IO.Directory]::Move($backupPath, $installPath)
     }
     throw
 }

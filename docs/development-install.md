@@ -133,6 +133,15 @@ fail-closed 한다. 이전 무표식 개발판을 자동 채택하는 일회성 
 ## 제거 계약
 
 개발판 제거는 자신이 만든 설치 파일과 자신이 소유한 registry value만 제거한다.
+새 설치는 `.nyatidraw-install.json`에 설치 파일의 상대 경로와 SHA-256을 기록한다.
+갱신 전에 manifest와 현재 파일이 정확히 일치해야 한다. 설치 폴더에 추가하거나
+수정한 파일이 있으면 그대로 보존하고 갱신을 중단한다. 해당 파일을 설치 폴더 밖으로
+옮긴 뒤 다시 설치한다. 소유권 manifest가 없는 기존 설치는 자동 승계하지 않는다.
+
+제거는 manifest에 있고 현재 hash도 일치하는 파일만 지운다. 추가 파일과 수정된
+파일은 남기며, 비어 있는 폴더만 비재귀적으로 제거한다. 경로 이탈·중복 경로·reparse
+point는 파일 제거 전에 거부한다. Registry 기본값 제거는 명시적인 쓰기 handle에서
+예상 값을 다시 확인하며, 설치와 제거 모두 Shell association 변경을 알린다.
 다음은 절대 삭제하지 않는다.
 
 - 사용자의 `.ntdr` 프로젝트
@@ -142,3 +151,25 @@ fail-closed 한다. 이전 무표식 개발판을 자동 채택하는 일회성 
 
 uninstall 후에도 프로젝트와 PNG는 일반 파일로 남고, 새 버전 재설치나 `Open with`로
 다시 연결할 수 있어야 한다.
+
+## 2026-09-05 설치판 실행 근거
+
+Windows 11 Home 10.0.26200 / Core Ultra 7 155H / Intel Arc integrated / DX12,
+DX 0.7.9 release bundle을 실제 사용자 Programs 경로에 설치했다. 새 설치, 반복 갱신,
+제거와 재설치가 통과했다. 추가 scratch `.ntdr`과 외부 registry value가 있으면 갱신을
+거부했고, 제거 뒤 두 값은 그대로 남고 소유한 binary/등록만 제거됐다. PNG `UserChoice`
+ProgID는 전 과정에서 동일했다. scratch 파일과 값만 정리한 뒤 개발판을 다시 설치했다.
+
+독립 scratch 디렉터리에서도 수정된 설치 파일 보존, manifest 경로 이탈 거부,
+junction 거부를 확인했다. 처음 실제 제거 실행에서 기존 read-only RegistryKey의
+`DeleteValue` 실패를 재현했고 writable handle로 수정한 뒤 위 acceptance를 다시 통과했다.
+이는 [Microsoft RegistryKey.DeleteValue 계약](https://learn.microsoft.com/en-us/dotnet/api/microsoft.win32.registrykey.deletevalue)에 따른다.
+
+`NAYATI_DESKTOP_SMOKE_BINARY`로 실제 설치된 `NyatiDraw.exe`를 지정해
+`desktop_durability_reopen_smoke`와 `desktop_export_recovery_smoke`를 실행했다.
+32-stroke exact root/tile 재실행, active close/deferred Save, invalid bytes 보존,
+네 export crash 경계, 구세대 export 폐기, 잠금 실패 후 창 유지·durable reopen·Save
+재시도가 통과했다. 로그는 `target/installed-durability.log`,
+`target/installed-export-recovery.log`에 남겼다. 새 unit test는 추가하지 않았다.
+Explorer Open with 메뉴 직접 조작, Godot reimport, 물리 펜과 시각적 UI 검증은
+이 결과에 포함하지 않는다.

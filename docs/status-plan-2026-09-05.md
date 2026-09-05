@@ -227,3 +227,17 @@ CLI 버전 불일치 메시지는 남아 있으며 실제 펜·시각적 UI 실�
 연결했다. 0.7.5의 사전 거부, 공식 asset을 통한 설치, setup 재실행과 0.7.9 release
 bundle 성공을 확인했다. 전역 CLI와 PATH는 유지한다. 이전 DX 버전 불일치 항목은
 해결됐으며, 설치 앱 및 PNG pair 왕복 확인을 이어간다. 새 자동화 테스트는 추가하지 않았다.
+
+### 개발판 설치·제거 및 설치 binary 검증
+
+설치 폴더 전체를 재귀 삭제하던 갱신/제거 경로를 파일 manifest/hash 기반 소유권
+검사로 교체했다. 추가·수정 파일이 있는 갱신은 거부하며, 제거는 해당 파일을 보존한다.
+실제 제거에서 read-only registry handle 오류를 찾아 고쳤다. 새 설치·반복 갱신·
+추가 artwork/registry 보존·제거·재설치와 PNG 기본 앱 유지가 통과했다. 별도 scratch에서
+수정 파일·경로 이탈·junction 거부도 확인했다.
+
+설치된 release binary로 기존 durability/reopen과 export recovery smoke 모두 통과했다.
+테스트 수는 57개를 유지하며 이번 설치 스크립트 변경은 실제 실행으로 검증했다.
+상세 근거는 [개발판 설치](development-install.md#2026-09-05-설치판-실행-근거)에 기록했다.
+다음은 positional PNG pair 및 Shell activation 왕복이고, Explorer 직접 조작과
+Godot reimport는 아직 미검증이다.

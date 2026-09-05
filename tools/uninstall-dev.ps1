@@ -3,6 +3,7 @@ param()
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'install-files.ps1')
 
 $programsRoot = [System.IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs'))
 $installPath = [System.IO.Path]::GetFullPath((Join-Path $programsRoot 'NyatiDraw Development'))
@@ -21,14 +22,39 @@ if ($runningInstalled) {
     throw 'Close NyatiDraw Development before uninstalling it.'
 }
 
+Assert-InstallFilePath $programsRoot $installPath
+if (Test-Path -LiteralPath $installPath) {
+    # Refuse unknown installations before changing their file associations.
+    $null = Read-InstallFileManifest $installPath
+    $null = @(Get-InstallFileInventory $installPath)
+}
+
 $classes = 'HKCU:\Software\Classes'
+function Remove-OwnedRegistryDefault {
+    param([string] $Path, [string] $ExpectedValue)
+    if (-not $Path.StartsWith('HKCU:\Software\Classes\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing a registry path outside user file associations: $Path"
+    }
+    # Get-Item returns a read-only RegistryKey. Open a short-lived writable
+    # handle explicitly and recheck the value before deleting only the default.
+    $writable = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($Path.Substring(6), $true)
+    if ($null -eq $writable) { return }
+    try {
+        if ($writable.GetValue('') -ceq $ExpectedValue -and
+            $writable.GetValueKind('') -eq [Microsoft.Win32.RegistryValueKind]::String) {
+            $writable.DeleteValue('', $false)
+        }
+    }
+    finally { $writable.Dispose() }
+}
+
 $extensionKey = Join-Path $classes '.ntdr'
 if (Test-Path -LiteralPath $extensionKey) {
     $extensionItem = Get-Item -LiteralPath $extensionKey
     if ($extensionItem.GetValue($ownershipMarkerName) -eq $ownershipMarkerValue -and
         $extensionItem.GetValue('') -eq $projectProgId) {
+        Remove-OwnedRegistryDefault $extensionKey $projectProgId
         Remove-ItemProperty -LiteralPath $extensionKey -Name $ownershipMarkerName -Force
-        $extensionItem.DeleteValue('', $false)
         if (-not (Get-Item -LiteralPath $extensionKey).GetValueNames() -and
             -not (Get-Item -LiteralPath $extensionKey).GetSubKeyNames()) {
             Remove-Item -LiteralPath $extensionKey -Force
@@ -42,15 +68,14 @@ if (Test-Path -LiteralPath $projectKey) {
     if ($projectItem.GetValue($ownershipMarkerName) -eq $ownershipMarkerValue -and
         (Test-Path -LiteralPath $commandKey) -and
         (Get-Item -LiteralPath $commandKey).GetValue('') -eq $projectCommand) {
-        Remove-ItemProperty -LiteralPath $projectKey -Name $ownershipMarkerName -Force
         if ($projectItem.GetValue('') -eq 'NyatiDraw Project') {
-            $projectItem.DeleteValue('', $false)
+            Remove-OwnedRegistryDefault $projectKey 'NyatiDraw Project'
         }
         $iconKey = Join-Path $projectKey 'DefaultIcon'
         if (Test-Path -LiteralPath $iconKey) {
             $iconItem = Get-Item -LiteralPath $iconKey
             if ($iconItem.GetValue('') -eq ('"' + $installedExecutable + '",0')) {
-                $iconItem.DeleteValue('', $false)
+                Remove-OwnedRegistryDefault $iconKey ('"' + $installedExecutable + '",0')
                 $iconItem = Get-Item -LiteralPath $iconKey
                 if ($iconItem.GetValueNames().Count -eq 0 -and $iconItem.GetSubKeyNames().Count -eq 0) { Remove-Item -LiteralPath $iconKey -Force }
             }
@@ -58,7 +83,7 @@ if (Test-Path -LiteralPath $projectKey) {
         if (Test-Path -LiteralPath $commandKey) {
             $commandItem = Get-Item -LiteralPath $commandKey
             if ($commandItem.GetValue('') -eq $projectCommand) {
-                $commandItem.DeleteValue('', $false)
+                Remove-OwnedRegistryDefault $commandKey $projectCommand
                 $commandItem = Get-Item -LiteralPath $commandKey
                 if ($commandItem.GetValueNames().Count -eq 0 -and $commandItem.GetSubKeyNames().Count -eq 0) { Remove-Item -LiteralPath $commandKey -Force }
             }
@@ -73,6 +98,7 @@ if (Test-Path -LiteralPath $projectKey) {
             $shellItem = Get-Item -LiteralPath $shellKey
             if ($shellItem.GetValueNames().Count -eq 0 -and $shellItem.GetSubKeyNames().Count -eq 0) { Remove-Item -LiteralPath $shellKey -Force }
         }
+        Remove-ItemProperty -LiteralPath $projectKey -Name $ownershipMarkerName -Force
         if (-not (Get-Item -LiteralPath $projectKey).GetValueNames() -and
             -not (Get-Item -LiteralPath $projectKey).GetSubKeyNames()) {
             Remove-Item -LiteralPath $projectKey -Force
@@ -86,14 +112,13 @@ if (Test-Path -LiteralPath $applicationKey) {
     if ($applicationItem.GetValue($ownershipMarkerName) -eq $ownershipMarkerValue -and
         (Test-Path -LiteralPath $commandKey) -and
         (Get-Item -LiteralPath $commandKey).GetValue('') -eq $projectCommand) {
-        Remove-ItemProperty -LiteralPath $applicationKey -Name $ownershipMarkerName -Force
         if ($applicationItem.GetValue('FriendlyAppName') -eq 'NyatiDraw') {
             Remove-ItemProperty -LiteralPath $applicationKey -Name FriendlyAppName -Force
         }
         if (Test-Path -LiteralPath $commandKey) {
             $commandItem = Get-Item -LiteralPath $commandKey
             if ($commandItem.GetValue('') -eq $projectCommand) {
-                $commandItem.DeleteValue('', $false)
+                Remove-OwnedRegistryDefault $commandKey $projectCommand
                 $commandItem = Get-Item -LiteralPath $commandKey
                 if ($commandItem.GetValueNames().Count -eq 0 -and $commandItem.GetSubKeyNames().Count -eq 0) { Remove-Item -LiteralPath $commandKey -Force }
             }
@@ -123,6 +148,7 @@ if (Test-Path -LiteralPath $applicationKey) {
                 Remove-Item -LiteralPath $supportedTypesKey -Force
             }
         }
+        Remove-ItemProperty -LiteralPath $applicationKey -Name $ownershipMarkerName -Force
         if (-not (Get-Item -LiteralPath $applicationKey).GetValueNames() -and
             -not (Get-Item -LiteralPath $applicationKey).GetSubKeyNames()) {
             Remove-Item -LiteralPath $applicationKey -Force
@@ -138,8 +164,22 @@ if (Test-Path -LiteralPath $pngOpenWith) {
     }
 }
 if (Test-Path -LiteralPath $installPath) {
-    Remove-Item -LiteralPath $installPath -Recurse -Force
+    Remove-OwnedInstallFiles $installPath
 }
 
-Write-Host 'NyatiDraw Development registration and installed files were removed.'
+if (-not ('NyatiDraw.ShellNotify' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace NyatiDraw {
+    public static class ShellNotify {
+        [DllImport("shell32.dll")]
+        public static extern void SHChangeNotify(uint eventId, uint flags, IntPtr item1, IntPtr item2);
+    }
+}
+'@
+}
+[NyatiDraw.ShellNotify]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+
+Write-Host 'Removed owned NyatiDraw Development registration and unchanged installed files.'
 Write-Host 'User .ntdr projects and PNG files were not touched.'
