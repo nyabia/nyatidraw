@@ -12,7 +12,7 @@ use raw_window_handle::{
 use windows::{
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-        Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ScreenToClient},
+        Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT, ScreenToClient},
         System::LibraryLoader::GetModuleHandleW,
         UI::HiDpi::GetDpiForWindow,
         UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, VK_SPACE},
@@ -478,7 +478,13 @@ unsafe extern "system" fn canvas_wnd_proc(
                 return LRESULT(0);
             }
             WM_NAYATI_REDRAW => {
-                state.render(hwnd);
+                // Keep the bridge's pending bit set until WM_PAINT begins.
+                // Posted wakeups must not run a surface wait ahead of queued
+                // pointer messages. Windows coalesces the invalid region and
+                // paints after higher-priority input/posted messages drain.
+                // SAFETY: invalidate this live child without synchronous paint
+                // or background erasure; WM_PAINT owns BeginPaint/EndPaint.
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                 return LRESULT(0);
             }
             message if message == crate::single_instance::activation_message() => {
@@ -514,11 +520,14 @@ unsafe extern "system" fn canvas_wnd_proc(
                 }
                 let msg = current_message(hwnd, message, wparam, lparam);
                 if state.observe_viewport(hwnd, &msg) {
-                    state.render(hwnd);
+                    state.live_ink.request_redraw();
                     return LRESULT(0);
                 }
                 if state.observe_input(&msg) {
-                    state.render(hwnd);
+                    // Admission already requests a wakeup. This is idempotent
+                    // for capture/phase-only paths, without entering rendering
+                    // from this input dispatch.
+                    state.live_ink.request_redraw();
                 }
             }
             _ => {}

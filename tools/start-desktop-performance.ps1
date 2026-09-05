@@ -1,13 +1,14 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [ValidateSet('baseline', 'export')] [string] $Mode,
-    [Parameter(Mandatory)] [ValidateRange(1, 99)] [int] $Run
+    [Parameter(Mandatory)] [ValidateRange(1, 99)] [int] $Run,
+    [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$')] [string] $Campaign = 'performance-foreground'
 )
 $ErrorActionPreference = 'Stop'
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $fixture = Join-Path $repositoryRoot 'target\release\examples\desktop_performance_fixture.exe'
 $executable = Join-Path $env:LOCALAPPDATA 'Programs\NyatiDraw Development\NyatiDraw.exe'
-$runRoot = Join-Path $repositoryRoot "target\performance-foreground\$Mode-$Run"
+$runRoot = Join-Path $repositoryRoot "target\$Campaign\$Mode-$Run"
 if (Test-Path -LiteralPath $runRoot) { throw "Run folder already exists: $runRoot" }
 if (-not (Test-Path -LiteralPath $executable) -or -not (Test-Path -LiteralPath $fixture)) {
     throw 'Build desktop_performance_fixture in release and run install-dev.ps1 first.'
