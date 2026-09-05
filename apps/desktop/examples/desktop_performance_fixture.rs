@@ -146,6 +146,60 @@ fn main() -> Result<()> {
             Ok(())
         }
         "verify" => verify(project),
+        "verify-reference" => verify_reference(
+            project,
+            Path::new(args.get(3).ok_or("reference project path")?),
+        ),
         _ => Err("invalid mode".into()),
     }
+}
+
+// Compare a copied historical scratch without reinterpreting its recorded color
+// with today's UI transfer function. The reference project is never exported.
+fn verify_reference(project: &Path, reference: &Path) -> Result<()> {
+    if !project.is_file() || !reference.is_file() || project == reference {
+        return Err("requires two existing separate scratch projects".into());
+    }
+    let reference_db = ProjectDb::open(reference)?;
+    let reference_head = reference_db
+        .load_reopened()?
+        .ok_or("missing reference head")?;
+    let canvas = reference_db.load_canvas_spec()?;
+    let tree = reference_db
+        .load_layer_tree()?
+        .ok_or("missing reference tree")?;
+    let db = ProjectDb::open(project)?;
+    let head = db.load_reopened()?.ok_or("missing copied head")?;
+    if head.current_snapshot() != reference_head.current_snapshot()
+        || head.history().node_count() != reference_head.history().node_count()
+        || head.current_tiles() != reference_head.current_tiles()
+        || db.load_canvas_spec()? != canvas
+        || db.load_layer_tree()? != Some(tree.clone())
+    {
+        return Err(
+            "copied project no longer matches its reference artwork/history/page/tree".into(),
+        );
+    }
+    let flattened = nyatidraw_paint_cpu::flatten_layer_tree_rgba8(
+        reference_head.current_tiles(),
+        &tree,
+        canvas,
+    )
+    .map_err(|e| format!("reference flatten: {e:?}"))?;
+    let imported = nyatidraw_png_io::decode_png(&project.with_extension("png"), LayerId(1))?;
+    let exported = imported
+        .tiles
+        .crop_base_layer_rgba8_to_canvas(LayerId(1), imported.canvas)
+        .map_err(|e| format!("export crop: {e:?}"))?;
+    if imported.canvas != canvas || exported.pixels != flattened.pixels {
+        return Err("copied project PNG differs from reference artwork".into());
+    }
+    println!(
+        "history-reference-verify snapshot={} history={} tiles={} all_tiles=exact png=exact root={:?}",
+        head.current_snapshot().0,
+        head.history().node_count(),
+        head.current_tiles().iter().count(),
+        head.current_tiles().root()
+    );
+    Ok(())
 }

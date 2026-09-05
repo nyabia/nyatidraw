@@ -1931,22 +1931,29 @@ impl ActiveCanvas {
         };
         let clear_selection = moved.tree.is_some() || moved.canvas.is_some();
         let tree = moved.tree.unwrap_or_else(|| self.scene.tree().clone());
+        // Only reuse closed pixels while their disposable surfaces survive.
+        // Tree/page changes keep the conservative full upload path, including
+        // restored layers and artwork that becomes visible after page growth.
+        let rebuild_surfaces = tree != *self.scene.tree()
+            || moved.canvas.is_some_and(|canvas| {
+                [canvas.width_px, canvas.height_px] != self.scene.document_size()
+            });
         if let Some(canvas) = moved.canvas {
             let size = [canvas.width_px, canvas.height_px];
-            if size == self.scene.document_size() {
-                self.scene
-                    .replace_tree(tree)
-                    .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
-            } else {
+            if size != self.scene.document_size() {
                 self.scene
                     .replace_document(size, tree)
+                    .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
+            } else if rebuild_surfaces {
+                self.scene
+                    .replace_tree(tree)
                     .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
             }
             self.canvas_spec = canvas;
             let mut current = self.projection.current().clone();
             current.canvas = canvas;
             self.projection.install_authoritative(current);
-        } else if clear_selection {
+        } else if rebuild_surfaces {
             self.scene
                 .replace_tree(tree)
                 .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
@@ -1980,7 +1987,16 @@ impl ActiveCanvas {
             .copied()
             .chain(snapshot.iter().map(|(key, _)| key))
             .collect();
+        let mut retained = 0;
+        let mut uploaded = 0;
         for key in keys {
+            if !rebuild_surfaces
+                && self.cpu_tiles.get(&key).map(Vec::as_slice)
+                    == snapshot.get(key).map(nyatidraw_tiles::TileObject::pixels)
+            {
+                retained += 1;
+                continue;
+            }
             if self
                 .scene
                 .tree()
@@ -1995,6 +2011,12 @@ impl ActiveCanvas {
             self.scene
                 .upload_closed_tile(key, &pixels)
                 .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
+            uploaded += 1;
+        }
+        if crate::performance::start().is_some() {
+            println!(
+                "performance-history-upload rebuilt_surfaces={rebuild_surfaces} retained={retained} uploaded={uploaded}"
+            );
         }
         self.cpu_tiles = snapshot
             .iter()
