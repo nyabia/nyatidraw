@@ -143,7 +143,37 @@ impl HeadlessStrokeSession {
         color: StrokeColor,
         samples: Vec<StylusSample>,
     ) -> Result<ProjectCommitBatch, HeadlessStrokeError> {
-        let stroke = StrokeCommit::seal(
+        self.prepare_round_stroke_with_selection(
+            next_snapshot,
+            history_node,
+            timestamp_ns,
+            layer,
+            brush,
+            recorded,
+            color,
+            samples,
+            None,
+        )
+    }
+
+    /// Captures selection coverage in the durable, deterministic stroke record.
+    ///
+    /// # Errors
+    /// Returns sealing, replay or project invariant failures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_round_stroke_with_selection(
+        &self,
+        next_snapshot: SnapshotId,
+        history_node: HistoryNodeId,
+        timestamp_ns: u64,
+        layer: LayerId,
+        brush: BrushSnapshot,
+        recorded: RecordedStroke,
+        color: StrokeColor,
+        samples: Vec<StylusSample>,
+        selection: Option<std::sync::Arc<nyatidraw_stroke::StrokeSelection>>,
+    ) -> Result<ProjectCommitBatch, HeadlessStrokeError> {
+        let stroke = StrokeCommit::seal_with_selection(
             self.current_snapshot,
             layer,
             &self.tiles,
@@ -151,6 +181,7 @@ impl HeadlessStrokeSession {
             recorded,
             color,
             samples,
+            selection,
         )
         .map_err(HeadlessStrokeError::Seal)?;
         let materialized =

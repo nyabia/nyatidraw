@@ -5,6 +5,7 @@ use super::{
     ProjectOpenError, ReadableTable, RecordKind, SNAPSHOTS, STATE, SnapshotId, TableDefinition,
     decode_envelope, decode_layer_tree, encode_layer_tree,
 };
+use nyatidraw_project::SELECTION_STROKE_SCHEMA_VERSION;
 use std::collections::BTreeSet;
 
 pub(super) const SNAPSHOT_LAYERS: TableDefinition<&[u8], &[u8]> =
@@ -21,7 +22,12 @@ impl ProjectDb {
         Ok(metadata
             .get("schema_version")
             .map_err(|error| self.io(error))?
-            .is_some_and(|value| value.value() == LAYER_HISTORY_SCHEMA_VERSION))
+            .is_some_and(|value| {
+                matches!(
+                    value.value(),
+                    LAYER_HISTORY_SCHEMA_VERSION | SELECTION_STROKE_SCHEMA_VERSION
+                )
+            }))
     }
 
     /// Loads the hierarchy belonging to a validated history cursor. Legacy
@@ -79,6 +85,7 @@ impl ProjectDb {
         snapshot: SnapshotId,
         initial_snapshot: SnapshotId,
         tree: Option<&LayerTree>,
+        force: bool,
     ) -> Result<(), ProjectOpenError> {
         let enabled = {
             let metadata = transaction
@@ -87,9 +94,14 @@ impl ProjectDb {
             metadata
                 .get("schema_version")
                 .map_err(|error| self.io(error))?
-                .is_some_and(|value| value.value() == LAYER_HISTORY_SCHEMA_VERSION)
+                .is_some_and(|value| {
+                    matches!(
+                        value.value(),
+                        LAYER_HISTORY_SCHEMA_VERSION | SELECTION_STROKE_SCHEMA_VERSION
+                    )
+                })
         };
-        if !enabled && tree.is_none() {
+        if !enabled && tree.is_none() && !force {
             return Ok(());
         }
         let current = {

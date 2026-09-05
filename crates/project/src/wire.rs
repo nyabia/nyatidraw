@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use nyatidraw_api::{ContentRootId, GroupId, HistoryNodeId, LayerId, SnapshotId};
 use nyatidraw_brush::{BrushPreset, BrushPresetId, BrushSnapshot, RecordedStroke};
@@ -7,7 +7,7 @@ use nyatidraw_history::{HistoryNode, OperationRecord};
 use nyatidraw_input::{PenButtons, Point, PointerPhase, StylusSample};
 use nyatidraw_stroke::{
     MAX_SAMPLES_PER_STROKE, MaterializedStroke, StrokeColor, StrokeCommit, StrokeCommitError,
-    StrokeCommitId,
+    StrokeCommitId, StrokeSelection,
 };
 use nyatidraw_tiles::{
     ContentRoot, ObjectHash, TILE_EDGE, TileBounds, TileKey, TileSnapshot, TileSnapshotError,
@@ -17,6 +17,7 @@ const RECORD_MAGIC: [u8; 8] = *b"NYREC001";
 const RECORD_SCHEMA_VERSION: u16 = 1;
 const ROOT_ENTRY_ENCODED_LEN: usize = 57;
 const SAMPLE_MIN_ENCODED_LEN: usize = 61;
+const SELECTION_EXTENSION: [u8; 8] = *b"NYSEL001";
 const LAYER_TREE_WIRE_VERSION: u16 = 2;
 const MAX_LAYER_TREE_NODES: usize = 4_096;
 const MAX_LAYER_TREE_DEPTH: usize = 64;
@@ -581,6 +582,13 @@ pub fn encode_stroke_commit(commit: &StrokeCommit) -> Vec<u8> {
     for sample in commit.samples() {
         encode_sample(&mut output, sample);
     }
+    if let Some(selection) = commit.selection() {
+        output.extend_from_slice(&SELECTION_EXTENSION);
+        let [width, height] = selection.dimensions();
+        output.extend_from_slice(&width.to_le_bytes());
+        output.extend_from_slice(&height.to_le_bytes());
+        output.extend_from_slice(&selection.packed_bits());
+    }
     output
 }
 
@@ -613,11 +621,28 @@ pub fn decode_stroke_commit(
     for _ in 0..sample_count {
         samples.push(decode_sample(&mut decoder)?);
     }
+    let selection = if decoder.remaining_len() == 0 {
+        None
+    } else {
+        if decoder.array::<8>()? != SELECTION_EXTENSION {
+            return Err(WireError::InvalidData(
+                "unsupported stroke selection extension",
+            ));
+        }
+        let width = decoder.u32()?;
+        let height = decoder.u32()?;
+        let packed = &decoder.bytes[decoder.position..];
+        decoder.position = decoder.bytes.len();
+        Some(Arc::new(
+            StrokeSelection::from_packed_bits(width, height, packed)
+                .map_err(|_| WireError::InvalidData("invalid stroke selection coverage"))?,
+        ))
+    };
     decoder.finish()?;
     if before.root() != before_root {
         return Err(WireError::RootMismatch);
     }
-    let commit = StrokeCommit::seal(
+    let commit = StrokeCommit::seal_with_selection(
         parent_snapshot,
         layer,
         before,
@@ -625,6 +650,7 @@ pub fn decode_stroke_commit(
         recorded,
         color,
         samples,
+        selection,
     )
     .map_err(WireError::StrokeCommit)?;
     if commit.id != expected_id || commit.affected_tiles != affected_tiles {

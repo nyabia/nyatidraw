@@ -282,3 +282,5 @@ pub const SCHEMA_VERSION: u64 = 1;
 /// Adds immutable per-snapshot layer metadata. Writers using the original
 /// schema must reject this marker instead of silently discarding that history.
 pub const LAYER_HISTORY_SCHEMA_VERSION: u64 = 2;
+/// Selected stroke records require readers that preserve their replay coverage.
+pub const SELECTION_STROKE_SCHEMA_VERSION: u64 = 3;

@@ -9,6 +9,7 @@ use nyatidraw_brush::{
     BrushDab, BrushSnapshot, RecordedStroke, RoundBrushReplayError, replay_round_stroke,
 };
 use nyatidraw_input::{PointerPhase, StylusSample};
+pub use nyatidraw_paint_cpu::SelectionMask as StrokeSelection;
 use nyatidraw_paint_cpu::{CpuCanvas, CpuCanvasError, PremultipliedRgba8};
 use nyatidraw_tiles::{
     ContentRoot, ObjectHash, TILE_BYTE_LEN, TILE_EDGE, TileBounds, TileKey, TileSnapshot,
@@ -53,6 +54,7 @@ pub struct StrokeCommit {
     pub recorded: RecordedStroke,
     pub color: StrokeColor,
     samples: Arc<[StylusSample]>,
+    selection: Option<Arc<StrokeSelection>>,
 }
 
 impl StrokeCommit {
@@ -70,6 +72,33 @@ impl StrokeCommit {
         recorded: RecordedStroke,
         color: StrokeColor,
         samples: Vec<StylusSample>,
+    ) -> Result<Self, StrokeCommitError> {
+        Self::seal_with_selection(
+            parent_snapshot,
+            layer,
+            before,
+            brush,
+            recorded,
+            color,
+            samples,
+            None,
+        )
+    }
+
+    /// Seals the exact immutable selection observed at Begin with the stroke.
+    ///
+    /// # Errors
+    /// Returns the same replay and phase validation failures as [`Self::seal`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal_with_selection(
+        parent_snapshot: SnapshotId,
+        layer: LayerId,
+        before: &TileSnapshot,
+        brush: BrushSnapshot,
+        recorded: RecordedStroke,
+        color: StrokeColor,
+        samples: Vec<StylusSample>,
+        selection: Option<Arc<StrokeSelection>>,
     ) -> Result<Self, StrokeCommitError> {
         validate_closed_samples(&samples)?;
         let mut dabs = Vec::new();
@@ -89,6 +118,7 @@ impl StrokeCommit {
             recorded,
             color,
             samples,
+            selection,
         };
         commit.id = StrokeCommitId(hash_commit(&commit));
         Ok(commit)
@@ -97,6 +127,11 @@ impl StrokeCommit {
     #[must_use]
     pub fn samples(&self) -> &[StylusSample] {
         &self.samples
+    }
+
+    #[must_use]
+    pub fn selection(&self) -> Option<&StrokeSelection> {
+        self.selection.as_deref()
     }
 }
 
@@ -201,6 +236,12 @@ impl StrokeMaterializer for CpuReplayMaterializer {
         let color = PremultipliedRgba8(commit.color.0);
         let mut replacements = Vec::with_capacity(affected_keys.len());
         for key in &affected_keys {
+            if commit
+                .selection()
+                .is_some_and(|selection| !selection_intersects_tile(selection, *key))
+            {
+                continue;
+            }
             let base_pixels = before
                 .get(*key)
                 .map_or_else(|| vec![0; TILE_BYTE_LEN], |tile| tile.pixels().to_vec());
@@ -218,7 +259,29 @@ impl StrokeMaterializer for CpuReplayMaterializer {
                     canvas.apply_dab(dab, color);
                 }
             }
-            replacements.push((*key, canvas.pixels_rgba8_premultiplied().to_vec()));
+            let mut pixels = canvas.pixels_rgba8_premultiplied().to_vec();
+            if let Some(selection) = commit.selection() {
+                for y in 0..TILE_EDGE {
+                    for x in 0..TILE_EDGE {
+                        let document_x = origin_x + i64::from(x);
+                        let document_y = origin_y + i64::from(y);
+                        let selected = match (u32::try_from(document_x), u32::try_from(document_y))
+                        {
+                            (Ok(x), Ok(y)) => selection.contains(x, y),
+                            _ => false,
+                        };
+                        if !selected {
+                            let offset = usize::try_from((y * TILE_EDGE + x) * 4)
+                                .expect("tile offset fits usize");
+                            let original = before
+                                .get(*key)
+                                .map_or(&[0; 4][..], |tile| &tile.pixels()[offset..offset + 4]);
+                            pixels[offset..offset + 4].copy_from_slice(original);
+                        }
+                    }
+                }
+            }
+            replacements.push((*key, pixels));
         }
 
         let after = before
@@ -252,6 +315,23 @@ fn dab_intersects_tile(dab: BrushDab, origin_x: i64, origin_y: i64) -> bool {
         && dab.center.x - radius < origin_x + edge
         && dab.center.y + radius > origin_y
         && dab.center.y - radius < origin_y + edge
+}
+
+fn selection_intersects_tile(selection: &StrokeSelection, key: TileKey) -> bool {
+    let [width, height] = selection.dimensions();
+    let (origin_x, origin_y) = key.pixel_origin();
+    let x0 = origin_x.max(0);
+    let y0 = origin_y.max(0);
+    let x1 = (origin_x + i64::from(TILE_EDGE)).min(i64::from(width));
+    let y1 = (origin_y + i64::from(TILE_EDGE)).min(i64::from(height));
+    (y0..y1).any(|y| {
+        (x0..x1).any(|x| {
+            selection.contains(
+                u32::try_from(x).expect("clipped page x"),
+                u32::try_from(y).expect("clipped page y"),
+            )
+        })
+    })
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -418,7 +498,15 @@ fn hash_commit(commit: &StrokeCommit) -> ObjectHash {
     for sample in commit.samples() {
         encode_sample(&mut payload, sample);
     }
-    ObjectHash::digest_tagged(b"nyatidraw-stroke-commit-v1", &payload)
+    if let Some(selection) = commit.selection() {
+        let [width, height] = selection.dimensions();
+        payload.extend_from_slice(&width.to_le_bytes());
+        payload.extend_from_slice(&height.to_le_bytes());
+        payload.extend_from_slice(&selection.packed_bits());
+        ObjectHash::digest_tagged(b"nyatidraw-stroke-commit-selected-v1", &payload)
+    } else {
+        ObjectHash::digest_tagged(b"nyatidraw-stroke-commit-v1", &payload)
+    }
 }
 
 fn encode_sample(output: &mut Vec<u8>, sample: &StylusSample) {
@@ -547,5 +635,103 @@ mod tests {
                 MaterializationStrategy::GpuReadback
             ))
         ));
+    }
+
+    #[test]
+    fn selected_brush_and_eraser_preserve_unselected_signed_and_padding_pixels() {
+        let key = |layer, x| TileKey {
+            layer: LayerId(layer),
+            mip: 0,
+            x,
+            y: 0,
+        };
+        let before = TileSnapshot::from_tiles(
+            [key(8, -1), key(8, 0), key(8, 1), key(9, 0)]
+                .map(|key| (key, [80, 60, 40, 160].repeat(TILE_BYTE_LEN / 4))),
+        )
+        .unwrap();
+        let template = sealed_commit(&before);
+        for eraser in [false, true] {
+            for empty in [false, true] {
+                let mut packed = vec![0; (129_usize * 64).div_ceil(8)];
+                if !empty {
+                    for y in 0..64 {
+                        for x in [0, 1, 2, 3, 128] {
+                            let index = y * 129 + x;
+                            packed[index / 8] |= 1 << (index % 8);
+                        }
+                    }
+                }
+                let selection =
+                    Arc::new(StrokeSelection::from_packed_bits(129, 64, &packed).unwrap());
+                let mut samples = template.samples().to_vec();
+                for sample in &mut samples {
+                    sample.eraser = eraser;
+                }
+                let unrestricted = StrokeCommit::seal(
+                    template.parent_snapshot,
+                    template.layer,
+                    &before,
+                    template.brush,
+                    template.recorded.clone(),
+                    template.color,
+                    samples.clone(),
+                )
+                .unwrap();
+                let selected = StrokeCommit::seal_with_selection(
+                    template.parent_snapshot,
+                    template.layer,
+                    &before,
+                    template.brush,
+                    template.recorded.clone(),
+                    template.color,
+                    samples,
+                    Some(selection),
+                )
+                .unwrap();
+                assert_ne!(
+                    selected.id, unrestricted.id,
+                    "coverage is part of replay identity"
+                );
+                let all = CpuReplayMaterializer
+                    .materialize(&unrestricted, &before)
+                    .unwrap();
+                let clipped = CpuReplayMaterializer
+                    .materialize(&selected, &before)
+                    .unwrap();
+                for (key, tile) in before.iter() {
+                    let actual = clipped.after.get(key).unwrap();
+                    let unrestricted = all.after.get(key).unwrap();
+                    let (origin_x, origin_y) = key.pixel_origin();
+                    for y in 0..128_usize {
+                        for x in 0..128_usize {
+                            let document_x = origin_x + i64::try_from(x).unwrap();
+                            let document_y = origin_y + i64::try_from(y).unwrap();
+                            let selected = !empty
+                                && key.layer == LayerId(8)
+                                && (0..64).contains(&document_y)
+                                && ((0..4).contains(&document_x) || document_x == 128);
+                            let offset = (y * 128 + x) * 4;
+                            let expected = if selected { unrestricted } else { tile };
+                            assert_eq!(
+                                &actual.pixels()[offset..offset + 4],
+                                &expected.pixels()[offset..offset + 4],
+                                "eraser={eraser} empty={empty} key={key:?} x={x} y={y}"
+                            );
+                        }
+                    }
+                }
+                if empty {
+                    assert_eq!(clipped.after, before);
+                    assert!(clipped.changed_tiles.is_empty());
+                } else {
+                    assert_ne!(
+                        clipped.after.root(),
+                        before.root(),
+                        "selected area was actually painted"
+                    );
+                }
+            }
+        }
     }
 }

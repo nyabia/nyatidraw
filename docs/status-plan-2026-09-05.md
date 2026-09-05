@@ -374,3 +374,16 @@ Native 선택 제스처와 overlay, 선택 영역에 맞춘 brush/eraser 처리�
 최종 설치판에서 일반 완료 후 GPU 표시, 선택 해제, UI Undo → 저장/종료 → 별도
 검증, 재실행 후 UI Redo → 저장/종료 → 별도 검증까지 통과했다. 페이지 밖 데이터와
 history 두 노드는 유지됐다. All-target/all-feature Clippy와 전체 66개 테스트도 통과했다.
+
+### 선택 브러시·지우개 저장 계약
+
+선택 마스크를 닫힌 stroke의 불변 기록과 식별값에 포함했다. CPU 재생 시 선택 밖,
+다른 레이어, 음수 타일과 페이지 경계 패딩을 보존한다. 기존 선택 없는 기록과 ID는
+호환되며, 선택 stroke를 처음 저장할 때만 marker 3으로 원자적 전환한다. Undo 뒤에도
+구버전이 선택 있는 redo branch를 잘못 다루지 않도록 marker를 유지한다.
+
+Core 위험 검사 두 개를 추가했다. Release의 10개 별도 child process로 선택 브러시,
+선택 지우개, Undo, Redo의 저장·재실행·마스크·타일·PNG 비교가 통과했다. 실제 구버전
+reader가 새 파일을 거부하고 원본 바이트를 보존하는 것도 확인했다.
+[ADR-0014](decisions/ADR-0014-selected-stroke-replay.md)에 형식과 근거를 기록했다.
+다음은 같은 마스크를 GPU 경로에 적용하고 native 선택 제스처/표시를 연결하는 것이다.

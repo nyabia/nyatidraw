@@ -21,10 +21,11 @@ use nyatidraw_project::{
     Envelope, LAYER_HISTORY_SCHEMA_VERSION, MAX_LAYER_TREE_RECORD_BYTES, OpenMode,
     ProjectCommitBatch, ProjectHistoryCursor, ProjectOpenError, ProjectRepository,
     ProjectStructuralBatch, RecordKind, ReopenedProject, RootManifest, SCHEMA_VERSION,
-    decode_history_cursor, decode_history_node, decode_initial_history_cursor, decode_layer_tree,
-    decode_project_head, decode_root_manifest, decode_stroke_commit, encode_history_cursor,
-    encode_history_node, encode_initial_history_cursor, encode_layer_tree, encode_project_head,
-    encode_root_manifest, encode_stroke_commit, open_mode,
+    SELECTION_STROKE_SCHEMA_VERSION, decode_history_cursor, decode_history_node,
+    decode_initial_history_cursor, decode_layer_tree, decode_project_head, decode_root_manifest,
+    decode_stroke_commit, encode_history_cursor, encode_history_node,
+    encode_initial_history_cursor, encode_layer_tree, encode_project_head, encode_root_manifest,
+    encode_stroke_commit, open_mode,
 };
 use nyatidraw_stroke::{MaterializationStrategy, materialize_with_strategy};
 use nyatidraw_tiles::{ContentRoot, ObjectHash, TileSnapshot};
@@ -199,7 +200,7 @@ impl ProjectDb {
         self.validate_structural_lineage(batch)?;
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
         transaction.set_durability(Durability::Immediate);
-        self.capture_snapshot_layers(&transaction, batch.snapshot_id, SnapshotId(0), tree)?;
+        self.capture_snapshot_layers(&transaction, batch.snapshot_id, SnapshotId(0), tree, false)?;
         {
             let mut objects = transaction
                 .open_table(OBJECTS)
@@ -337,7 +338,15 @@ impl ProjectDb {
             batch.snapshot_id,
             batch.stroke.parent_snapshot,
             None,
+            batch.stroke.selection().is_some(),
         )?;
+        if batch.stroke.selection().is_some() {
+            transaction
+                .open_table(META)
+                .map_err(|error| self.io(error))?
+                .insert("schema_version", SELECTION_STROKE_SCHEMA_VERSION)
+                .map_err(|error| self.io(error))?;
+        }
 
         {
             let mut objects = transaction
@@ -1174,7 +1183,10 @@ impl ProjectDb {
             .get("schema_version")
             .map_err(|error| self.io(error))?
             .is_some_and(|value| {
-                matches!(value.value(), SCHEMA_VERSION | LAYER_HISTORY_SCHEMA_VERSION)
+                matches!(
+                    value.value(),
+                    SCHEMA_VERSION | LAYER_HISTORY_SCHEMA_VERSION | SELECTION_STROKE_SCHEMA_VERSION
+                )
             }))
     }
 
@@ -1680,6 +1692,107 @@ mod tests {
             );
         }
         std::fs::remove_file(path).expect("remove scratch project");
+    }
+
+    #[test]
+    fn selected_stroke_recovery_preserves_coverage_identity_and_atomic_format_upgrade() {
+        use nyatidraw_stroke::{StrokeCommit, StrokeSelection};
+        let path = temp("selected-stroke-upgrade");
+        let template = prepared_batch();
+        let old_wire = encode_stroke_commit(&template.stroke);
+        assert_eq!(
+            decode_stroke_commit(&old_wire, &template.before).unwrap(),
+            template.stroke,
+            "legacy unselected records retain their exact identity"
+        );
+        let mut packed = vec![255; (129_usize * 41).div_ceil(8)];
+        *packed.last_mut().unwrap() = 1;
+        let selection =
+            std::sync::Arc::new(StrokeSelection::from_packed_bits(129, 41, &packed).unwrap());
+        let stroke: &StrokeCommit = &template.stroke;
+        let batch = HeadlessStrokeSession::new(stroke.parent_snapshot, template.before.clone())
+            .prepare_round_stroke_with_selection(
+                template.snapshot_id,
+                template.history_node.id,
+                template.history_node.timestamp_ns,
+                stroke.layer,
+                stroke.brush,
+                stroke.recorded.clone(),
+                stroke.color,
+                stroke.samples().to_vec(),
+                Some(selection),
+            )
+            .unwrap();
+        let encoded = encode_stroke_commit(&batch.stroke);
+        assert_eq!(
+            decode_stroke_commit(&encoded, &template.before).unwrap(),
+            batch.stroke
+        );
+        for mutation in 0..5 {
+            let mut corrupt = encoded.clone();
+            match mutation {
+                0 => {
+                    corrupt[old_wire.len()] ^= 1;
+                } // Unknown extension.
+                1 => {
+                    *corrupt.last_mut().unwrap() |= 128;
+                } // Noncanonical tail.
+                2 => {
+                    corrupt[old_wire.len() + 8..old_wire.len() + 12]
+                        .copy_from_slice(&u32::MAX.to_le_bytes());
+                }
+                3 => {
+                    corrupt.pop();
+                } // Truncated coverage.
+                _ => {
+                    corrupt[old_wire.len() + 16] ^= 1;
+                } // Valid mask, wrong sealed ID.
+            }
+            assert!(
+                decode_stroke_commit(&corrupt, &template.before).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let database = ProjectDb::open(&path).unwrap();
+        assert!(
+            database
+                .commit_with_failure(&batch, CommitFailurePoint::BeforeCommitAbort)
+                .is_err()
+        );
+        assert!(
+            !database.layer_history_enabled().unwrap(),
+            "abort must not half-upgrade the format"
+        );
+        assert!(database.load_reopened().unwrap().is_none());
+        database.commit(&batch).unwrap();
+        drop(database);
+        let database = ProjectDb::open(&path).unwrap();
+        assert!(database.layer_history_enabled().unwrap());
+        assert_eq!(
+            database.load_current().unwrap().unwrap().stroke,
+            batch.stroke
+        );
+        let reopened = database.load_reopened().unwrap().unwrap();
+        assert_eq!(reopened.current_tiles(), &batch.materialized.after);
+        let session = HeadlessStrokeSession::from_reopened(reopened);
+        database
+            .persist_history_cursor(session.prepare_undo_cursor().unwrap().target())
+            .unwrap();
+        let transaction = database.db.begin_read().unwrap();
+        assert_eq!(
+            transaction
+                .open_table(META)
+                .unwrap()
+                .get("schema_version")
+                .unwrap()
+                .unwrap()
+                .value(),
+            SELECTION_STROKE_SCHEMA_VERSION,
+            "Undo must not downgrade a project with selected redo branches"
+        );
+        drop(transaction);
+        drop(database);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

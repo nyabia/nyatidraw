@@ -62,6 +62,7 @@ pub enum EditError {
     InvalidSeed,
     InvalidPolygon,
     InvalidPaint,
+    InvalidMask,
     LimitExceeded,
     Composite(CpuCompositeError),
     Tiles(TileSnapshotError),
@@ -77,6 +78,48 @@ pub struct SelectionMask {
 }
 
 impl SelectionMask {
+    /// Canonical row-major, least-significant-bit-first coverage. Unused tail
+    /// bits are zero; this representation is bounded to 2 MiB.
+    #[must_use]
+    pub fn packed_bits(&self) -> Vec<u8> {
+        let mut packed = vec![0; self.selected.len().div_ceil(8)];
+        for (index, selected) in self.selected.iter().enumerate() {
+            packed[index / 8] |= selected << (index % 8);
+        }
+        packed
+    }
+
+    /// Restores canonical binary coverage without trusting a serialized count.
+    ///
+    /// # Errors
+    /// Rejects oversized dimensions, wrong lengths and nonzero unused bits
+    /// before allocating the decoded page.
+    pub fn from_packed_bits(width: u32, height: u32, packed: &[u8]) -> Result<Self, EditError> {
+        let count = page_len(
+            CanvasSpec {
+                width_px: width,
+                height_px: height,
+                pixels_per_inch: 96,
+            },
+            EditLimits::default(),
+        )?;
+        if packed.len() != count.div_ceil(8)
+            || (count % 8 != 0 && packed.last().is_some_and(|last| last >> (count % 8) != 0))
+        {
+            return Err(EditError::InvalidMask);
+        }
+        let selected: Vec<_> = (0..count)
+            .map(|index| (packed[index / 8] >> (index % 8)) & 1)
+            .collect();
+        let count = selected.iter().map(|&value| u64::from(value)).sum();
+        Ok(Self {
+            width,
+            height,
+            selected,
+            count,
+        })
+    }
+
     #[must_use]
     pub const fn dimensions(&self) -> [u32; 2] {
         [self.width, self.height]
