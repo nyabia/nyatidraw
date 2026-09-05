@@ -138,7 +138,7 @@ texture tip, stabilizer는 Sprint 4 범위다.
 |---|---|---|
 | 고정 명령 | 저장, 실제 PNG queued/running/current/failed 상태, 실패한 export의 `PNG 재시도`, undo/redo, Windows second-activation file routing 연결; 메뉴와 앱 내부 열기 대화상자는 미구현 | 종료 진행 상태와 Explorer 수동 activation acceptance |
 | 도구 막대 | Move, Pencil, Pen, Brush, Eraser의 클릭·G/B/E 단축키·active projection 연결; 범위 밖 도구 disabled | Wand/Lasso, Fill/Gradient와 도구별 커서 |
-| 세부 도구/브러시 값 | round-engine preset, 크기, 불투명도 연결 | 실제 preset library와 최근 크기 기록 |
+| 세부 도구/브러시 값 | round-engine preset, 크기·불투명도 및 최근 크기 4개 연결; activation/재도킹 유지와 작은 패널 스크롤 확인 | 실제 preset library; 최근 크기는 앱 세션 범위 |
 | 캔버스 | GPU live stroke, signed outside tiles, 휠/가운데/Space/Move 패닝, 포인터 zoom | 실제 펜·장시간 수동 acceptance와 device-loss 복구 |
 | 내비게이터 | durable CPU page crop 미리보기, viewport overlay, click/press-drag recenter, Fit/1:1/zoom 연결 | 수동 회전/resize acceptance |
 | 색상 | hue wheel/SV/value 직접 드래그·키보드 조절과 current/recent 8개 공유; 도킹 후 조절 및 선택 색으로 채운 그림의 재시작/PNG 검증 | 실제 장치 capture loss·held-drag 취소 acceptance, 최근 목록은 앱 세션 범위 |
