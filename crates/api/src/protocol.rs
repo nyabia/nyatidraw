@@ -388,6 +388,8 @@ pub struct UiProjection {
     pub viewport: ViewportProjection,
     pub drawing_tool: DrawingTool,
     pub brush_size_tenths: u16,
+    /// Session brush sizes, newest first, at most four unique tenths of a pixel.
+    pub recent_brush_sizes: Vec<u16>,
     pub brush_opacity_u16: u16,
     pub brush_color: [u8; 4],
     /// Session palette, newest first, at most eight unique RGBA colors.
@@ -426,6 +428,7 @@ impl UiProjection {
             },
             drawing_tool: DrawingTool::Brush,
             brush_size_tenths: 280,
+            recent_brush_sizes: vec![280],
             brush_opacity_u16: 60_292,
             brush_color: [26, 199, 232, 255],
             recent_colors: vec![[26, 199, 232, 255]],

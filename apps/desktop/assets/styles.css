@@ -63,7 +63,7 @@ button:focus, [tabindex="0"]:focus { outline: 2px solid #9ee8ff; outline-offset:
 .tool-key { position: absolute; right: 1px; bottom: 0; min-width: 14px; padding: 0 2px; border-radius: 2px; background: rgba(70,70,70,.82); font-size: 12px; font-weight: 700; line-height: 15px; text-align: center; text-shadow: 0 1px #333; }
 .tool-separator { width: 32px; height: 1px; margin: 3px 0; background: #666; box-shadow: 0 1px rgba(255,255,255,.25); }
 
-.brush-panel { display: flex; width: 100%; min-height: 0; flex-direction: column; overflow: hidden; }
+.brush-panel { display: flex; width: 100%; min-height: 0; flex-direction: column; overflow-x: hidden; overflow-y: auto; }
 .subtool-list { flex: 0 0 190px; overflow-y: auto; }
 .subtool { display: grid; width: 100%; height: 62px; padding: 5px 7px; border-bottom: 1px solid #a1a1a1; text-align: left; }
 .subtool.selected { background: #6d6d6d; outline: 1px solid #ddd; outline-offset: -1px; }
@@ -76,10 +76,11 @@ button:focus, [tabindex="0"]:focus { outline: 2px solid #9ee8ff; outline-offset:
 .property-value { text-align: right; font-variant-numeric: tabular-nums; }
 .slider { position: relative; grid-column: 1 / -1; height: 6px; background: #606060; }
 .slider-thumb { position: absolute; top: -2px; width: 13px; height: 10px; background: #ddd; }
-.brush-sizes { display: flex; min-height: 0; flex: 1; flex-direction: column; padding: 7px; border-top: 3px solid #181818; }
+.brush-sizes { display: flex; min-height: 280px; flex: 1 0 280px; flex-direction: column; padding: 7px; border-top: 3px solid #181818; }
 .section-caption { height: 17px; font-size: 10px; }
 .recent-sizes { display: grid; grid-template-columns: repeat(4,1fr); flex: 0 0 32px; align-items: center; border-bottom: 1px solid #b2b2b2; }
 .recent-size { display: grid; height: 29px; place-items: center; }
+.recent-size.active { background: rgba(40,40,40,.26); outline: 1px solid #dadada; outline-offset: -2px; }
 .size-dot { display: block; justify-self: center; border-radius: 50%; background: #e1e1e1; }
 .size-list { flex: 1; margin-top: 4px; overflow-y: auto; }
 .size-option { display: grid; grid-template-columns: 38px 1fr; align-items: center; width: 100%; height: 27px; border-bottom: 1px solid rgba(255,255,255,.16); text-align: left; font-variant-numeric: tabular-nums; }

@@ -693,3 +693,25 @@ export active는 34.815ms였다. Surface acquire 대기가 크고 한 기준 실
 [ADR-0027](decisions/ADR-0027-paced-desktop-performance.md)에 재현 조건,
 전체 JSON 및 한계를 기록했다. 다음은 surface/종료 hitch 조사, startup/reopen/
 undo와 장시간 UI 검증 및 아직 고정 목록인 최근 브러시 크기의 실제 상태 연결이다.
+
+### 실제 최근 브러시 크기와 작은 도킹 패널의 스크롤
+
+고정된 7/11/20/8px 버튼을 실제 승인된 크기 변경 목록으로 교체했다. 현재 크기와
+최신 4개 고유 크기를 semantic projection으로 공유하며 중복 선택은 앞으로 옮긴다.
+프로젝트 activation과 패널 remount에서는 유지하고 새 앱 프로세스는 기본 28px부터
+시작한다. 색상/불투명도/도구 변경은 크기 이력을 바꾸지 않는다. 버튼에 정확한
+크기 이름과 선택 상태를 제공하며 원시 입력이나 project format은 변경하지 않는다.
+
+실제 설치판에서 10→20→40→80px 선택으로 4개 제한, 최근 버튼을 통한 10→20px
+재선택을 확인했다. 오른쪽 낮은 도킹 영역에서 크기 목록이 잘리는 문제도 발견해
+브러시 패널 전체의 세로 스크롤과 크기 목록의 최소 공간을 확보했다. 수정 설치판의
+재시작에서 기본 28px을 확인하고, 스크롤해 120→10px 선택, 다른 scratch 프로젝트
+activation 뒤 최근 120px 재선택, Color 위로 패널 재도킹 뒤 최근 10px 재선택과
+실제 속성 값을 확인했다. 같은 세션의 native canvas/GPU는 한 번만 생성됐다.
+
+두 scratch 프로젝트는 정상 Save/Close 후 별도 프로세스에서 원본 전체 타일,
+잠금/숨김/음수 영역, page/PPI, snapshot 1/history 1과 독립 PNG 비교를 통과했다.
+근거는 `target/recent-sizes-ui/`의 `first-out.log`, `compact-out.log`,
+`one-final-verify.log`, `two-final-verify.log`다. 전체 Clippy와 release 설치가
+통과했다(`target/recent-sizes-clippy.log`, `recent-sizes-install-final.log`).
+새 단위 테스트나 의존성은 추가하지 않았다. 성능 개선과 나머지 gate 감사는 계속한다.

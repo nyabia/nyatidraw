@@ -898,7 +898,9 @@ fn BrushPanel(ui_projection: Signal<UiProjection>) -> Element {
             div { class: "brush-sizes",
                 div { class: "section-caption", "브러시 크기" }
                 div { class: "recent-sizes", aria_label: "최근 브러시 크기",
-                    for (size, dot) in [(70_u16, 7), (110, 11), (200, 20), (80, 8)] { BrushSizeButton { size_tenths: size, dot, recent: true, active: current_size == size } }
+                    for size in ui_projection.read().recent_brush_sizes.iter().copied() {
+                        BrushSizeButton { key: "{size}", size_tenths: size, dot: brush_dot(i32::from(size) / 10), recent: true, active: current_size == size }
+                    }
                 }
                 div { class: "size-list",
                     for size in [1_u16, 3, 5, 10, 20, 40, 80, 120] {
@@ -936,8 +938,15 @@ fn BrushSizeButton(size_tenths: u16, dot: i32, recent: bool, active: bool) -> El
     let size = f32::from(size_tenths) / 10.0;
     rsx! {
         button {
-            class: if recent { "recent-size" } else if active { "size-option active" } else { "size-option" },
+            class: match (recent, active) {
+                (true, true) => "recent-size active",
+                (true, false) => "recent-size",
+                (false, true) => "size-option active",
+                (false, false) => "size-option",
+            },
             title: "브러시 크기 {size:.1}",
+            aria_label: "브러시 크기 {size:.1}",
+            aria_pressed: "{active}",
             onclick: move |_| send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::SetSizeTenths(size_tenths)), error),
             span { class: "size-dot", style: "width:{dot}px;height:{dot}px" }
             if !recent { span { "{size:.0}" } }
