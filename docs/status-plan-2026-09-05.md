@@ -544,3 +544,27 @@ release 취소, 일반 탭 클릭과 상단 순서 변경을 확인했다. Scrat
 [ADR-0021](decisions/ADR-0021-dock-pointer-capture.md)에 근거와 남은 수동 범위를
 기록했다. 실제 최근 색상 이력, 도킹 중 marker의 직접 시각 확인·장시간/물리 펜
 acceptance와 나머지 기본 편집·성능 계측은 계속 열려 있다.
+
+### 실제 최근 색상 목록 공유
+
+고정 팔레트를 최근 색상으로 표시하던 부분을 바꿨다. 승인된 색상 변경은 renderer의
+semantic projection에서 최신순 8개로 유지하고 같은 RGBA를 중복 저장하지 않는다.
+상단/측면 Quick colors와 Color panel이 같은 목록과 swatch 명령을 사용한다. 기존
+고정 색은 별도 기본 팔레트로 남겼다. 색상/최근 이력은 앱 세션 상태이며 project
+activation 때 함께 보존하고, 앱 종료 이후의 사용자 설정 저장 범위에는 넣지 않았다.
+입력 sample·brush stroke snapshot·작품/history 저장 형식은 바꾸지 않았다.
+
+Windows 11 build 26200 / Core Ultra 7 155H / Intel Arc / DX12 설치판 release에서
+컴퓨터 사용으로 기본 팔레트 8개를 차례로 선택했다. 초기 cyan을 포함한 9개 고유색
+중 마지막 8개가 두 UI에 동일한 최신순으로 남았다. 상단에서 오래된 검정을 다시
+선택하면 중복 없이 선두로 옮겼고, 현재 색을 재선택해도 목록은 바뀌지 않았다.
+Quick colors를 왼쪽에 도킹한 뒤에도 목록이 같았으며, 별도 경로의 두 번째 scratch를
+activation한 뒤 현재 검정과 목록을 유지했다. 측면의 주황 재선택도 양쪽에 반영됐다.
+
+두 프로젝트에서 실제 Save와 PNG 완료를 확인했고, 각 writer 종료 후 별도 fixture
+프로세스로 8385개 페이지 픽셀·다른 레이어·음수 타일·경계 패딩·snapshot 2/history 2
+및 독립 PNG 기대값을 비교해 통과했다. 근거는 `target/recent-colors-ui/`의
+`first-out.log`, `activation-out.log`, `first-verify.log`, `second-verify.log`다.
+전체 Clippy와 release 설치가 통과했다(`target/recent-colors-clippy-final.log`,
+`target/recent-colors-install-final.log`). UI 상태를 위한 새 단위 테스트는 추가하지 않았다.
+색상환/SV/value 직접 조작과 나머지 기본 편집·성능 gate는 계속 진행한다.

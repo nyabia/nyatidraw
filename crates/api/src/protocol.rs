@@ -366,6 +366,8 @@ pub struct UiProjection {
     pub brush_size_tenths: u16,
     pub brush_opacity_u16: u16,
     pub brush_color: [u8; 4],
+    /// Session palette, newest first, at most eight unique RGBA colors.
+    pub recent_colors: Vec<[u8; 4]>,
     pub edit_settings: EditSettings,
 }
 
@@ -401,6 +403,7 @@ impl UiProjection {
             brush_size_tenths: 280,
             brush_opacity_u16: 60_292,
             brush_color: [26, 199, 232, 255],
+            recent_colors: vec![[26, 199, 232, 255]],
             edit_settings: EditSettings::default(),
         }
     }

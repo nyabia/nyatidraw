@@ -56,6 +56,11 @@ impl ProjectionState {
         self.current.drawing_tool = tool;
         self.current.brush_size_tenths = size_tenths;
         self.current.brush_opacity_u16 = opacity_u16;
+        if self.current.brush_color != color {
+            self.current.recent_colors.retain(|recent| *recent != color);
+            self.current.recent_colors.insert(0, color);
+            self.current.recent_colors.truncate(8);
+        }
         self.current.brush_color = color;
     }
 

@@ -581,6 +581,7 @@ impl LiveInkBridge {
             next.brush_size_tenths = previous.brush_size_tenths;
             next.brush_opacity_u16 = previous.brush_opacity_u16;
             next.brush_color = previous.brush_color;
+            next.recent_colors = previous.recent_colors;
             protocol.projection = next;
             protocol.latest_event = None;
         }

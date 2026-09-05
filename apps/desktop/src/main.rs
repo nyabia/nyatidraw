@@ -447,11 +447,8 @@ fn QuickColors(ui_projection: Signal<UiProjection>) -> Element {
     let current_color = format!("#{:02X}{:02X}{:02X}", current[0], current[1], current[2]);
     rsx! {
                 div { class: "color-stack", span { class: "color-chip back" } span { class: "color-chip front", style: "background:{current_color}" } }
-                div { class: "quick-colors",
-                    for (color, rgba) in [("#e83030", [232,48,48,255]), ("#20b94a", [32,185,74,255]), ("#267be0", [38,123,224,255]), ("#f1c94a", [241,201,74,255]), ("#ffffff", [255,255,255,255]), ("#171717", [23,23,23,255]), ("#ef8ea0", [239,142,160,255]), ("#8f61c9", [143,97,201,255])] {
-                        ToolbarColorButton { color, rgba }
-                    }
-                }
+                RecentColors { ui_projection, compact: true }
+
     }
 }
 
@@ -466,11 +463,39 @@ fn TopToolbar(panel: PanelKind, ui_projection: Signal<UiProjection>) -> Element 
 }
 
 #[component]
-fn ToolbarColorButton(color: &'static str, rgba: [u8; 4]) -> Element {
+fn RecentColors(ui_projection: Signal<UiProjection>, compact: bool) -> Element {
+    let colors = ui_projection.read().recent_colors.clone();
+    rsx! {
+        div { class: if compact { "quick-colors" } else { "recent-colors" }, aria_label: "최근 선택한 색상",
+            for rgba in colors {
+                ColorSwatch { rgba, recent: true }
+            }
+        }
+    }
+}
+
+#[component]
+fn ColorSwatch(rgba: [u8; 4], recent: bool) -> Element {
     let live_ink = use_context::<LiveInkBridge>();
     let error = use_signal(|| Option::<String>::None);
+    let color = if rgba[3] == 255 {
+        format!("#{:02X}{:02X}{:02X}", rgba[0], rgba[1], rgba[2])
+    } else {
+        format!(
+            "#{:02X}{:02X}{:02X}{:02X}",
+            rgba[0], rgba[1], rgba[2], rgba[3]
+        )
+    };
+    let label = format!(
+        "{} {color}",
+        if recent {
+            "최근 색상"
+        } else {
+            "기본 색상"
+        }
+    );
     rsx! {
-        button { class: "quick-color", style: "background:{color}", title: "{color}", aria_label: "최근 색상 {color}", onclick: move |_| send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::SetColor(rgba)), error) }
+        button { class: "quick-color", style: "background:{color}", title: "{label}", aria_label: "{label}", onclick: move |_| send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::SetColor(rgba)), error) }
     }
 }
 
@@ -481,11 +506,10 @@ fn dock_stack_height(node: &DockNode) -> Option<u16> {
         DockNode::Panel(panel) => match panel {
             PanelKind::Canvas => None,
             PanelKind::Navigator => Some(200),
-            PanelKind::Color => Some(240),
             PanelKind::CanvasActions | PanelKind::QuickColors => Some(110),
             PanelKind::Viewport => Some(265),
             PanelKind::Tools | PanelKind::Brush => Some(620),
-            PanelKind::Layers | PanelKind::History => Some(300),
+            PanelKind::Color | PanelKind::Layers | PanelKind::History => Some(300),
         },
         DockNode::Tabs { panels, .. } => panels
             .iter()
@@ -1161,9 +1185,12 @@ fn ColorPanel(ui_projection: Signal<UiProjection>) -> Element {
                 span { class: "value-strip" }
             }
             span { class: "color-value", "{current_hex}" }
-            div { class: "recent-colors",
-                for (color, rgba) in [("#171717", [23,23,23,255]), ("#ffffff", [255,255,255,255]), ("#e83030", [232,48,48,255]), ("#20b94a", [32,185,74,255]), ("#267be0", [38,123,224,255]), ("#f1c94a", [241,201,74,255]), ("#8f61c9", [143,97,201,255]), ("#ef8c35", [239,140,53,255])] {
-                    RecentColorButton { color, rgba }
+            span { class: "palette-caption", "최근 색상" }
+            RecentColors { ui_projection, compact: false }
+            span { class: "palette-caption", "기본 색상" }
+            div { class: "recent-colors", aria_label: "기본 색상 팔레트",
+                for rgba in [[23,23,23,255], [255,255,255,255], [232,48,48,255], [32,185,74,255], [38,123,224,255], [241,201,74,255], [143,97,201,255], [239,140,53,255]] {
+                    ColorSwatch { rgba, recent: false }
                 }
             }
             if let Some(message) = error.read().as_ref() { div { class: "command-error", role: "alert", "{message}" } }
@@ -1183,15 +1210,6 @@ fn parse_html_color(value: &str) -> Option<[u8; 4]> {
         u8::try_from(rgb & 0xff).ok()?,
         u8::MAX,
     ])
-}
-
-#[component]
-fn RecentColorButton(color: &'static str, rgba: [u8; 4]) -> Element {
-    let live_ink = use_context::<LiveInkBridge>();
-    let error = use_signal(|| Option::<String>::None);
-    rsx! {
-        button { style: "background:{color}", title: "{color}", aria_label: "최근 색상 {color}", onclick: move |_| send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::SetColor(rgba)), error) }
-    }
 }
 
 #[component]
