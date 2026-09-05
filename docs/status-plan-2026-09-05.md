@@ -788,3 +788,22 @@ import와 그라데이션 Inspector 갱신이 확인됐다. 수동 reimport나 a
 
 색상 후속 acceptance는 새 색상의 실제 native brush와 absent-sibling 16-bit PNG
 bootstrap이다. 그 뒤 기존 latency 및 startup/reopen/undo·장시간 UI gate를 계속한다.
+
+### 색상 경계 acceptance 완료
+
+설치판에서 3px mouse brush와 UI #1AC7E8로 그린 뒤 Save/정상 Close/일반 재시작을
+확인했다. 저장된 4개 sample과 canonical 색 [3,146,206,255], snapshot 2/history 2,
+CPU replay 전체 타일, 페이지 밖 작품 보존 및 PNG가 별도 process 검증을 통과했다.
+이것은 stored-sample replay이며 물리 펜이나 독립 GPU pixel oracle은 아니다.
+
+paired project가 없는 새 폴더의 16-bit gradient PNG를 설치판에서 열어 snapshot
+1/history 1로 가져왔다. 첫 Save 전 원본 PNG hash가 보존됐고, Save/정상 Close/
+일반 재시작/정상 Close 후 모든 tile 및 PNG pixel이 독립 gradient 기대값과 일치했다.
+최종 PNG hash도 원본과 같았다. 네 앱 세션의 worker join과 빈 stderr를 확인했다.
+`target/color-ui/{brush,import}/`에 원본·재시작 검증 로그를 남겼다.
+
+[ADR-0029](decisions/ADR-0029-srgb-boundaries.md)의 제한된 sRGB 계약은 accepted로
+갱신했다. 기존 acceptance fixture에 검증 모드 두 개만 추가하고 Clippy를 통과했다.
+새 자동 UI 테스트나 의존성은 추가하지 않았다. 남은 우선순위는 UI thread의 surface
+대기와 입력 경로 격리, 현 export 경로의 성능 분포, startup/reopen/undo 및 장시간
+UI acceptance다. 표시 색상 보정·물리 펜·가시 픽셀 latency gate는 여전히 미검증이다.

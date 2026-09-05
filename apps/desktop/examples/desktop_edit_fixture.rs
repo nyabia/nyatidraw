@@ -108,6 +108,10 @@ fn main() -> Result<()> {
             args.get(4).ok_or("nodes")?.parse()?,
             args.get(5).ok_or("solid/gradient/empty")?,
         )?;
+    } else if mode == "verify-color-stroke" {
+        verify_color_stroke(project)?;
+    } else if mode == "verify-gradient-import" {
+        verify_gradient_import(project)?;
     } else if mode == "verify-selection" {
         verify_selection(
             project,
@@ -336,6 +340,119 @@ fn verify_selection(project: &Path, stage: u128, nodes: usize) -> Result<()> {
     }
     println!(
         "desktop-selection-verify snapshot={stage} nodes={nodes} changed_inside={changed_inside} outside=exact replay=exact png=exact"
+    );
+    Ok(())
+}
+
+fn verify_color_stroke(project: &Path) -> Result<()> {
+    let db = ProjectDb::open(project)?;
+    let reopened = db.load_reopened()?.ok_or("missing color stroke")?;
+    let batch = db.load_current()?.ok_or("missing stroke record")?;
+    let canvas = CanvasSpec {
+        height_px: 65,
+        ..CANVAS
+    };
+    if reopened.current_snapshot() != SnapshotId(2)
+        || reopened.history().node_count() != 2
+        || db.load_canvas_spec()? != canvas
+        || db.load_layer_tree()? != Some(tree())
+        || batch.before != expected(false)?
+        || batch.stroke.color.0 != [3, 146, 206, 255]
+        || (batch.stroke.brush.preset.size_px - 3.0).abs() > f32::EPSILON
+        || batch.stroke.selection().is_some()
+        || batch.stroke.samples().iter().any(|sample| sample.eraser)
+    {
+        return Err("native color/brush/before/history metadata differs".into());
+    }
+    let replay = nyatidraw_stroke::materialize_with_strategy(
+        nyatidraw_stroke::MaterializationStrategy::CpuReplay,
+        &batch.stroke,
+        &batch.before,
+    )
+    .map_err(|error| format!("color stroke replay: {error:?}"))?;
+    if replay.after != *reopened.current_tiles() || replay.after == batch.before {
+        return Err("native stroke did not preserve its deterministic artwork".into());
+    }
+    let keys: std::collections::BTreeSet<_> = batch
+        .before
+        .iter()
+        .chain(reopened.current_tiles().iter())
+        .map(|(key, _)| key)
+        .collect();
+    for key in keys {
+        let (origin_x, origin_y) = key.pixel_origin();
+        let before = batch.before.get(key);
+        let after = reopened.current_tiles().get(key);
+        for index in 0..128 * 128 {
+            let x = origin_x + i64::try_from(index % 128)?;
+            let y = origin_y + i64::try_from(index / 128)?;
+            let old = before.map_or(&[0; 4][..], |tile| &tile.pixels()[index * 4..index * 4 + 4]);
+            let pixel = after.map_or(&[0; 4][..], |tile| &tile.pixels()[index * 4..index * 4 + 4]);
+            if (!(0..129).contains(&x) || !(0..65).contains(&y)) && pixel != old {
+                return Err("in-page native brush changed outside artwork".into());
+            }
+        }
+    }
+    let expected =
+        nyatidraw_paint_cpu::flatten_layer_tree_rgba8(reopened.current_tiles(), &tree(), canvas)
+            .map_err(|error| format!("flatten: {error:?}"))?;
+    let imported = nyatidraw_png_io::decode_png(&project.with_extension("png"), LayerId(1))?;
+    let actual = imported
+        .tiles
+        .crop_base_layer_rgba8_to_canvas(LayerId(1), imported.canvas)
+        .map_err(|error| format!("crop: {error:?}"))?;
+    if imported.canvas != canvas || actual.pixels != expected.pixels {
+        return Err("native color stroke PNG differs from durable composite".into());
+    }
+    println!(
+        "native-color-stroke snapshot=2 history=2 color=3,146,206,255 size=3 samples={} tiles=exact outside=exact png=exact oracle=stored-sample-CPU-replay",
+        batch.stroke.samples().len()
+    );
+    Ok(())
+}
+
+fn verify_gradient_import(project: &Path) -> Result<()> {
+    let db = ProjectDb::open(project)?;
+    let reopened = db.load_reopened()?.ok_or("missing imported head")?;
+    let canvas = CanvasSpec {
+        height_px: 65,
+        ..CANVAS
+    };
+    if reopened.current_snapshot() != SnapshotId(1)
+        || reopened.history().node_count() != 1
+        || db.load_canvas_spec()? != canvas
+        || reopened.current_tiles().iter().count() != 1
+    {
+        return Err("fresh gradient import has wrong metadata or extra tiles".into());
+    }
+    let mut expected = vec![0; TILE_BYTE_LEN];
+    for y in 0..65 {
+        for x in 0..128 {
+            let numerator = (220_i64 - (2 * i64::try_from(x)? + 1)).clamp(0, 200);
+            let color = [3_i64, 146, 206, 255]
+                .map(|channel| u8::try_from((channel * numerator + 100) / 200).unwrap());
+            expected[(y * 128 + x) * 4..(y * 128 + x) * 4 + 4].copy_from_slice(&color);
+        }
+    }
+    let expected = TileSnapshot::from_tiles([(
+        TileKey {
+            layer: LayerId(1),
+            mip: 0,
+            x: 0,
+            y: 0,
+        },
+        expected,
+    )])
+    .map_err(|error| format!("import oracle: {error:?}"))?;
+    if reopened.current_tiles() != &expected {
+        return Err("16-bit PNG bootstrap changed independently expected gradient tiles".into());
+    }
+    let imported = nyatidraw_png_io::decode_png(&project.with_extension("png"), LayerId(1))?;
+    if imported.canvas != canvas || imported.tiles != expected {
+        return Err("re-exported imported PNG changed artwork".into());
+    }
+    println!(
+        "native-gradient-import snapshot=1 history=1 canvas=129x65 ppi=96 all_tiles=independent-exact png=exact"
     );
     Ok(())
 }

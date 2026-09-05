@@ -1,6 +1,7 @@
 # ADR-0029: Explicit sRGB boundaries with precise PNG transport
 
-Status: implemented with CPU/process evidence; installed UI and Godot acceptance pending.
+Status: accepted for the bounded sRGB contract below, with CPU, installed restart
+and Godot 4.6.3 evidence. Display calibration and latency gates remain open.
 
 The [color-boundary audit](../color-boundary-audit-2026-09-05.md) reproduced
 linear tile bytes being emitted directly as untagged PNG and UI sRGB bytes
@@ -79,5 +80,33 @@ Official Godot 4.6.3 decoded the PNGs, imported normal textures, and refreshed a
 live editor Inspector automatically on focus return after NyatiDraw Save.
 A separate process verified that editor cache's non-primary translucent pixels.
 See [ADR-0030](ADR-0030-godot-png-acceptance.md) for hashes, logs and scope.
-New-color native brush and fresh absent-sibling PNG bootstrap remain to verify;
-this update does not claim calibrated monitor color or latency gates.
+The remaining new-color brush and absent-sibling bootstrap checks are recorded
+below; this update does not claim calibrated monitor color or latency gates.
+
+## Native brush and fresh PNG bootstrap acceptance
+
+The same installed release (SHA256 recorded in ADR-0030) drew a 3px mouse brush
+stroke using UI #1AC7E8 on the 129×65 scratch page. Save/normal Close and an
+ordinary app restart preserved snapshot 2/history 2 and canonical stored stroke
+color [3,146,206,255]. A separate process replayed all four stored samples and
+matched the complete durable tiles and decoded PNG; all artwork outside the
+page was unchanged. This oracle is stored-sample CPU replay, not an independent
+rasterizer, GPU readback or physical pen measurement.
+
+A fresh directory contained only the previous independently checked gradient
+PNG and no paired project. Opening that 16-bit PNG in the installed app created
+snapshot 1/history 1, a 129×65 page at 96 PPI, and exactly one canonical tile.
+The original PNG hash remained unchanged before the first Save. After Save,
+normal Close, an ordinary project restart and another normal Close, a separate
+process matched every tile byte and decoded PNG pixel against an independent
+rational gradient oracle, including zero edge padding. The final PNG SHA256
+also matched the source:
+`be5b112d4d4ceaf1200e84ec9e4e9cbfddb16cb421d3260d334151d553163dde`.
+
+Evidence: `target/color-ui/{brush,import}/{verify,reopen-verify}.log`, matching
+`out.log`/`reopen-out.log`, and the import `source-hash.json`. All four app
+sessions reported drained-and-joined workers and `close-ready writer=joined`;
+their stderr files were empty. Existing `desktop_edit_fixture` gained two
+manual acceptance verification modes; no automated UI tests or dependencies
+were added. Its all-feature example Clippy passed in
+`target/color-final-fixture-clippy.log`.

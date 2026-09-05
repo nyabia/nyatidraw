@@ -72,5 +72,5 @@ Computer Use injects mouse/keyboard actions. This does not prove physical pen,
 first-visible-pixel timing, calibrated display color, other Godot versions or
 render backends, exported-game packaging, or long-session watcher reliability.
 The linear8 first-import quantization constraint in ADR-0029 still applies.
-This run adds no automated UI tests. New-color native brush acceptance and fresh
-16-bit PNG bootstrap into an absent paired project remain separate follow-ups.
+This run adds no automated UI tests. Separate installed new-color native brush
+and fresh 16-bit PNG bootstrap acceptance subsequently passed; see ADR-0029.
