@@ -1,0 +1,91 @@
+{
+  "production_commit": "047cf6f",
+  "profile": "cargo --release",
+  "cpu": "Intel Core Ultra 7 155H",
+  "os": "Windows 11 Home 10.0.26200",
+  "backend": "CPU PNG encode + buffered file write/close; no fsync, worker queue, GPU or display timing",
+  "background": "user-owned download untouched; desktop load uncontrolled",
+  "workload": "3840x2160 deterministic valid premultiplied channel/alpha pattern; see color_export_probe.rs",
+  "warmup": 1,
+  "samples": 20,
+  "raw_us": [
+    63381,
+    64922,
+    65279,
+    65384,
+    64867,
+    67305,
+    65364,
+    65255,
+    64046,
+    65595,
+    63168,
+    66610,
+    65439,
+    65300,
+    64337,
+    67733,
+    65291,
+    67052,
+    64713,
+    66602
+  ],
+  "nearest_rank_us": {
+    "p50": 65291,
+    "p95": 67305,
+    "p99": 67733
+  },
+  "file_bytes": 2376932,
+  "lookup_bytes": 131072,
+  "encoded_row_bytes": 30720,
+  "roundtrip": "production decode compared all 8294400 pixels exactly",
+  "independent_png_observations": [
+    {
+      "file": "color-export-probe.png",
+      "dimensions": [
+        3840,
+        2160
+      ],
+      "depth": 16,
+      "srgb_intent": 1,
+      "first_pixel": [
+        65535,
+        48192,
+        35199,
+        32896
+      ],
+      "expected": [
+        65535,
+        48192,
+        35199,
+        32896
+      ],
+      "crc": "all chunks valid",
+      "scope": "independent zlib first-pixel decode; all predictor neighbors are zero"
+    },
+    {
+      "file": "preview.png",
+      "dimensions": [
+        1,
+        1
+      ],
+      "depth": 8,
+      "srgb_intent": 1,
+      "first_pixel": [
+        255,
+        188,
+        137,
+        128
+      ],
+      "expected": [
+        255,
+        188,
+        137,
+        128
+      ],
+      "crc": "all chunks valid",
+      "scope": "independent zlib first-pixel decode; all predictor neighbors are zero"
+    }
+  ],
+  "limits": "One warmed CPU/file-cache run. Not old-vs-new comparison, installed UI acceptance, Godot acceptance, export-interference or latency gate."
+}

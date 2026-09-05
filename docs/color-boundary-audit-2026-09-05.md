@@ -1,6 +1,6 @@
 # 2026-09-05 color-boundary audit
 
-Status: reproduced software gap; correction not implemented or accepted yet.
+Status: historical pre-correction audit. Implementation 047cf6f and current acceptance status are recorded in [ADR-0029](decisions/ADR-0029-srgb-boundaries.md).
 This is part of the existing UI-color/export gates, not a new wide-gamut feature.
 
 ## Reproduced mismatch

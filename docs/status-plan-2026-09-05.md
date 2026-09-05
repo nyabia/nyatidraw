@@ -745,3 +745,26 @@ premultiply/unpremultiply만 수행하고 있었다. 설치판 4K PNG를 독립 
 기록했다. 다음 구현은 UI와 CPU/GPU의 canonical 색 일치, PNG metadata/변환과
 재가져오기 정밀도이며, 기존 파일 보존·실제 재시작·독립 PNG pixel 검증을 요구한다.
 이 소프트웨어 gap은 미완료다. 물리 펜이나 다운로드 상태와 무관하게 진행 가능하다.
+
+### sRGB 변환 구현과 정밀 PNG 왕복
+
+`047cf6f`에서 UI 색상은 sRGB→선형 변환 뒤 한 번 premultiply/quantize하며 GPU
+브러시도 동일한 canonical 색에서 유도하도록 수정했다. 저장 PNG는 tagged 16-bit
+sRGB를 행 단위로 출력하고 import는 16-bit 정밀도를 유지한다. 미리보기는 tagged
+8-bit sRGB다. Untagged는 sRGB 가정, gamma-only는 명시적 transfer를 적용하며
+미지원 ICC/cICP/비-sRGB primaries는 import 전에 오류로 처리한다. 기존 타일·저장
+stroke·history·schema는 변환하거나 migration하지 않는다.
+
+기존 PNG 왕복 test를 모든 유효 channel/alpha 32,896쌍과 독립 encoded midpoint로
+강화했고, 색상/메타데이터에 대한 핵심 invariant test 두 개만 추가했다. Workspace
+tests, 전체 Clippy, pinned-DX release 설치가 통과했다. CPU fill/gradient/Undo/branch/
+Redo의 별도 process reopen 및 legacy scratch tile/history 보존과 PNG 검사도
+통과했다. 4K 전체 8,294,400 pixels의 정확한 file export/import와 독립 PNG tag/
+비원색 반투명 픽셀을 확인했다. 20회 CPU encode p95는 67.305ms이며 fsync나
+화면 지연을 포함하지 않는다. [ADR-0029](decisions/ADR-0029-srgb-boundaries.md)와
+[성능 결과](performance.md)에 범위와 정밀도 한계를 기록했다.
+
+실제 앱 검증 시 Windows 잠금 화면이 관측되어 UI Save/Close·새 색상 stroke/
+fill/gradient·일반 재시작 확인은 아직 미완료다. 열린 legacy scratch 앱은 유지했다.
+Godot 호환성 검증도 남아 있다. 다음에는 이 acceptance를 끝내고 기존 latency,
+startup/reopen/undo 및 장시간 UI gate를 이어간다.

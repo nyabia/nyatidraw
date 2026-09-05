@@ -1,6 +1,6 @@
 # ADR-0029: Explicit sRGB boundaries with precise PNG transport
 
-Status: implementation checkpoint; installed acceptance and export cost pending.
+Status: implemented with CPU/process evidence; installed UI and Godot acceptance pending.
 
 The [color-boundary audit](../color-boundary-audit-2026-09-05.md) reproduced
 linear tile bytes being emitted directly as untagged PNG and UI sRGB bytes
@@ -47,3 +47,25 @@ independent PNG verification, actual restart and export cost remain required.
 Earlier 4K measurements describe the old color/export path, not this change.
 
 No dependency versions changed; PNG remains pinned at 0.17.16.
+
+## Additional CPU/process evidence
+
+`basic_edit_reopen_probe` passed initial, wand fill, lasso gradient, undo,
+branch fill and redo with a fresh process at each stage, exact tiles/history
+and PNG (`target/color-edit-reopen.log`). A copied pre-correction page project
+was exported and then reopened by separate headless processes: original signed,
+locked/hidden tiles, canvas/PPI, snapshot 1/history 2 and independent page pixels
+all matched (`target/color-legacy-headless/`). This is not installed UI evidence.
+
+The 4K color export probe compared all 8,294,400 pixels after file import and
+independent Python PNG/CRC parsing checked a non-primary translucent encoded
+pixel plus the 8-bit preview. Release file-encoding p50/p95/p99 were
+65.291/67.305/67.733ms over 20 samples after one warmup, without fsync/worker/GPU.
+See performance.md and its raw JSON; this is not a previous-path comparison.
+
+Pinned DX release installation passed (`target/color-install.log`). The legacy
+scratch app launched and uploaded existing tiles, but Computer Use observed
+the Windows lock screen and could not activate the app. Normal UI Save/Close,
+reopen, new-color draw/fill/gradient acceptance and Godot compatibility remain
+pending. The running scratch app was left intact; the user-owned download was
+not inspected or altered. Do not promote locked-screen startup logs to UI proof.

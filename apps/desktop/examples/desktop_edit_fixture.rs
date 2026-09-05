@@ -172,14 +172,14 @@ fn verify_native_edit(project: &Path, stage: u128, nodes: usize, pattern: &str) 
     }
     let color_at = |x: i64, y: i64| -> Result<[u8; 4]> {
         Ok(match pattern {
-            "solid" => [26, 199, 232, 255],
-            "rectangle" if (10..100).contains(&x) && (10..55).contains(&y) => [26, 199, 232, 255],
+            "solid" => [3, 146, 206, 255],
+            "rectangle" if (10..100).contains(&x) && (10..55).contains(&y) => [3, 146, 206, 255],
             "rectangle" | "empty" => [0; 4],
             // UI drag document x=10 -> 110. Independent rational interpolation
             // at pixel centers, with the current color fading to transparent.
             "gradient" => {
                 let numerator = (220 - (2 * x + 1)).clamp(0, 200);
-                [26_i64, 199, 232, 255]
+                [3_i64, 146, 206, 255]
                     .map(|channel| u8::try_from((channel * numerator + 100) / 200).unwrap())
             }
             _ => return Err("unknown native edit pattern".into()),

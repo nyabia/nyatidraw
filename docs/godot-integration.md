@@ -107,3 +107,15 @@ Godot FileSystem의 `만들기`, `NyatiDraw로 편집`, 명시적 reimport 기�
 addon은 유용하지만 현재 스프린트 완료 조건이 아니다. 기본 Windows image-open 경로가
 충분히 안정화된 뒤 별도 통합 작업으로 판단한다. addon 때문에 현재 문서 포맷,
 activation CLI 또는 저장/export 경계를 바꾸지 않는다.
+
+## 색상 수정 이후 PNG 계약
+
+`047cf6f`부터 file export는 sRGB tag가 있는 16-bit straight-alpha PNG다.
+이는 기존 linear-light RGBA8 타일의 export/import 정밀도를 보존하기 위한
+전송 형식이며 project painting bit depth를 바꾸지는 않는다. PNG import는
+sRGB/명시적 gamma를 해석하고 미지원 ICC/cICP/색 원색은 오류로 알린다.
+색상 정보가 없는 PNG는 sRGB로 가정한다. 임의의 외부 sRGB 색은 최초 linear8
+타일 변환 때 양자화되므로 모든 원본 색의 byte-exact 보존을 주장하지 않는다.
+원본 PNG는 여전히 첫 Save 전까지 바꾸지 않으며 valid `.ntdr`이 있으면 그
+프로젝트를 사용한다. Godot의 16-bit PNG 실제 import/watch 검증은 아직 남아 있다.
+[색상 결정과 근거](decisions/ADR-0029-srgb-boundaries.md)를 참조한다.

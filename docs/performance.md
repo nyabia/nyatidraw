@@ -235,3 +235,29 @@ hash와 소스 commit, 모든 단계 분포를 보존했다. 원본은
 `target/paint-redraw/{baseline,export}-{1,2,3}/{out,err,verify}.log`, 최종 정상
 재시작은 `export-3/reopen-*.log`다. 실제 UI 입력·Undo·pan·Fit 검증은 ADR-0028을
 참조한다. 구조적 중복 렌더링 제거는 유지하되 성능 gate 해결과 구분한다.
+
+## 2026-09-05 corrected color export CPU cost
+
+색상 경계 수정(047cf6f)의 16-bit sRGB file export를 Windows 11 Home
+10.0.26200 / Core Ultra 7 155H / cargo release / CPU backend에서 측정했다.
+3840×2160의 유효 premultiplied 색·알파 패턴, warmup 1회 뒤 20회다.
+동일 scratch 파일을 반복 인코딩·buffered write·close하는 시간이며 fsync,
+writer queue, desktop 입력·GPU·화면 지연은 포함하지 않는다.
+
+| p50 | p95 | p99 | PNG 크기 |
+|---:|---:|---:|---:|
+| 65.291ms | 67.305ms | 67.733ms | 2,376,932 bytes |
+
+Nearest-rank percentile이며 [전체 측정 JSON](measurements/color-export-4k-2026-09-05.json)에
+원시 20개 시간과 독립 PNG 관측을 보존했다. 고정 변환 lookup은 128KiB,
+이 장면의 추가 encoded row는 30,720 bytes다. 16-bit 전체 이미지 복사 대신
+행 단위 streaming을 사용한다. 이 값은 전체 프로세스 peak memory 측정은 아니다.
+8,294,400개 픽셀의 export/import를 byte-exact 비교했고, 별도 Python zlib/CRC
+검사로 file PNG의 16-bit/sRGB tag 및 비원색·반투명 첫 픽셀과 preview PNG의
+8-bit 대응값을 독립 확인했다.
+
+실행: `cargo run --locked -p nyatidraw-png-io --example color_export_probe --release -- target/color-export-cost`.
+출력 폴더는 새 경로여야 하며 기존 폴더를 거부한다. 원본 로그는
+`target/color-export-cost.log`다. 사용자 다운로드와 다른 desktop 부하는 통제하지
+않았다. 단일 warm file-cache run이고 이전 export와 직접 비교한 장면이 아니므로
+개선율, export 간섭 gate 또는 설치판 지연 합격을 주장하지 않는다.

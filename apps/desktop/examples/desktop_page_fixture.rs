@@ -163,6 +163,23 @@ fn main() -> Result<()> {
             args.get(4).ok_or("snapshot")?.parse()?,
             args.get(5).ok_or("nodes")?.parse()?,
         ),
+        "reexport" => {
+            if !project.is_file() {
+                return Err("requires an existing scratch project".into());
+            }
+            let db = ProjectDb::open(project)?;
+            let reopened = db.load_reopened()?.ok_or("missing artwork")?;
+            let layers = db.load_layer_tree()?.ok_or("missing layers")?;
+            let surface = nyatidraw_paint_cpu::flatten_layer_tree_rgba8(
+                reopened.current_tiles(),
+                &layers,
+                db.load_canvas_spec()?,
+            )
+            .map_err(|error| format!("composite: {error:?}"))?;
+            nyatidraw_png_io::encode_png(&project.with_extension("png"), &surface)?;
+            println!("page-reexport source=existing-scratch cpu_only=true");
+            Ok(())
+        }
         _ => Err("invalid fixture mode".into()),
     }
 }

@@ -391,8 +391,9 @@ pub struct UiProjection {
     /// Session brush sizes, newest first, at most four unique tenths of a pixel.
     pub recent_brush_sizes: Vec<u16>,
     pub brush_opacity_u16: u16,
+    /// Straight sRGB8 UI color; alpha is linear. Convert before artwork commands.
     pub brush_color: [u8; 4],
-    /// Session palette, newest first, at most eight unique RGBA colors.
+    /// Session palette, newest first, at most eight unique straight sRGB8 colors.
     pub recent_colors: Vec<[u8; 4]>,
     pub edit_settings: EditSettings,
 }

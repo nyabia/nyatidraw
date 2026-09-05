@@ -249,3 +249,21 @@ Open은 모든 snapshot과 initial page record의 일대일 대응, 길이·chec
 현재 page/cursor 일치와 버전 marker를 검사한다. 손상된 과거 분기도 조용히 무시하지
 않으며 invalid 파일을 보존한다. 이 저장 기반의 검증과 UI 연결 상태는
 [ADR-0024](decisions/ADR-0024-page-history-storage.md)를 따른다.
+
+## PNG color boundary (047cf6f)
+
+Durable tiles and stored stroke colors remain premultiplied linear-light RGBA8;
+this correction does not migrate roots, history or schema. UI colors are straight
+sRGB8 and convert before producing artwork commands. Colocated file exports now
+use tagged straight-alpha **16-bit sRGB PNG**, retaining enough transport
+precision to recover existing valid linear8 tile bytes on direct import.
+Navigator/thumbnail previews use tagged 8-bit sRGB.
+
+PNG import retains 16-bit precision through inverse transfer and premultiplication.
+Untagged input assumes sRGB; gamma-only input uses the declared transfer with
+sRGB primaries. Unsupported ICC/cICP or non-sRGB primaries produce an import
+error. Arbitrary external sRGB colors still quantize when first represented in
+linear8 tiles; original PNG byte/color exactness for every source value is not
+promised. Valid paired `.ntdr` files remain authoritative and are not reimported
+from PNG. See [ADR-0029](decisions/ADR-0029-srgb-boundaries.md) for verification
+and pending installed UI/Godot acceptance.
