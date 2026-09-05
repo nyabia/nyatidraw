@@ -85,15 +85,19 @@ fn expected(limit: usize) -> Result<TileSnapshot> {
     TileSnapshot::from_tiles(tiles).map_err(|error| format!("fixture tiles: {error:?}").into())
 }
 
-fn verify(project: &Path, limit: usize) -> Result<()> {
+fn verify(project: &Path, limit: usize, stage: u128, nodes: usize, visible: bool) -> Result<()> {
     if ![32, 64, 129].contains(&limit) {
         return Err("expected filled width must be 32, 64, or 129".into());
     }
     let db = ProjectDb::open(project)?;
     let reopened = db.load_reopened()?.ok_or("missing head")?;
-    if reopened.current_snapshot() != SnapshotId(2)
-        || reopened.history().node_count() != 2
-        || db.load_layer_tree()? != Some(tree())
+    let mut expected_tree = tree();
+    expected_tree
+        .set_visibility(nyatidraw_api::LayerTreeNodeId::Raster(LayerId(3)), visible)
+        .map_err(|error| format!("fixture tree: {error:?}"))?;
+    if reopened.current_snapshot() != SnapshotId(stage)
+        || reopened.history().node_count() != nodes
+        || db.load_layer_tree()? != Some(expected_tree)
         || db.load_canvas_spec()? != CANVAS
         || reopened.current_tiles() != &expected(limit)?
     {
@@ -104,7 +108,7 @@ fn verify(project: &Path, limit: usize) -> Result<()> {
     for _ in 0..65 {
         for x in 0..129 {
             pixels.extend_from_slice(&match x {
-                32 => [0, 0, 128, 255],
+                32 if visible => [0, 0, 128, 255],
                 64 if limit == 129 => [51, 149, 174, 255],
                 64 => [32, 0, 0, 64],
                 x if x < limit => INK,
@@ -129,7 +133,7 @@ fn verify(project: &Path, limit: usize) -> Result<()> {
         return Err("source/tolerance exported composite differs".into());
     }
     println!(
-        "source-tolerance-verify width={limit} pixels={} tiles=exact other_layers=exact off_page=exact png=exact history=2",
+        "source-tolerance-verify width={limit} pixels={} tiles=exact other_layers=exact off_page=exact png=exact snapshot={stage} history={nodes} visible={visible}",
         limit * 65
     );
     Ok(())
@@ -158,7 +162,20 @@ fn main() -> Result<()> {
             println!("source-tolerance-fixture created={}", project.display());
             Ok(())
         }
-        "verify" => verify(project, args.get(3).ok_or("filled width")?.parse()?),
+        "verify" | "verify-hidden" | "verify-undo" => {
+            let (stage, nodes, visible) = match mode.as_str() {
+                "verify-hidden" => (3, 3, false),
+                "verify-undo" => (2, 3, true),
+                _ => (2, 2, true),
+            };
+            verify(
+                project,
+                args.get(3).ok_or("filled width")?.parse()?,
+                stage,
+                nodes,
+                visible,
+            )
+        }
         _ => Err("invalid mode".into()),
     }
 }

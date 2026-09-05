@@ -631,7 +631,7 @@ struct ActiveCanvas {
     project_title: String,
     project_export_path: Option<PathBuf>,
     pending_save: Option<u64>,
-    edit_job: Option<Receiver<Result<EditOutcome, EditFailure>>>,
+    artwork_job: Option<ArtworkJob>,
     selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     canvas_spec: CanvasSpec,
     drawing: DrawingConfig,
@@ -771,7 +771,7 @@ impl ActiveCanvas {
             project_title: project_location.title(),
             project_export_path: project_location.export_path(),
             pending_save: None,
-            edit_job: None,
+            artwork_job: None,
             selection: None,
             canvas_spec,
             drawing,
@@ -822,6 +822,9 @@ impl ActiveCanvas {
     }
 
     fn advance_protocol_probe(&mut self) {
+        if self.artwork_job.is_some() {
+            return;
+        }
         let Some(step) = self.protocol_probe_step else {
             return;
         };
@@ -908,6 +911,9 @@ impl ActiveCanvas {
     }
 
     fn advance_history_probe(&mut self) {
+        if self.artwork_job.is_some() {
+            return;
+        }
         let Some((command, submitted)) = self.history_probe.clone() else {
             return;
         };
@@ -972,7 +978,7 @@ impl ActiveCanvas {
                 {
                     self.edit_probe_step = Some(1);
                 }
-            } else if self.edit_job.is_none() && self.selection.is_some() {
+            } else if self.artwork_job.is_none() && self.selection.is_some() {
                 println!(
                     "native-canvas event=selected-brush-probe-ready selected_pixels={} input=native-only",
                     self.projection.current().edit.selected_pixels
@@ -987,12 +993,12 @@ impl ActiveCanvas {
                 tolerance: 0,
                 source: EditSource::ActiveLayer,
             }),
-            1 if self.edit_job.is_none() && self.selection.is_some() => {
+            1 if self.artwork_job.is_none() && self.selection.is_some() => {
                 EditorCommand::Edit(EditCommand::FillSelection {
                     color: [0, 255, 0, 255],
                 })
             }
-            2 if self.edit_job.is_some() => {
+            2 if self.artwork_job.is_some() => {
                 for (sequence, phase) in
                     [(80_001, PointerPhase::Begin), (80_002, PointerPhase::End)]
                 {
@@ -1008,7 +1014,7 @@ impl ActiveCanvas {
                 );
                 EditorCommand::Project(ProjectCommand::Save)
             }
-            3 if self.pending_save.is_some() && self.edit_job.is_some() => {
+            3 if self.pending_save.is_some() && self.artwork_job.is_some() => {
                 println!("native-canvas event=edit-probe-save-retained worker_busy=true");
                 self.edit_probe_step = None;
                 return;
@@ -1253,7 +1259,7 @@ impl ActiveCanvas {
             return None;
         }
 
-        self.poll_edit();
+        self.poll_artwork();
         // Native samples already carry the renderer-published document
         // coordinates from their admission moment. Consume their End and put
         // its closed stroke in the writer FIFO before accepting same-frame UI
@@ -1469,7 +1475,7 @@ impl ActiveCanvas {
         height: u32,
         scale: f64,
     ) -> Result<bool, CommandRejectReason> {
-        if self.edit_job.is_some()
+        if self.artwork_job.is_some()
             && matches!(command, EditorCommand::Layer(_) | EditorCommand::History(_))
         {
             return Err(CommandRejectReason::CommandQueueBusy);
@@ -1593,7 +1599,7 @@ impl ActiveCanvas {
                 Ok(false)
             }
             EditorCommand::Layer(LayerCommand::SetActive(layer)) => {
-                if self.stroke.edit_gesture.is_some() || self.edit_job.is_some() {
+                if self.stroke.edit_gesture.is_some() || self.artwork_job.is_some() {
                     return Err(CommandRejectReason::CommandQueueBusy);
                 }
                 if self
@@ -1622,7 +1628,9 @@ impl ActiveCanvas {
                     return Err(CommandRejectReason::CommandQueueBusy);
                 }
                 let result = self.apply_layer_command(command);
-                self.stroke.live_ink.resume_after_edit();
+                if self.artwork_job.is_none() {
+                    self.stroke.live_ink.resume_after_edit();
+                }
                 result
             }
             EditorCommand::Dock(command) => {
@@ -1720,7 +1728,7 @@ impl ActiveCanvas {
                         .stage_edit_settings(self.drawing.edit_settings);
                     Ok(false)
                 })();
-                if self.edit_job.is_none() {
+                if self.artwork_job.is_none() {
                     self.stroke.live_ink.resume_after_edit();
                 }
                 result
@@ -1730,18 +1738,12 @@ impl ActiveCanvas {
                 if !self.stroke.live_ink.try_pause_for_edit() {
                     return Err(CommandRejectReason::CommandQueueBusy);
                 }
-                let result = (|| {
-                    let moved = self
-                        .stroke
-                        .materializer
-                        .move_history(command)
-                        .map_err(|()| CommandRejectReason::UnsupportedCommand)?;
-                    let changed = moved.tiles.is_some();
-                    self.install_history_move(moved)?;
-                    Ok(changed)
-                })();
-                self.stroke.live_ink.resume_after_edit();
-                result
+                let (reply, received) = sync_channel(1);
+                self.enqueue_artwork(
+                    WorkerRequest::MoveHistory { command, reply },
+                    received,
+                    None,
+                )
             }
         }
     }
@@ -1750,7 +1752,7 @@ impl ActiveCanvas {
     fn apply_layer_command(&mut self, command: LayerCommand) -> Result<bool, CommandRejectReason> {
         let mut tree = self.scene.tree().clone();
         let mut active = self.active_layer;
-        let mut next_id = self.next_layer_node_id;
+        let next_id = self.next_layer_node_id;
         let white = matches!(command, LayerCommand::AddWhiteBackground);
         match command {
             LayerCommand::AddRaster | LayerCommand::AddGroup => {
@@ -1774,7 +1776,7 @@ impl ActiveCanvas {
                     active = LayerId(next_id);
                     LayerTreeNode::Raster(empty_raster(active, name))
                 };
-                next_id = next_id
+                let _ = next_id
                     .checked_add(1)
                     .ok_or(CommandRejectReason::RevisionExhausted)?;
                 tree.insert(parent, index, node)
@@ -1789,7 +1791,7 @@ impl ActiveCanvas {
                     .map_err(|_| CommandRejectReason::UnknownLayer)?;
                 if raster_layer_ids(&tree).is_empty() {
                     active = LayerId(next_id);
-                    next_id = next_id
+                    let _ = next_id
                         .checked_add(1)
                         .ok_or(CommandRejectReason::RevisionExhausted)?;
                     tree.insert(
@@ -1851,19 +1853,16 @@ impl ActiveCanvas {
         self.scene
             .validate_tree_replacement(&tree)
             .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
-        let moved = self
-            .stroke
-            .materializer
-            .commit_layer_tree(tree, white)
-            .map_err(|()| CommandRejectReason::WorkspaceFailed)?;
-        self.active_layer = active;
-        self.install_history_move(moved)?;
-        self.next_layer_node_id = self.next_layer_node_id.max(next_id);
-        Ok(true)
+        let (reply, received) = sync_channel(1);
+        self.enqueue_artwork(
+            WorkerRequest::CommitLayerTree { tree, white, reply },
+            received,
+            Some(active),
+        )
     }
 
     fn ensure_artwork_command_idle(&mut self) -> Result<(), CommandRejectReason> {
-        if self.edit_job.is_some()
+        if self.artwork_job.is_some()
             || self.stroke.edit_gesture.is_some()
             || self.scene.active_live_stroke().is_some()
             || self.stroke.active.is_some()
@@ -1958,7 +1957,7 @@ impl ActiveCanvas {
             .map(|(key, tile)| (key, tile.pixels().to_vec()))
             .collect();
         self.latest_preview_generation.clear();
-        if self.edit_job.is_none() {
+        if self.artwork_job.is_none() {
             self.stroke.live_ink.resume_after_edit();
         }
         Ok(())
@@ -1978,6 +1977,21 @@ impl ActiveCanvas {
             target: self.active_layer,
             reply,
         };
+        self.enqueue_artwork(request, received, None)
+    }
+
+    fn enqueue_artwork(
+        &mut self,
+        request: WorkerRequest,
+        received: Receiver<Result<ArtworkOutcome, EditFailure>>,
+        active_layer: Option<LayerId>,
+    ) -> Result<bool, CommandRejectReason> {
+        let kind = match &request {
+            WorkerRequest::Edit { .. } => "edit",
+            WorkerRequest::MoveHistory { .. } => "history",
+            WorkerRequest::CommitLayerTree { .. } => "layer",
+            _ => unreachable!("only artwork requests use the artwork job"),
+        };
         let queued = self
             .stroke
             .materializer
@@ -1988,12 +2002,17 @@ impl ActiveCanvas {
             self.stroke.live_ink.resume_after_edit();
             return Err(CommandRejectReason::CommandQueueBusy);
         }
-        self.edit_job = Some(received);
+        self.artwork_job = Some(ArtworkJob {
+            received,
+            active_layer,
+        });
         let mut edit = self.projection.current().edit.clone();
         edit.busy = true;
         edit.error = None;
         self.projection.stage_edit(edit);
-        println!("native-canvas event=edit-queued pending=1 response_capacity=1 wait=nonblocking");
+        println!(
+            "native-canvas event=artwork-queued kind={kind} pending=1 response_capacity=1 wait=nonblocking"
+        );
         Ok(false)
     }
 
@@ -2016,20 +2035,21 @@ impl ActiveCanvas {
         self.publish_committed_history();
     }
 
-    fn poll_edit(&mut self) {
-        let Some(job) = &self.edit_job else {
+    fn poll_artwork(&mut self) {
+        let Some(job) = &self.artwork_job else {
             return;
         };
-        let result = match job.try_recv() {
+        let result = match job.received.try_recv() {
             Ok(result) => result,
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err(EditFailure::Fatal("Edit worker disconnected".into()))
+                Err(EditFailure::Fatal("Artwork worker disconnected".into()))
             }
         };
+        let active_layer = job.active_layer;
         let mut error = None;
         match result {
-            Ok(outcome) => {
+            Ok(ArtworkOutcome::Edit(outcome)) => {
                 let changed = outcome.tiles.is_some();
                 if changed
                     && self
@@ -2052,6 +2072,20 @@ impl ActiveCanvas {
                     self.projection.install_authoritative(current);
                 }
             }
+            Ok(ArtworkOutcome::History(moved)) => {
+                let changed = moved.tiles.is_some();
+                if let Some(active) = active_layer {
+                    self.active_layer = active;
+                }
+                if self.install_history_move(moved).is_err() {
+                    return;
+                }
+                if changed {
+                    let mut current = self.projection.current().clone();
+                    current.dirty = true;
+                    self.projection.install_authoritative(current);
+                }
+            }
             Err(EditFailure::Rejected(reason)) => {
                 error = Some(reason);
             }
@@ -2060,7 +2094,7 @@ impl ActiveCanvas {
                 return;
             }
         }
-        self.edit_job = None;
+        self.artwork_job = None;
         let selected_pixels = self
             .selection
             .as_ref()
@@ -2075,7 +2109,7 @@ impl ActiveCanvas {
         self.async_publication_base_revision
             .get_or_insert(self.projection.current().revision);
         self.publish_committed_history();
-        println!("native-canvas event=edit-adopted selected_pixels={selected_pixels} pending=0");
+        println!("native-canvas event=artwork-adopted selected_pixels={selected_pixels} pending=0");
     }
 
     fn install_selection(
@@ -2133,7 +2167,7 @@ impl ActiveCanvas {
         let Some(generation) = self.pending_save else {
             return;
         };
-        if self.edit_job.is_some()
+        if self.artwork_job.is_some()
             || self.stroke.active.is_some()
             || !self.stroke.pending_materializations.is_empty()
         {
@@ -2142,13 +2176,11 @@ impl ActiveCanvas {
         let Some(path) = self.project_export_path.clone() else {
             return;
         };
-        match self.stroke.materializer.enqueue_export(
-            generation,
-            path,
-            self.scene.tree().clone(),
-            self.canvas_spec,
-            false,
-        ) {
+        match self
+            .stroke
+            .materializer
+            .enqueue_export(generation, path, self.canvas_spec, false)
+        {
             Ok(()) => {
                 self.pending_save = None;
                 // The FIFO now includes every closed stroke represented by
@@ -3385,13 +3417,7 @@ impl Drop for ActiveCanvas {
                 && self
                     .stroke
                     .materializer
-                    .enqueue_export(
-                        generation,
-                        path,
-                        self.scene.tree().clone(),
-                        self.canvas_spec,
-                        true,
-                    )
+                    .enqueue_export(generation, path, self.canvas_spec, true)
                     .is_err()
             {
                 self.stroke
@@ -3568,23 +3594,32 @@ enum WorkerRequest {
     Edit {
         command: nyatidraw_api::EditCommand,
         target: LayerId,
-        reply: SyncSender<Result<EditOutcome, EditFailure>>,
+        reply: SyncSender<Result<ArtworkOutcome, EditFailure>>,
     },
     CommitLayerTree {
         tree: LayerTree,
         white: bool,
-        reply: SyncSender<Result<HistoryMove, String>>,
+        reply: SyncSender<Result<ArtworkOutcome, EditFailure>>,
     },
     ExportPng {
         generation: u64,
         path: PathBuf,
-        tree: LayerTree,
         canvas: CanvasSpec,
     },
     MoveHistory {
         command: nyatidraw_api::HistoryCommand,
-        reply: SyncSender<Result<HistoryMove, String>>,
+        reply: SyncSender<Result<ArtworkOutcome, EditFailure>>,
     },
+}
+
+enum ArtworkOutcome {
+    Edit(EditOutcome),
+    History(HistoryMove),
+}
+
+struct ArtworkJob {
+    received: Receiver<Result<ArtworkOutcome, EditFailure>>,
+    active_layer: Option<LayerId>,
 }
 
 struct HistoryMove {
@@ -3872,17 +3907,6 @@ impl MaterializationWorker {
         }
     }
 
-    fn commit_layer_tree(&self, tree: LayerTree, white: bool) -> Result<HistoryMove, ()> {
-        let Some(sender) = self.sender.as_ref() else {
-            return Err(());
-        };
-        let (reply, received) = sync_channel(0);
-        sender
-            .try_send(WorkerRequest::CommitLayerTree { tree, white, reply })
-            .map_err(|_| ())?;
-        received.recv().ok().and_then(Result::ok).ok_or(())
-    }
-
     fn reserve_export(&self) -> Result<u64, ()> {
         // Acceptance supersedes older work even while this request waits for
         // an active stroke. Final replacement uses the same generation gate.
@@ -3904,7 +3928,6 @@ impl MaterializationWorker {
         &self,
         generation: u64,
         path: PathBuf,
-        tree: LayerTree,
         canvas: CanvasSpec,
         shutdown: bool,
     ) -> Result<(), ExportEnqueueError> {
@@ -3915,7 +3938,6 @@ impl MaterializationWorker {
         let request = WorkerRequest::ExportPng {
             generation,
             path,
-            tree,
             canvas,
         };
         // Never hold the replacement gate while waiting on worker capacity:
@@ -3933,17 +3955,6 @@ impl MaterializationWorker {
         self.live_ink
             .publish_export_status(ExportStatus::Queued { generation });
         Ok(())
-    }
-
-    fn move_history(&self, command: nyatidraw_api::HistoryCommand) -> Result<HistoryMove, ()> {
-        let Some(sender) = self.sender.as_ref() else {
-            return Err(());
-        };
-        let (reply, received) = sync_channel(0);
-        sender
-            .try_send(WorkerRequest::MoveHistory { command, reply })
-            .map_err(|_| ())?;
-        received.recv().ok().and_then(Result::ok).ok_or(())
     }
 
     /// Only the retiring canvas owner may waive display delivery. Closed
@@ -4082,6 +4093,18 @@ fn materialization_loop(
         // Dequeue freed a bounded writer slot. Wake a Save retained by the
         // canvas even when this work only changes metadata or exports a PNG.
         live_ink.request_redraw();
+        let probe = match &work {
+            WorkerRequest::MoveHistory { reply, .. } => Some(("history", reply)),
+            WorkerRequest::CommitLayerTree { reply, .. } => Some(("layer", reply)),
+            _ => None,
+        };
+        if let Some((kind, reply)) = probe
+            && let Err(reason) = crate::edit_worker::pause_artwork_probe(kind)
+        {
+            let _ = reply.send(Err(EditFailure::Rejected(reason)));
+            live_ink.request_redraw();
+            continue;
+        }
         let request = match work {
             WorkerRequest::Stroke(request) => request,
             WorkerRequest::Edit {
@@ -4135,7 +4158,7 @@ fn materialization_loop(
                     started.elapsed().as_micros(),
                     session.current_snapshot().0
                 );
-                let _ = reply.send(result);
+                let _ = reply.send(result.map(ArtworkOutcome::Edit));
                 live_ink.request_redraw();
                 if failed {
                     exit = WorkerExit::FailStop;
@@ -4146,7 +4169,6 @@ fn materialization_loop(
             WorkerRequest::ExportPng {
                 generation,
                 path,
-                tree,
                 canvas,
             } => {
                 let current = export_generations
@@ -4168,7 +4190,7 @@ fn materialization_loop(
                 match export_current_png(
                     &path,
                     session.tiles(),
-                    &tree,
+                    &preview_tree,
                     canvas,
                     generation,
                     export_generations,
@@ -4204,11 +4226,12 @@ fn materialization_loop(
             }
             WorkerRequest::MoveHistory { command, reply } => {
                 if let nyatidraw_api::HistoryCommand::ShowRedoBranches { after } = command {
-                    let _ = reply.send(Ok(HistoryMove {
+                    let _ = reply.send(Ok(ArtworkOutcome::History(HistoryMove {
                         tiles: None,
                         tree: None,
                         history: session.history_projection_after(after),
-                    }));
+                    })));
+                    live_ink.request_redraw();
                     continue;
                 }
                 let prepared = match command {
@@ -4222,7 +4245,7 @@ fn materialization_loop(
                     }
                 };
                 let result = prepared
-                    .map_err(|error| format!("history-prepare:{error:?}"))
+                    .map_err(|error| EditFailure::Rejected(format!("history-prepare:{error:?}")))
                     .and_then(|prepared| {
                         let target = prepared.target();
                         let db = match sink {
@@ -4231,16 +4254,21 @@ fn materialization_loop(
                         };
                         let tiles = db
                             .load_cursor_tiles(target)
-                            .map_err(|error| format!("history-load:{error}"))?;
+                            .map_err(|error| EditFailure::Fatal(format!("history-load:{error}")))?;
                         let tree = db
                             .load_cursor_layer_tree(target)
-                            .map_err(|error| format!("history-tree-load:{error}"))?
+                            .map_err(|error| {
+                                EditFailure::Fatal(format!("history-tree-load:{error}"))
+                            })?
                             .unwrap_or_else(default_layer_tree);
-                        db.persist_history_cursor(target)
-                            .map_err(|error| format!("history-persist:{error}"))?;
+                        db.persist_history_cursor(target).map_err(|error| {
+                            EditFailure::Fatal(format!("history-persist:{error}"))
+                        })?;
                         session
                             .accept_history_cursor_move(prepared, tiles.clone())
-                            .map_err(|error| format!("history-accept:{error:?}"))?;
+                            .map_err(|error| {
+                                EditFailure::Fatal(format!("history-accept:{error:?}"))
+                            })?;
                         preview_tree = tree.clone();
                         selection = None;
                         Ok(HistoryMove {
@@ -4249,7 +4277,11 @@ fn materialization_loop(
                             history: session.history_projection(),
                         })
                     });
-                if let Err(error) = &result {
+                let failed = matches!(result, Err(EditFailure::Fatal(_)));
+                if let Err(EditFailure::Fatal(error)) = &result {
+                    live_ink
+                        .publish_workspace_error(format!("History could not be restored: {error}"));
+                } else if let Err(EditFailure::Rejected(error)) = &result {
                     eprintln!("native-canvas event=history-move-rejected error={error}");
                 } else {
                     publish_navigator_frame(
@@ -4267,7 +4299,12 @@ fn materialization_loop(
                         preview_canvas,
                     );
                 }
-                let _ = reply.send(result);
+                let _ = reply.send(result.map(ArtworkOutcome::History));
+                live_ink.request_redraw();
+                if failed {
+                    exit = WorkerExit::FailStop;
+                    break;
+                }
                 continue;
             }
             WorkerRequest::CommitLayerTree { tree, white, reply } => {
@@ -4355,7 +4392,12 @@ fn materialization_loop(
                     );
                 }
                 let failed = result.is_err();
-                let _ = reply.send(result);
+                let _ = reply.send(
+                    result
+                        .map(ArtworkOutcome::History)
+                        .map_err(EditFailure::Fatal),
+                );
+                live_ink.request_redraw();
                 if failed {
                     exit = WorkerExit::FailStop;
                     break;

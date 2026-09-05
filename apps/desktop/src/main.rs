@@ -193,7 +193,7 @@ fn app() -> Element {
             if dirty { span { class: "unsaved-dot", title: "저장되지 않은 변경", "•" } }
             if edit.busy || edit.has_selection || edit.error.is_some() {
                 aside { class: "edit-status", role: "status", aria_live: "polite",
-                    if edit.busy { span { "선택·채우기 처리 중…" } }
+                    if edit.busy { span { "작업 처리 중…" } }
                     else {
                         span { "선택 {edit.selected_pixels} px" }
                         button { onclick: move |_| {

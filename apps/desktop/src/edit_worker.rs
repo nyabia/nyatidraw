@@ -197,3 +197,34 @@ fn pause_scratch_probe() -> Result<(), EditFailure> {
     }
     Ok(())
 }
+
+/// Only a marked scratch file can suspend the writer for UI responsiveness
+/// acceptance. The native input and renderer threads never wait at this gate.
+pub(crate) fn pause_artwork_probe(kind: &str) -> Result<(), String> {
+    if std::env::var("NAYATI_ARTWORK_PAUSE").ok().as_deref() != Some(kind) {
+        return Ok(());
+    }
+    let Some(project) = std::env::args_os().nth(1).map(std::path::PathBuf::from) else {
+        return Ok(());
+    };
+    if project.file_name().and_then(|name| name.to_str()) != Some("edit-source-scratch.ntdr")
+        || !project
+            .parent()
+            .is_some_and(|parent| parent.join(".nyatidraw-scratch-artwork-probe").is_file())
+    {
+        return Ok(());
+    }
+    let release = project.with_extension("artwork-release");
+    println!(
+        "native-canvas event=artwork-probe-paused kind={kind} release={}",
+        release.display()
+    );
+    let started = std::time::Instant::now();
+    while !release.is_file() {
+        if started.elapsed() > std::time::Duration::from_mins(3) {
+            return Err("Scratch artwork barrier timeout".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
+}

@@ -467,3 +467,22 @@ production compositor를 재사용하지 않는 위치별 상수다. 실행 근�
 단위 테스트는 추가하지 않았으며 example build와 focused Clippy가 통과했다.
 Windows 설치판 release/DX12/Intel Arc에서 컴퓨터 사용으로 검증했으며 물리 펜이나
 표시 지연 측정은 아니다. 다음 작업은 metadata/history의 renderer 대기 제거다.
+
+### History·레이어 저장의 renderer 대기 제거
+
+Undo/Redo/분기 조회와 durable 레이어 변경을 기존 선택·채우기와 같은 단일 pending
+artwork job으로 통합했다. Renderer의 동기 `recv`를 제거하고 bounded 요청/응답과
+완료 후 redraw로 연결했다. 작업 중 입력 admission은 잠그고 결과 채택 뒤 재개하며,
+viewport·도킹·Save·Close는 계속 처리한다. History 저장/채택 오류는 fail-closed다.
+
+종료 시 아직 화면에 채택되지 않은 레이어 변경도 PNG에 반영되도록 export는 writer의
+최신 tree를 사용한다. 설치판에서 레이어 저장을 scratch barrier로 대기시켜 확대,
+Save 보류와 종료 진행창을 확인했다. 종료 이후 변경 commit → 최신 PNG → join과
+별도 reopen 비교가 통과했다. Undo 대기 중 확대/Save, 자동 완료 표시, 재실행 후
+Redo도 tree·전체 타일·페이지 밖·history·독립 PNG 기대값과 정확히 일치했다.
+
+기존 69개 테스트와 전체 Clippy를 통과했으며 단위 테스트는 늘리지 않았다.
+[ADR-0018](decisions/ADR-0018-asynchronous-history-and-layers.md)에 계약과 설치판
+근거를 기록했다. 이 변경은 저장 스레드 대기를 분리한 것이며 대형 페이지의 GPU
+채택·projection 비용까지 성능 통과로 판정하지 않는다. 해당 계측, 기본 변형/page
+크기 변경과 도킹·layout 복원 등 남은 gate를 계속 진행한다.
