@@ -568,3 +568,24 @@ activation한 뒤 현재 검정과 목록을 유지했다. 측면의 주황 재�
 전체 Clippy와 release 설치가 통과했다(`target/recent-colors-clippy-final.log`,
 `target/recent-colors-install-final.log`). UI 상태를 위한 새 단위 테스트는 추가하지 않았다.
 색상환/SV/value 직접 조작과 나머지 기본 편집·성능 gate는 계속 진행한다.
+
+
+### 색상환·SV·명도 직접 조절
+
+색상 패널의 장식과 OS 색상 입력을 hue wheel, SV 사각형과 명도 strip의 실제
+컨트롤로 교체했다. 드래그 preview는 WebView 안에서 처리하고 완료할 때 revision에
+묶인 RGBA 명령 하나를 보낸다. 방향키·Shift·Home/End 조절, 영역 밖 좌표 clamp,
+검정에서 명도를 다시 올릴 때 hue/saturation 보존과 도킹 재생성 정리를 포함한다.
+상단 current/recent는 승인된 상태만 공유한다. 원시 펜 입력 경로는 바꾸지 않았다.
+
+Windows 설치판에서 실제 hue/SV/value 드래그와 키보드로 정확한 빨강을 선택하고
+채우기·Save·PNG 완료 후 정상 종료했다. 별도 fixture 프로세스가 8385개 페이지 픽셀,
+다른 레이어·음수 타일·경계 패딩·snapshot 3/history 3와 독립 PNG 기대값을 정확히
+검증했다. 최종 설치판 재시작 화면에서도 빨강이 복원됐다. Color를 Navigator 위로
+도킹한 뒤 명도를 다시 조절했고, 종료 후 동일한 독립 검사도 통과했다.
+
+전체 Clippy와 release 설치 빌드가 통과했고 새 단위 테스트는 추가하지 않았다.
+근거는 `target/color-picker-ui/`의 `first-out.log`, `red-verify.log`, `reopen-out.log`,
+`reopen-verify.log`와 [ADR-0022](decisions/ADR-0022-direct-color-picker.md)에 있다.
+실제 held-drag 취소·장치 capture loss와 물리 펜/표시 지연을 검증한 것은 아니다.
+기본 변형·page 크기 변경과 projection/hot-path 계측 등 남은 gate를 계속 진행한다.

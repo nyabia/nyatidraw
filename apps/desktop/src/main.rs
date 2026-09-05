@@ -1,3 +1,4 @@
+mod color_picker;
 #[cfg(windows)]
 mod desktop_canvas;
 mod desktop_shell;
@@ -1159,32 +1160,10 @@ fn finish_navigator_drag(
 
 #[component]
 fn ColorPanel(ui_projection: Signal<UiProjection>) -> Element {
-    let live_ink = use_context::<LiveInkBridge>();
-    let error = use_signal(|| Option::<String>::None);
     let current = ui_projection.read().brush_color;
-    let current_hex = format!("#{:02X}{:02X}{:02X}", current[0], current[1], current[2]);
     rsx! {
         div { class: "color-panel",
-            div { class: "wheel-wrap",
-                div { class: "color-wheel", aria_label: "색상환",
-                    span { class: "wheel-inner" }
-                    span { class: "sv-square" }
-                    span { class: "wheel-picker" }
-                    input {
-                        class: "color-wheel-input",
-                        r#type: "color",
-                        title: "색상 선택",
-                        value: "{current_hex}",
-                        oninput: move |event| {
-                            if let Some(rgba) = parse_html_color(&event.value()) {
-                                send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::SetColor(rgba)), error);
-                            }
-                        }
-                    }
-                }
-                span { class: "value-strip" }
-            }
-            span { class: "color-value", "{current_hex}" }
+            color_picker::ColorPicker { color: current }
             span { class: "palette-caption", "최근 색상" }
             RecentColors { ui_projection, compact: false }
             span { class: "palette-caption", "기본 색상" }
@@ -1193,23 +1172,8 @@ fn ColorPanel(ui_projection: Signal<UiProjection>) -> Element {
                     ColorSwatch { rgba, recent: false }
                 }
             }
-            if let Some(message) = error.read().as_ref() { div { class: "command-error", role: "alert", "{message}" } }
         }
     }
-}
-
-fn parse_html_color(value: &str) -> Option<[u8; 4]> {
-    let hex = value.strip_prefix('#')?;
-    if hex.len() != 6 {
-        return None;
-    }
-    let rgb = u32::from_str_radix(hex, 16).ok()?;
-    Some([
-        u8::try_from((rgb >> 16) & 0xff).ok()?,
-        u8::try_from((rgb >> 8) & 0xff).ok()?,
-        u8::try_from(rgb & 0xff).ok()?,
-        u8::MAX,
-    ])
 }
 
 #[component]

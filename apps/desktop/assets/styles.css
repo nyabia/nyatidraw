@@ -97,15 +97,18 @@ button:focus, [tabindex="0"]:focus { outline: 2px solid #9ee8ff; outline-offset:
 .nav-value { min-width: 38px; text-align: center; font-variant-numeric: tabular-nums; }
 
 .color-panel { display: flex; width: 100%; min-height: 0; flex-direction: column; align-items: center; padding: 8px 8px 9px; overflow-y: auto; }
-.wheel-wrap { display: grid; grid-template-columns: 148px 18px; gap: 8px; align-items: center; }
-.color-wheel { position: relative; width: 148px; height: 148px; border: 1px solid #555; border-radius: 50%; background: conic-gradient(#f44,#ff0,#3d5,#0df,#35f,#c3f,#f44); }
-.color-wheel-input { position: absolute; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; border-radius: 50%; opacity: 0.01; cursor: crosshair; }
-.color-wheel:focus-within { outline: 2px solid #9ee8ff; outline-offset: 2px; }
-.wheel-inner { position: absolute; inset: 22px; border-radius: 50%; background: #777; }
-.sv-square { position: absolute; inset: 35px; border: 1px solid #333; background: linear-gradient(0deg,#000,transparent),linear-gradient(90deg,#fff,rgba(255,255,255,0)); }
-.wheel-picker { position: absolute; top: 7px; left: 91px; width: 11px; height: 11px; border: 2px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px #222; }
-.value-strip { width: 18px; height: 112px; border: 1px solid #555; background: linear-gradient(#fff,#111); }
-.color-value { height: 20px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+#color-picker { width: 100%; flex: 0 0 auto; --hue-color: #f00; --wheel-x: 50%; --wheel-y: 7%; --saturation: 100%; --darkness: 0%; --value-top: #fff; }
+.wheel-wrap { display: grid; grid-template-columns: minmax(0, 1fr) 18px; gap: 8px; align-items: stretch; width: 100%; }
+.color-wheel { position: relative; width: 100%; aspect-ratio: 1; border: 1px solid #555; border-radius: 50%; background: conic-gradient(#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00); }
+[data-color-axis] { touch-action: none; cursor: crosshair; }
+.wheel-inner { position: absolute; inset: 17%; border-radius: 50%; background: #898989; pointer-events: none; }
+.sv-square { position: absolute; inset: 24%; background: linear-gradient(to top,#000,transparent), linear-gradient(to right,#fff,var(--hue-color)); }
+.wheel-picker, .sv-picker { position: absolute; width: 9px; height: 9px; transform: translate(-50%,-50%); border: 2px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px #222; pointer-events: none; }
+.wheel-picker { left: var(--wheel-x); top: var(--wheel-y); }
+.sv-picker { left: var(--saturation); top: var(--darkness); }
+.value-strip { position: relative; border: 1px solid #555; background: linear-gradient(to top,#000,var(--value-top)); }
+.value-picker { position: absolute; left: -2px; right: -2px; top: var(--darkness); height: 4px; transform: translateY(-50%); border: 1px solid #111; background: #fff; pointer-events: none; }
+.color-value { display: block; margin: 8px 0 2px; padding-left: 5px; border-left: 16px solid transparent; line-height: 20px; font-variant-numeric: tabular-nums; }
 .recent-colors { display: grid; grid-template-columns: repeat(8,1fr); width: 100%; gap: 3px; }
 .recent-colors button { height: 22px; border: 1px solid #555; }
 

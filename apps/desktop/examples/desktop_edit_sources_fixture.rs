@@ -41,7 +41,7 @@ fn tree() -> LayerTree {
     .unwrap()
 }
 
-fn expected(limit: usize) -> Result<TileSnapshot> {
+fn expected(limit: usize, ink: [u8; 4]) -> Result<TileSnapshot> {
     let mut tiles = Vec::new();
     for layer in 1..=3 {
         for tile_x in 0..2 {
@@ -50,7 +50,7 @@ fn expected(limit: usize) -> Result<TileSnapshot> {
                 for local_x in 0..128 {
                     let x = tile_x * 128 + local_x;
                     let color = match (layer, x) {
-                        (1, x) if x < limit => INK,
+                        (1, x) if x < limit => ink,
                         (2, 64) => [32, 0, 0, 64],
                         (3, 32) => [0, 0, 128, 255],
                         _ => [0; 4],
@@ -85,7 +85,14 @@ fn expected(limit: usize) -> Result<TileSnapshot> {
     TileSnapshot::from_tiles(tiles).map_err(|error| format!("fixture tiles: {error:?}").into())
 }
 
-fn verify(project: &Path, limit: usize, stage: u128, nodes: usize, visible: bool) -> Result<()> {
+fn verify(
+    project: &Path,
+    limit: usize,
+    stage: u128,
+    nodes: usize,
+    visible: bool,
+    ink: [u8; 4],
+) -> Result<()> {
     if ![32, 64, 129].contains(&limit) {
         return Err("expected filled width must be 32, 64, or 129".into());
     }
@@ -99,7 +106,7 @@ fn verify(project: &Path, limit: usize, stage: u128, nodes: usize, visible: bool
         || reopened.history().node_count() != nodes
         || db.load_layer_tree()? != Some(expected_tree)
         || db.load_canvas_spec()? != CANVAS
-        || reopened.current_tiles() != &expected(limit)?
+        || reopened.current_tiles() != &expected(limit, ink)?
     {
         return Err("source/tolerance durable artwork, metadata, or history mismatch".into());
     }
@@ -109,9 +116,10 @@ fn verify(project: &Path, limit: usize, stage: u128, nodes: usize, visible: bool
         for x in 0..129 {
             pixels.extend_from_slice(&match x {
                 32 if visible => [0, 0, 128, 255],
+                64 if limit == 129 && ink == [255, 0, 0, 255] => [223, 0, 0, 255],
                 64 if limit == 129 => [51, 149, 174, 255],
                 64 => [32, 0, 0, 64],
-                x if x < limit => INK,
+                x if x < limit => ink,
                 _ => [0; 4],
             });
         }
@@ -156,16 +164,17 @@ fn main() -> Result<()> {
             db.persist_canvas_spec(CANVAS)?;
             let session = HeadlessStrokeSession::new(SnapshotId(0), TileSnapshot::empty());
             let batch = session
-                .prepare_structural_change(SnapshotId(1), HistoryNodeId(1), 1, expected(0)?)
+                .prepare_structural_change(SnapshotId(1), HistoryNodeId(1), 1, expected(0, INK)?)
                 .map_err(|error| format!("prepare fixture: {error:?}"))?;
             db.commit_structural_with_layer_tree(&batch, &tree())?;
             println!("source-tolerance-fixture created={}", project.display());
             Ok(())
         }
-        "verify" | "verify-hidden" | "verify-undo" => {
+        "verify" | "verify-hidden" | "verify-undo" | "verify-red" => {
             let (stage, nodes, visible) = match mode.as_str() {
                 "verify-hidden" => (3, 3, false),
                 "verify-undo" => (2, 3, true),
+                "verify-red" => (3, 3, true),
                 _ => (2, 2, true),
             };
             verify(
@@ -174,6 +183,11 @@ fn main() -> Result<()> {
                 stage,
                 nodes,
                 visible,
+                if mode == "verify-red" {
+                    [255, 0, 0, 255]
+                } else {
+                    INK
+                },
             )
         }
         _ => Err("invalid mode".into()),

@@ -141,7 +141,7 @@ texture tip, stabilizer는 Sprint 4 범위다.
 | 세부 도구/브러시 값 | round-engine preset, 크기, 불투명도 연결 | 실제 preset library와 최근 크기 기록 |
 | 캔버스 | GPU live stroke, signed outside tiles, 휠/가운데/Space/Move 패닝, 포인터 zoom | 실제 펜·장시간 수동 acceptance와 device-loss 복구 |
 | 내비게이터 | durable CPU page crop 미리보기, viewport overlay, click/press-drag recenter, Fit/1:1/zoom 연결 | 수동 회전/resize acceptance |
-| 색상 | current와 실제 최근 8개 색을 상단/측면에서 공유; 중복 제거·최신순·프로젝트 activation 유지 확인; 기본 팔레트 분리 | wheel/SV/value 직접 조작 (현재 OS color picker), 최근 목록은 앱 세션 범위 |
+| 색상 | hue wheel/SV/value 직접 드래그·키보드 조절과 current/recent 8개 공유; 도킹 후 조절 및 선택 색으로 채운 그림의 재시작/PNG 검증 | 실제 장치 capture loss·held-drag 취소 acceptance, 최근 목록은 앱 세션 범위 |
 | 레이어 | 선택, visibility, opacity, 흰 배경, raster/group 추가·삭제, 이름 변경, group 접기, session-only Solo, durable Reference/thumbnail, metadata Undo, drag reorder/위·아래 이동 연결 | 물리 drag·스크롤 중 끌기 실사용 |
 | 히스토리 | 현재 branch ancestry와 active cursor를 최대 64행으로 투영; 상단 undo/redo 연결 | 분기 탐색 UI와 history panel 직접 이동 |
 | 도킹 | 독립 toolbar의 top/left/right·상단 순서, 좌우 stack/fill, layout 복원, 실제 mouse capture·target 밖 release와 controlled cancel 확인; bottom target 없음 | held-drag marker 시각 확인, 실제 OS/장치 capture loss, 장시간/물리 펜 연속성 acceptance |
