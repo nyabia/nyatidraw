@@ -448,3 +448,22 @@ snapshot 2 / history 2와 전체 8385개 페이지 픽셀, 페이지 밖 데이�
 새 단위 테스트 없이 기존 종료 시 작품 보존 검사와 전체 Clippy를 통과했다.
 `close-native-fill` probe는 표시된 scratch project에서만 작동한다. 참조/오차 UI와
 metadata/history renderer 격리는 계속 진행한다.
+
+### 참조 범위와 허용 오차 설치판 왕복
+
+서로 다른 위치에 반투명 참조선과 불투명 일반 레이어 선이 있는 129×65 scratch를
+만들어, 설치판의 실제 드롭다운·슬라이더·마법봉·채우기·Save/Close를 조작했다.
+현재 레이어/오차 0은 8385px, 참조 표시 레이어/오차 63은 4160px, 같은 범위/오차
+64는 8385px, 보이는 모든 레이어/오차 0은 2080px를 선택했다. 참조선의 최대 RGBA
+차이 64를 포함하는 경계 조건과 비참조 레이어 제외가 UI에서도 확인됐다.
+
+네 프로젝트 모두 종료와 writer join 이후 별도 fixture 프로세스로 reopen했다.
+선택 결과를 채운 전체 타일, 다른 레이어, 음수 타일, 페이지 경계 패딩, canvas/tree,
+snapshot 2/history 2 및 PNG 합성이 독립 기대값과 정확히 일치했다. PNG 기대값은
+production compositor를 재사용하지 않는 위치별 상수다. 실행 근거는
+`target/source-ui-{active,reference63,reference64,visible}/`의 app/verify 로그에 있다.
+
+`desktop_edit_sources_fixture` example으로 생성·재검증을 재현할 수 있다. 제품 코드나
+단위 테스트는 추가하지 않았으며 example build와 focused Clippy가 통과했다.
+Windows 설치판 release/DX12/Intel Arc에서 컴퓨터 사용으로 검증했으며 물리 펜이나
+표시 지연 측정은 아니다. 다음 작업은 metadata/history의 renderer 대기 제거다.
