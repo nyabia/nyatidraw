@@ -165,6 +165,21 @@ fn main() -> Result<()> {
                 .create_selection_mask(mask.dimensions(), &mask.packed_bits())
                 .map_err(debug_error)?;
             painter.set_selection_mask(Some(&gpu_mask));
+            scene.set_selection_overlay(Some(&gpu_mask));
+            // Display chrome must compile on this backend and leave all artwork
+            // surfaces byte-identical, including after viewport rotation.
+            scene
+                .render_viewport(nyatidraw_input::ViewportTransform {
+                    revision: 2,
+                    window_origin_physical: Point::default(),
+                    physical_size: [384, 384],
+                    dpi_scale: 1.5,
+                    pan: Point { x: 80.0, y: 80.0 },
+                    zoom: 0.8,
+                    rotation_radians: 0.3,
+                })
+                .map_err(debug_error)?;
+            compare(&scene, &before, None, 0)?;
             let samples = [
                 (PointerPhase::Begin, -8.0, 5.0, 0.4),
                 (PointerPhase::Move, 60.0, 75.0, 0.7),

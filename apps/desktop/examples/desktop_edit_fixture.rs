@@ -101,6 +101,13 @@ fn main() -> Result<()> {
         session
             .accept_structural_change(&batch)
             .map_err(|error| format!("accept: {error:?}"))?;
+    } else if mode == "verify-native-edit" {
+        verify_native_edit(
+            project,
+            args.get(3).ok_or("snapshot")?.parse()?,
+            args.get(4).ok_or("nodes")?.parse()?,
+            args.get(5).ok_or("solid/gradient/empty")?,
+        )?;
     } else if mode == "verify-selection" {
         verify_selection(
             project,
@@ -145,6 +152,90 @@ fn main() -> Result<()> {
     println!(
         "desktop-edit-fixture status=passed mode={mode} project={}",
         project.display()
+    );
+    Ok(())
+}
+
+fn verify_native_edit(project: &Path, stage: u128, nodes: usize, pattern: &str) -> Result<()> {
+    let db = ProjectDb::open(project)?;
+    let reopened = db.load_reopened()?.ok_or("missing head")?;
+    let canvas = CanvasSpec {
+        height_px: 65,
+        ..CANVAS
+    };
+    if reopened.current_snapshot() != SnapshotId(stage)
+        || reopened.history().node_count() != nodes
+        || db.load_layer_tree()? != Some(tree())
+        || db.load_canvas_spec()? != canvas
+    {
+        return Err("native edit metadata mismatch".into());
+    }
+    let color_at = |x: i64| -> Result<[u8; 4]> {
+        Ok(match pattern {
+            "solid" => [26, 199, 232, 255],
+            "empty" => [0; 4],
+            // UI drag document x=10 -> 110. Independent rational interpolation
+            // at pixel centers, with the current color fading to transparent.
+            "gradient" => {
+                let numerator = (220 - (2 * x + 1)).clamp(0, 200);
+                [26_i64, 199, 232, 255]
+                    .map(|channel| u8::try_from((channel * numerator + 100) / 200).unwrap())
+            }
+            _ => return Err("unknown native edit pattern".into()),
+        })
+    };
+    let before = expected(false)?;
+    let keys: std::collections::BTreeSet<_> = before
+        .iter()
+        .chain(reopened.current_tiles().iter())
+        .map(|(key, _)| key)
+        .collect();
+    for key in keys {
+        let old = before.get(key);
+        let actual = reopened.current_tiles().get(key);
+        let (origin_x, origin_y) = key.pixel_origin();
+        for index in 0..128 * 128 {
+            let x = origin_x + i64::try_from(index % 128)?;
+            let y = origin_y + i64::try_from(index / 128)?;
+            let expected: &[u8] = if (0..129).contains(&x) && (0..65).contains(&y) {
+                &color_at(x)?
+            } else {
+                old.map_or(&[0; 4], |tile| &tile.pixels()[index * 4..index * 4 + 4])
+            };
+            let actual =
+                actual.map_or(&[0; 4][..], |tile| &tile.pixels()[index * 4..index * 4 + 4]);
+            if actual != expected {
+                return Err(format!(
+                    "native edit pixels differ ({x},{y}): {actual:?} != {expected:?}"
+                )
+                .into());
+            }
+        }
+    }
+    let mut pixels = Vec::new();
+    for _y in 0..65 {
+        for x in 0..129 {
+            pixels.extend_from_slice(&color_at(x)?);
+        }
+    }
+    let golden = project.with_extension("expected.png");
+    nyatidraw_png_io::encode_png(
+        &golden,
+        &FlattenedRgba8 {
+            origin_x: 0,
+            origin_y: 0,
+            width: 129,
+            height: 65,
+            pixels,
+        },
+    )?;
+    let actual = nyatidraw_png_io::decode_png(&project.with_extension("png"), LayerId(1))?;
+    let expected = nyatidraw_png_io::decode_png(&golden, LayerId(1))?;
+    if actual.canvas != expected.canvas || actual.tiles != expected.tiles {
+        return Err("native edit PNG/chrome mismatch".into());
+    }
+    println!(
+        "native-edit-verify snapshot={stage} nodes={nodes} pattern={pattern} all_pixels=exact outside=exact png=exact"
     );
     Ok(())
 }

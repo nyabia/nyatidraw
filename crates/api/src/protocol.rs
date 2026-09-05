@@ -46,6 +46,12 @@ pub enum EditCommand {
     FillSelection {
         color: [u8; 4],
     },
+    FloodFill {
+        seed: [i32; 2],
+        tolerance: u8,
+        source: EditSource,
+        color: [u8; 4],
+    },
     GradientSelection {
         start: [i32; 2],
         end: [i32; 2],
@@ -69,6 +75,32 @@ pub enum DrawingTool {
     Pen,
     Brush,
     Eraser,
+    Wand,
+    Lasso,
+    Fill,
+    Gradient,
+}
+
+impl DrawingTool {
+    #[must_use]
+    pub const fn is_edit(self) -> bool {
+        matches!(self, Self::Wand | Self::Lasso | Self::Fill | Self::Gradient)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EditSettings {
+    pub source: EditSource,
+    pub tolerance: u8,
+}
+
+impl Default for EditSettings {
+    fn default() -> Self {
+        Self {
+            source: EditSource::ActiveLayer,
+            tolerance: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +110,8 @@ pub enum ToolCommand {
     SetSizeTenths(u16),
     SetOpacityU16(u16),
     SetColor([u8; 4]),
+    SetEditSource(EditSource),
+    SetEditTolerance(u8),
 }
 
 /// Discrete viewport operations keep the cross-thread protocol deterministic
@@ -326,6 +360,7 @@ pub struct UiProjection {
     pub brush_size_tenths: u16,
     pub brush_opacity_u16: u16,
     pub brush_color: [u8; 4],
+    pub edit_settings: EditSettings,
 }
 
 /// Fixed-point mirror of the renderer-owned viewport for UI display and
@@ -360,6 +395,7 @@ impl UiProjection {
             brush_size_tenths: 280,
             brush_opacity_u16: 60_292,
             brush_color: [26, 199, 232, 255],
+            edit_settings: EditSettings::default(),
         }
     }
 

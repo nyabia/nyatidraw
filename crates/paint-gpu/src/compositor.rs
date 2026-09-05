@@ -437,6 +437,8 @@ pub struct GpuCompositeScene {
     composite_pipeline: wgpu::RenderPipeline,
     opacity: DynamicOpacityBuffer,
     viewport_pipeline: wgpu::RenderPipeline,
+    selection_overlay: crate::selection::SelectionBinding,
+    selection_pipeline: wgpu::RenderPipeline,
     viewport_bind_group: wgpu::BindGroup,
     viewport_uniform: wgpu::Buffer,
     workspace_pipeline: wgpu::RenderPipeline,
@@ -566,6 +568,7 @@ impl GpuCompositeScene {
     /// # Errors
     ///
     /// Returns an error for empty document dimensions.
+    #[allow(clippy::too_many_lines)]
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -621,7 +624,19 @@ impl GpuCompositeScene {
         });
         let (viewport_layout, viewport_bind_group) =
             create_viewport_binding(device, &viewport_uniform);
-        let viewport_pipeline = create_viewport_pipeline(device, &source_layout, &viewport_layout);
+        let viewport_pipeline = create_viewport_pipeline(
+            device,
+            &source_layout,
+            &viewport_layout,
+            include_str!("viewport.wgsl"),
+        );
+        let selection_overlay = crate::selection::SelectionBinding::new(device);
+        let selection_pipeline = create_viewport_pipeline(
+            device,
+            &selection_overlay.layout,
+            &viewport_layout,
+            include_str!("selection_overlay.wgsl"),
+        );
         let workspace_params = DynamicWorkspaceParams::new(device);
         let workspace_pipeline =
             create_workspace_pipeline(device, &source_layout, &workspace_params.layout);
@@ -658,6 +673,8 @@ impl GpuCompositeScene {
             composite_pipeline,
             opacity,
             viewport_pipeline,
+            selection_overlay,
+            selection_pipeline,
             viewport_bind_group,
             viewport_uniform,
             workspace_pipeline,
@@ -707,6 +724,12 @@ impl GpuCompositeScene {
     #[must_use]
     pub fn display_texture(&self) -> Option<wgpu::Texture> {
         self.display.as_ref().map(GpuWorkingTile::texture)
+    }
+
+    /// Session chrome only: never changes raster, composite, or export pixels.
+    pub fn set_selection_overlay(&mut self, mask: Option<&crate::GpuSelectionMask>) {
+        self.selection_overlay
+            .replace(&self.device, &self.queue, mask);
     }
 
     /// Returns the current disposable display projection for bounded probes or
@@ -1993,6 +2016,28 @@ impl GpuCompositeScene {
             }
             stats.display_passes = stats.display_passes.saturating_add(1);
         }
+        if self.selection_overlay.dimensions().is_some() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("nyatidraw-selection-overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &display.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.selection_pipeline);
+            pass.set_bind_group(0, &self.selection_overlay.group, &[]);
+            pass.set_bind_group(1, &self.viewport_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+            stats.display_passes = stats.display_passes.saturating_add(1);
+        }
         self.queue.submit([encoder.finish()]);
         stats.display_passes = stats.display_passes.saturating_add(1);
         stats.cache_entries = self.cache.len();
@@ -2334,10 +2379,11 @@ fn create_viewport_pipeline(
     device: &wgpu::Device,
     source_layout: &wgpu::BindGroupLayout,
     viewport_layout: &wgpu::BindGroupLayout,
+    shader_source: &str,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("nayati-viewport-shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("viewport.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(shader_source.into()),
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("nayati-viewport-pipeline-layout"),

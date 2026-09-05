@@ -12,9 +12,9 @@ use std::{
 
 use nyatidraw_api::{
     CanvasSpec, CommandEnvelope, CommandRejectReason, ContentRootId, DockCommand, DockTree,
-    DrawingTool, EditorCommand, EditorEvent, GroupId, HistoryNodeId, HistoryProjection,
-    LayerCommand, LayerId, ProjectCommand, Revision, SnapshotId, ToolCommand, ViewportCommand,
-    ViewportProjection,
+    DrawingTool, EditCommand, EditorCommand, EditorEvent, GroupId, HistoryNodeId,
+    HistoryProjection, LayerCommand, LayerId, ProjectCommand, Revision, SnapshotId, ToolCommand,
+    ViewportCommand, ViewportProjection,
 };
 use nyatidraw_brush::{
     BrushDab, BrushEvaluator, BrushPreset, BrushPresetId, BrushSnapshot,
@@ -135,6 +135,7 @@ fn history_probe_command() -> Option<EditorCommand> {
 
 #[derive(Clone, Copy, Debug)]
 struct DrawingConfig {
+    edit_settings: nyatidraw_api::EditSettings,
     tool: DrawingTool,
     size_tenths: u16,
     opacity_u16: u16,
@@ -144,6 +145,7 @@ struct DrawingConfig {
 impl DrawingConfig {
     fn from_projection(projection: &nyatidraw_api::UiProjection) -> Self {
         Self {
+            edit_settings: projection.edit_settings,
             tool: projection.drawing_tool,
             size_tenths: projection.brush_size_tenths,
             opacity_u16: projection.brush_opacity_u16,
@@ -155,9 +157,7 @@ impl DrawingConfig {
         let (id, flow, spacing_ratio) = match self.tool {
             DrawingTool::Pencil => (BrushPresetId(2), 0.82, 0.08),
             DrawingTool::Pen => (BrushPresetId(3), 0.62, 0.10),
-            DrawingTool::Move | DrawingTool::Brush | DrawingTool::Eraser => {
-                (BrushPresetId(1), 0.38, 0.12)
-            }
+            _ => (BrushPresetId(1), 0.38, 0.12),
         };
         BrushPreset {
             id,
@@ -1173,6 +1173,7 @@ impl ActiveCanvas {
             self.publish_closed_stroke_dirty();
         }
         self.apply_materialized_tiles();
+        self.adopt_native_edit();
         self.apply_commands(width, height, scale);
         if self.synchronize_workspace_failure() {
             return None;
@@ -1488,6 +1489,9 @@ impl ActiveCanvas {
                 Ok(false)
             }
             EditorCommand::Layer(LayerCommand::SetActive(layer)) => {
+                if self.stroke.edit_gesture.is_some() || self.edit_job.is_some() {
+                    return Err(CommandRejectReason::CommandQueueBusy);
+                }
                 if self
                     .scene
                     .tree()
@@ -1555,46 +1559,61 @@ impl ActiveCanvas {
                 Ok(false)
             }
             EditorCommand::Tool(command) => {
-                if self.scene.active_live_stroke().is_some() {
-                    return Err(CommandRejectReason::UnsupportedCommand);
+                if self.scene.active_live_stroke().is_some()
+                    || self.stroke.edit_gesture.is_some()
+                    || !self.stroke.live_ink.try_pause_for_edit()
+                {
+                    return Err(CommandRejectReason::CommandQueueBusy);
                 }
-                match command {
-                    ToolCommand::Select(tool) => {
-                        self.drawing.tool = tool;
-                        self.stroke
-                            .live_ink
-                            .set_navigation_tool(tool == DrawingTool::Move);
+                let result = (|| {
+                    match command {
+                        ToolCommand::Select(tool) => {
+                            self.drawing.tool = tool;
+                            self.stroke
+                                .live_ink
+                                .set_navigation_tool(tool == DrawingTool::Move);
+                        }
+                        ToolCommand::CycleBrushFamily => {
+                            self.drawing.tool = match self.drawing.tool {
+                                DrawingTool::Pencil => DrawingTool::Pen,
+                                DrawingTool::Pen => DrawingTool::Brush,
+                                _ => DrawingTool::Pencil,
+                            };
+                            self.stroke.live_ink.set_navigation_tool(false);
+                        }
+                        ToolCommand::SetSizeTenths(size) if (1..=2_000).contains(&size) => {
+                            self.drawing.size_tenths = size;
+                        }
+                        ToolCommand::SetOpacityU16(opacity) if opacity > 0 => {
+                            self.drawing.opacity_u16 = opacity;
+                        }
+                        ToolCommand::SetColor(color) if color[3] > 0 => self.drawing.color = color,
+                        ToolCommand::SetEditSource(source) => {
+                            self.drawing.edit_settings.source = source;
+                        }
+                        ToolCommand::SetEditTolerance(tolerance) => {
+                            self.drawing.edit_settings.tolerance = tolerance;
+                        }
+                        ToolCommand::SetSizeTenths(_)
+                        | ToolCommand::SetOpacityU16(_)
+                        | ToolCommand::SetColor(_) => {
+                            return Err(CommandRejectReason::UnsupportedCommand);
+                        }
                     }
-                    ToolCommand::CycleBrushFamily => {
-                        self.drawing.tool = match self.drawing.tool {
-                            DrawingTool::Pencil => DrawingTool::Pen,
-                            DrawingTool::Pen => DrawingTool::Brush,
-                            DrawingTool::Move | DrawingTool::Brush | DrawingTool::Eraser => {
-                                DrawingTool::Pencil
-                            }
-                        };
-                        self.stroke.live_ink.set_navigation_tool(false);
-                    }
-                    ToolCommand::SetSizeTenths(size) if (1..=2_000).contains(&size) => {
-                        self.drawing.size_tenths = size;
-                    }
-                    ToolCommand::SetOpacityU16(opacity) if opacity > 0 => {
-                        self.drawing.opacity_u16 = opacity;
-                    }
-                    ToolCommand::SetColor(color) if color[3] > 0 => self.drawing.color = color,
-                    ToolCommand::SetSizeTenths(_)
-                    | ToolCommand::SetOpacityU16(_)
-                    | ToolCommand::SetColor(_) => {
-                        return Err(CommandRejectReason::UnsupportedCommand);
-                    }
+                    self.projection.stage_drawing_controls(
+                        self.drawing.tool,
+                        self.drawing.size_tenths,
+                        self.drawing.opacity_u16,
+                        self.drawing.color,
+                    );
+                    self.projection
+                        .stage_edit_settings(self.drawing.edit_settings);
+                    Ok(false)
+                })();
+                if self.edit_job.is_none() {
+                    self.stroke.live_ink.resume_after_edit();
                 }
-                self.projection.stage_drawing_controls(
-                    self.drawing.tool,
-                    self.drawing.size_tenths,
-                    self.drawing.opacity_u16,
-                    self.drawing.color,
-                );
-                Ok(false)
+                result
             }
             EditorCommand::History(command) => {
                 self.ensure_artwork_command_idle()?;
@@ -1735,6 +1754,7 @@ impl ActiveCanvas {
 
     fn ensure_artwork_command_idle(&mut self) -> Result<(), CommandRejectReason> {
         if self.edit_job.is_some()
+            || self.stroke.edit_gesture.is_some()
             || self.scene.active_live_stroke().is_some()
             || self.stroke.active.is_some()
             || !self.stroke.pending_materializations.is_empty()
@@ -1783,6 +1803,7 @@ impl ActiveCanvas {
             self.stroke.selection = None;
             self.painter.set_selection_mask(None);
             self.eraser.set_selection_mask(None);
+            self.scene.set_selection_overlay(None);
             self.projection
                 .stage_edit(nyatidraw_api::EditProjection::default());
         }
@@ -1864,6 +1885,25 @@ impl ActiveCanvas {
         self.projection.stage_edit(edit);
         println!("native-canvas event=edit-queued pending=1 response_capacity=1 wait=nonblocking");
         Ok(false)
+    }
+
+    fn adopt_native_edit(&mut self) {
+        let Some(result) = self.stroke.completed_edit.take() else {
+            return;
+        };
+        let result = result.and_then(|command| {
+            self.enqueue_edit(command)
+                .map(|_| ())
+                .map_err(|error| format!("편집을 적용하지 못했습니다. 다시 시도하세요: {error:?}"))
+        });
+        if let Err(error) = result {
+            let mut edit = self.projection.current().edit.clone();
+            edit.error = Some(error);
+            self.projection.stage_edit(edit);
+        }
+        self.async_publication_base_revision
+            .get_or_insert(self.projection.current().revision);
+        self.publish_committed_history();
     }
 
     fn poll_edit(&mut self) {
@@ -1948,6 +1988,7 @@ impl ActiveCanvas {
                 .map_err(|error| format!("Selection could not be adopted by the GPU: {error:?}"))?;
             self.painter.set_selection_mask(mask.as_ref());
             self.eraser.set_selection_mask(mask.as_ref());
+            self.scene.set_selection_overlay(mask.as_ref());
         }
         self.stroke.selection = selection.clone();
         self.selection = selection;
@@ -2655,6 +2696,8 @@ fn input_probe_sample(sequence: u64, phase: PointerPhase) -> StylusSample {
 }
 
 struct StrokePipeline {
+    edit_gesture: Option<crate::edit_gesture::EditGesture>,
+    completed_edit: Option<Result<EditCommand, String>>,
     selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     live_ink: LiveInkBridge,
     evaluator: RoundBrushEvaluator,
@@ -2690,6 +2733,8 @@ impl StrokePipeline {
         Self {
             live_ink,
             selection: None,
+            edit_gesture: None,
+            completed_edit: None,
             evaluator: RoundBrushEvaluator::new(0x4e41_5941_5449),
             active: None,
             queued: Vec::with_capacity(materialization_backlog_capacity),
@@ -2700,6 +2745,7 @@ impl StrokePipeline {
             next_generation: 1,
             selected_layer: LIVE_LAYER,
             drawing: DrawingConfig {
+                edit_settings: nyatidraw_api::EditSettings::default(),
                 tool: DrawingTool::Brush,
                 size_tenths: 280,
                 opacity_u16: 60_292,
@@ -2759,6 +2805,44 @@ impl StrokePipeline {
                     "live-ink event=input-discontinuity-recovered clean_begin_sequence={} quarantined_after_ack={}",
                     sample.sequence, self.recovery_quarantined,
                 );
+            }
+            if drawing.tool.is_edit() {
+                match sample.phase {
+                    PointerPhase::Begin if admitted.begin_layer != Some(active_layer) => {
+                        self.edit_gesture = None;
+                        self.completed_edit = Some(Err(
+                            "대상 레이어가 변경되어 선택 제스처를 취소했습니다.".into(),
+                        ));
+                    }
+                    PointerPhase::Begin => {
+                        self.edit_gesture = Some(crate::edit_gesture::EditGesture::begin(
+                            drawing.tool,
+                            drawing.edit_settings,
+                            drawing.stroke_color().0,
+                            self.selection.is_some(),
+                            sample,
+                        ));
+                    }
+                    PointerPhase::Move => {
+                        if let Some(gesture) = &mut self.edit_gesture {
+                            gesture.push(sample);
+                        }
+                    }
+                    PointerPhase::End | PointerPhase::Cancel => {
+                        if let Some(gesture) = self.edit_gesture.take() {
+                            let result = gesture.finish(sample);
+                            self.completed_edit = Some(if self.completed_edit.is_none() {
+                                result
+                            } else {
+                                Err(
+                                    "여러 선택 제스처가 겹쳐 적용하지 않았습니다. 다시 시도하세요."
+                                        .into(),
+                                )
+                            });
+                        }
+                    }
+                }
+                continue;
             }
             match sample.phase {
                 PointerPhase::Begin => {
@@ -2929,6 +3013,10 @@ impl StrokePipeline {
     }
 
     fn consume_discontinuity(&mut self, discontinuity: InputDiscontinuity) {
+        if self.edit_gesture.take().is_some() {
+            self.completed_edit =
+                Some(Err("입력 연속성이 끊겨 선택 제스처를 취소했습니다.".into()));
+        }
         self.input_discontinuities = self.input_discontinuities.saturating_add(1);
         let cancelled = self.active.take().map(|active| {
             self.gpu_ops.truncate(active.gpu_op_start);
@@ -2959,6 +3047,8 @@ impl StrokePipeline {
     }
 
     fn fail_closed(&mut self, reason: &str) {
+        self.edit_gesture = None;
+        self.completed_edit = None;
         if self.fatal {
             return;
         }
@@ -3141,6 +3231,33 @@ impl Drop for StrokePipeline {
 impl Drop for ActiveCanvas {
     fn drop(&mut self) {
         self.stroke.prepare_shutdown();
+        // A native End received before Close must reach the writer FIFO before
+        // export. Blocking here is confined to the dedicated close worker.
+        if let Some(result) = self.stroke.completed_edit.take() {
+            let result = result.and_then(|command| {
+                let (reply, received) = sync_channel(1);
+                self.stroke
+                    .materializer
+                    .sender
+                    .as_ref()
+                    .ok_or("Project writer unavailable")?
+                    .send(WorkerRequest::Edit {
+                        command,
+                        target: self.active_layer,
+                        reply,
+                    })
+                    .map_err(|_| "Project writer stopped")?;
+                match received.recv().map_err(|_| "Edit result unavailable")? {
+                    Ok(_) => Ok(()),
+                    Err(EditFailure::Rejected(error) | EditFailure::Fatal(error)) => Err(error),
+                }
+            });
+            if let Err(error) = result {
+                self.stroke
+                    .live_ink
+                    .publish_workspace_error(format!("Closing edit was not applied: {error}"));
+            }
+        }
         if let Some(generation) = self.pending_save.take() {
             if self.stroke.live_ink.workspace_failed() {
                 self.stroke.live_ink.fail_incomplete_export();

@@ -199,7 +199,15 @@ fn record_wm_mouse_into<'a>(
             if !buffer.left_button_down {
                 return Ok(buffer.events());
             }
-            let count = read_mouse_history(message, &mut buffer.history)?;
+            let count = match read_mouse_history(message, &mut buffer.history) {
+                Ok(count) => count,
+                // A dispatched move can already have fallen out of the global
+                // history (also common with SendInput). Retain the current MSG
+                // point via the CurrentOnly path; missing history is not a
+                // reason to discard a valid native move or its gesture.
+                Err(WindowsMessageError::Win32(_)) => 0,
+                Err(error) => return Err(error),
+            };
             let history = &buffer.history[..count];
             let client_origin = client_origin(message.hwnd)?;
             let current = history

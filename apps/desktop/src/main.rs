@@ -1,6 +1,7 @@
 #[cfg(windows)]
 mod desktop_canvas;
 mod desktop_shell;
+mod edit_gesture;
 mod edit_worker;
 mod layer_drag;
 mod live_ink;
@@ -262,6 +263,16 @@ fn handle_editor_shortcut(live_ink: &LiveInkBridge, key: &str, shift: bool) -> b
         Some(EditorCommand::Tool(ToolCommand::CycleBrushFamily))
     } else if key.eq_ignore_ascii_case("g") {
         Some(EditorCommand::Tool(ToolCommand::Select(DrawingTool::Move)))
+    } else if key.eq_ignore_ascii_case("w") {
+        Some(EditorCommand::Tool(ToolCommand::Select(DrawingTool::Wand)))
+    } else if key.eq_ignore_ascii_case("l") {
+        Some(EditorCommand::Tool(ToolCommand::Select(DrawingTool::Lasso)))
+    } else if key.eq_ignore_ascii_case("f") {
+        Some(EditorCommand::Tool(ToolCommand::Select(if shift {
+            DrawingTool::Gradient
+        } else {
+            DrawingTool::Fill
+        })))
     } else if key.eq_ignore_ascii_case("e") {
         Some(EditorCommand::Tool(ToolCommand::Select(
             DrawingTool::Eraser,
@@ -710,8 +721,8 @@ fn ToolsPanel(ui_projection: Signal<UiProjection>) -> Element {
     rsx! {
         nav { class: "tool-list", aria_label: "도구",
             ToolButton { label: "이동", icon: "move", shortcut: "g", tool: Some(DrawingTool::Move), active: active == DrawingTool::Move }
-            ToolButton { label: "마법봉", icon: "wand", shortcut: "g", tool: None }
-            ToolButton { label: "올가미", icon: "lasso", shortcut: "g", tool: None }
+            ToolButton { label: "마법봉", icon: "wand", shortcut: "w", tool: Some(DrawingTool::Wand), active: active == DrawingTool::Wand }
+            ToolButton { label: "올가미", icon: "lasso", shortcut: "l", tool: Some(DrawingTool::Lasso), active: active == DrawingTool::Lasso }
             span { class: "tool-separator" }
             ToolButton { label: "연필", icon: "pencil", shortcut: "b", tool: Some(DrawingTool::Pencil), active: active == DrawingTool::Pencil }
             ToolButton { label: "펜", icon: "pen", shortcut: "b", tool: Some(DrawingTool::Pen), active: active == DrawingTool::Pen }
@@ -719,8 +730,8 @@ fn ToolsPanel(ui_projection: Signal<UiProjection>) -> Element {
             span { class: "tool-separator" }
             ToolButton { label: "지우개", icon: "eraser", shortcut: "e", tool: Some(DrawingTool::Eraser), active: active == DrawingTool::Eraser }
             span { class: "tool-separator" }
-            ToolButton { label: "채우기", icon: "bucket", shortcut: "f", tool: None }
-            ToolButton { label: "그라데이션", icon: "gradient", shortcut: "f", tool: None }
+            ToolButton { label: "채우기", icon: "bucket", shortcut: "f", tool: Some(DrawingTool::Fill), active: active == DrawingTool::Fill }
+            ToolButton { label: "그라데이션", icon: "gradient", shortcut: "Shift f", tool: Some(DrawingTool::Gradient), active: active == DrawingTool::Gradient }
         }
     }
 }
@@ -754,6 +765,9 @@ fn ToolButton(
 
 #[component]
 fn BrushPanel(ui_projection: Signal<UiProjection>) -> Element {
+    if ui_projection.read().drawing_tool.is_edit() {
+        return rsx! { EditToolPanel { ui_projection } };
+    }
     let current_size = ui_projection.read().brush_size_tenths;
     let display_size = f32::from(current_size) / 10.0;
     let opacity = u32::from(ui_projection.read().brush_opacity_u16) * 100 / u32::from(u16::MAX);
@@ -815,6 +829,54 @@ fn BrushSizeButton(size_tenths: u16, dot: i32, recent: bool, active: bool) -> El
             onclick: move |_| send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::SetSizeTenths(size_tenths)), error),
             span { class: "size-dot", style: "width:{dot}px;height:{dot}px" }
             if !recent { span { "{size:.0}" } }
+        }
+    }
+}
+
+#[component]
+fn EditToolPanel(ui_projection: Signal<UiProjection>) -> Element {
+    use nyatidraw_api::EditSource;
+    let live_ink = use_context::<LiveInkBridge>();
+    let tolerance_ink = live_ink.clone();
+    let error = use_signal(|| Option::<String>::None);
+    let settings = ui_projection.read().edit_settings;
+    let tool = ui_projection.read().drawing_tool;
+    let source = match settings.source {
+        EditSource::ActiveLayer => "active",
+        EditSource::ReferenceLayers => "reference",
+        EditSource::AllVisible => "visible",
+    };
+    let help = match tool {
+        DrawingTool::Wand => "클릭한 픽셀과 연결된 영역을 선택합니다.",
+        DrawingTool::Lasso => "끌어서 영역을 둘러싸세요. 손을 떼면 닫힙니다.",
+        DrawingTool::Fill => {
+            "선택 영역을 현재 색으로 채웁니다. 선택이 없으면 클릭한 연결 영역을 채웁니다."
+        }
+        _ => "선택 영역에서 끌어 현재 색 → 투명 그라데이션을 만듭니다.",
+    };
+    rsx! {
+        div { class: "edit-tool-properties",
+            p { "{help}" }
+            if matches!(tool, DrawingTool::Wand | DrawingTool::Fill) {
+                label { "참조 범위"
+                    select { value: source, aria_label: "선택 참조 범위",
+                        onchange: move |event| {
+                            let source = match event.value().as_str() { "reference" => EditSource::ReferenceLayers, "visible" => EditSource::AllVisible, _ => EditSource::ActiveLayer };
+                            send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::SetEditSource(source)), error);
+                        },
+                        option { value: "active", "현재 레이어" }
+                        option { value: "reference", "참조 표시 레이어" }
+                        option { value: "visible", "보이는 모든 레이어" }
+                    }
+                }
+                label { "허용 오차 {settings.tolerance} / 255"
+                    input { r#type: "range", min: "0", max: "255", value: "{settings.tolerance}", aria_label: "색상 허용 오차",
+                        onchange: move |event| { if let Ok(value) = event.value().parse::<u8>() {
+                            send_editor_command(&tolerance_ink, EditorCommand::Tool(ToolCommand::SetEditTolerance(value)), error);
+                        } }
+                    }
+                }
+            }
         }
     }
 }

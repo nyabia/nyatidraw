@@ -570,6 +570,19 @@ impl WindowsViewportInput {
                     0x45 => Some(nyatidraw_api::EditorCommand::Tool(
                         nyatidraw_api::ToolCommand::Select(nyatidraw_api::DrawingTool::Eraser),
                     )),
+                    0x57 => Some(nyatidraw_api::EditorCommand::Tool(
+                        nyatidraw_api::ToolCommand::Select(nyatidraw_api::DrawingTool::Wand),
+                    )),
+                    0x4c => Some(nyatidraw_api::EditorCommand::Tool(
+                        nyatidraw_api::ToolCommand::Select(nyatidraw_api::DrawingTool::Lasso),
+                    )),
+                    0x46 => Some(nyatidraw_api::EditorCommand::Tool(
+                        nyatidraw_api::ToolCommand::Select(if shift_is_down() {
+                            nyatidraw_api::DrawingTool::Gradient
+                        } else {
+                            nyatidraw_api::DrawingTool::Fill
+                        }),
+                    )),
                     0x53 => Some(nyatidraw_api::EditorCommand::Project(
                         nyatidraw_api::ProjectCommand::Save,
                     )),
@@ -1169,7 +1182,7 @@ impl WindowsMouseInput {
         match event.message {
             nyatidraw_input_platform::WindowsMouseMessage::Down => self.begin(event),
             nyatidraw_input_platform::WindowsMouseMessage::Move => self.move_to(event),
-            nyatidraw_input_platform::WindowsMouseMessage::Up => self.end(event.timestamp_ms),
+            nyatidraw_input_platform::WindowsMouseMessage::Up => self.end(event),
         }
     }
 
@@ -1226,15 +1239,20 @@ impl WindowsMouseInput {
         }
     }
 
-    fn end(&mut self, timestamp_ms: u32) -> bool {
+    fn end(&mut self, event: nyatidraw_input_platform::WindowsMouseEvent) -> bool {
+        if self.active.is_some_and(|active| {
+            self.live_ink.canvas_viewport_snapshot().revision != active.mapping.revision
+        }) {
+            return self.cancel(event.timestamp_ms);
+        }
         let Some(active) = self.active.take() else {
             return false;
         };
         self.push(
             nyatidraw_input::PointerPhase::End,
-            active.last_document_point,
+            active.mapping.document_point(event.position_client_px),
             active.mapping.revision,
-            timestamp_ms,
+            event.timestamp_ms,
         )
     }
 

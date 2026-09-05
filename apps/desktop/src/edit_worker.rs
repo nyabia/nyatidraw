@@ -21,7 +21,7 @@ pub(crate) struct EditOutcome {
     pub(crate) history: nyatidraw_api::HistoryProjection,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn execute(
     command: EditCommand,
     target: LayerId,
@@ -34,6 +34,7 @@ pub(crate) fn execute(
 ) -> Result<EditOutcome, EditFailure> {
     let reject = |error| EditFailure::Rejected(format!("{error:?}"));
     let limits = EditLimits::default();
+    let mut flood_mask = None;
     let paint = match command {
         EditCommand::SelectWand {
             seed,
@@ -73,6 +74,39 @@ pub(crate) fn execute(
         EditCommand::FillSelection { color } => {
             Some(SelectionPaint::Solid(PremultipliedRgba8(color)))
         }
+        EditCommand::FloodFill {
+            seed,
+            tolerance,
+            source,
+            color,
+        } => {
+            if selection.is_some() {
+                return Err(EditFailure::Rejected(
+                    "Use FillSelection while a selection exists".into(),
+                ));
+            }
+            let source = match source {
+                EditSource::ActiveLayer => SelectionSource::ActiveLayer,
+                EditSource::ReferenceLayers => SelectionSource::ReferenceLayers,
+                EditSource::AllVisible => SelectionSource::AllVisible,
+            };
+            flood_mask = Some(Arc::new(
+                wand_selection(
+                    session.tiles(),
+                    tree,
+                    WandRequest {
+                        canvas,
+                        active: target,
+                        source,
+                        seed,
+                        tolerance,
+                    },
+                    limits,
+                )
+                .map_err(reject)?,
+            ));
+            Some(SelectionPaint::Solid(PremultipliedRgba8(color)))
+        }
         EditCommand::GradientSelection {
             start,
             end,
@@ -88,8 +122,9 @@ pub(crate) fn execute(
     let mut tiles = None;
     if let Some(paint) = paint {
         pause_scratch_probe()?;
-        let mask = selection
+        let mask = flood_mask
             .as_ref()
+            .or(selection.as_ref())
             .ok_or_else(|| EditFailure::Rejected("NoSelection".into()))?;
         let painted =
             paint_selection(session.tiles(), tree, target, mask, paint, limits).map_err(reject)?;
