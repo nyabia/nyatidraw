@@ -10,6 +10,7 @@ mod layout_store;
 mod live_ink;
 mod native_canvas;
 mod page_panel;
+mod performance;
 mod preview;
 #[cfg(windows)]
 mod single_instance;

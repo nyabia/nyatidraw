@@ -40,6 +40,7 @@ use crate::{
     edit_worker::{EditFailure, EditOutcome},
     elapsed_since_launch,
     live_ink::{AdmittedSample, CloseStatus, ExportStatus, InputDiscontinuity, LiveInkBridge},
+    performance::{Span, Stage},
     preview::{
         LAYER_THUMBNAIL_MAX_HEIGHT, LAYER_THUMBNAIL_MAX_WIDTH, MAX_LAYER_THUMBNAILS,
         NAVIGATOR_MAX_HEIGHT, NAVIGATOR_MAX_WIDTH, NavigatorViewport, layer_thumbnail_frame,
@@ -1366,6 +1367,7 @@ impl ActiveCanvas {
             .as_ref()
             .map_or((&[][..], false), crate::edit_gesture::EditGesture::preview);
         self.scene.set_gesture_preview(guide, closed);
+        let composite_timing = Span::new(Stage::Composite);
         let stats = match self.scene.render_viewport(viewport) {
             Ok(stats) => stats,
             Err(error) => {
@@ -1380,6 +1382,7 @@ impl ActiveCanvas {
                 return None;
             }
         };
+        drop(composite_timing);
         if stats.group_tiles_rebuilt > 0 && self.gpu_batch_logs_remaining > 0 {
             println!(
                 "native-canvas event=composite-cache-update rebuilt={} resident={} viewport_passes={}",
@@ -1910,6 +1913,7 @@ impl ActiveCanvas {
         &mut self,
         moved: HistoryMove,
     ) -> Result<(), CommandRejectReason> {
+        let _timing = Span::new(Stage::HistoryAdoption);
         self.projection.stage_history(moved.history);
         let Some(snapshot) = moved.tiles else {
             return Ok(());
@@ -2353,6 +2357,7 @@ impl ActiveCanvas {
     /// durable storage. This is deliberately separate from the raw-input
     /// close boundary, so the panel cannot claim a stroke before commit.
     fn publish_committed_history(&mut self) {
+        let _timing = Span::new(Stage::Projection);
         let publish = self.projection.publish_editor_state(
             self.project_title.clone(),
             self.projection.current().dirty,
@@ -2378,6 +2383,7 @@ impl ActiveCanvas {
     }
 
     fn execute_gpu_ops(&mut self, drained_samples: usize) {
+        let _timing = (!self.stroke.gpu_ops.is_empty()).then(|| Span::new(Stage::GpuOps));
         for op in std::mem::take(&mut self.stroke.gpu_ops) {
             match op {
                 GpuStrokeOp::Replace {
@@ -2953,6 +2959,7 @@ impl StrokePipeline {
         queued_samples.clear();
         let discontinuity = self.live_ink.drain_into(&mut queued_samples);
         let drained = queued_samples.len();
+        let _timing = (drained > 0).then(|| Span::new(Stage::DrainBrush));
 
         if self.fatal {
             if drained > 0 || discontinuity.is_some() {
@@ -4451,6 +4458,7 @@ fn materialization_loop(
         let started_at = Instant::now();
         let queue_wait_micros = started_at.duration_since(request.enqueued_at).as_micros();
         let snapshot_id = SnapshotId(next_id);
+        let replay_timing = Span::new(Stage::Replay);
         let result = session.prepare_round_stroke_with_selection(
             snapshot_id,
             HistoryNodeId(next_id),
@@ -4462,6 +4470,7 @@ fn materialization_loop(
             request.samples,
             request.selection,
         );
+        drop(replay_timing);
         let keep_running = match result {
             Ok(batch) => {
                 let closed_tiles = batch
@@ -4477,6 +4486,7 @@ fn materialization_loop(
                         (*key, pixels)
                     })
                     .collect();
+                let commit_timing = Span::new(Stage::Commit);
                 let durable_result = match sink {
                     ProjectSink::UntitledRecovery { db, .. }
                     | ProjectSink::ExplicitProject { db, .. } => db
@@ -4488,6 +4498,7 @@ fn materialization_loop(
                                 .map_err(WorkerCommitError::Session)
                         }),
                 };
+                drop(commit_timing);
                 match durable_result {
                     Ok(()) => {
                         publish_navigator_frame(
@@ -4600,6 +4611,7 @@ fn materialization_loop(
         }
     };
     println!("live-ink event=materialization-worker-exit mode={mode} processed={processed}");
+    crate::performance::flush("writer");
     exit
 }
 
@@ -4609,6 +4621,7 @@ fn publish_navigator_frame(
     tree: &LayerTree,
     canvas: CanvasSpec,
 ) {
+    let _timing = Span::new(Stage::Navigator);
     let frame = render_page_preview_rgba8(
         tiles,
         tree,
@@ -4636,6 +4649,7 @@ fn publish_layer_thumbnail_frames(
     layers: impl IntoIterator<Item = LayerId>,
     canvas: CanvasSpec,
 ) {
+    let _timing = Span::new(Stage::Thumbnails);
     let frames = layers
         .into_iter()
         .take(MAX_LAYER_THUMBNAILS)
@@ -4691,8 +4705,11 @@ fn export_current_png(
     generation: u64,
     generations: &Mutex<ExportGenerationGate>,
 ) -> Result<ExportPngOutcome, String> {
+    let _export_interval = crate::performance::ExportInterval::enter();
+    let composite_timing = Span::new(Stage::ExportComposite);
     let surface = flatten_layer_tree_rgba8(tiles, tree, canvas)
         .map_err(|error| format!("composite:{error:?}"))?;
+    drop(composite_timing);
     let sequence = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
@@ -4703,10 +4720,13 @@ fn export_current_png(
         ".{file_name}.~tmp-{}-{sequence}",
         std::process::id()
     ));
+    let encode_timing = Span::new(Stage::ExportEncode);
     if let Err(error) = nyatidraw_png_io::encode_png(&temporary, &surface) {
         let _ = std::fs::remove_file(&temporary);
         return Err(format!("encode:{error}"));
     }
+    drop(encode_timing);
+    let _replace_timing = Span::new(Stage::ExportReplace);
     export_probe_boundary(path, "encoded");
     if let Err(error) = std::fs::OpenOptions::new()
         .write(true)

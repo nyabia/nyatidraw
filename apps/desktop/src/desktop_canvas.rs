@@ -854,6 +854,12 @@ struct CanvasSurfaceRenderer {
     first_presented: bool,
 }
 
+impl Drop for CanvasSurfaceRenderer {
+    fn drop(&mut self) {
+        crate::performance::flush("canvas");
+    }
+}
+
 impl CanvasSurfaceRenderer {
     fn new(hwnd: HWND, live_ink: LiveInkBridge) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
@@ -959,6 +965,7 @@ impl CanvasSurfaceRenderer {
     }
 
     fn render(&mut self, hwnd: HWND) -> Result<(), String> {
+        use crate::performance::{Span, Stage};
         if !self.configured {
             self.resize(hwnd);
         }
@@ -971,6 +978,7 @@ impl CanvasSurfaceRenderer {
         if self.config.width < 16 || self.config.height < 16 {
             return Ok(());
         }
+        let _frame_timing = Span::new(Stage::Frame);
         let Some(display) = self
             .canvas
             .render(self.config.width, self.config.height, self.scale)
@@ -978,6 +986,7 @@ impl CanvasSurfaceRenderer {
             return Ok(());
         };
 
+        let acquire_timing = Span::new(Stage::SurfaceAcquire);
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
@@ -989,12 +998,16 @@ impl CanvasSurfaceRenderer {
                 return Err("WGPU surface is out of memory".to_owned());
             }
         };
+        drop(acquire_timing);
+        let present_timing = Span::new(Stage::SurfacePresent);
         let target = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.presenter
             .present(&self.device, &self.queue, &display, &target);
         frame.present();
+        drop(present_timing);
+        crate::performance::presented();
         if !self.first_presented {
             self.first_presented = true;
             println!(

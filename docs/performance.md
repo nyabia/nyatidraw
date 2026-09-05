@@ -125,3 +125,18 @@ redb commit, PNG encode, GPU upload, UI/입력/display 지연은 포함하지 �
 `target/basic-edit-release.log`이며 CPU/OS를 함께 기록한 JSON artifact는
 `target/basic-edit-cpu-measure.json`이다. 현재 수치는 단일 host의 국소 비교이며
 CI latency baseline으로 채택한 것은 아니다.
+
+## 2026-09-05 installed desktop timing instrumentation
+
+`NAYATI_PERFORMANCE=1`로 입력 묶음의 앱 admission→dequeue/present 요청, brush,
+GPU encode/submit, composite, surface 대기, history GPU 채택, committed-history
+projection, CPU replay/commit, navigator/thumbnail, export 단계를 분리한다.
+스레드별 고정 histogram으로 정상 종료 때 count/min/max 및 p50/p95/p99 **상한**을
+출력한다. 기본 실행은 비활성이다. 계측 정의와 한계는
+[ADR-0026](decisions/ADR-0026-bounded-desktop-timing.md)에 기록했다.
+
+설치 release에서 실제 UI를 통한 도구 선택·mouse 입력 주입·Undo·Save·Close와
+별도 process reopen/독립 PNG 비교를 통과했다. 16×16 scratch의 입력 묶음 3개로
+배선만 확인한 결과이며 성능 합격이나 4K export 간섭 결과로 사용하지 않는다.
+현재 환경의 Windows/WMI는 120 Hz 설정을 보고하지만 실제 frame cadence나 첫
+가시 픽셀을 입증하지 않는다. 사용자 영상 다운로드가 병행 중인 환경임도 기록했다.

@@ -220,6 +220,7 @@ struct ExportMailbox {
 }
 
 struct RawInputState {
+    performance_batch_start: Option<std::time::Instant>,
     queue: InputQueue,
     /// Bounded retry lane for transitions encountered while the primary queue
     /// contains only transitions. The producer never waits for the consumer.
@@ -300,6 +301,7 @@ impl LiveInkBridge {
             inner: Arc::new(LiveInkInner {
                 layout: OnceLock::new(),
                 raw_input: Mutex::new(RawInputState {
+                    performance_batch_start: None,
                     queue: InputQueue::with_capacity(capacity),
                     pending_transitions: VecDeque::with_capacity(capacity),
                     transition_capacity: capacity,
@@ -339,6 +341,7 @@ impl LiveInkBridge {
 
     /// Enqueues one sample and reports whether the event loop needs one wake-up.
     pub(crate) fn push(&self, sample: StylusSample) -> Result<bool, PushError> {
+        let performance_start = crate::performance::start();
         let mut raw = self.raw_input();
         if self.is_closing() {
             return Err(PushError::TransitionQueueFull);
@@ -396,6 +399,9 @@ impl LiveInkBridge {
                 raw.pending_transitions.push_back(sample);
             }
             Err(error) => return Err(error),
+        }
+        if raw.performance_batch_start.is_none() {
+            raw.performance_batch_start = performance_start;
         }
         if sample.phase == PointerPhase::Begin {
             raw.admitted_active = true;
@@ -557,6 +563,7 @@ impl LiveInkBridge {
             while raw.queue.pop().is_some() {}
             raw.pending_transitions.clear();
             raw.begin_layers.clear();
+            raw.performance_batch_start = None;
             raw.discontinuity = None;
             raw.admitted_active = false;
             raw.edit_paused = false;
@@ -1007,6 +1014,11 @@ impl LiveInkBridge {
             raw.admitted_active = false;
             raw.stats.discontinuities_acknowledged =
                 raw.stats.discontinuities_acknowledged.saturating_add(1);
+        }
+        let performance_start = raw.performance_batch_start.take();
+        drop(raw);
+        if discontinuity.is_none() && output.len() > first {
+            crate::performance::input_dequeued(performance_start);
         }
         discontinuity
     }

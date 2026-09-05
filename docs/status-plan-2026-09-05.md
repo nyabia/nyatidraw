@@ -657,3 +657,19 @@ renderer가 새 크기를 채택하기 전에 종료해도 최종 1×1 PNG와 sn
 기록했다. 작은 fixture의 기능/내구성 확인이므로 대형 장면 성능 통과로 해석하지
 않는다. 다음 우선순위는 현행 설치 shell의 projection/hot-path 및 대형 장면 release
 계측과 남은 Sprint 1~3 gate 근거 감사다.
+
+### 설치판 단계별 CPU 계측 연결
+
+선택적으로 켜는 고정 histogram 계측을 추가했다. 입력 묶음의 admission과 dequeue,
+present API 요청, brush/GPU/composite/surface, history/projection, worker replay/commit,
+미리보기, PNG composite/encode/sync-replace를 분리한다. 프레임마다 I/O나 새 shared
+mutex를 추가하지 않으며 export 중 여부를 단계 시작 시점으로 분류한다. 기본 실행은
+계측을 끈다. 기록은 count/min/max와 p50/p95/p99 bin 상한이며 GPU 완료·물리 펜·
+가시 픽셀 지연을 뜻하지 않는다.
+
+Clippy와 기존 desktop 테스트 15개, release 설치가 통과했다. 설치판에서 도구 선택과
+mouse 주입·Undo·Save·Close를 수행해 단계별 로그를 확보했고, 별도 프로세스의 전체
+타일/history/독립 PNG 검증도 통과했다. 계측을 끈 재실행 화면과 종료 후 검사도
+통과했으며 해당 세션의 performance 로그는 0개였다. 입력 묶음 3개인 연결 검사이므로
+성능 gate는 계속 열려 있다. [ADR-0026](decisions/ADR-0026-bounded-desktop-timing.md)의
+정의를 기준으로 반복 startup/reopen/undo 및 4K export 동시 드로잉을 측정한다.
