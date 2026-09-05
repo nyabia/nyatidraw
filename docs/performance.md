@@ -1,5 +1,17 @@
 # 성능 계약
 
+## 최신 국소 측정: 4K history 타일 재사용
+
+동일 4K 작품의 UI Undo/Redo 각 20회에서 history adoption CPU 구간의 p50/p95/p99
+상한은 전체 업로드 53.247/55.295/56.138ms, 동일 타일 재사용 후
+45.055/48.408/48.408ms였다. 902개 중 846개를 유지하고 56개만 업로드했다.
+이는 worker/command 대기 및 후속 composite/present를 제외한 한 구간이다.
+Undo 전체 응답 목표 통과로 해석하지 않는다. Windows 11 10.0.26200 / Core Ultra 7
+155H / Intel Arc DX12 / pinned-DX release, 전후 각 한 세션이며 첫 표본도 포함했다.
+설치판 Save/정상 종료/재시작과 전체 artwork/PNG 비교가 통과했다.
+[ADR-0031](decisions/ADR-0031-retain-unchanged-history-tiles.md)과
+[원본 행·환경 JSON](measurements/history-upload-4k-2026-09-05.json)에 한계를 기록했다.
+
 ## 목표와 측정값을 분리한다
 
 아래 수치는 초기 설계 목표이며 아직 검증 결과가 아니다. 모든 측정은 p50뿐 아니라 p95/p99, 하드웨어, OS, backend, 캔버스 크기, brush 크기, layer 수를 함께 기록한다.

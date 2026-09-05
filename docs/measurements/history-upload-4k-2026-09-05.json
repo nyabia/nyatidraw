@@ -1,0 +1,181 @@
+{
+  "source_commit": "3db055e",
+  "before_executable_sha256": "ac6bed6e68c59d82e9006516fcf8d459294bf4dd76932ab1e7780167cb2f40c6",
+  "after_executable_sha256": "2b61e9435d535a0071f3ce674117f72df60cfa17a9cc27199d8aa3c296068cb4",
+  "hardware": {
+    "cpu": "Intel Core Ultra 7 155H",
+    "gpu": "Intel Arc",
+    "os": "Windows 11 Home 10.0.26200",
+    "backend": "DX12",
+    "profile": "release, pinned Dioxus CLI 0.7.9",
+    "surface_px": [
+      2096,
+      1458
+    ],
+    "scale": 2,
+    "configured_display_px": [
+      2880,
+      1800
+    ],
+    "configured_refresh_hz": 120
+  },
+  "workload": {
+    "page_px": [
+      3840,
+      2160
+    ],
+    "raster_layers": 2,
+    "strokes": 32,
+    "tiles": 902,
+    "history_nodes": 33,
+    "ui_undo_redo_pairs": 10,
+    "warmups_excluded": 0,
+    "reference_project": "target/paint-redraw/baseline-1/performance-scratch.ntdr",
+    "historical_tile_colors_preserved": true
+  },
+  "scope": "CPU history adoption only; excludes pre-adoption worker/command queue and subsequent composite/present; no visible-pixel or end-to-end Undo claim",
+  "background": "User-owned download uncontrolled, not inspected or altered",
+  "after_ordinary_restart_exact": true,
+  "page_tree_fallback_acceptance": "pending; user requested stop",
+  "runs": [
+    {
+      "name": "before",
+      "history_adoption": {
+        "owner": "canvas",
+        "stage": "history_adoption",
+        "export": "inactive",
+        "count": 20,
+        "min_us": 45434,
+        "p50_upper_us": 53247,
+        "p95_upper_us": 55295,
+        "p99_upper_us": 56138,
+        "max_us": 56138,
+        "histogram": "log2-16-sub-bins",
+        "claim": "cpu-api-only"
+      },
+      "uploads": [],
+      "normal_close": true,
+      "reference_artwork_and_png_exact": true
+    },
+    {
+      "name": "after",
+      "history_adoption": {
+        "owner": "canvas",
+        "stage": "history_adoption",
+        "export": "inactive",
+        "count": 20,
+        "min_us": 40109,
+        "p50_upper_us": 45055,
+        "p95_upper_us": 48408,
+        "p99_upper_us": 48408,
+        "max_us": 48408,
+        "histogram": "log2-16-sub-bins",
+        "claim": "cpu-api-only"
+      },
+      "uploads": [
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        },
+        {
+          "rebuilt_surfaces": false,
+          "retained": 846,
+          "uploaded": 56
+        }
+      ],
+      "normal_close": true,
+      "reference_artwork_and_png_exact": true
+    }
+  ]
+}

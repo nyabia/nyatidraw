@@ -1,6 +1,7 @@
 # ADR-0031: Retain unchanged GPU tiles during history adoption
 
-Status: implemented; installed before/after acceptance in progress.
+Status: implemented; installed 4K before/after and restart passed. Page/tree
+fallback acceptance remains pending at the user's stop request.
 
 Undo/Redo and asynchronous edits previously uploaded the union of every old
 and new CPU tile, including byte-identical tiles. History cursor moves also
@@ -45,3 +46,31 @@ All-feature desktop tests (15 existing tests) and all-target/all-feature
 workspace Clippy passed. No tests or dependencies were added for simple byte
 equality or framework wiring. Installed after acceptance and measurements must
 still verify the optimization and the page/tree fallback paths.
+
+## Installed after result and stopping point
+
+Pinned release installation passed (`target/history-upload-install.log`).
+Executable SHA256:
+`2b61e9435d535a0071f3ce674117f72df60cfa17a9cc27199d8aa3c296068cb4`.
+The same ten UI Undo/Redo pairs completed with all 20 operations retaining 846
+tiles and uploading 56. Composite rebuilds fell from 540 to 56 per restoration.
+The last stroke visibly disappeared on Undo and returned on Redo.
+
+After p50/p95/p99 histogram upper bounds were 45.055/48.408/48.408ms, minimum
+40.109ms and maximum 48.408ms. This is one before/after session each, not a
+long-session distribution or full Undo target pass. Raw parsed rows, upload
+counts and environment are in
+[`history-upload-4k-2026-09-05.json`](../measurements/history-upload-4k-2026-09-05.json).
+
+Save/normal Close and independent reference comparison passed; an ordinary
+installed restart restored the artwork, then normal Close and a second process
+comparison again passed every tile, snapshot/history, tree/page and decoded PNG.
+Logs are `target/history-upload/after/{out,err,verify,reopen-out,reopen-err,reopen-verify}.log`.
+All three measured/reopened app sessions closed with joined writers and empty
+stderr. No app was left running by this acceptance.
+
+At the user's request to finish for the night, work stopped here. A scratch
+copy at `target/history-upload/page/page-scratch.ntdr` is prepared but has not
+been launched or modified. Next, verify page-size and layer-tree fallback
+restoration, then examine remaining adoption CPU copies and UI-thread surface
+waiting. Do not mark the broader performance or Sprint 1–3 gates complete.

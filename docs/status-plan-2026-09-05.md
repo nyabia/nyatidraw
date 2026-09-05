@@ -1,5 +1,10 @@
 # 2026-09-05 현황 점검과 실행 계획
 
+**최신 중단 지점:** 사용자 취침 요청으로 작업을 멈췄다. 색상 경계 acceptance와
+4K Undo 타일 재사용 구현·설치·20회 비교·일반 재시작까지 완료했다. 상세 결과는
+문서 끝과 ADR-0031을 따른다. 다음은 페이지/레이어 구조 변경 시 전체 복원 경로
+확인이다. 아래 최초 점검 표의 미완료 항목은 후속 완료 기록과 함께 읽는다.
+
 기준 커밋은 `fa9603c`이며 점검 시작 시 작업 트리는 깨끗했다. 이 문서는
 코드·기존 증거·새로 수행한 검증을 구분한다. 처음에는 현황을 점검했으며,
 이후 개발 요청에 따라 저장·종료 경로를 수정했다. 아래 표와 실행 순서는 최초
@@ -807,3 +812,20 @@ paired project가 없는 새 폴더의 16-bit gradient PNG를 설치판에서 �
 새 자동 UI 테스트나 의존성은 추가하지 않았다. 남은 우선순위는 UI thread의 surface
 대기와 입력 경로 격리, 현 export 경로의 성능 분포, startup/reopen/undo 및 장시간
 UI acceptance다. 표시 색상 보정·물리 펜·가시 픽셀 latency gate는 여전히 미검증이다.
+
+### 4K Undo 타일 재사용과 사용자 요청 중단
+
+`3db055e`는 페이지 크기와 전체 tree가 같을 때 동일 타일과 GPU cache를 유지한다.
+달라진/삭제된 타일은 계속 업로드하고, 크기/tree 변경은 기존 전체 업로드를 따른다.
+기존 desktop test 15개, 전체 Clippy 및 release 설치를 통과했다. 새 테스트나
+의존성은 추가하지 않았다. 전후 설치판에서 각각 Undo/Redo 20회를 완료했고
+902개 중 846개 유지·56개 업로드를 확인했다. History adoption 구간 p95 상한은
+55.295→48.408ms였다. Undo 전체 응답 시간이나 입력 latency gate 통과는 아니다.
+
+두 실행 모두 Save/정상 Close 뒤 reference 작품 전체 tile/PNG와 일치했고,
+개선판은 일반 재시작/정상 Close 후 재검증도 통과했다. 검증 앱은 종료했다.
+[ADR-0031](decisions/ADR-0031-retain-unchanged-history-tiles.md)과 측정 JSON에
+실행 환경·로그·범위를 기록했다. 다음에 사용자가 재개를 요청하면 준비된
+`target/history-upload/page/page-scratch.ntdr`로 page-size fallback과 layer-tree
+복원을 먼저 확인한다. 이후 CPU 복사 비용, UI thread surface 대기와 기존 미완료
+성능·장시간 gate를 진행한다. 사용자의 다운로드 PID 11716 및 파일은 건드리지 않았다.
