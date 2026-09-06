@@ -69,6 +69,7 @@ UI adoption/composite/present와 저장 반영 tail이 남는다. 정확한 환�
 4. UI thread의 surface wait 격리를 설계·구현한다. child HWND 생존, renderer 종료/join,
    resize/suspend, bounded pending frame과 입력 phase 보존을 먼저 정한다.
    채널만 옮기고 HWND/GPU ownership 안전성이 불명확한 상태를 완료로 보지 않는다.
+   현재 소유권 검토와 작은 실행 단위는 [렌더 스레드 초안](render-thread-design.md)에 기록했다.
 5. 현재 16-bit PNG export를 포함한 4K drawing 간섭 campaign, startup/reopen 분포,
    resize/minimize/panel/Save 장시간 시나리오를 실행한다. 이전 8-bit export 측정과
    isolated encoder 시간은 새 campaign을 대신하지 않는다.
