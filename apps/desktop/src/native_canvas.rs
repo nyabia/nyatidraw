@@ -61,6 +61,7 @@ const LIVE_BRUSH_COLOR: StrokeColor = StrokeColor([26, 199, 232, 255]);
 const LIVE_LAYER: LayerId = LayerId(1);
 const BACKGROUND_LAYER: LayerId = LayerId(2);
 const ROOT_GROUP: GroupId = GroupId(100);
+static TRANSPARENT_HISTORY_TILE: [u8; TILE_BYTE_LEN] = [0; TILE_BYTE_LEN];
 const INK_GROUP: GroupId = GroupId(10);
 const MATERIALIZATION_QUEUE_CAPACITY: usize = 4;
 // A completion carries the exact CPU tile payload needed to retire the GPU
@@ -2005,11 +2006,12 @@ impl ActiveCanvas {
             {
                 continue;
             }
-            let pixels = snapshot
-                .get(key)
-                .map_or_else(|| vec![0; TILE_BYTE_LEN], |tile| tile.pixels().to_vec());
+            let pixels = snapshot.get(key).map_or(
+                &TRANSPARENT_HISTORY_TILE[..],
+                nyatidraw_tiles::TileObject::pixels,
+            );
             self.scene
-                .upload_closed_tile(key, &pixels)
+                .upload_closed_tile(key, pixels)
                 .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
             uploaded += 1;
         }
@@ -2018,10 +2020,7 @@ impl ActiveCanvas {
                 "performance-history-upload rebuilt_surfaces={rebuild_surfaces} retained={retained} uploaded={uploaded}"
             );
         }
-        self.cpu_tiles = snapshot
-            .iter()
-            .map(|(key, tile)| (key, tile.pixels().to_vec()))
-            .collect();
+        adopt_cpu_snapshot(&mut self.cpu_tiles, &snapshot);
         self.latest_preview_generation.clear();
         if self.artwork_job.is_none() {
             self.stroke.live_ink.resume_after_edit();
@@ -2739,6 +2738,25 @@ fn empty_raster(id: LayerId, name: String) -> LayerNode {
         reference: false,
         opacity_u16: u16::MAX,
         content_root: ContentRootId(0),
+    }
+}
+
+// Keep the mutable renderer cache exactly equal to the validated snapshot,
+// while retaining allocations for surviving tiles. Missing keys must be
+// removed: an Undo to an empty layer cannot leave old artwork in this cache.
+fn adopt_cpu_snapshot(cache: &mut BTreeMap<TileKey, Vec<u8>>, snapshot: &TileSnapshot) {
+    let _timing = Span::new(Stage::HistoryCpuSnapshot);
+    cache.retain(|key, pixels| {
+        let Some(tile) = snapshot.get(*key) else {
+            return false;
+        };
+        if pixels.as_slice() != tile.pixels() {
+            tile.pixels().clone_into(pixels);
+        }
+        true
+    });
+    for (key, tile) in snapshot.iter() {
+        cache.entry(key).or_insert_with(|| tile.pixels().to_vec());
     }
 }
 
@@ -4906,6 +4924,32 @@ pub(crate) fn system_timestamp_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_snapshot_adoption_cannot_retain_deleted_artwork_or_lose_restored_layers() {
+        let signed = TileKey::from_pixel(LayerId(1), 128, -129, -1);
+        let retained = TileKey::from_pixel(LayerId(2), 128, 0, 0);
+        let restored = TileKey::from_pixel(LayerId(3), 128, 129, 129);
+        let mut cache = BTreeMap::new();
+        // Add, modify/retain/remove, restore a removed layer, then undo all ink.
+        for entries in [
+            vec![(signed, 16), (retained, 32), (restored, 64)],
+            vec![(signed, 24), (retained, 32)],
+            vec![(retained, 32), (restored, 64)],
+            vec![],
+        ] {
+            let expected: BTreeMap<_, _> = entries
+                .into_iter()
+                .map(|(key, value)| (key, vec![value; TILE_BYTE_LEN]))
+                .collect();
+            let snapshot = TileSnapshot::from_tiles(expected.clone()).unwrap();
+            adopt_cpu_snapshot(&mut cache, &snapshot);
+            assert_eq!(
+                cache, expected,
+                "renderer cache must equal all authoritative pixels"
+            );
+        }
+    }
 
     fn sample(sequence: u64, phase: PointerPhase, x: f64, y: f64) -> StylusSample {
         StylusSample {

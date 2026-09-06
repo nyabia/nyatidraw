@@ -10,7 +10,7 @@ use std::{
 };
 
 const BINS: usize = 1024;
-const STAGES: [&str; 17] = [
+const STAGES: [&str; 18] = [
     "input_batch_to_dequeue",
     "input_batch_to_present_request",
     "drain_brush",
@@ -28,6 +28,7 @@ const STAGES: [&str; 17] = [
     "export_composite",
     "export_encode",
     "export_sync_replace",
+    "history_cpu_snapshot",
 ];
 
 #[derive(Clone, Copy)]
@@ -49,6 +50,7 @@ pub(crate) enum Stage {
     ExportComposite,
     ExportEncode,
     ExportReplace,
+    HistoryCpuSnapshot,
 }
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
