@@ -4,8 +4,28 @@ NyatiDraw는 Godot 프로젝트의 PNG를 빠르게 열고 수정하기 위한 W
 래스터 드로잉 편집기입니다. 편집 가능한 `.ntdr` 프로젝트를 PNG 옆에 두고,
 저장 시 프로젝트의 내구성 있는 스냅샷과 PNG export를 별도 실패 영역으로 처리합니다.
 
-현재 저장소는 개발 중인 vertical slice입니다. 독립 소프트웨어 공개판이 아니며,
+현재 Windows x64 알파판을 준비하고 있습니다.
+[홈페이지](https://nyabia.github.io/nyatidraw/)에서 배포 현황을 확인할 수 있습니다.
 Windows 외 플랫폼·고급 브러시·애니메이션·벡터 기능은 후속 범위입니다.
+
+## 설치와 기본 사용
+
+[Releases](https://github.com/nyabia/nyatidraw/releases)의 게시된 알파판에서
+`NyatiDraw-Alpha-win-Setup.exe`를 실행합니다. 사용자 계정에 설치되며,
+시작 메뉴의 **NyatiDraw Alpha**로 실행합니다. 현재 Windows 게시자 서명은 없습니다.
+
+- 처음 실행하면 `%LOCALAPPDATA%\NyatiDraw\Sketchbook\작업 중.ntdr`를 엽니다.
+  이 기본 그림은 다음 실행에도 다시 열립니다.
+- **새 그림**은 새 `.ntdr` 파일을 만듭니다. **열기**는 PNG 또는 `.ntdr`를 엽니다.
+- **저장**은 프로젝트를 저장하고 같은 이름의 PNG를 옆에 내보냅니다.
+  PNG 옆에 `.ntdr`가 있으면 이후 열기에서 편집 가능한 프로젝트를 우선합니다.
+- 새 알파판을 받으면 **저장 후 업데이트**로 적용하고 현재 그림을 다시 엽니다.
+  다운로드 실패 시 기존 앱은 계속 사용할 수 있습니다.
+
+아직 `다른 이름으로 저장`, 탐색기 파일 연결의 최종 검증, 실제 펜/고주사율 하드웨어
+검증은 남아 있습니다. 번지기·레이어 색상화·브러시 미리보기 등 미완성 UI에는
+‘준비 중’을 표시했습니다. 자동 업데이트의 운영·검증 범위는
+[배포 문서](docs/releasing.md)를 참고하세요.
 
 ## 현재 구현 범위
 
@@ -22,7 +42,7 @@ Windows 외 플랫폼·고급 브러시·애니메이션·벡터 기능은 후�
 
 ## 개발
 
-stable Rust toolchain과 프로젝트에 고정된 Dioxus CLI가 필요합니다.
+프로젝트에 고정된 Rust 1.96.0과 Dioxus CLI 0.7.9가 필요합니다.
 setup은 CLI를 저장소의 `.nyatidraw/toolchains/`에 설치합니다.
 
 ```powershell
@@ -47,7 +67,7 @@ cargo clippy --workspace --all-targets --locked
 - 제품명: `NyatiDraw`
 - 프로젝트 확장자: `.ntdr`
 - 현재 우선순위: Godot 작업 중 PNG open → draw → save/export → pair reopen
-- Godot 전용 addon과 공개 배포는 현재 스프린트 밖입니다.
+- Godot 전용 addon과 웹 임베드는 후속 범위입니다.
 
 로드맵은 [Godot 우선 스프린트 계획](docs/sprints/README.md)에 있습니다.
 
