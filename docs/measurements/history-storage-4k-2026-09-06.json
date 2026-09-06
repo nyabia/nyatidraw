@@ -1,0 +1,480 @@
+{
+  "date": "2026-09-06",
+  "baseline_source": "cd71059 plus the measure-history-storage fixture mode",
+  "after_source": "ADR-0036 changes",
+  "hardware": {
+    "gpu": "Intel Arc (not used by this probe)",
+    "os": "Windows 11 Home 10.0.26200",
+    "profile": "Cargo release",
+    "cpu": "Intel Core Ultra 7 155H",
+    "backend": "redb 2.6.3, CPU storage only"
+  },
+  "scope": "One 20-operation Undo/Redo session per variant. Storage portion only: prepare, load tiles, load tree/page, immediate cursor persistence and session adoption. Excludes worker admission, previews, UI/GPU adoption and present. Nearest-rank quantiles; first operation retained.",
+  "background": "Other host activity uncontrolled; installed editor idle; no concurrent build/test during measurement; protected downloads not inspected or altered.",
+  "fixture": {
+    "distinct_objects_at_end": 156,
+    "reference": "target/paint-redraw/baseline-1/performance-scratch.ntdr",
+    "raster_layers": 2,
+    "strokes": 32,
+    "page_px": [
+      3840,
+      2160
+    ],
+    "history_nodes": 33,
+    "tiles_at_end": 902
+  },
+  "note": "After variant includes a 204677 us immediate-persist outlier on operation 0; it is retained. No whole-Undo or visible-pixel target is claimed.",
+  "variants": [
+    {
+      "name": "baseline",
+      "raw_log": "target/history-storage/baseline/storage.log",
+      "verification_log": "target/history-storage/baseline/verify.log",
+      "separate_process_all_tiles_tree_page_snapshot_history_png_exact": true,
+      "rows": [
+        {
+          "operation": 0,
+          "load_us": 79347,
+          "metadata_us": 63,
+          "persist_us": 5487,
+          "accept_us": 66,
+          "total_us": 84979,
+          "tiles": 874
+        },
+        {
+          "operation": 1,
+          "load_us": 83591,
+          "metadata_us": 28,
+          "persist_us": 4552,
+          "accept_us": 9165,
+          "total_us": 97353,
+          "tiles": 902
+        },
+        {
+          "operation": 2,
+          "load_us": 81205,
+          "metadata_us": 76,
+          "persist_us": 5634,
+          "accept_us": 6068,
+          "total_us": 93001,
+          "tiles": 874
+        },
+        {
+          "operation": 3,
+          "load_us": 80354,
+          "metadata_us": 50,
+          "persist_us": 4693,
+          "accept_us": 5872,
+          "total_us": 90985,
+          "tiles": 902
+        },
+        {
+          "operation": 4,
+          "load_us": 81442,
+          "metadata_us": 52,
+          "persist_us": 4093,
+          "accept_us": 5530,
+          "total_us": 91130,
+          "tiles": 874
+        },
+        {
+          "operation": 5,
+          "load_us": 84250,
+          "metadata_us": 29,
+          "persist_us": 1854,
+          "accept_us": 6633,
+          "total_us": 92782,
+          "tiles": 902
+        },
+        {
+          "operation": 6,
+          "load_us": 84992,
+          "metadata_us": 28,
+          "persist_us": 4116,
+          "accept_us": 5654,
+          "total_us": 94806,
+          "tiles": 874
+        },
+        {
+          "operation": 7,
+          "load_us": 88371,
+          "metadata_us": 29,
+          "persist_us": 1925,
+          "accept_us": 6617,
+          "total_us": 96960,
+          "tiles": 902
+        },
+        {
+          "operation": 8,
+          "load_us": 86328,
+          "metadata_us": 41,
+          "persist_us": 5082,
+          "accept_us": 6110,
+          "total_us": 97579,
+          "tiles": 874
+        },
+        {
+          "operation": 9,
+          "load_us": 88084,
+          "metadata_us": 47,
+          "persist_us": 4739,
+          "accept_us": 7556,
+          "total_us": 100454,
+          "tiles": 902
+        },
+        {
+          "operation": 10,
+          "load_us": 87606,
+          "metadata_us": 38,
+          "persist_us": 4533,
+          "accept_us": 6237,
+          "total_us": 98442,
+          "tiles": 874
+        },
+        {
+          "operation": 11,
+          "load_us": 90378,
+          "metadata_us": 57,
+          "persist_us": 4282,
+          "accept_us": 6389,
+          "total_us": 101138,
+          "tiles": 902
+        },
+        {
+          "operation": 12,
+          "load_us": 84298,
+          "metadata_us": 25,
+          "persist_us": 4533,
+          "accept_us": 6587,
+          "total_us": 95464,
+          "tiles": 874
+        },
+        {
+          "operation": 13,
+          "load_us": 85416,
+          "metadata_us": 42,
+          "persist_us": 4381,
+          "accept_us": 7091,
+          "total_us": 96944,
+          "tiles": 902
+        },
+        {
+          "operation": 14,
+          "load_us": 76129,
+          "metadata_us": 28,
+          "persist_us": 4134,
+          "accept_us": 6678,
+          "total_us": 86985,
+          "tiles": 874
+        },
+        {
+          "operation": 15,
+          "load_us": 84690,
+          "metadata_us": 29,
+          "persist_us": 4021,
+          "accept_us": 8291,
+          "total_us": 97045,
+          "tiles": 902
+        },
+        {
+          "operation": 16,
+          "load_us": 87528,
+          "metadata_us": 42,
+          "persist_us": 4378,
+          "accept_us": 6894,
+          "total_us": 98866,
+          "tiles": 874
+        },
+        {
+          "operation": 17,
+          "load_us": 86647,
+          "metadata_us": 28,
+          "persist_us": 4559,
+          "accept_us": 5699,
+          "total_us": 96946,
+          "tiles": 902
+        },
+        {
+          "operation": 18,
+          "load_us": 85989,
+          "metadata_us": 53,
+          "persist_us": 4388,
+          "accept_us": 6529,
+          "total_us": 97004,
+          "tiles": 874
+        },
+        {
+          "operation": 19,
+          "load_us": 90902,
+          "metadata_us": 34,
+          "persist_us": 1941,
+          "accept_us": 6526,
+          "total_us": 99419,
+          "tiles": 902
+        }
+      ],
+      "quantiles": [
+        {
+          "stage": "load_us",
+          "count": 20,
+          "p50_us": 84992,
+          "p95_us": 90378,
+          "p99_us": 90902
+        },
+        {
+          "stage": "metadata_us",
+          "count": 20,
+          "p50_us": 38,
+          "p95_us": 63,
+          "p99_us": 76
+        },
+        {
+          "stage": "persist_us",
+          "count": 20,
+          "p50_us": 4381,
+          "p95_us": 5487,
+          "p99_us": 5634
+        },
+        {
+          "stage": "accept_us",
+          "count": 20,
+          "p50_us": 6526,
+          "p95_us": 8291,
+          "p99_us": 9165
+        },
+        {
+          "stage": "total_us",
+          "count": 20,
+          "p50_us": 96946,
+          "p95_us": 100454,
+          "p99_us": 101138
+        }
+      ]
+    },
+    {
+      "name": "after",
+      "raw_log": "target/history-storage/after/storage.log",
+      "verification_log": "target/history-storage/after/verify.log",
+      "separate_process_all_tiles_tree_page_snapshot_history_png_exact": true,
+      "rows": [
+        {
+          "operation": 0,
+          "load_us": 12776,
+          "metadata_us": 62,
+          "persist_us": 204677,
+          "accept_us": 77,
+          "total_us": 217607,
+          "tiles": 874
+        },
+        {
+          "operation": 1,
+          "load_us": 11644,
+          "metadata_us": 21,
+          "persist_us": 1520,
+          "accept_us": 739,
+          "total_us": 13944,
+          "tiles": 902
+        },
+        {
+          "operation": 2,
+          "load_us": 10129,
+          "metadata_us": 22,
+          "persist_us": 1905,
+          "accept_us": 1467,
+          "total_us": 13533,
+          "tiles": 874
+        },
+        {
+          "operation": 3,
+          "load_us": 11771,
+          "metadata_us": 24,
+          "persist_us": 2392,
+          "accept_us": 932,
+          "total_us": 15144,
+          "tiles": 902
+        },
+        {
+          "operation": 4,
+          "load_us": 11321,
+          "metadata_us": 20,
+          "persist_us": 1972,
+          "accept_us": 877,
+          "total_us": 14207,
+          "tiles": 874
+        },
+        {
+          "operation": 5,
+          "load_us": 11269,
+          "metadata_us": 24,
+          "persist_us": 1955,
+          "accept_us": 1030,
+          "total_us": 14291,
+          "tiles": 902
+        },
+        {
+          "operation": 6,
+          "load_us": 10118,
+          "metadata_us": 18,
+          "persist_us": 1305,
+          "accept_us": 1132,
+          "total_us": 12584,
+          "tiles": 874
+        },
+        {
+          "operation": 7,
+          "load_us": 14136,
+          "metadata_us": 28,
+          "persist_us": 1516,
+          "accept_us": 667,
+          "total_us": 16361,
+          "tiles": 902
+        },
+        {
+          "operation": 8,
+          "load_us": 9814,
+          "metadata_us": 36,
+          "persist_us": 2698,
+          "accept_us": 1209,
+          "total_us": 13772,
+          "tiles": 874
+        },
+        {
+          "operation": 9,
+          "load_us": 10827,
+          "metadata_us": 21,
+          "persist_us": 2250,
+          "accept_us": 1402,
+          "total_us": 14514,
+          "tiles": 902
+        },
+        {
+          "operation": 10,
+          "load_us": 11154,
+          "metadata_us": 23,
+          "persist_us": 2027,
+          "accept_us": 1188,
+          "total_us": 14414,
+          "tiles": 874
+        },
+        {
+          "operation": 11,
+          "load_us": 11060,
+          "metadata_us": 16,
+          "persist_us": 2792,
+          "accept_us": 776,
+          "total_us": 14659,
+          "tiles": 902
+        },
+        {
+          "operation": 12,
+          "load_us": 10116,
+          "metadata_us": 18,
+          "persist_us": 2092,
+          "accept_us": 829,
+          "total_us": 13073,
+          "tiles": 874
+        },
+        {
+          "operation": 13,
+          "load_us": 11696,
+          "metadata_us": 22,
+          "persist_us": 2260,
+          "accept_us": 1377,
+          "total_us": 15367,
+          "tiles": 902
+        },
+        {
+          "operation": 14,
+          "load_us": 10090,
+          "metadata_us": 26,
+          "persist_us": 1707,
+          "accept_us": 885,
+          "total_us": 12735,
+          "tiles": 874
+        },
+        {
+          "operation": 15,
+          "load_us": 10889,
+          "metadata_us": 24,
+          "persist_us": 1821,
+          "accept_us": 880,
+          "total_us": 13625,
+          "tiles": 902
+        },
+        {
+          "operation": 16,
+          "load_us": 9011,
+          "metadata_us": 17,
+          "persist_us": 1937,
+          "accept_us": 1903,
+          "total_us": 12882,
+          "tiles": 874
+        },
+        {
+          "operation": 17,
+          "load_us": 12514,
+          "metadata_us": 19,
+          "persist_us": 2001,
+          "accept_us": 796,
+          "total_us": 15346,
+          "tiles": 902
+        },
+        {
+          "operation": 18,
+          "load_us": 10364,
+          "metadata_us": 27,
+          "persist_us": 1699,
+          "accept_us": 1463,
+          "total_us": 13567,
+          "tiles": 874
+        },
+        {
+          "operation": 19,
+          "load_us": 10955,
+          "metadata_us": 21,
+          "persist_us": 1826,
+          "accept_us": 850,
+          "total_us": 13666,
+          "tiles": 902
+        }
+      ],
+      "quantiles": [
+        {
+          "stage": "load_us",
+          "count": 20,
+          "p50_us": 10955,
+          "p95_us": 12776,
+          "p99_us": 14136
+        },
+        {
+          "stage": "metadata_us",
+          "count": 20,
+          "p50_us": 22,
+          "p95_us": 36,
+          "p99_us": 62
+        },
+        {
+          "stage": "persist_us",
+          "count": 20,
+          "p50_us": 1955,
+          "p95_us": 2792,
+          "p99_us": 204677
+        },
+        {
+          "stage": "accept_us",
+          "count": 20,
+          "p50_us": 885,
+          "p95_us": 1467,
+          "p99_us": 1903
+        },
+        {
+          "stage": "total_us",
+          "count": 20,
+          "p50_us": 13944,
+          "p95_us": 16361,
+          "p99_us": 217607
+        }
+      ]
+    }
+  ],
+  "after_executable_sha256": "5533A4F367B6EE98FF5FB8A6719616F56AD6E177F5EE6C986E81D0D127BAF6A4"
+}

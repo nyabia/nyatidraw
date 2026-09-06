@@ -29,7 +29,7 @@ use nyatidraw_project::{
     encode_stroke_commit, open_mode,
 };
 use nyatidraw_stroke::{MaterializationStrategy, materialize_with_strategy};
-use nyatidraw_tiles::{ContentRoot, ObjectHash, TileSnapshot};
+use nyatidraw_tiles::{ContentRoot, ObjectHash, TileObject, TileSnapshot};
 use redb::{Database, DatabaseError, Durability, ReadableTable, TableDefinition};
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
@@ -1376,18 +1376,30 @@ fn snapshot_from_manifest(
     manifest: RootManifest,
 ) -> Result<TileSnapshot, String> {
     let mut tiles = Vec::with_capacity(manifest.tiles.len());
+    // A root can reference one content-addressed object at many signed keys.
+    // Validate each unique record once in this read transaction and share its
+    // immutable pixels. This cache never survives a load or masks later disk
+    // corruption by borrowing objects from an earlier snapshot.
+    let mut validated = std::collections::BTreeMap::<ObjectHash, TileObject>::new();
     for (key, expected_hash) in manifest.tiles {
-        let bytes = get_required(objects, expected_hash.0.as_slice(), "tile object missing")?;
-        let envelope = decode_envelope(RecordKind::Tile, &bytes)
-            .map_err(|message| format!("tile object corrupt: {message}"))?;
-        let actual_hash =
-            ObjectHash::digest_tagged(b"nyatidraw-tile-rgba8-linear-premul-v1", &envelope.payload);
-        if actual_hash != expected_hash {
-            return Err("tile object key/content mismatch".into());
-        }
-        tiles.push((key, envelope.payload));
+        let object = match validated.entry(expected_hash) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let bytes =
+                    get_required(objects, expected_hash.0.as_slice(), "tile object missing")?;
+                let envelope = decode_envelope(RecordKind::Tile, &bytes)
+                    .map_err(|message| format!("tile object corrupt: {message}"))?;
+                let object = TileObject::new(envelope.payload)
+                    .map_err(|error| format!("tile object corrupt: {error:?}"))?;
+                if object.hash() != expected_hash {
+                    return Err("tile object key/content mismatch".into());
+                }
+                entry.insert(object).clone()
+            }
+        };
+        tiles.push((key, object));
     }
-    let snapshot = TileSnapshot::from_tiles(tiles).map_err(|error| format!("{error:?}"))?;
+    let snapshot = TileSnapshot::from_objects(tiles).map_err(|error| format!("{error:?}"))?;
     if snapshot.root() != manifest.root {
         return Err("reconstructed tile root mismatch".into());
     }
@@ -1583,6 +1595,66 @@ mod tests {
             history_node,
         )
         .expect("branch fixture remains a valid materialized transition")
+    }
+
+    #[test]
+    fn shared_tile_reads_preserve_artwork_and_recheck_corruption_on_each_load() {
+        // Product risk: per-root deduplication must neither merge signed/layer
+        // keys nor hide a corrupted shared object behind a previous valid load.
+        for fault in ["missing", "checksum", "wrong-content", "wrong-length"] {
+            let path = temp(fault);
+            let database = ProjectDb::open(&path).unwrap();
+            let pixels = vec![32; TILE_BYTE_LEN];
+            let tiles = TileSnapshot::from_tiles([
+                (
+                    TileKey::from_pixel(LayerId(1), 128, -129, -1),
+                    pixels.clone(),
+                ),
+                (TileKey::from_pixel(LayerId(2), 128, 128, 0), pixels),
+            ])
+            .unwrap();
+            let batch = HeadlessStrokeSession::new(SnapshotId(0), TileSnapshot::empty())
+                .prepare_structural_change(SnapshotId(1), HistoryNodeId(1), 1, tiles.clone())
+                .unwrap();
+            database.commit_structural(&batch).unwrap();
+            let reopened = database.load_reopened().unwrap().unwrap();
+            assert_eq!(reopened.current_tiles(), &tiles);
+            let manifest = decode_root_manifest(&encode_root_manifest(&tiles)).unwrap();
+            let key = tiles.iter().next().unwrap().1.hash();
+            let transaction = database.db.begin_write().unwrap();
+            {
+                let mut objects = transaction.open_table(OBJECTS).unwrap();
+                if fault == "missing" {
+                    objects.remove(key.0.as_slice()).unwrap();
+                } else {
+                    let bytes = match fault {
+                        "checksum" => vec![0],
+                        "wrong-content" => {
+                            Envelope::new(RecordKind::Tile, vec![33; TILE_BYTE_LEN]).encode()
+                        }
+                        _ => Envelope::new(RecordKind::Tile, vec![32; 4]).encode(),
+                    };
+                    objects.insert(key.0.as_slice(), bytes.as_slice()).unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+            let transaction = database.db.begin_read().unwrap();
+            let objects = transaction.open_table(OBJECTS).unwrap();
+            assert!(
+                snapshot_from_manifest(&objects, manifest).is_err(),
+                "{fault}"
+            );
+            drop(objects);
+            drop(transaction);
+            drop(database);
+            let before_reopen = std::fs::read(&path).unwrap();
+            assert!(
+                matches!(ProjectDb::open(&path), Err(ProjectOpenError::Corrupt { .. })),
+                "{fault}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before_reopen);
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     fn layer_tree_fixture() -> LayerTree {

@@ -1,5 +1,20 @@
 # 성능 계약
 
+## 2026-09-06 저장소의 중복 타일 읽기 제거
+
+한 root 안에서 같은 객체를 중복으로 읽고 검증하던 작업을 줄였다. 4K 기준
+타일 읽기 p50/p95/p99는 84.992/90.378/90.902ms에서
+10.955/12.776/14.136ms로 내려갔다. 한 번의 읽기 안에서만 공유하며 다음 읽기에서는
+파일을 다시 검증한다. 저장소 처리 전체 p95는 100.454→16.361ms였으나,
+수정 후 첫 저장 반영 204.677ms 표본 때문에 전체 p99는 217.607ms였다.
+전후 각각 20회, 첫 표본 포함이며 이상치를 제거하지 않았다.
+
+CPU/저장소만의 별도 측정이다. 실제 UI Undo 전체 시간과 물리 표시 지연을
+대신하지 않는다. 두 scratch의 종료 후 전체 artwork/PNG 재열기 비교와 workspace
+검사는 통과했다. 새 설치판 UI 측정은 남아 있다.
+[원본 표본과 환경](measurements/history-storage-4k-2026-09-06.json),
+[검증 계약과 한계](decisions/ADR-0036-deduplicate-root-object-loads.md).
+
 ## 2026-09-06 Undo 대기열부터 화면 제출까지
 
 4K 작품의 실제 Undo/Redo 20회에서 worker queue 접수 → 복원 frame의 present API
@@ -9,7 +24,8 @@ frame 제출은 모두 20회였다. 복원 함수 내부만의 p95는 같은 세
 OS/UI 명령 전달 전 대기와 물리 가시 픽셀은 측정하지 않는다.
 
 독립 WebView 프로필로 정상 실행된 한 세션의 조건부 결과다. 기본 프로필과 이후
-재시작에서 WebView2 초기화 오류가 발생해 GUI 재시작 gate는 미완료로 남긴다.
+재시작에서 WebView2 초기화 오류가 발생했다. 이후 초기 포커스 실패 처리를
+[ADR-0035](decisions/ADR-0035-webview-startup-focus.md)에서 수정·검증했다.
 Save/Close 후 별도 프로세스의 전체 artwork/tree/page/PNG 검증은 통과했다.
 [전체 행·환경](measurements/history-present-4k-2026-09-06.json)과
 [계측 경계·누락 횟수·실행 한계](decisions/ADR-0034-history-adoption-frame-timing.md)를

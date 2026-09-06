@@ -285,6 +285,29 @@ impl TileSnapshot {
         Self::empty().with_replacements(tiles)
     }
 
+    /// Assembles already validated immutable objects without copying or hashing
+    /// their pixels again. Transparent objects are omitted from the same
+    /// canonical root used by [`Self::from_tiles`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate keys, including transparent entries.
+    pub fn from_objects(
+        objects: impl IntoIterator<Item = (TileKey, TileObject)>,
+    ) -> Result<Self, TileSnapshotError> {
+        let mut tiles = BTreeMap::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for (key, object) in objects {
+            if !seen.insert(key) {
+                return Err(TileSnapshotError::DuplicateKey(key));
+            }
+            if !object.pixels().iter().all(|byte| *byte == 0) {
+                tiles.insert(key, Arc::new(object));
+            }
+        }
+        Ok(Self::from_canonical_tiles(tiles))
+    }
+
     /// Replaces tiles while structurally sharing every unchanged object.
     /// Transparent replacements remove their key from the canonical root.
     ///
@@ -582,6 +605,43 @@ fn hash_root(tiles: &BTreeMap<TileKey, Arc<TileObject>>) -> ObjectHash {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_assembly_preserves_canonical_artwork_and_rejects_duplicate_keys() {
+        // Product risk: sharing decoded objects must not change signed/layer
+        // addressing, transparent omission, or content roots used by history.
+        let keys = [
+            TileKey::from_pixel(LayerId(1), 128, -129, -1),
+            TileKey::from_pixel(LayerId(2), 128, 128, 0),
+            TileKey::from_pixel(LayerId(1), 128, 0, 0),
+        ];
+        let pixels = vec![32; TILE_BYTE_LEN];
+        let object = TileObject::new(pixels.clone()).unwrap();
+        let transparent = TileObject::new(vec![0; TILE_BYTE_LEN]).unwrap();
+        let expected = TileSnapshot::from_tiles([
+            (keys[0], pixels.clone()),
+            (keys[1], pixels),
+            (keys[2], vec![0; TILE_BYTE_LEN]),
+        ])
+        .unwrap();
+        let objects = [
+            (keys[0], object.clone()),
+            (keys[1], object.clone()),
+            (keys[2], transparent.clone()),
+        ];
+        for entries in [
+            objects.clone().to_vec(),
+            objects.into_iter().rev().collect(),
+        ] {
+            assert_eq!(TileSnapshot::from_objects(entries).unwrap(), expected);
+        }
+        for repeated in [object, transparent] {
+            assert_eq!(
+                TileSnapshot::from_objects([(keys[0], repeated.clone()), (keys[0], repeated),]),
+                Err(TileSnapshotError::DuplicateKey(keys[0]))
+            );
+        }
+    }
 
     #[test]
     fn negative_pixels_use_euclidean_tiles() {

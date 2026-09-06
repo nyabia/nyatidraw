@@ -146,12 +146,74 @@ fn main() -> Result<()> {
             Ok(())
         }
         "verify" => verify(project),
+        "measure-history-storage" => measure_history_storage(project),
         "verify-reference" => verify_reference(
             project,
             Path::new(args.get(3).ok_or("reference project path")?),
         ),
         _ => Err("invalid mode".into()),
     }
+}
+
+// Isolate the durable portion of the desktop worker. This deliberately excludes
+// worker admission, previews, UI adoption and presentation; it is not Undo latency.
+fn measure_history_storage(project: &Path) -> Result<()> {
+    let marker = project
+        .parent()
+        .ok_or("scratch parent")?
+        .join(".nyatidraw-performance-scratch");
+    if !project.is_file() || !marker.is_file() {
+        return Err("history measurements require an existing marked scratch".into());
+    }
+    let db = ProjectDb::open(project)?;
+    let reopened = db.load_reopened()?.ok_or("missing scratch artwork")?;
+    let mut session = HeadlessStrokeSession::from_reopened(reopened);
+    let original = session.tiles().clone();
+    let snapshot = session.current_snapshot();
+    println!(
+        "history-storage fixture_tiles={} fixture_unique_objects={}",
+        original.len(),
+        original
+            .iter()
+            .map(|(_, object)| object.hash())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    );
+    for operation in 0..20 {
+        let started = std::time::Instant::now();
+        let prepared = if operation % 2 == 0 {
+            session.prepare_undo_cursor()
+        } else {
+            session.prepare_redo_cursor()
+        }
+        .map_err(|error| format!("history prepare: {error:?}"))?;
+        let target = prepared.target();
+        let load_started = std::time::Instant::now();
+        let tiles = db.load_cursor_tiles(target)?;
+        let load_us = load_started.elapsed().as_micros();
+        let metadata_started = std::time::Instant::now();
+        let _tree = db.load_cursor_layer_tree(target)?;
+        let _canvas = db.load_cursor_canvas_spec(target)?;
+        let metadata_us = metadata_started.elapsed().as_micros();
+        let persist_started = std::time::Instant::now();
+        db.persist_history_cursor(target)?;
+        let persist_us = persist_started.elapsed().as_micros();
+        let accept_started = std::time::Instant::now();
+        session
+            .accept_history_cursor_move(prepared, tiles.clone())
+            .map_err(|error| format!("history accept: {error:?}"))?;
+        let accept_us = accept_started.elapsed().as_micros();
+        let total_us = started.elapsed().as_micros();
+        println!(
+            "history-storage operation={operation} load_us={load_us} metadata_us={metadata_us} persist_us={persist_us} accept_us={accept_us} total_us={total_us} tiles={}",
+            tiles.len()
+        );
+    }
+    if session.current_snapshot() != snapshot || session.tiles() != &original {
+        return Err("history measurement did not return to its original artwork".into());
+    }
+    println!("history-storage completed=20 original_artwork=exact");
+    Ok(())
 }
 
 // Compare a copied historical scratch without reinterpreting its recorded color
