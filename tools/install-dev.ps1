@@ -29,6 +29,17 @@ if (-not $installPath.StartsWith($programsRoot + [System.IO.Path]::DirectorySepa
 }
 
 $pngOpenWith = Join-Path $classes '.png\OpenWithList\NyatiDraw.exe'
+$pngProgIds = Join-Path $classes '.png\OpenWithProgIds'
+$projectProgIds = Join-Path $extensionKey 'OpenWithProgIds'
+
+function Test-OpenWithProgId {
+    param([string] $Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $item = Get-Item -LiteralPath $Path
+    return ($item.GetValueNames() -ccontains $projectProgId -and
+        $item.GetValue($projectProgId) -ceq '' -and
+        $item.GetValueKind($projectProgId) -eq [Microsoft.Win32.RegistryValueKind]::String)
+}
 
 function Test-RegistryKeyShape {
     param(
@@ -93,8 +104,17 @@ function Test-NyatiDrawRegistration {
         $ownershipMarkerName = $ownershipMarkerValue
     }
 
+    # Accept the exact previous installer shape for an additive upgrade. The PNG
+    # ProgID list is shared with other applications; inspect only our named value.
+    $hasPngProgId = (Test-Path -LiteralPath $pngProgIds) -and
+        ((Get-Item -LiteralPath $pngProgIds).GetValueNames() -contains $projectProgId)
+    $hasProjectProgIds = Test-Path -LiteralPath $projectProgIds
+    if ($hasPngProgId -ne $hasProjectProgIds) { return $false }
+    if ($hasPngProgId -and -not (Test-OpenWithProgId $pngProgIds)) { return $false }
+    $extensionSubkeys = @()
+    if ($hasProjectProgIds) { $extensionSubkeys = @('OpenWithProgIds') }
     $shapes = @(
-        @{ Path = $extensionKey; Default = $projectProgId; Values = $rootMarkerValues; Subkeys = @() }
+        @{ Path = $extensionKey; Default = $projectProgId; Values = $rootMarkerValues; Subkeys = $extensionSubkeys }
         @{ Path = $projectKey; Default = 'NyatiDraw Project'; Values = $rootMarkerValues; Subkeys = @('DefaultIcon', 'shell') }
         @{ Path = (Join-Path $projectKey 'DefaultIcon'); Default = ('"' + $installedExecutable + '",0'); Values = @{}; Subkeys = @() }
         @{ Path = (Join-Path $projectKey 'shell'); Default = $null; Values = @{}; Subkeys = @('open') }
@@ -107,6 +127,9 @@ function Test-NyatiDrawRegistration {
         @{ Path = (Join-Path $applicationKey 'SupportedTypes'); Default = $null; Values = @{ '.png' = ''; '.ntdr' = '' }; Subkeys = @() }
         @{ Path = $pngOpenWith; Default = $null; Values = $rootMarkerValues; Subkeys = @() }
     )
+    if ($hasProjectProgIds) {
+        $shapes += @{ Path = $projectProgIds; Default = $null; Values = @{ $projectProgId = '' }; Subkeys = @() }
+    }
 
     foreach ($shape in $shapes) {
         if (-not (Test-RegistryKeyShape -Path $shape.Path -ExpectedDefaultValue $shape.Default -ExpectedValues $shape.Values -ExpectedSubkeys $shape.Subkeys)) {
@@ -133,6 +156,10 @@ if ($registrationExists -and
 }
 if ($registrationExists) {
     Write-Host 'Existing NyatiDraw development registration matched the exact owned shape; continuing.'
+}
+if (-not $registrationExists -and (Test-Path -LiteralPath $pngProgIds) -and
+    ((Get-Item -LiteralPath $pngProgIds).GetValueNames() -contains $projectProgId)) {
+    throw 'An unowned NyatiDraw PNG ProgID value exists; refusing to overwrite it.'
 }
 
 Assert-InstallFilePath $programsRoot $installPath
@@ -224,6 +251,13 @@ Set-ItemProperty -Path (Join-Path $applicationKey 'SupportedTypes') -Name '.ntdr
 New-Item -Path $pngOpenWith -Force | Out-Null
 Set-ItemProperty -Path $pngOpenWith -Name $ownershipMarkerName -Value $ownershipMarkerValue
 
+# OpenWithList is retained only as an owned legacy registration. Current Shell
+# discovery uses OpenWithProgIds. Never replace the shared PNG key or UserChoice.
+foreach ($path in @($pngProgIds, $projectProgIds)) {
+    if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -Force | Out-Null }
+    New-ItemProperty -LiteralPath $path -Name $projectProgId -PropertyType String -Value '' -Force | Out-Null
+}
+
 if (-not ('NyatiDraw.ShellNotify' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -236,7 +270,7 @@ namespace NyatiDraw {
 }
 '@
 }
-[NyatiDraw.ShellNotify]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+[NyatiDraw.ShellNotify]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero)
 
 Write-Host "NyatiDraw development build installed: $installedExecutable"
 Write-Host '.ntdr is registered for direct open; PNG default-app settings were not changed.'

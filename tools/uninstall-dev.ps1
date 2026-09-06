@@ -48,6 +48,30 @@ function Remove-OwnedRegistryDefault {
     finally { $writable.Dispose() }
 }
 
+# Shared OpenWithProgIds keys can contain other applications. Remove only our
+# exact value, and only while the owning ProgID and open command still match.
+$ownedProjectKey = Join-Path $classes $projectProgId
+$ownedProjectCommandKey = Join-Path $ownedProjectKey 'shell\open\command'
+if ((Test-Path -LiteralPath $ownedProjectKey) -and
+    (Get-Item -LiteralPath $ownedProjectKey).GetValue($ownershipMarkerName) -ceq $ownershipMarkerValue -and
+    (Test-Path -LiteralPath $ownedProjectCommandKey) -and
+    (Get-Item -LiteralPath $ownedProjectCommandKey).GetValue('') -ceq $projectCommand) {
+    foreach ($extension in @('.png', '.ntdr')) {
+        $path = Join-Path $classes ($extension + '\OpenWithProgIds')
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $item = Get-Item -LiteralPath $path
+        if ($item.GetValueNames() -ccontains $projectProgId -and
+            $item.GetValue($projectProgId) -ceq '' -and
+            $item.GetValueKind($projectProgId) -eq [Microsoft.Win32.RegistryValueKind]::String) {
+            Remove-ItemProperty -LiteralPath $path -Name $projectProgId -Force
+            $item = Get-Item -LiteralPath $path
+            if ($item.GetValueNames().Count -eq 0 -and $item.GetSubKeyNames().Count -eq 0) {
+                Remove-Item -LiteralPath $path -Force
+            }
+        }
+    }
+}
+
 $extensionKey = Join-Path $classes '.ntdr'
 if (Test-Path -LiteralPath $extensionKey) {
     $extensionItem = Get-Item -LiteralPath $extensionKey
@@ -179,7 +203,7 @@ namespace NyatiDraw {
 }
 '@
 }
-[NyatiDraw.ShellNotify]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+[NyatiDraw.ShellNotify]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero)
 
 Write-Host 'Removed owned NyatiDraw Development registration and unchanged installed files.'
 Write-Host 'User .ntdr projects and PNG files were not touched.'

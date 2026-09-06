@@ -82,17 +82,33 @@ uninstall 검증은 Sprint 8 범위다.
 
 개발판은 Windows에 정확히 `NyatiDraw`로 표시되고, 기본 등록 위치는 `HKCU\Software\Classes`다. `.ntdr`에는 versioned ProgID,
 `DefaultIcon`, `shell\open\command`를 등록한다. PNG에는 NyatiDraw application open
-command와 supported type만 등록한다. Windows `UserChoice`는 installer나 앱이
+command와 supported type, `.png` 및 `.ntdr`의 `OpenWithProgIds`에
+`NyatiDraw.Project.1` 빈 문자열 값을 등록한다. 이전 개발판의 소유권 확인과 제거를
+위해 legacy `OpenWithList` 키는 유지하지만 현재 Shell 발견 경로로 의존하지 않는다.
+Windows `UserChoice`는 installer나 앱이
 강제로 바꾸지 않는다.
 
 Windows Shell은 HKCU와 HKLM의 `Software\Classes`를 합친 view를 사용하고 사용자
-등록을 우선한다. 등록 변경 뒤에는 `SHChangeNotify(SHCNE_ASSOCCHANGED)`를 호출한다.
+등록을 우선한다. 등록 변경 뒤에는 `SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_FLUSH)`로
+알림 전달을 기다린다.
 설치 스크립트는 build나 설치 경로 교체 전에 기존 `.ntdr` handler와 NyatiDraw registry
 command의 소유권을 확인해 다른 앱의 등록을 덮어쓰지 않는다. 이미 설치된 과거 개발판이
 `NyatiDrawDevOwner` marker가 있는 현재 개발판 등록만 갱신한다. marker가 없거나 네
 루트와 명시된 자식 키에 다른 값·자식이 있거나 일부만 존재하면 승계하지 않고 즉시
 fail-closed 한다. 이전 무표식 개발판을 자동 채택하는 일회성 호환 분기는 유지하지
-않는다.
+않는다. `OpenWithProgIds` 도입 전의 정확한 소유 형태는 두 extension의 등록을
+추가하는 갱신만 허용한다. 공유 PNG ProgID 목록에서는 자신의 이름·값·형식만 검사하고
+다른 앱의 값은 보존한다. 두 새 등록 중 하나만 있거나 자신의 값이 다르면 거부한다.
+
+2026-09-06의 추가 등록 acceptance는 기존 형태에서 갱신, 반복 갱신, 공유 PNG 목록의
+외부 값 보존, 자신의 값 충돌 시 binary 교체 전 거부, 제거와 재설치가 통과했다.
+PNG UserChoice 전체 값과 원래 PNG 등록 목록, scratch project/PNG bytes, 설치 binary
+hash는 전후 동일했다. 새 Shell 호출의 `.ntdr` 직접 실행은 PID 25020으로 설치 앱을
+열었고 정상 종료 뒤 16×16 원본 fixture의 전체 signed tile·locked/hidden layer·PNG를
+검증했다. **기존 탐색기의 실제 double-click은 앱 선택기를 표시했고 PNG 연결 메뉴에는
+NyatiDraw가 보이지 않아 Explorer gate는 미완료다.** 새 프로세스의 연결 조회 성공을
+탐색기 성공으로 대체하지 않는다. 원인과 캐시 반영 조건은 아직 확정하지 않았다.
+상세 근거: [ADR-0033](decisions/ADR-0033-open-with-progids.md).
 
 - [Microsoft: HKEY_CLASSES_ROOT와 사용자별 Classes](https://learn.microsoft.com/en-us/windows/win32/sysinfo/hkey-classes-root-key)
 - [Microsoft: File Types 등록](https://learn.microsoft.com/en-us/windows/win32/shell/fa-file-types)
