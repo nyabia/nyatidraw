@@ -44,7 +44,9 @@ try {
     }
 } finally { Pop-Location }
 [IO.File]::WriteAllText((Join-Path $stage 'THIRD-PARTY-NOTICES.txt'), $notices.ToString())
-if (Test-Path (Join-Path $repositoryRoot 'LICENSE')) { Copy-Item (Join-Path $repositoryRoot 'LICENSE') $stage }
+foreach ($name in @('LICENSE-MIT', 'LICENSE-APACHE')) {
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot $name) -Destination $stage
+}
 $versionText = (Get-Item -LiteralPath $tool).VersionInfo.ProductVersion
 if ($versionText -notmatch '^1\.2\.0(?:\+|$)') { throw 'Expected Velopack packager 1.2.0.' }
 & $Dotnet $tool pack --packId NyatiDraw.Alpha --packVersion $Version --packDir $stage --mainExe nyatidraw-desktop.exe --packTitle 'NyatiDraw Alpha' --packAuthors nyabia --channel alpha --runtime win-x64 --framework webview2 --delta None --shortcuts StartMenuRoot --outputDir $output

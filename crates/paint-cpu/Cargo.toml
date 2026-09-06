@@ -2,6 +2,7 @@
 name = "nyatidraw-paint-cpu"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 nyatidraw-brush.workspace = true

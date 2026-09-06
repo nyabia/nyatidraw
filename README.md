@@ -73,4 +73,16 @@ cargo clippy --workspace --all-targets --locked
 
 ## 라이선스
 
-아직 공개 라이선스를 지정하지 않았습니다.
+NyatiDraw는 [MIT](LICENSE-MIT) 또는 [Apache-2.0](LICENSE-APACHE) 중
+하나를 선택하여 사용할 수 있는 이중 라이선스입니다.
+타사 코드는 각자의 라이선스를 따릅니다.
+
+## 피드백
+
+버그 제보와 기능 제안은 [이슈](https://github.com/nyabia/nyatidraw/issues)로 받습니다.
+현재 외부 코드 기여(PR/MR)는 받지 않으며, 저장소의 PR 기능을 비활성화했습니다.
+
+## AI 생성 고지
+
+이 프로젝트는 OpenAI Codex 등 생성형 AI를 활용해 개발했으며,
+소스 코드와 문서에는 AI가 생성하거나 수정한 내용이 포함되어 있습니다.

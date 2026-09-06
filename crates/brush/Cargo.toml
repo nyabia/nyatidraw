@@ -2,6 +2,7 @@
 name = "nyatidraw-brush"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 nyatidraw-input.workspace = true

@@ -21,7 +21,8 @@ cancels that update request. There is no force-kill path in the app updater.
 The unsigned installer is an alpha delivery choice, not a claim of publisher
 verification or warning-free Windows installation. Full package checksums are
 separate from publisher signing. Third-party notices are collected into the
-package. The repository's own license has not yet been assigned.
+package. The initial alpha package preceded the license decision; the repository
+now uses MIT OR Apache-2.0, with both texts included by subsequent packaging.
 
 ## Evidence so far
 
