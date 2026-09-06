@@ -40,7 +40,7 @@ use crate::{
     edit_worker::{EditFailure, EditOutcome},
     elapsed_since_launch,
     live_ink::{AdmittedSample, CloseStatus, ExportStatus, InputDiscontinuity, LiveInkBridge},
-    performance::{Span, Stage},
+    performance::{HistoryTiming, Span, Stage},
     preview::{
         LAYER_THUMBNAIL_MAX_HEIGHT, LAYER_THUMBNAIL_MAX_WIDTH, MAX_LAYER_THUMBNAILS,
         NAVIGATOR_MAX_HEIGHT, NAVIGATOR_MAX_WIDTH, NavigatorViewport, layer_thumbnail_frame,
@@ -585,7 +585,7 @@ impl SharedGpuCanvas {
     /// A child-HWND host presents the returned texture to its own surface. The
     /// origin is intentionally `(0, 0)`: Win32 input delivered to that child is
     /// relative to the child, not to the `WebView` parent.
-    pub(crate) fn render(&mut self, width: u32, height: u32, scale: f64) -> Option<wgpu::Texture> {
+    pub(crate) fn render(&mut self, width: u32, height: u32, scale: f64) -> Option<RenderedCanvas> {
         let CanvasState::Active(canvas) = &mut self.state else {
             return None;
         };
@@ -623,6 +623,11 @@ impl SharedGpuCanvas {
 
         Some(display)
     }
+}
+
+pub(crate) struct RenderedCanvas {
+    pub(crate) texture: wgpu::Texture,
+    pub(crate) history_timing: Option<HistoryTiming>,
 }
 
 enum CanvasState {
@@ -1237,7 +1242,7 @@ impl ActiveCanvas {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn render(&mut self, width: u32, height: u32, scale: f64) -> Option<wgpu::Texture> {
+    fn render(&mut self, width: u32, height: u32, scale: f64) -> Option<RenderedCanvas> {
         if width == 0 || height == 0 {
             return None;
         }
@@ -1255,7 +1260,10 @@ impl ActiveCanvas {
             // Scratch-only boundary: keep admitted raw End for the close drain,
             // while allowing the real UI Save request to enter semantic state.
             self.apply_commands(width, height, scale);
-            return self.scene.display_texture();
+            return self.scene.display_texture().map(|texture| RenderedCanvas {
+                texture,
+                history_timing: None,
+            });
         }
 
         if std::env::var_os(CLOSE_RAW_QUEUE_PROBE_ENV).is_some() {
@@ -1273,7 +1281,7 @@ impl ActiveCanvas {
             return None;
         }
 
-        self.poll_artwork();
+        let history_timing = self.poll_artwork();
         // Native samples already carry the renderer-published document
         // coordinates from their admission moment. Consume their End and put
         // its closed stroke in the writer FIFO before accepting same-frame UI
@@ -1405,7 +1413,10 @@ impl ActiveCanvas {
             .scene
             .display_texture()
             .expect("viewport render created the display texture");
-        Some(texture)
+        Some(RenderedCanvas {
+            texture,
+            history_timing,
+        })
     }
 
     fn apply_commands(&mut self, width: u32, height: u32, scale: f64) {
@@ -2075,6 +2086,7 @@ impl ActiveCanvas {
         self.artwork_job = Some(ArtworkJob {
             received,
             active_layer,
+            history_timing: (kind == "history").then(HistoryTiming::queued).flatten(),
         });
         let mut edit = self.projection.current().edit.clone();
         edit.busy = true;
@@ -2105,18 +2117,20 @@ impl ActiveCanvas {
         self.publish_committed_history();
     }
 
-    fn poll_artwork(&mut self) {
+    fn poll_artwork(&mut self) -> Option<HistoryTiming> {
         let Some(job) = &self.artwork_job else {
-            return;
+            return None;
         };
         let result = match job.received.try_recv() {
             Ok(result) => result,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 Err(EditFailure::Fatal("Artwork worker disconnected".into()))
             }
         };
         let active_layer = job.active_layer;
+        let history_timing = job.history_timing;
+        let mut history_changed = false;
         let mut error = None;
         match result {
             Ok(ArtworkOutcome::Edit(outcome)) => {
@@ -2131,11 +2145,11 @@ impl ActiveCanvas {
                         })
                         .is_err()
                 {
-                    return;
+                    return None;
                 }
                 if let Err(error) = self.install_selection(outcome.selection) {
                     self.stroke.live_ink.publish_workspace_error(error);
-                    return;
+                    return None;
                 }
                 if changed {
                     let mut current = self.projection.current().clone();
@@ -2149,8 +2163,9 @@ impl ActiveCanvas {
                     self.active_layer = active;
                 }
                 if self.install_history_move(moved).is_err() {
-                    return;
+                    return None;
                 }
+                history_changed = changed;
                 if changed {
                     let mut current = self.projection.current().clone();
                     current.dirty = true;
@@ -2162,7 +2177,7 @@ impl ActiveCanvas {
             }
             Err(EditFailure::Fatal(reason)) => {
                 self.stroke.live_ink.publish_workspace_error(reason);
-                return;
+                return None;
             }
         }
         self.artwork_job = None;
@@ -2181,6 +2196,11 @@ impl ActiveCanvas {
             .get_or_insert(self.projection.current().revision);
         self.publish_committed_history();
         println!("native-canvas event=artwork-adopted selected_pixels={selected_pixels} pending=0");
+        let timing = history_timing.filter(|_| history_changed);
+        if let Some(timing) = timing {
+            timing.adopted();
+        }
+        timing
     }
 
     fn install_selection(
@@ -3714,6 +3734,7 @@ enum ArtworkOutcome {
 struct ArtworkJob {
     received: Receiver<Result<ArtworkOutcome, EditFailure>>,
     active_layer: Option<LayerId>,
+    history_timing: Option<HistoryTiming>,
 }
 
 struct HistoryMove {

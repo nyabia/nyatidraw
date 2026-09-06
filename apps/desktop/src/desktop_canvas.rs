@@ -1013,10 +1013,13 @@ impl CanvasSurfaceRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.presenter
-            .present(&self.device, &self.queue, &display, &target);
+            .present(&self.device, &self.queue, &display.texture, &target);
         frame.present();
         drop(present_timing);
         crate::performance::presented();
+        if let Some(timing) = display.history_timing {
+            timing.presented();
+        }
         if !self.first_presented {
             self.first_presented = true;
             println!(

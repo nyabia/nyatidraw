@@ -10,7 +10,7 @@ use std::{
 };
 
 const BINS: usize = 1024;
-const STAGES: [&str; 18] = [
+const STAGES: [&str; 20] = [
     "input_batch_to_dequeue",
     "input_batch_to_present_request",
     "drain_brush",
@@ -29,6 +29,8 @@ const STAGES: [&str; 18] = [
     "export_encode",
     "export_sync_replace",
     "history_cpu_snapshot",
+    "history_queue_to_adoption",
+    "history_queue_to_present_request",
 ];
 
 #[derive(Clone, Copy)]
@@ -51,6 +53,37 @@ pub(crate) enum Stage {
     ExportEncode,
     ExportReplace,
     HistoryCpuSnapshot,
+    HistoryQueueToAdoption,
+    HistoryQueueToPresent,
+}
+
+/// One accepted history worker request, carried only by its adoption frame.
+/// A failed/no-op request or a dropped frame never borrows a later frame's time.
+#[derive(Clone, Copy)]
+pub(crate) struct HistoryTiming {
+    at: Instant,
+    exporting: bool,
+}
+
+impl HistoryTiming {
+    pub(crate) fn queued() -> Option<Self> {
+        let at = start()?;
+        with_recorder(|r| r.history_queued = r.history_queued.saturating_add(1));
+        Some(Self {
+            at,
+            exporting: EXPORTING.load(Ordering::Relaxed),
+        })
+    }
+
+    pub(crate) fn adopted(self) {
+        record(Stage::HistoryQueueToAdoption, self.at, self.exporting);
+        with_recorder(|r| r.history_adopted = r.history_adopted.saturating_add(1));
+    }
+
+    pub(crate) fn presented(self) {
+        record(Stage::HistoryQueueToPresent, self.at, self.exporting);
+        with_recorder(|r| r.history_presented = r.history_presented.saturating_add(1));
+    }
 }
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -151,6 +184,9 @@ impl Histogram {
 struct Recorder {
     histograms: Vec<Histogram>,
     pending_input: Option<(Instant, bool)>,
+    history_queued: u64,
+    history_adopted: u64,
+    history_presented: u64,
 }
 
 thread_local! {
@@ -163,6 +199,9 @@ fn with_recorder(f: impl FnOnce(&mut Recorder)) {
         f(recorder.get_or_insert_with(|| Recorder {
             histograms: (0..STAGES.len() * 2).map(|_| Histogram::new()).collect(),
             pending_input: None,
+            history_queued: 0,
+            history_adopted: 0,
+            history_presented: 0,
         }));
     });
 }
@@ -225,5 +264,11 @@ pub(crate) fn flush(owner: &str) {
     }
     if recorder.pending_input.is_some() {
         println!("performance owner={owner} input_batch_without_present=1");
+    }
+    if recorder.history_queued > 0 {
+        println!(
+            "performance-history owner={owner} queued={} changed_adopted={} adoption_frame_presented={} claim=cpu-api-only",
+            recorder.history_queued, recorder.history_adopted, recorder.history_presented
+        );
     }
 }
