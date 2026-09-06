@@ -163,6 +163,39 @@ impl Drop for PrimaryInstance {
 }
 
 impl ActivationInbox {
+    /// UI file pickers share the bounded activation lane without restoring or
+    /// foregrounding the already-active window.
+    pub(crate) fn open_from_dialog(&self, path: PathBuf) -> Result<(), String> {
+        let mut pending = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.len() >= MAX_PENDING_ACTIVATIONS {
+            return Err("파일 열기 요청을 처리 중입니다. 잠시 뒤 다시 시도해주세요".into());
+        }
+        pending.push_back(path);
+        drop(pending);
+        let child = *self
+            .inner
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(child) = child {
+            // SAFETY: pointer-free notification to the bound UI-owned HWND.
+            unsafe {
+                PostMessageW(
+                    Some(HWND(child as *mut std::ffi::c_void)),
+                    ACTIVATION_MESSAGE,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                )
+            }
+            .map_err(|error| format!("파일 열기 알림 실패: {error}"))?;
+        }
+        Ok(())
+    }
+
     /// Binds the transport to the UI-thread-owned windows after Dioxus has
     /// created them. Earlier messages remain queued and are posted once the
     /// child canvas exists.

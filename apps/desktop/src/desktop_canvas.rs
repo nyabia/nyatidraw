@@ -50,6 +50,7 @@ const CLOSE_TIMER: usize = 0x4e59;
 pub(crate) struct DesktopCanvasHandle {
     hwnd: HWND,
     live_ink: LiveInkBridge,
+    activation: ActivationInbox,
 }
 
 impl DesktopCanvasHandle {
@@ -139,6 +140,7 @@ impl DesktopCanvasHandle {
         Ok(Self {
             hwnd,
             live_ink: live_ink.clone(),
+            activation: state.activation.clone(),
         })
     }
 
@@ -192,6 +194,13 @@ impl DesktopCanvasHandle {
     pub(crate) fn hide(&self) {
         // SAFETY: hiding a live or already-destroyed child is harmless.
         let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+    }
+
+    pub(crate) fn open_path(&self, path: std::path::PathBuf) -> Result<(), String> {
+        if self.live_ink.is_closing() {
+            return Err("저장을 마친 뒤 파일을 열어주세요".into());
+        }
+        self.activation.open_from_dialog(path)
     }
 
     pub(crate) fn reopen_after_close_failure(&self) {

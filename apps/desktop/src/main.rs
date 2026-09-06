@@ -357,7 +357,7 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
                     menu_open.set(false);
                 }, "기본 화면 배치" }
             }
-            button { class: "command", title: "열기 (후속 구현)", disabled: true, UiIcon { name: "folder" } span { class: "shortcut", "Alt O" } }
+            FileButtons {}
             button { class: "command", title: "저장 (S)", onclick: move |_| {
                 send_editor_command(&save_ink, EditorCommand::Project(ProjectCommand::Save), error);
             }, UiIcon { name: "save" } span { class: "command-label", "저장" } span { class: "shortcut", "S" } }
@@ -393,6 +393,62 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
             }
         }
     }
+}
+
+#[component]
+fn FileButtons() -> Element {
+    #[cfg(windows)]
+    {
+        let host = try_use_context::<desktop_canvas::DesktopCanvasHandle>();
+        let live_ink = use_context::<LiveInkBridge>();
+        let mut busy = use_signal(|| false);
+        let window = dioxus_desktop::window().window.clone();
+        return rsx! {
+            for new_file in [false, true] {
+                button {
+                    class: "command", disabled: busy() || host.is_none(),
+                    title: if new_file { "새 그림의 저장 위치 선택" } else { "PNG 또는 NyatiDraw 프로젝트 열기" },
+                    onclick: {
+                        let host = host.clone();
+                        let live_ink = live_ink.clone();
+                        let window = window.clone();
+                        move |_| {
+                            let host = host.clone();
+                            let live_ink = live_ink.clone();
+                            let window = window.clone();
+                            async move {
+                                if busy() { return; }
+                                busy.set(true);
+                                let dialog = rfd::AsyncFileDialog::new().set_parent(window.as_ref());
+                                let selected = if new_file {
+                                    dialog.set_title("새 그림 저장 위치").add_filter("NyatiDraw 프로젝트", &["ntdr"])
+                                        .set_file_name("새 그림.ntdr").save_file().await
+                                } else {
+                                    dialog.set_title("그림 열기").add_filter("그림 / 프로젝트", &["png", "ntdr"])
+                                        .pick_file().await
+                                };
+                                if let Some(file) = selected {
+                                    let mut path = file.path().to_path_buf();
+                                    if new_file && path.extension().is_none() { path.set_extension("ntdr"); }
+                                    let result = if new_file && (path.exists() || path.with_extension("png").exists()) {
+                                        Err("같은 이름의 그림이 있습니다. 다른 이름을 선택하거나 기존 그림을 열어주세요".into())
+                                    } else if let Some(host) = host {
+                                        host.open_path(path)
+                                    } else { Err("캔버스가 아직 준비되지 않았습니다".into()) };
+                                    if let Err(error) = result { live_ink.publish_activation_notice(error); }
+                                }
+                                busy.set(false);
+                            }
+                        }
+                    },
+                    if new_file { span { "새 그림" } }
+                    else { UiIcon { name: "folder" } span { "열기" } }
+                }
+            }
+        };
+    }
+    #[cfg(not(windows))]
+    rsx! { button { disabled: true, "열기 · Windows 전용" } }
 }
 
 #[component]
@@ -467,7 +523,7 @@ fn QuickColors(ui_projection: Signal<UiProjection>) -> Element {
     let current = ui_projection.read().brush_color;
     let current_color = format!("#{:02X}{:02X}{:02X}", current[0], current[1], current[2]);
     rsx! {
-                div { class: "color-stack", span { class: "color-chip back" } span { class: "color-chip front", style: "background:{current_color}" } }
+                div { class: "color-stack", title: "현재 그리기 색상 · 전경/배경 교환은 준비 중", span { class: "color-chip back unavailable" } span { class: "color-chip front", style: "background:{current_color}" } }
                 RecentColors { ui_projection, compact: true }
 
     }
@@ -891,7 +947,7 @@ fn BrushPanel(ui_projection: Signal<UiProjection>) -> Element {
                 SubtoolButton { name: "뭉개기", tool: None, active: false }
             }
             div { class: "tool-properties",
-                div { class: "brush-sample", span { class: "stroke-sample wide" } }
+                div { class: "brush-sample unavailable", title: "실제 브러시 미리보기는 준비 중", span { class: "unavailable-label", "미리보기 준비 중" } }
                 div { class: "property-row", span { "브러시 크기" } span { class: "property-value", "{display_size:.1}" } }
                 OpacityControl { percent: opacity }
             }
@@ -920,13 +976,14 @@ fn SubtoolButton(name: &'static str, tool: Option<DrawingTool>, active: bool) ->
         button {
             class: if active { "subtool selected" } else { "subtool" },
             disabled: tool.is_none(),
+            title: if tool.is_none() { "준비 중 · 아직 사용할 수 없습니다" } else { "기본 원형 브러시" },
             onclick: move |_| {
                 if let Some(tool) = tool {
                     send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::Select(tool)), error);
                 }
             },
             span { class: "stroke-sample" }
-            span { class: "subtool-name", "{name}" }
+            span { class: "subtool-name", "{name}", if tool.is_none() { small { " 준비 중" } } }
         }
     }
 }
@@ -1270,7 +1327,7 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
                 layer_drag::LayerMoveButtons { projection: ui_projection, error }
             }
             div { class: "layer-settings",
-                button { disabled: true, title: "레이어 색상화 (후속 구현)", span { class: "layer-color-chip" } "색상화" }
+                button { class: "unavailable", disabled: true, title: "레이어 색상화 · 준비 중", span { class: "layer-color-chip" } "색상화 · 준비 중" }
                 button {
                     disabled: active.is_none(), aria_pressed: "{active_reference}",
                     title: "선택·채우기 참조 레이어 표시 (일반 PNG에는 영향 없음)",
