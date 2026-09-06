@@ -18,6 +18,10 @@ Sprint 1~3의 주요 편집 기능은 구현됐지만 **사용자 완료 gate는
   재시작과 두 번의 전체 그림/PNG 비교를 통과했다. 두 시작에서 실제 초기
   포커스 오류를 기록하고 계속 실행했다. 컴퓨터 사용 도구도 다시 정상 동작했다.
   프로세스 강제 종료나 다운로드 작업 변경은 없었다.
+- `e4f9f4c`: CPU/GPU history 복원이 같은 픽셀 비교 결과를 공유한다. 기존 core
+  테스트 보강(총수 유지), Clippy, 새 설치판 4K 왕복과 page/레이어 삭제·복원의
+  저장·재시작·독립 전체 PNG 비교를 통과했다.
+  [ADR-0037](decisions/ADR-0037-compare-history-tiles-once.md).
 
 ## Gate별 상태
 
@@ -50,6 +54,7 @@ Sprint 1~3의 주요 편집 기능은 구현됐지만 **사용자 완료 gate는
 |---|---|---|
 | 이전 설치판: worker 접수→복원 frame present API | 131.071 / 155.647 / 164.815 ms | UI 20회, histogram 상한. Undo 16ms 목표 미통과 |
 | 저장소 수정 후 설치판: 같은 구간 | 51.199 / 55.728 / 55.728 ms | UI 20회, 접수/복원/제출 각 20. 엄격한 A/B 아님; 목표 미통과 |
+| 비교 중복 제거 후 설치판: 같은 구간 | 45.055 / 47.103 / 157.958 ms | UI 20회, 접수/복원/제출 각 20. p95 개선, p99 악화 표본 유지 |
 | 저장소 수정 전: 타일 읽기 | 84.992 / 90.378 / 90.902 ms | 별도 CPU/storage probe 20회 |
 | 저장소 수정 후: 타일 읽기 | 10.955 / 12.776 / 14.136 ms | 동일 fixture; 902 keys/156 objects |
 | 저장소 수정 후: 준비→저장→session 반영 | 13.944 / 16.361 / 217.607 ms | 첫 immediate persist 204.677ms를 포함함 |
@@ -62,10 +67,12 @@ UI adoption/composite/present와 저장 반영 tail이 남는다. 정확한 환�
 
 1. **완료:** 새 release 설치, 4K scratch Undo/Redo·Save·Close·일반 재시작과 전체
    비교. 계측 session의 queue/adoption/present 각 20회와 전체 분포를 기록했다.
-2. 남은 adoption/composite 비용과 저장 반영의 긴 표본을 별도로 조사한다.
+2. adoption의 중복 비교 제거와 설치판 검증은 완료했다. 남은 composite 비용과
+   worker/adoption 이전의 긴 표본을 별도로 계측해 조사한다.
    artwork durability를 낮추거나 fsync 결과를 제외해 목표를 맞추지 않는다.
 3. Explorer Open With 후보/직접 열기와 primary foreground를 실제 UI로 검증한다.
-   레지스트리 조회 성공과 Explorer 동작 차이는 미해결 상태다.
+   새 설치판에서도 실제 double-click이 앱 선택 창을 띄웠다. 레지스트리 조회
+   성공과 Explorer 동작 차이는 미해결 상태다.
 4. UI thread의 surface wait 격리를 설계·구현한다. child HWND 생존, renderer 종료/join,
    resize/suspend, bounded pending frame과 입력 phase 보존을 먼저 정한다.
    채널만 옮기고 HWND/GPU ownership 안전성이 불명확한 상태를 완료로 보지 않는다.

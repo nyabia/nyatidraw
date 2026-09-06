@@ -1,5 +1,20 @@
 # 성능 계약
 
+## 2026-09-06 CPU/GPU history 비교 결과 공유
+
+동일 타일의 픽셀을 두 번 비교하던 작업을 한 번으로 줄였다. 설치판 UI 20회의
+history adoption p50/p95/p99 상한은 **10.239/11.775/12.192ms**,
+worker 접수→복원 frame present API는 **45.055/47.103/157.958ms**였다.
+직전 세션의 전체 p95 55.728ms보다 낮지만 p99는 악화됐다. 가장 긴 표본을
+제외하지 않았으며, 원인은 추가 계측이 필요하다. 16ms 목표는 미통과다.
+
+4K Save/Close/일반 재시작과 전체 artwork/PNG 비교, page Undo/Redo 및 레이어
+삭제·복원의 별도 저장/재시작 비교를 통과했다. CPU snapshot 내부 span은 이제
+미리 계산한 변경분 적용만 측정하므로 이전 span과 단독 비교하지 않는다.
+같은 호스트·프로필의 별도 세션이며 물리 표시 지연이나 엄격한 A/B 결과는 아니다.
+[환경·전체 행](measurements/history-compare-once-4k-2026-09-06.json),
+[변경·왕복 검증·한계](decisions/ADR-0037-compare-history-tiles-once.md).
+
 ## 2026-09-06 저장소 수정 후 설치판 전체 Undo
 
 실제 UI Undo/Redo 20회의 worker 접수→복원 frame present API 시간은 p50/p95/p99
