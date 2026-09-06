@@ -1,5 +1,9 @@
 # Godot 우선 NyatiDraw 스프린트 계획
 
+2026-09-06의 구현·검증 상태와 다음 작업은
+[현재 gate 점검](../status-plan-2026-09-06.md)에 모았다. 아래 표는 제품 완료 조건이며,
+엔진 probe나 제한된 설치판 acceptance만으로 전체 Sprint를 완료 처리하지 않는다.
+
 활성 스프린트는 내부 엔진 부품 수가 아니라 **Godot 작업 중 사용자가 끝까지 수행할
 수 있는 작업**으로 판정한다. 독립 드로잉 소프트웨어 공개는 장기 목표지만, 당장은
 Godot project 안의 PNG를 Windows `Open with`로 열고, paired `.ntdr`을 자동으로 찾아

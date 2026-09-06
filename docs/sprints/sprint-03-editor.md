@@ -1,5 +1,13 @@
 # Sprint 3 — 매일 쓰는 개발판
 
+## 2026-09-06 판정
+
+**장시간 사용과 hot-path 지연 gate는 미완료**다. Toolbar/side stack·layout 복원,
+bounded mouse capture/cancel, 비동기 history/layer와 초기 포커스 실패 처리를
+검증했다. 그러나 UI thread가 여전히 surface acquire/present를 수행한다.
+저장소 국소 개선을 전체 Undo나 physical pen 통과로 계산하지 않는다.
+[현재 구현·gate·실행 순서](../status-plan-2026-09-06.md)를 따른다.
+
 ## 사용자 결과
 
 Sprint 1~2의 편집기를 오래 켜 두고 반복 사용해도 입력, 창, docking, 저장 상태가
@@ -43,8 +51,8 @@ PNG `Open with` 또는 `.ntdr` 더블클릭으로 같은 작업을 계속할 수
 
 ### 현재 상태
 
-**Windows-first software vertical slice는 구현·검증됐고 UI 셸은 Dioxus Desktop으로
-전환됐다. 물리 펜과 표시 지연 gate는 명시적으로 열려 있다.** `ViewportTransform`은 physical window, logical
+**Windows-first 엔진 기반과 제한된 설치판 시나리오는 검증됐으며 전체 Sprint 완료를
+뜻하지 않는다.** UI 셸은 Dioxus Desktop이다. `ViewportTransform`은 physical window, logical
 canvas, document 좌표의 pan/zoom/rotation/DPI/revision을 검증한다. Windows recorder는
 Begin mapping을 고정하고 native admission은 renderer-owned canvas geometry와 같은
 affine snapshot을 사용한다.
@@ -52,8 +60,8 @@ affine snapshot을 사용한다.
 `LayerTree`는 raster/group, visibility, opacity, reorder와 cycle validation을
 제공한다. Raster tile 변경은 같은 coordinate의 ancestor group/root cache만
 무효화하고 sibling/other-coordinate cache를 보존한다. `DockTree`는 Canvas/Tools/
-Brush/Navigator/Color/Layers/History를 각각 한 번만 포함하는 bounded split/tab
-tree이며 decode 또는 validation failure는 partial salvage 없이 complete safe
+Brush/Navigator/Color/Layers/History와 세 toolbar entry를 각각 한 번만 포함하는
+bounded split/tab 및 top-list 모델이며 decode 또는 validation failure는 partial salvage 없이 complete safe
 default로 교체한다. Safe default는 compact action bar 아래에 tool/brush, canvas,
 navigator/color/layer columns를 배치한다.
 
@@ -65,14 +73,15 @@ wire record로 redb에 즉시 저장되며 visibility/opacity/cross-parent reord
 process restart/reopen 뒤 exact equality를 유지한다. Corrupt checksum/tag/trailing
 payload는 파일을 고치지 않고 scoped `Corrupt`로 거부한다.
 
-### GPU compositor/viewport evidence
+### 역사적 GPU compositor/viewport evidence
 
-`GpuCompositeScene`은 Dioxus가 제공한 하나의 `Device`/`Queue`만 사용한다. 현재
-Windows slice는 1024x768 document-space raster/group/root textures와 128x128
+초기 Native slice의 `GpuCompositeScene`은 당시 Dioxus가 제공한 하나의
+`Device`/`Queue`를 사용했다. 아래 기록은 1024x768 document-space raster/group/root textures와 128x128
 coordinate `CompositeCache`를 사용한다. Cache miss만 bottom-up recomposite하며,
 resize 또는 affine change는 disposable display texture만 바꾼다. Closed CPU replay
 tile은 renderer layer로 upload되므로 closed artwork의 유일한 representation이 GPU가
-아니다.
+아니다. 현재 Desktop은 별도 native host가 GPU를 소유하고 실제 page 크기를 사용하며,
+이 과거 fixture 크기를 현재 앱의 고정 크기나 지원 한계로 해석하지 않는다.
 
 `gpu_layer_viewport --release` Windows 11 build 26200, RTX 3080/Vulkan 기록은
 premultiplied source-over, nested-group/root의 incremental rebuild, visibility/
@@ -174,18 +183,21 @@ Space+펜/마우스, Move 도구로 패닝한다.
 
 ## 남은 gate
 
-- WebView pointer path의 panel drag/capture와 cyan insertion marker는
-  post-migration manual acceptance가 남아 있다.
+- Toolbar top/side 배치와 layout restart는 ADR-0019/0020, bounded mouse
+  drag/cancel은 ADR-0021에서 수용했다. Held-drag cyan marker의 시각 확인과 실제
+  OS focus/capture 상실, 장시간 상호작용은 남아 있다.
 - Native child canvas 위에 WebView modal/overlay가 필요한 경우 child를 잠시 숨기는
   명시적 z-order protocol이 필요하다.
 - Physical pen under panel rerender, live resize/DPI, and first-visible/present
   timing acceptance.
-- Development install remove와 activation의 physical Explorer acceptance, 그리고
-  richer recovery-state UI가 남아 있다. 설치된 release의 positional activation
+- Development install update/remove의 소유권·artwork 보존은 ADR-0033에서 검증했다.
+  실제 Explorer acceptance와 recovery dialog focus/capture는 남아 있다.
+  설치된 release의 positional activation
   probe에서는 secondary exit, primary PID 유지, 이전 project unlock, 대상 project의
   `Locked` 상태까지 확인했다. Explorer `Open with`와 실제 foreground 결과는 아직
   수동 미검증이다.
-- Top toolbar docking과 left/right stack/fill acceptance가 남아 있다.
+- Startup/Undo/reopen 및 현재 16-bit PNG export 간섭 분포, UI thread surface 대기
+  격리와 장시간 resize/minimize/Save acceptance가 남아 있다.
 - Zoom-out mip, advanced blend modes, multi-window docks, vector/text/workspace sync는
   Sprint 4 이후 범위다.
 

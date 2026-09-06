@@ -1,5 +1,16 @@
 # Sprint 1 — Godot asset 즉석 스케치
 
+## 2026-09-06 판정
+
+**설치 앱의 실제 Explorer 왕복 gate는 미완료**다. PNG/sibling·도구·저장·재열기와
+Godot의 focus 복귀 자동 재수입은 제한된 설치판 시나리오에서 검증했다.
+OpenWithProgIds 소유권 보존과 설치 갱신·제거 검증은 실제 Explorer 후보 표시를
+대신하지 않는다. [현재 gate 목록](../status-plan-2026-09-06.md),
+[Godot 증거](../decisions/ADR-0030-godot-png-acceptance.md),
+[Explorer 차이](../decisions/ADR-0033-open-with-progids.md)를 따른다.
+아래 날짜별 체크포인트는 당시 증거이며, 후속 Sprint 2 도구의 현재 활성 상태와
+혼동하지 않는다.
+
 ## 사용자 결과
 
 개발판을 현재 사용자 계정에 설치하고 Godot project의 PNG를 Windows에서 NyatiDraw로
@@ -49,7 +60,7 @@
 **소프트웨어 경로 구현, 실물/지연 gate 미종료.** Windows desktop에는 Win32
 `WM_POINTER` recorder, canvas-origin/DPI/affine viewport snapshot, bounded sample
 queue와 transition retry lane, pressure-aware round-brush evaluation, shared
-Dioxus-supplied `Device`/`Queue`의 GPU mutation path가 있다. Raw samples는
+native child canvas가 소유하는 `Device`/`Queue`의 GPU mutation path가 있다. Raw samples는
 Dioxus state를 통과하지 않는다.
 
 `Begin` 때의 viewport mapping은 active pointer에 고정되어 Move/End/Cancel이
@@ -61,8 +72,8 @@ coordinate/queue software invariant다.
 pressure 1.0 sample로 native queue에 들어간다. Windows에서는 raw hook이
 `GetMouseMovePointsEx`의 최대 64개 display-point history를 anchor 이후부터
 oldest-first로 복원하며, stale global history와 pen/touch-promoted mouse를
-거부한다. Canvas 밖에서 시작한 Windows
-pen/touch gesture는 Blitz가 처리할 수 있는 UI mouse transition으로 변환된다.
+거부한다. 과거 Native/Blitz 셸의 canvas 밖 gesture 변환 기록과 달리,
+현재 UI 컨트롤은 WebView가 소유하고 raw canvas 입력은 별도 child HWND가 처리한다.
 같은 render drain의 연속 Move dab은 generation별 한 GPU batch로 합쳐진다.
 Raw pen Update는 Win32가 한 message에 합쳐 둔 history를 oldest-first batch로
 복원하며, HIMETRIC 좌표를 fractional client pixel로 변환한다. Hover, non-pen,
@@ -131,7 +142,7 @@ continuity만 수용하고 input-to-present gate는 닫지 않는다.
   재열었다. redraw wake latch도 각 render 시작에 소비해 후속 command/materialization
   wake가 사라지지 않게 했다.
 
-아직 남은 Sprint 1 gate는 실제 펜 재확인, UI에서 draw/erase/undo/redo/save/close 전체
+당시 남은 Sprint 1 gate는 실제 펜 재확인, UI에서 draw/erase/undo/redo/save/close 전체
 수동 흐름, 설치된 Open With shell surface 확인이다. Move와 Space/middle drag는 mouse와
 pen viewport path에 연결했다. 마법봉/올가미/채우기/그라데이션과 열기 버튼은 동작하는
 척하지 않도록 disabled다.

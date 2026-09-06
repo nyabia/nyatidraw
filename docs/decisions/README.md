@@ -22,3 +22,19 @@
 | 검증 대기 | GPU→CPU materialization 방식 | readback, CPU replay, hybrid 비교 필요 |
 
 결정이 바뀌면 이 표만 덮어쓰지 않는다. `ADR-xxxx-title.md`를 추가해 상황, 선택지, 결정, 결과, 되돌림 조건을 기록한다.
+
+## 2026-09-05~06 후속 결정
+
+아래 기록은 앞 표의 당시 연결 대기 상태를 보완한다. 전체 Sprint 완료 판정은
+[현재 gate 목록](../status-plan-2026-09-06.md)을 따른다.
+
+| 범위 | 결정과 근거 |
+|---|---|
+| 선택·편집의 native 경로 | [비동기 작업](ADR-0013-asynchronous-selection-edit.md), [선택 stroke 저장](ADR-0014-selected-stroke-replay.md), [GPU clipping](ADR-0015-gpu-selected-painting.md), [native 도구](ADR-0016-native-selection-tools.md), [gesture 표시](ADR-0017-edit-gesture-guides.md) |
+| History/layer 비동기 처리 | [ADR-0018](ADR-0018-asynchronous-history-and-layers.md) |
+| 도킹 | [설정 복원](ADR-0019-workspace-layout-persistence.md), [toolbar/stack](ADR-0020-dockable-toolbar-entries.md), [mouse capture/cancel](ADR-0021-dock-pointer-capture.md) |
+| 색·기본 편집 | [HSV](ADR-0022-direct-color-picker.md), [정수 raster 변형](ADR-0023-basic-raster-transforms.md), [page 저장](ADR-0024-page-history-storage.md), [page resize/crop](ADR-0025-page-resize-crop.md) |
+| 성능 계측과 UI 대기 | [고정 histogram](ADR-0026-bounded-desktop-timing.md), [paced workload](ADR-0027-paced-desktop-performance.md), [WM_PAINT wake](ADR-0028-windows-paint-wakeup.md) |
+| PNG 색상과 Godot | [sRGB 경계](ADR-0029-srgb-boundaries.md), [실제 Godot 재수입](ADR-0030-godot-png-acceptance.md) |
+| History 복원 비용 | [GPU 타일 유지](ADR-0031-retain-unchanged-history-tiles.md), [CPU 버퍼 재사용](ADR-0032-reuse-history-cpu-buffers.md), [worker 접수→복원 frame](ADR-0034-history-adoption-frame-timing.md), [root 읽기 중복 제거](ADR-0036-deduplicate-root-object-loads.md) |
+| Windows 셸 | [Open With 소유권 보존](ADR-0033-open-with-progids.md), [초기 포커스 실패](ADR-0035-webview-startup-focus.md) |

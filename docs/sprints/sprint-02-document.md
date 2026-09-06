@@ -1,5 +1,14 @@
 # Sprint 2 — 게임 프로토타이핑 편집기
 
+## 2026-09-06 판정
+
+레이어 metadata/분기·선택/채우기·기본 변형·page resize/crop은 설치판의 bounded
+Save/Close/restart/reopen과 독립 PNG 비교를 통과했다. Godot PNG 갱신도
+[ADR-0030](../decisions/ADR-0030-godot-png-acceptance.md) 범위에서 확인했다.
+현재 저장소 최적화는 별도 프로세스 재열기와 core 검사까지 통과했으며 새 설치판
+통합 검증이 남아 있다. 이 사실만으로 반복 실사용/전체 Sprint gate를 닫지 않는다.
+[현재 gate 목록](../status-plan-2026-09-06.md)을 기준으로 이어간다.
+
 ## 사용자 결과
 
 한 장짜리 스케치판을 넘어 캐릭터, 배경, 주석과 reference를 레이어·그룹으로
@@ -21,17 +30,20 @@
    command에 연결한다. tolerance와 Reference layer 참조 범위를 명시한다.
    CPU 선택/단색/gradient 결과 및 history/reopen/PNG는
    [ADR-0012](../decisions/ADR-0012-basic-selection-and-paint.md)에서 검증했다.
-   Native gesture·비동기 실행·선택 표시·brush clipping을 연결했고 설치판 검증을 진행했다.
+   Native gesture·비동기 실행·선택 표시·brush clipping의 bounded 설치판 검증은
+   [ADR-0016](../decisions/ADR-0016-native-selection-tools.md)에 기록했다.
    선택/레이어의 수치 이동·반전·90도 회전·최근접 크기 조절과 durable 왕복은
    [ADR-0023](../decisions/ADR-0023-basic-raster-transforms.md)에 기록했다.
 4. 출력 page 크기 변경과 crop을 제공하되 page 밖 signed artwork를 자동 삭제하지
-   않는다.
+   않는다. schema v4의 atomic page/history와 설치판 resize/crop/Undo/restart는
+   [ADR-0025](../decisions/ADR-0025-page-resize-crop.md)에서 검증했다.
 5. 출력 페이지로 crop한 실제 layer thumbnail과 navigator composite/viewport box를
    제공한다.
 6. branch-preserving history 목록과 cursor를 UI projection에 연결한다. 2026-09-05에
    직접 자식 분기 선택 `RedoTo`와 64개 단위 목록 페이지를 연결했다. 설치 release에서
    66개 sibling의 목록·선택·Save/restart/reopen/export와 invalid/ambiguous 선택의
-   원본 보존을 확인했다. Layer metadata 자체의 history snapshot 복원은 남아 있다.
+   원본 보존을 확인했다. Layer metadata history 복원도
+   [ADR-0010](../decisions/ADR-0010-snapshot-layer-history.md)에서 검증했다.
 7. 반복 Save 중 오래된 export가 최신 PNG를 덮지 못하게 하고 export 실패를 project
    저장 실패와 분리해 표시한다.
 8. 실제 Godot prototype 폴더에서 반복 PNG activation과 watcher 갱신을 확인한다.
@@ -145,7 +157,8 @@ snapshot에서 제거하고 과거 snapshot에는 보존한다. 마지막 raster
 20 raster·2단계 중첩 fixture에서 metadata/삭제/분기/순서를 Save·재시작·reopen·PNG
 전체 픽셀로 검증했다. [구현 근거](../implementation.md#2026-09-05-desktop-layer-history)를
 따른다. Reference metadata는 ADR-0011에서, drag reorder UI는 ADR-0007 후속 절에서
-이어 연결했다. Per-cursor page state와 물리 drag 실사용은 남아 있다.
+이어 연결했다. Per-cursor page state는 ADR-0024/0025에서 후속 완료했다.
+물리 drag와 장시간 실사용은 별도 gate로 남는다.
 
 ### 남은 engineering evidence
 
