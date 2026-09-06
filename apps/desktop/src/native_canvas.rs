@@ -1993,22 +1993,18 @@ impl ActiveCanvas {
         {
             self.projection.stage_solo(None);
         }
-        let keys: BTreeSet<_> = self
-            .cpu_tiles
-            .keys()
-            .copied()
-            .chain(snapshot.iter().map(|(key, _)| key))
-            .collect();
-        let mut retained = 0;
+        let adoption = CpuSnapshotAdoption::new(&mut self.cpu_tiles, &snapshot);
+        let retained = if rebuild_surfaces {
+            0
+        } else {
+            adoption
+                .tiles
+                .iter()
+                .filter(|(_, changed)| !changed)
+                .count()
+        };
         let mut uploaded = 0;
-        for key in keys {
-            if !rebuild_surfaces
-                && self.cpu_tiles.get(&key).map(Vec::as_slice)
-                    == snapshot.get(key).map(nyatidraw_tiles::TileObject::pixels)
-            {
-                retained += 1;
-                continue;
-            }
+        for key in adoption.upload_keys(rebuild_surfaces) {
             if self
                 .scene
                 .tree()
@@ -2031,7 +2027,7 @@ impl ActiveCanvas {
                 "performance-history-upload rebuilt_surfaces={rebuild_surfaces} retained={retained} uploaded={uploaded}"
             );
         }
-        adopt_cpu_snapshot(&mut self.cpu_tiles, &snapshot);
+        adoption.apply();
         self.latest_preview_generation.clear();
         if self.artwork_job.is_none() {
             self.stroke.live_ink.resume_after_edit();
@@ -2761,22 +2757,58 @@ fn empty_raster(id: LayerId, name: String) -> LayerNode {
     }
 }
 
-// Keep the mutable renderer cache exactly equal to the validated snapshot,
-// while retaining allocations for surviving tiles. Missing keys must be
-// removed: an Undo to an empty layer cannot leave old artwork in this cache.
-fn adopt_cpu_snapshot(cache: &mut BTreeMap<TileKey, Vec<u8>>, snapshot: &TileSnapshot) {
-    let _timing = Span::new(Stage::HistoryCpuSnapshot);
-    cache.retain(|key, pixels| {
-        let Some(tile) = snapshot.get(*key) else {
-            return false;
-        };
-        if pixels.as_slice() != tile.pixels() {
-            tile.pixels().clone_into(pixels);
+// Compare pixels once for GPU upload and CPU adoption. Borrowing both maps
+// keeps that decision valid until all GPU uploads succeed and apply consumes
+// the plan. Dropping a failed upload's plan leaves the CPU cache unchanged.
+struct CpuSnapshotAdoption<'a> {
+    cache: &'a mut BTreeMap<TileKey, Vec<u8>>,
+    snapshot: &'a TileSnapshot,
+    tiles: Vec<(TileKey, bool)>,
+}
+
+impl<'a> CpuSnapshotAdoption<'a> {
+    fn new(cache: &'a mut BTreeMap<TileKey, Vec<u8>>, snapshot: &'a TileSnapshot) -> Self {
+        let keys: BTreeSet<_> = cache
+            .keys()
+            .copied()
+            .chain(snapshot.iter().map(|(key, _)| key))
+            .collect();
+        let tiles = keys
+            .into_iter()
+            .map(|key| {
+                let changed = cache.get(&key).map(Vec::as_slice)
+                    != snapshot.get(key).map(nyatidraw_tiles::TileObject::pixels);
+                (key, changed)
+            })
+            .collect();
+        Self {
+            cache,
+            snapshot,
+            tiles,
         }
-        true
-    });
-    for (key, tile) in snapshot.iter() {
-        cache.entry(key).or_insert_with(|| tile.pixels().to_vec());
+    }
+
+    fn upload_keys(&self, rebuild_surfaces: bool) -> impl Iterator<Item = TileKey> + '_ {
+        self.tiles
+            .iter()
+            .filter(move |(_, changed)| rebuild_surfaces || *changed)
+            .map(|(key, _)| *key)
+    }
+
+    fn apply(self) {
+        let _timing = Span::new(Stage::HistoryCpuSnapshot);
+        for (key, changed) in self.tiles {
+            if !changed {
+                continue;
+            }
+            if let Some(tile) = self.snapshot.get(key) {
+                // Reuse surviving allocations; a new key starts with an empty Vec.
+                tile.pixels().clone_into(self.cache.entry(key).or_default());
+            } else {
+                // Undo to an empty layer must not retain deleted artwork.
+                self.cache.remove(&key);
+            }
+        }
     }
 }
 
@@ -4953,18 +4985,41 @@ mod tests {
         let restored = TileKey::from_pixel(LayerId(3), 128, 129, 129);
         let mut cache = BTreeMap::new();
         // Add, modify/retain/remove, restore a removed layer, then undo all ink.
-        for entries in [
-            vec![(signed, 16), (retained, 32), (restored, 64)],
-            vec![(signed, 24), (retained, 32)],
-            vec![(retained, 32), (restored, 64)],
-            vec![],
+        for (entries, changed_keys, all_keys) in [
+            (
+                vec![(signed, 16), (retained, 32), (restored, 64)],
+                vec![signed, retained, restored],
+                vec![signed, retained, restored],
+            ),
+            (
+                vec![(signed, 24), (retained, 32)],
+                vec![signed, restored],
+                vec![signed, retained, restored],
+            ),
+            (
+                vec![(retained, 32), (restored, 64)],
+                vec![signed, restored],
+                vec![signed, retained, restored],
+            ),
+            (vec![], vec![retained, restored], vec![retained, restored]),
         ] {
             let expected: BTreeMap<_, _> = entries
                 .into_iter()
                 .map(|(key, value)| (key, vec![value; TILE_BYTE_LEN]))
                 .collect();
             let snapshot = TileSnapshot::from_tiles(expected.clone()).unwrap();
-            adopt_cpu_snapshot(&mut cache, &snapshot);
+            let adoption = CpuSnapshotAdoption::new(&mut cache, &snapshot);
+            assert_eq!(
+                adoption.upload_keys(false).collect::<Vec<_>>(),
+                changed_keys,
+                "surviving surfaces must receive every changed or deleted tile"
+            );
+            assert_eq!(
+                adoption.upload_keys(true).collect::<Vec<_>>(),
+                all_keys,
+                "recreated surfaces must also receive unchanged artwork"
+            );
+            adoption.apply();
             assert_eq!(
                 cache, expected,
                 "renderer cache must equal all authoritative pixels"

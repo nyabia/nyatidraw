@@ -38,3 +38,4 @@
 | PNG 색상과 Godot | [sRGB 경계](ADR-0029-srgb-boundaries.md), [실제 Godot 재수입](ADR-0030-godot-png-acceptance.md) |
 | History 복원 비용 | [GPU 타일 유지](ADR-0031-retain-unchanged-history-tiles.md), [CPU 버퍼 재사용](ADR-0032-reuse-history-cpu-buffers.md), [worker 접수→복원 frame](ADR-0034-history-adoption-frame-timing.md), [root 읽기 중복 제거](ADR-0036-deduplicate-root-object-loads.md) |
 | Windows 셸 | [Open With 소유권 보존](ADR-0033-open-with-progids.md), [초기 포커스 실패](ADR-0035-webview-startup-focus.md) |
+| History 비교 중복 제거 | [CPU/GPU 비교 결과 공유](ADR-0037-compare-history-tiles-once.md) |

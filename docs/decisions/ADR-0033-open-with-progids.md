@@ -64,3 +64,11 @@ same session as Explorer; package virtualization is not established as the cause
 No Explorer restart, PC restart, download process/file inspection, or PNG default
 change was performed. The actual Explorer draw/erase/Undo/Redo/Save/Close/reopen
 acceptance remains open. New-process Shell success is a narrower result.
+
+A further actual Explorer double-click after installing source `b308b9f` still
+opened the NTDR chooser without NyatiDraw in its alphabetical position. The
+computer-use helper exposed no separately targetable chooser window; returning
+to the scratch Explorer dismissed it. Read-only checks found the same extension
+default through HKCU, the current SID's HKU/Software/Classes and SID_Classes, and
+merged HKCR. This does not establish what registry view Explorer itself used.
+No additional registration or default-app changes were made for this retry.
