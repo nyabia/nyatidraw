@@ -203,6 +203,28 @@ impl DesktopCanvasHandle {
         self.activation.open_from_dialog(path)
     }
 
+    pub(crate) fn request_close(&self) {
+        // SAFETY: request the same writer-draining close as the titlebar X.
+        if let Ok(parent) = unsafe { GetParent(self.hwnd) } {
+            if self
+                .live_ink
+                .push_ui_editor_command(nyatidraw_api::EditorCommand::Project(
+                    nyatidraw_api::ProjectCommand::Save,
+                ))
+                .is_err()
+            {
+                self.live_ink.publish_activation_notice(
+                    "저장 요청을 처리 중입니다. 업데이트를 잠시 뒤 다시 시도해주세요".into(),
+                );
+                return;
+            }
+            if !crate::updates::request_restart() {
+                return;
+            }
+            let _ = unsafe { PostMessageW(Some(parent), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        }
+    }
+
     pub(crate) fn reopen_after_close_failure(&self) {
         // SAFETY: asynchronous, pointer-free message to the owned child.
         let _ = unsafe { PostMessageW(Some(self.hwnd), WM_NAYATI_REOPEN, WPARAM(0), LPARAM(0)) };
@@ -245,6 +267,17 @@ unsafe extern "system" fn close_wnd_proc(
             let _ =
                 unsafe { PostMessageW(Some(state.child), WM_NAYATI_CLOSE, WPARAM(0), LPARAM(0)) };
         }
+        return LRESULT(0);
+    }
+    if message == WM_CLOSE
+        && let Err(error) = crate::updates::apply_after_saved_close()
+    {
+        state.live_ink.publish_activation_notice(error);
+        state.live_ink.publish_close_status(CloseStatus::Failed {
+            project_saved: true,
+            project_path: String::new(),
+        });
+        let _ = unsafe { PostMessageW(Some(state.child), WM_NAYATI_REOPEN, WPARAM(0), LPARAM(0)) };
         return LRESULT(0);
     }
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
@@ -392,6 +425,7 @@ impl CanvasWindowState {
                 }
             }
             CloseStatus::Failed { .. } => {
+                crate::updates::cancel_restart();
                 let _ = unsafe { KillTimer(Some(hwnd), CLOSE_TIMER) };
             }
             _ => {}

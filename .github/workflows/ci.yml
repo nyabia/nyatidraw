@@ -3,9 +3,9 @@ name: Windows CI
 on:
   push:
     branches: [main]
-    paths-ignore: ['docs/**', 'site/**', '**.md']
+    paths-ignore: ['docs/**', 'site/**', '**.md', 'tools/build-site.ps1', '.github/workflows/pages.yml']
   pull_request:
-    paths-ignore: ['docs/**', 'site/**', '**.md']
+    paths-ignore: ['docs/**', 'site/**', '**.md', 'tools/build-site.ps1', '.github/workflows/pages.yml']
   workflow_dispatch:
 
 permissions:

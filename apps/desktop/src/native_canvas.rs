@@ -221,6 +221,22 @@ impl ProjectLocation {
             };
         }
 
+        // A normal installed launch must reopen its scratchbook on the next
+        // launch, and Save must have a visible PNG destination.
+        #[cfg(windows)]
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let directory = PathBuf::from(local).join("NyatiDraw").join("Sketchbook");
+            if let Err(error) = std::fs::create_dir_all(&directory) {
+                // Keep this destination so the ordinary project-open error is
+                // visible; do not silently fall back to a disposable document.
+                eprintln!("native-canvas event=sketchbook-directory-failed error={error}");
+            }
+            return Self::Explicit {
+                path: directory.join("작업 중.ntdr"),
+                bootstrap_png: None,
+            };
+        }
+
         let sequence = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
@@ -369,9 +385,16 @@ pub(crate) struct SharedGpuCanvas {
 
 impl SharedGpuCanvas {
     pub(crate) fn new(live_ink: LiveInkBridge) -> Self {
+        let project_location = ProjectLocation::from_environment_or_args();
+        #[cfg(windows)]
+        match &project_location {
+            ProjectLocation::Explicit { path, .. } | ProjectLocation::UntitledRecovery(path) => {
+                crate::updates::set_project_path(path.clone());
+            }
+        }
         Self {
             live_ink,
-            project_location: ProjectLocation::from_environment_or_args(),
+            project_location,
             state: CanvasState::Suspended,
             rendered_frames: 0,
             close_worker: None,
@@ -548,6 +571,10 @@ impl SharedGpuCanvas {
         match ActiveCanvas::new(device, queue, &self.live_ink, &self.project_location) {
             Ok(canvas) => {
                 self.state = CanvasState::Active(Box::new(canvas));
+                #[cfg(windows)]
+                if let ProjectLocation::Explicit { path, .. } = &self.project_location {
+                    crate::updates::set_project_path(path.clone());
+                }
                 println!(
                     "native-canvas event=activation-opened project={}",
                     self.project_location.title()

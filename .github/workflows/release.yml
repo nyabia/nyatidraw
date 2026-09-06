@@ -1,0 +1,71 @@
+name: Windows alpha release
+on:
+  push:
+    tags: ['v*-alpha.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version, for example 0.1.0-alpha.1'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: alpha-release
+  cancel-in-progress: false
+jobs:
+  package:
+    if: github.repository == 'nyabia/nyatidraw'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Resolve release version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $version = if ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { $env:GITHUB_REF_NAME -replace '^v','' }
+          if ($version -notmatch '^\d+\.\d+\.\d+-alpha\.\d+$') { throw 'Invalid alpha version' }
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+      - name: Install pinned Rust
+        run: |
+          $version = (Select-String '^channel = "([^"]+)"' rust-toolchain.toml).Matches.Groups[1].Value
+          rustup toolchain install $version --profile minimal --component clippy,rustfmt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: false
+      - name: Verify source
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --workspace --all-features --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build
+        run: |
+          ./tools/setup-ci.ps1
+          ./tools/build-dev.ps1
+      - name: Package installer and update feed
+        run: ./tools/package-release.ps1 -Version $env:RELEASE_VERSION
+      - name: Upload draft alpha release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem "target/releases/$env:RELEASE_VERSION" -File | ForEach-Object FullName
+          $notes = "Windows x64 alpha. Install and update acceptance is required before publication. See docs/public-alpha-plan-2026-09-06.md."
+          $notes | Set-Content target/release-notes.txt -Encoding utf8NoBOM
+          gh release create "v$env:RELEASE_VERSION" @files --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --draft --prerelease --title "NyatiDraw $env:RELEASE_VERSION" --notes-file target/release-notes.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

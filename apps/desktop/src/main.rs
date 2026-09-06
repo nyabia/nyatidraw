@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod color_picker;
 #[cfg(windows)]
 mod desktop_canvas;
@@ -17,6 +19,8 @@ mod preview;
 #[cfg(windows)]
 mod single_instance;
 mod transform_panel;
+#[cfg(windows)]
+mod updates;
 
 use std::time::{Duration, Instant};
 use std::{
@@ -55,6 +59,10 @@ struct NavigatorDrag {
 }
 
 fn main() {
+    #[cfg(windows)]
+    velopack::VelopackApp::build()
+        .set_auto_apply_on_startup(false)
+        .run();
     PROCESS_START.get_or_init(Instant::now);
     println!(
         "native-shell event=launch profile={} lifecycle={:?}",
@@ -87,6 +95,14 @@ fn app() -> Element {
     let live_ink = use_context::<LiveInkBridge>();
     let notifier_ink = live_ink.clone();
     use_hook(move || notifier_ink.set_ui_notifier(dioxus_core::schedule_update()));
+    #[cfg(windows)]
+    {
+        let mut update_status = use_context_provider(|| Signal::new(updates::status()));
+        let current = updates::status();
+        if *update_status.peek() != current {
+            update_status.set(current);
+        }
+    }
     let initial_dock = live_ink.protocol_snapshot().0.dock;
     let mut ui_projection = use_signal(move || {
         let mut initial = initial_ui_projection();
@@ -388,11 +404,49 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
                 TopToolbar { panel, ui_projection }
             }
             div { class: "toolbar-top-space", "data-dock-top": "" }
+            span { class: "document-name", title: "현재 그림: {ui_projection.read().document_title}", "{ui_projection.read().document_title}" }
+            UpdateControl {}
             if let Some(message) = error.read().as_ref() {
                 span { class: "commandbar-error", role: "alert", "{message}" }
             }
         }
     }
+}
+
+#[component]
+fn UpdateControl() -> Element {
+    #[cfg(windows)]
+    {
+        let host = try_use_context::<desktop_canvas::DesktopCanvasHandle>();
+        let status = use_context::<Signal<updates::Status>>().read().clone();
+        let (label, title, disabled) = match &status {
+            updates::Status::Development => return rsx! {},
+            updates::Status::Checking => ("업데이트 확인 중", "업데이트 확인 중".to_owned(), true),
+            updates::Status::Downloading => (
+                "업데이트 받는 중",
+                "작업을 계속할 수 있습니다".to_owned(),
+                true,
+            ),
+            updates::Status::Ready(version) => (
+                "저장 후 업데이트",
+                format!("{version} 적용 후 현재 그림을 다시 엽니다"),
+                false,
+            ),
+            updates::Status::Current(version) => {
+                ("업데이트 확인", format!("현재 버전 {version}"), false)
+            }
+            updates::Status::Failed(error) => ("업데이트 재시도", error.clone(), false),
+        };
+        return rsx! { button { class: "command compact", title, disabled,
+            onclick: move |_| {
+                if matches!(updates::status(), updates::Status::Ready(_)) {
+                    if let Some(host) = &host { host.request_close(); }
+                } else { updates::check(); }
+            }, "{label}"
+        } };
+    }
+    #[cfg(not(windows))]
+    rsx! {}
 }
 
 #[component]
@@ -430,7 +484,9 @@ fn FileButtons() -> Element {
                                 if let Some(file) = selected {
                                     let mut path = file.path().to_path_buf();
                                     if new_file && path.extension().is_none() { path.set_extension("ntdr"); }
-                                    let result = if new_file && (path.exists() || path.with_extension("png").exists()) {
+                                    let result = if new_file && !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("ntdr")) {
+                                        Err("새 그림은 .ntdr 확장자로 저장해주세요".into())
+                                    } else if new_file && (path.exists() || path.with_extension("png").exists()) {
                                         Err("같은 이름의 그림이 있습니다. 다른 이름을 선택하거나 기존 그림을 열어주세요".into())
                                     } else if let Some(host) = host {
                                         host.open_path(path)

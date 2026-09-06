@@ -965,7 +965,7 @@ impl LiveInkBridge {
         }
     }
 
-    fn notify_ui(&self) {
+    pub(crate) fn notify_ui(&self) {
         let notifier = self
             .inner
             .ui_notifier
