@@ -58,7 +58,7 @@ fields in the JSON are inherited host records, not new physical refresh evidence
 One actual toolbar Undo followed by 19 alternating keyboard Redo/Undo operations
 completed ten pairs. First included, no warmup omitted. Default WebView profile,
 missing scratch layout override during measurement, no override on restart.
-No concurrent build/test; other host activity uncontrolled and protected downloads
+No concurrent build/test; other host activity uncontrolled and unrelated processes
 not inspected or altered. Each operation retained 846 GPU tiles and uploaded 56.
 
 Queue/adoption/present counters and complete correlated samples are each 20;

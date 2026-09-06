@@ -49,7 +49,7 @@ One toolbar Undo click and 19 alternating keyboard Redo/Undo operations complete
 ten pairs. Every operation retained 846 GPU tiles and uploaded 56. Queue,
 changed-adoption and adoption-frame-present counters each equal 20; first sample
 included, no warmups omitted. No build/test ran during the 20 operations. Other
-host activity was uncontrolled; protected downloads were not inspected or altered.
+host activity was uncontrolled; unrelated processes were not inspected or altered.
 
 | Interval, histogram upper bounds in ms | p50 | p95 | p99 |
 |---|---:|---:|---:|

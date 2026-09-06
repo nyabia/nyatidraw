@@ -59,7 +59,7 @@ No warmup is silently removed. Whole-session frame rows include startup and idle
 redraws; matching input rows are used for interference comparisons. Histogram
 definitions and phase-boundary limitations remain those of ADR-0026. Percentiles
 are never averaged across runs. Scheduler lateness is recorded independently of
-the nominal input interval. User background downloads remain untouched and are
+the nominal input interval. Other background processes remain untouched and are
 an uncontrolled workload, so this is not an isolated CI baseline.
 
 ## Initial acceptance

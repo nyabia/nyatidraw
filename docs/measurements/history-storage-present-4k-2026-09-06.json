@@ -36,7 +36,7 @@
     "historical_tile_colors_preserved": true
   },
   "scope": "Successful history worker queue admission to the API present request of that changed snapshot adoption frame. Excludes UI/OS delivery before worker admission and GPU completion/visible pixels. One session, 20 accepted UI Undo/Redo commands; first included; no warmup excluded.",
-  "background": "Other host activity uncontrolled; no concurrent build/test during the 20 history operations; protected downloads not inspected or modified.",
+  "background": "Other host activity uncontrolled; no concurrent build/test during the 20 history operations; unrelated processes not inspected or modified.",
   "webview_profile": "Default installed application profile. Initial MoveFocus returned 0x80070057 in both measured startup and ordinary restart; the backport logged and continued.",
   "layout": "Explicit missing scratch layout during measurement, no override on ordinary restart.",
   "commands": "One screenshot-coordinate Undo click followed by 19 alternating Shift+Z/Z keyboard operations. All 20 included; no unadmitted attempts or warmups in this session.",

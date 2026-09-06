@@ -10,7 +10,7 @@
     "backend": "redb 2.6.3, CPU storage only"
   },
   "scope": "One 20-operation Undo/Redo session per variant. Storage portion only: prepare, load tiles, load tree/page, immediate cursor persistence and session adoption. Excludes worker admission, previews, UI/GPU adoption and present. Nearest-rank quantiles; first operation retained.",
-  "background": "Other host activity uncontrolled; installed editor idle; no concurrent build/test during measurement; protected downloads not inspected or altered.",
+  "background": "Other host activity uncontrolled; installed editor idle; no concurrent build/test during measurement; unrelated processes not inspected or altered.",
   "fixture": {
     "distinct_objects_at_end": 156,
     "reference": "target/paint-redraw/baseline-1/performance-scratch.ntdr",

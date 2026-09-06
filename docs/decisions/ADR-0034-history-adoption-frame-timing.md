@@ -54,7 +54,7 @@ These are one session's histogram bounds, not a before/after optimization claim.
 The 16 ms Undo target is not met. Worker-side preparation/reopen is a priority for
 additional instrumentation; do not assign exact per-stage cost by subtracting
 the percentile columns. No concurrent build/test ran during the accepted inputs;
-other host activity was uncontrolled and protected downloads were untouched.
+other host activity was uncontrolled and unrelated processes were untouched.
 
 Normal UI Save completed PNG export, normal Close drained/joined the writer, and
 the independent reference verifier reopened the closed database and compared all

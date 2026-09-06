@@ -68,7 +68,7 @@ Windows 11 Home 10.0.26200, Core Ultra 7 155H, redb **2.6.3**, Cargo **release**
 This probe uses CPU/storage; Intel Arc/DX12 is not involved. Fixture: 3840×2160,
 two raster layers, 32 strokes, 33 history nodes. Other host activity was
 uncontrolled, the installed editor was idle, and no build/test ran concurrently.
-Protected downloads were not inspected or modified.
+Unrelated processes were not inspected or modified.
 
 Each variant is one session of 20 alternating Undo/Redo operations, with no
 warmup discarded. Values below are nearest-rank quantiles of raw microsecond
@@ -84,7 +84,7 @@ samples, converted to milliseconds, not histogram bounds.
 The after run's first immediate cursor persistence took **204.677 ms**. This
 outlier is retained; it makes the total p99 worse despite the tile-load gain.
 The cause of that storage tail has not been established. Do not discard it or
-assign it to downloads, antivirus, hardware or the patch without evidence.
+assign it to background workloads, hardware or the patch without evidence.
 
 The measured total starts before cursor preparation and ends after session
 adoption. It excludes worker queueing, navigator/thumbnails, canvas adoption,
@@ -112,7 +112,7 @@ One toolbar Undo click followed by 19 alternating keyboard Redo/Undo operations
 completed ten pairs. All 20 samples include the first operation, with no warmup
 excluded. Queue admission, changed adoption and adoption-frame presentation
 counters are each 20. No build/test ran concurrently; other host activity was
-uncontrolled and protected downloads were not inspected or altered.
+uncontrolled and unrelated processes were not inspected or altered.
 
 | Interval, histogram upper bounds in ms | p50 | p95 | p99 |
 |---|---:|---:|---:|

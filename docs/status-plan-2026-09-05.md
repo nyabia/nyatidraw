@@ -841,7 +841,7 @@ UI acceptance다. 표시 색상 보정·물리 펜·가시 픽셀 latency gate�
 실행 환경·로그·범위를 기록했다. 다음에 사용자가 재개를 요청하면 준비된
 `target/history-upload/page/page-scratch.ntdr`로 page-size fallback과 layer-tree
 복원을 먼저 확인한다. 이후 CPU 복사 비용, UI thread surface 대기와 기존 미완료
-성능·장시간 gate를 진행한다. 사용자의 다운로드 PID 11716 및 파일은 건드리지 않았다.
+성능·장시간 gate를 진행한다.
 
 ### 2026-09-06 재개: 페이지·레이어 전체 복원 검증 완료
 
