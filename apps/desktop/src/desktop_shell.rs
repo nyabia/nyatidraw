@@ -79,23 +79,6 @@ fn launch_with_instance(
             }
         });
 
-    // Keep the disposable browser profile separate from recovery projects and
-    // layout data. Dioxus' executable-stem default shares the NyatiDraw root.
-    // Do not delete or migrate an existing browser profile during startup.
-    #[cfg(windows)]
-    let config = if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        let profile = std::path::PathBuf::from(local)
-            .join("NyatiDraw")
-            .join("WebView2");
-        println!(
-            "desktop-shell event=webview-profile path={} existing-data=preserved",
-            profile.display()
-        );
-        config.with_data_directory(profile)
-    } else {
-        config
-    };
-
     dioxus::LaunchBuilder::desktop()
         .with_cfg(config)
         .launch(app);
