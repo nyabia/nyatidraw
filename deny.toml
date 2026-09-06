@@ -1,0 +1,18 @@
+# Windows alpha dependency check; run with cargo-deny 0.20.2.
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = true
+
+[licenses]
+allow = [
+    "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib",
+    "Unicode-3.0", "CC0-1.0", "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Transitive duplicates are informational, not an optimization task.
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

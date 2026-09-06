@@ -85,3 +85,16 @@ GitHub Windows runner에서 기존 테스트·Clippy·release 빌드까지 통�
 Pages 환경의 deployment branch 정책은 `main` 브랜치와 `v*-alpha.*` 태그를 허용한다.
 릴리스 이벤트의 실행 ref는 태그이므로 태그 정책이 없으면 checkout을 main으로 지정해도
 배포가 거절된다. 첫 릴리스에서 이를 확인하고 알파 태그 정책을 추가했다.
+
+## 간단한 의존성 점검
+
+2026-09-06 cargo-deny **0.20.2**, `cargo deny check`, `deny.toml`의 Windows x64 /
+all-features 범위로 점검했다. 라이선스와 출처 검사는 통과했다.
+전체 종료 코드는 1이며, 검출된 advisory는 아래 유지보수 중단 2건이다.
+
+- `derivative 2.2.0` (Velopack 경유): [RUSTSEC-2024-0388](https://rustsec.org/advisories/RUSTSEC-2024-0388)
+- `paste 1.0.15` (그래픽/이미지 의존성 경유): [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436)
+
+이번 Windows 의존성 그래프에서 취약점 advisory는 검출되지 않았다. 중복 버전 경고는
+33건이었다. 가벼운 현황 점검으로 남기며 예외로 숨기거나 의존성을 교체하지 않았다.
+원본 결과는 `target/public-alpha-tools/cargo-deny-summary.txt`에 있다.
