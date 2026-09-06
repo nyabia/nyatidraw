@@ -1,5 +1,20 @@
 # 성능 계약
 
+## 2026-09-06 Undo 대기열부터 화면 제출까지
+
+4K 작품의 실제 Undo/Redo 20회에서 worker queue 접수 → 복원 frame의 present API
+반환까지 p50/p95/p99 상한은 **131.071/155.647/164.815ms**였다. 접수·변경 복원·해당
+frame 제출은 모두 20회였다. 복원 함수 내부만의 p95는 같은 세션에서 30.719ms여서
+이 구간만으로 사용자 대기를 판단할 수 없다. Undo 16ms 목표는 미통과다.
+OS/UI 명령 전달 전 대기와 물리 가시 픽셀은 측정하지 않는다.
+
+독립 WebView 프로필로 정상 실행된 한 세션의 조건부 결과다. 기본 프로필과 이후
+재시작에서 WebView2 초기화 오류가 발생해 GUI 재시작 gate는 미완료로 남긴다.
+Save/Close 후 별도 프로세스의 전체 artwork/tree/page/PNG 검증은 통과했다.
+[전체 행·환경](measurements/history-present-4k-2026-09-06.json)과
+[계측 경계·누락 횟수·실행 한계](decisions/ADR-0034-history-adoption-frame-timing.md)를
+함께 읽는다.
+
 ## 2026-09-06 CPU 타일 버퍼 재사용
 
 같은 4K fixture를 오늘 환경에서 전후 각각 Undo/Redo 20회 측정했다. History
