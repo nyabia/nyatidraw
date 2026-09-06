@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["third_party/wry"]
 members = [
     "apps/cli",
     "apps/desktop",
@@ -52,6 +53,11 @@ png = "=0.17.16"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+
+# Wry #1799 backport for the version required by Dioxus Desktop 0.7.9.
+# See third_party/wry/NYATIDRAW.md for provenance and removal criteria.
+[patch.crates-io]
+wry = { path = "third_party/wry" }
 
 [workspace.lints.clippy]
 all = "warn"
