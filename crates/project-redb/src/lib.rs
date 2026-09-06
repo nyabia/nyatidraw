@@ -1649,7 +1649,10 @@ mod tests {
             drop(database);
             let before_reopen = std::fs::read(&path).unwrap();
             assert!(
-                matches!(ProjectDb::open(&path), Err(ProjectOpenError::Corrupt { .. })),
+                matches!(
+                    ProjectDb::open(&path),
+                    Err(ProjectOpenError::Corrupt { .. })
+                ),
                 "{fault}"
             );
             assert_eq!(std::fs::read(&path).unwrap(), before_reopen);

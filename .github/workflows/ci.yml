@@ -1,0 +1,52 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['docs/**', 'site/**', '**.md']
+  pull_request:
+    paths-ignore: ['docs/**', 'site/**', '**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: |
+          $version = (Select-String '^channel = "([^"]+)"' rust-toolchain.toml).Matches.Groups[1].Value
+          rustup toolchain install $version --profile minimal --component clippy,rustfmt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: false
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Core artwork, input and recovery tests
+        run: cargo test --workspace --all-features --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Install verified Dioxus CLI
+        run: ./tools/setup-ci.ps1
+      - name: Build Windows release app
+        run: ./tools/build-dev.ps1
