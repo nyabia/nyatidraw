@@ -1,7 +1,7 @@
 # ADR-0036: Validate repeated root objects once per load
 
 - Date: 2026-09-06
-- Status: Accepted for storage correctness and isolated release improvement; new GUI timing pending
+- Status: Accepted for storage correctness, installed round trip and bounded release improvement; whole-Undo target remains open
 
 ## Problem and decision
 
@@ -59,9 +59,8 @@ scratch copies. Each operation persists its cursor with immediate durability.
 After each variant exits, the separate reference verifier reopens its database
 and matches all 902 tiles, tree/page, snapshot 33, history count 33 and decoded
 PNG to the original. Both passed. This is process restart verification of the
-storage path; the optimized loader has not yet completed a new installed GUI
-Save/Close/reopen campaign. The existing installed app was left running after
-the computer-use foreground PID failure recorded in ADR-0035.
+storage path. The subsequent installed GUI Save/Close/reopen campaign is
+recorded below; the temporary computer-use foreground failure was recovered.
 
 ## Release measurement
 
@@ -90,8 +89,8 @@ assign it to downloads, antivirus, hardware or the patch without evidence.
 The measured total starts before cursor preparation and ends after session
 adoption. It excludes worker queueing, navigator/thumbnails, canvas adoption,
 composite/present, UI/OS delivery and visible pixels. No whole-Undo 16 ms pass
-or replacement of ADR-0034's actual UI measurement is claimed. Next: installed
-GUI acceptance, new queue-to-present distribution and persistence-tail analysis.
+or replacement of actual UI measurement is claimed. The subsequent UI campaign
+is below; persistence-tail analysis remains open.
 
 Reproduce with `desktop_performance_fixture measure-history-storage` on a
 separate `performance-scratch.ntdr` whose parent contains
@@ -99,3 +98,43 @@ separate `performance-scratch.ntdr` whose parent contains
 reference. The helper never exports over the reference. Raw logs and complete
 sample rows are linked in
 [measurement JSON](../measurements/history-storage-4k-2026-09-06.json).
+
+## Installed GUI acceptance and timing
+
+Installed release source `b308b9f` includes storage change `b603673` and the Wry
+focus backport. Executable SHA-256:
+`897CC1AECA92809561BB774F251F99216BF138D9BC232BE7339C5AED8452C1ED`.
+Same Windows/Core Ultra host, Intel Arc DX12, pinned Dioxus CLI 0.7.9 release,
+2096×1458 native surface at scale 2; same 4K historical artwork. Display settings
+in the JSON are inherited host records, not a new physical refresh measurement.
+
+One toolbar Undo click followed by 19 alternating keyboard Redo/Undo operations
+completed ten pairs. All 20 samples include the first operation, with no warmup
+excluded. Queue admission, changed adoption and adoption-frame presentation
+counters are each 20. No build/test ran concurrently; other host activity was
+uncontrolled and protected downloads were not inspected or altered.
+
+| Interval, histogram upper bounds in ms | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| History adoption | 17.407 | 19.455 | 19.833 |
+| CPU snapshot update | 7.423 | 8.802 | 8.802 |
+| Worker queue admission → adoption | 36.863 | 38.512 | 38.512 |
+| Worker queue admission → restored frame present API | 51.199 | 55.728 | 55.728 |
+
+ADR-0034 recorded 131.071/155.647/164.815 ms for the last interval. This is a
+same-host, same-artwork comparison across separate sessions, not a randomized
+or strictly controlled A/B: the WebView profile and focus handling also differ.
+The isolated probe above independently measures the storage change. The whole
+Undo 16 ms target still fails. These timings exclude UI/OS delivery before worker
+admission, GPU completion and visible pixels; stage percentiles are not additive.
+
+Save completed PNG generation, then normal Close drained and joined the writer.
+A separate process matched all 902 tiles, tree/page, snapshot 33, history count
+33 and decoded PNG exactly. An ordinary installed restart without environment
+overrides displayed the artwork; normal Close and a second independent full
+comparison passed. Both GUI launches logged the deferred initial-focus error
+0x80070057 and continued, exercising the backport in the actual installed app.
+
+Raw evidence: `target/history-storage/ui/` (`out.log`, `verify.log`,
+`reopen-out.log`, `reopen-verify.log`, binary hash and scratch project/PNG).
+[All timing rows and campaign conditions](../measurements/history-storage-present-4k-2026-09-06.json).

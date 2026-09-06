@@ -5,8 +5,9 @@
 레이어 metadata/분기·선택/채우기·기본 변형·page resize/crop은 설치판의 bounded
 Save/Close/restart/reopen과 독립 PNG 비교를 통과했다. Godot PNG 갱신도
 [ADR-0030](../decisions/ADR-0030-godot-png-acceptance.md) 범위에서 확인했다.
-현재 저장소 최적화는 별도 프로세스 재열기와 core 검사까지 통과했으며 새 설치판
-통합 검증이 남아 있다. 이 사실만으로 반복 실사용/전체 Sprint gate를 닫지 않는다.
+현재 저장소 최적화는 core 검사와 새 설치판 4K Undo/Redo 20회·Save/Close/일반
+재시작·전체 artwork/PNG 비교까지 통과했다. 이 사실만으로 반복 실사용/전체
+Sprint gate를 닫지 않는다. Undo 지연 16ms 목표는 여전히 미통과다.
 [현재 gate 목록](../status-plan-2026-09-06.md)을 기준으로 이어간다.
 
 ## 사용자 결과

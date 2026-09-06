@@ -101,3 +101,18 @@ This closes the identified fatal focus handling defect. It does not prove all
 WebView initialization failures are
 recoverable, initial keyboard focus is always assigned, Explorer Open With is
 fixed, or hardware input/display performance gates pass.
+
+## Subsequent installed error-path acceptance
+
+The computer-use helper recovered on a later observation. The second instance
+was normally closed and its full independent comparison passed
+(`target/history-present/focus-fix-2-verify.log`); no forced termination was used.
+The helper failure's cause was not established.
+
+The subsequent storage-optimized installed application, PID 35024 and ordinary
+restart PID 42084, both logged `initial-focus-deferred` with 0x80070057 and
+continued. The first completed 20 actual UI Undo/Redo operations, Save and normal
+Close; the second displayed the saved 4K artwork and normally closed. Both full
+independent artwork/PNG comparisons passed. Unlike the earlier two launches,
+these exercise the nonfatal error branch in the real installed editor.
+See [ADR-0036](ADR-0036-deduplicate-root-object-loads.md) for source, hash and logs.

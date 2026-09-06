@@ -1,5 +1,17 @@
 # 성능 계약
 
+## 2026-09-06 저장소 수정 후 설치판 전체 Undo
+
+실제 UI Undo/Redo 20회의 worker 접수→복원 frame present API 시간은 p50/p95/p99
+상한 **51.199/55.728/55.728ms**였다. 접수·변경 복원·해당 frame 제출은 모두 20회다.
+이전 동일 호스트·그림의 131.071/155.647/164.815ms보다 낮지만 WebView 프로필과
+포커스 수정도 달라 엄격한 A/B는 아니다. **Undo 16ms 목표는 여전히 미통과**다.
+접수 이전 OS/UI 전달과 GPU 완료·실제 가시 픽셀은 포함하지 않는다.
+
+Save/정상 Close/일반 설치판 재시작과 두 번의 별도 프로세스 전체 artwork/PNG
+비교를 통과했다. [환경·전체 행](measurements/history-storage-present-4k-2026-09-06.json),
+[검증 범위](decisions/ADR-0036-deduplicate-root-object-loads.md).
+
 ## 2026-09-06 저장소의 중복 타일 읽기 제거
 
 한 root 안에서 같은 객체를 중복으로 읽고 검증하던 작업을 줄였다. 4K 기준
@@ -11,7 +23,7 @@
 
 CPU/저장소만의 별도 측정이다. 실제 UI Undo 전체 시간과 물리 표시 지연을
 대신하지 않는다. 두 scratch의 종료 후 전체 artwork/PNG 재열기 비교와 workspace
-검사는 통과했다. 새 설치판 UI 측정은 남아 있다.
+검사는 통과했다. 후속 설치판 UI 측정은 위 절에 기록했다.
 [원본 표본과 환경](measurements/history-storage-4k-2026-09-06.json),
 [검증 계약과 한계](decisions/ADR-0036-deduplicate-root-object-loads.md).
 
