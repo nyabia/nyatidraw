@@ -1,5 +1,17 @@
 # 성능 계약
 
+## 2026-09-06 CPU 타일 버퍼 재사용
+
+같은 4K fixture를 오늘 환경에서 전후 각각 Undo/Redo 20회 측정했다. History
+adoption CPU p50/p95/p99 상한은 전체 CPU 복사 때 45.055/48.369/48.369ms,
+버퍼 재사용과 GPU upload 임시 복사 제거 뒤 21.503/23.161/23.161ms였다.
+새로 분리한 CPU snapshot 갱신 구간은 8.703/9.727/10.105ms였다.
+원본 전체 artwork/PNG, Save/정상 종료/일반 재시작 검증을 통과했다.
+이 수치는 command/worker 대기와 composite/present를 제외하며 Undo 전체 16ms
+목표를 통과한 것이 아니다. 한 세션씩 20회이고 첫 복원도 포함했다.
+환경과 모든 stage 원본 행은 [JSON](measurements/history-cpu-reuse-4k-2026-09-06.json),
+변경·검증 범위는 [ADR-0032](decisions/ADR-0032-reuse-history-cpu-buffers.md)에 기록했다.
+
 ## 최신 국소 측정: 4K history 타일 재사용
 
 동일 4K 작품의 UI Undo/Redo 각 20회에서 history adoption CPU 구간의 p50/p95/p99

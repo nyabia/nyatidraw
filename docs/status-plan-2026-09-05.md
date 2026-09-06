@@ -840,3 +840,16 @@ UI acceptance다. 표시 색상 보정·물리 펜·가시 픽셀 latency gate�
 최적화를 건너뛰고 전체 복원 경로를 사용했다. 다섯 세션 모두 정상 writer join과
 빈 stderr를 확인했다. ADR-0031은 해당 최적화 범위에서 accepted로 갱신했다.
 새 단위 테스트는 추가하지 않았으며 기존 fixture의 삭제 상태 oracle만 확장했다.
+
+### 2026-09-06 CPU 버퍼 재사용과 재측정
+
+`07ef0c7`에서 Undo마다 전체 CPU 타일 버퍼를 다시 만들던 경로를, 삭제된 key 제거·
+변경된 byte만 기존 버퍼에 복사·새 key만 할당하는 방식으로 바꿨다. GPU 업로드의
+임시 tile 복사도 제거했다. 삭제/변경/유지/레이어 복원/전체 Undo를 다루는 작은
+table invariant 하나를 추가했다. Desktop test 16개와 전체 Clippy, release 설치가
+통과했다. 오늘 환경의 전후 20회에서 adoption CPU p95는 48.369→23.161ms였다.
+전체 artwork/history/tree/page/PNG와 정상 종료·일반 재시작 검증이 통과했다.
+ADR-0032와 JSON에 범위·원본 행을 기록했다. Undo 전체 latency 통과는 아니다.
+
+다음은 Sprint 1의 실제 Explorer Open With/직접 project activation 흐름을 확인하고,
+UI thread surface 대기 및 남은 startup/reopen/undo·장시간 gate를 진행한다.

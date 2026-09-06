@@ -1,6 +1,7 @@
 # ADR-0032: Reuse mutable CPU tile buffers during history adoption
 
-Status: implemented; installed comparison and restart acceptance pending.
+Status: accepted for CPU buffer reuse; installed comparison and restart passed.
+End-to-end Undo and input latency gates remain open.
 
 After ADR-0031, unchanged GPU tiles survived, but every history adoption still
 allocated and copied the complete CPU tile cache. In the 902-tile 4K fixture
@@ -39,3 +40,23 @@ recorded historical colors. Other host activity is uncontrolled; protected
 download processes/files were not inspected or modified. Build/test work was
 finished before collecting the UI samples. Repeat after installation and
 verify actual reopen before accepting this optimization.
+
+## Installed result
+
+Pinned-DX installation passed (`target/history-cpu-reuse-install.log`). The new
+executable SHA256 is
+`96bbfa0ecea62d38f44574b627088aedf5001525d372259d839e8de0a0556140`.
+The same 20 UI restorations all completed with 846 retained/56 uploaded GPU
+tiles per operation. Adoption CPU p50/p95/p99 upper bounds were
+21.503/23.161/23.161ms, min 18.069ms and max 23.161ms. The nested CPU snapshot
+update alone measured 8.703/9.727/10.105ms. The overall adoption improvement
+includes both CPU buffer retention and borrowing upload bytes; it does not
+isolate their separate contributions. One before and one after session cannot
+establish long-session p99 or the full 16ms Undo goal.
+
+Save/normal Close matched every reference tile, snapshot 33/history 33,
+tree/page and PNG. An ordinary installed restart displayed the restored 4K
+artwork, then normal Close and separate-process verification passed again.
+Both measured sessions and the reopen joined their writers with empty stderr.
+Logs are under `target/history-cpu-reuse/{before,after}/`; structured rows and
+scope are in [the measurement JSON](../measurements/history-cpu-reuse-4k-2026-09-06.json).
