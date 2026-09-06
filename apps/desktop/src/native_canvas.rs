@@ -40,7 +40,7 @@ use crate::{
     edit_worker::{EditFailure, EditOutcome},
     elapsed_since_launch,
     live_ink::{AdmittedSample, CloseStatus, ExportStatus, InputDiscontinuity, LiveInkBridge},
-    performance::{HistoryTiming, Span, Stage},
+    performance::{HistoryTiming, HistoryWorkerStep, HistoryWorkerTiming, Span, Stage},
     preview::{
         LAYER_THUMBNAIL_MAX_HEIGHT, LAYER_THUMBNAIL_MAX_WIDTH, MAX_LAYER_THUMBNAILS,
         NAVIGATOR_MAX_HEIGHT, NAVIGATOR_MAX_WIDTH, NavigatorViewport, layer_thumbnail_frame,
@@ -2125,7 +2125,7 @@ impl ActiveCanvas {
             }
         };
         let active_layer = job.active_layer;
-        let history_timing = job.history_timing;
+        let mut history_timing = job.history_timing;
         let mut history_changed = false;
         let mut error = None;
         match result {
@@ -2138,6 +2138,7 @@ impl ActiveCanvas {
                             canvas: outcome.canvas,
                             tree: None,
                             history: outcome.history,
+                            worker_timing: None,
                         })
                         .is_err()
                 {
@@ -2154,6 +2155,9 @@ impl ActiveCanvas {
                 }
             }
             Ok(ArtworkOutcome::History(moved)) => {
+                if let Some(timing) = &mut history_timing {
+                    timing.received(moved.worker_timing);
+                }
                 let changed = moved.tiles.is_some();
                 if let Some(active) = active_layer {
                     self.active_layer = active;
@@ -2192,8 +2196,8 @@ impl ActiveCanvas {
             .get_or_insert(self.projection.current().revision);
         self.publish_committed_history();
         println!("native-canvas event=artwork-adopted selected_pixels={selected_pixels} pending=0");
-        let timing = history_timing.filter(|_| history_changed);
-        if let Some(timing) = timing {
+        let mut timing = history_timing.filter(|_| history_changed);
+        if let Some(timing) = &mut timing {
             timing.adopted();
         }
         timing
@@ -3774,6 +3778,7 @@ struct HistoryMove {
     canvas: Option<CanvasSpec>,
     tree: Option<LayerTree>,
     history: HistoryProjection,
+    worker_timing: Option<HistoryWorkerTiming>,
 }
 
 enum ProjectSink {
@@ -4372,12 +4377,14 @@ fn materialization_loop(
                 continue;
             }
             WorkerRequest::MoveHistory { command, reply } => {
+                let mut worker_timing = HistoryWorkerTiming::begin();
                 if let nyatidraw_api::HistoryCommand::ShowRedoBranches { after } = command {
                     let _ = reply.send(Ok(ArtworkOutcome::History(HistoryMove {
                         tiles: None,
                         canvas: None,
                         tree: None,
                         history: session.history_projection_after(after),
+                        worker_timing: None,
                     })));
                     live_ink.request_redraw();
                     continue;
@@ -4392,9 +4399,10 @@ fn materialization_loop(
                         unreachable!("handled above")
                     }
                 };
-                let result = prepared
+                let mut result = prepared
                     .map_err(|error| EditFailure::Rejected(format!("history-prepare:{error:?}")))
                     .and_then(|prepared| {
+                        HistoryWorkerTiming::mark(&mut worker_timing, HistoryWorkerStep::Prepared);
                         let target = prepared.target();
                         let db = match sink {
                             ProjectSink::UntitledRecovery { db, .. }
@@ -4403,6 +4411,10 @@ fn materialization_loop(
                         let tiles = db
                             .load_cursor_tiles(target)
                             .map_err(|error| EditFailure::Fatal(format!("history-load:{error}")))?;
+                        HistoryWorkerTiming::mark(
+                            &mut worker_timing,
+                            HistoryWorkerStep::TilesLoaded,
+                        );
                         let tree = db
                             .load_cursor_layer_tree(target)
                             .map_err(|error| {
@@ -4412,14 +4424,26 @@ fn materialization_loop(
                         let canvas = db.load_cursor_canvas_spec(target).map_err(|error| {
                             EditFailure::Fatal(format!("history-page-load:{error}"))
                         })?;
+                        HistoryWorkerTiming::mark(
+                            &mut worker_timing,
+                            HistoryWorkerStep::MetadataLoaded,
+                        );
                         db.persist_history_cursor(target).map_err(|error| {
                             EditFailure::Fatal(format!("history-persist:{error}"))
                         })?;
+                        HistoryWorkerTiming::mark(
+                            &mut worker_timing,
+                            HistoryWorkerStep::CursorPersisted,
+                        );
                         session
                             .accept_history_cursor_move(prepared, tiles.clone())
                             .map_err(|error| {
                                 EditFailure::Fatal(format!("history-accept:{error:?}"))
                             })?;
+                        HistoryWorkerTiming::mark(
+                            &mut worker_timing,
+                            HistoryWorkerStep::SessionAccepted,
+                        );
                         preview_tree = tree.clone();
                         preview_canvas = canvas;
                         selection = None;
@@ -4428,6 +4452,7 @@ fn materialization_loop(
                             canvas: Some(canvas),
                             tree: Some(tree),
                             history: session.history_projection(),
+                            worker_timing: None,
                         })
                     });
                 let failed = matches!(result, Err(EditFailure::Fatal(_)));
@@ -4451,6 +4476,10 @@ fn materialization_loop(
                         raster_layer_ids(&preview_tree),
                         preview_canvas,
                     );
+                }
+                HistoryWorkerTiming::mark(&mut worker_timing, HistoryWorkerStep::ReplyReady);
+                if let Ok(moved) = &mut result {
+                    moved.worker_timing = worker_timing;
                 }
                 let _ = reply.send(result.map(ArtworkOutcome::History));
                 live_ink.request_redraw();
@@ -4518,6 +4547,7 @@ fn materialization_loop(
                         canvas: None,
                         tree: Some(tree),
                         history: session.history_projection(),
+                        worker_timing: None,
                     })
                 })();
                 if let Err(error) = &result {

@@ -10,6 +10,7 @@ use std::{
 };
 
 const BINS: usize = 1024;
+const HISTORY_SAMPLE_CAPACITY: usize = 64;
 const STAGES: [&str; 20] = [
     "input_batch_to_dequeue",
     "input_batch_to_present_request",
@@ -63,26 +64,138 @@ pub(crate) enum Stage {
 pub(crate) struct HistoryTiming {
     at: Instant,
     exporting: bool,
+    sequence: u64,
+    worker: Option<HistoryWorkerTiming>,
+    received: Option<Instant>,
+    adopted: Option<Instant>,
 }
 
 impl HistoryTiming {
     pub(crate) fn queued() -> Option<Self> {
         let at = start()?;
-        with_recorder(|r| r.history_queued = r.history_queued.saturating_add(1));
+        let mut sequence = 0;
+        with_recorder(|r| {
+            r.history_queued = r.history_queued.saturating_add(1);
+            sequence = r.history_queued;
+        });
         Some(Self {
             at,
             exporting: EXPORTING.load(Ordering::Relaxed),
+            sequence,
+            worker: None,
+            received: None,
+            adopted: None,
         })
     }
 
-    pub(crate) fn adopted(self) {
+    pub(crate) fn received(&mut self, worker: Option<HistoryWorkerTiming>) {
+        self.received = Some(Instant::now());
+        self.worker = worker;
+    }
+
+    pub(crate) fn adopted(&mut self) {
+        self.adopted = Some(Instant::now());
         record(Stage::HistoryQueueToAdoption, self.at, self.exporting);
         with_recorder(|r| r.history_adopted = r.history_adopted.saturating_add(1));
     }
 
     pub(crate) fn presented(self) {
+        let presented = Instant::now();
         record(Stage::HistoryQueueToPresent, self.at, self.exporting);
-        with_recorder(|r| r.history_presented = r.history_presented.saturating_add(1));
+        with_recorder(|r| {
+            r.history_presented = r.history_presented.saturating_add(1);
+            if let (Some(worker), Some(received), Some(adopted)) =
+                (self.worker, self.received, self.adopted)
+            {
+                if r.history_samples.len() < HISTORY_SAMPLE_CAPACITY {
+                    r.history_samples.push(HistorySample {
+                        sequence: self.sequence,
+                        exporting: self.exporting,
+                        admission: self.at,
+                        worker,
+                        received,
+                        adopted,
+                        presented,
+                    });
+                } else {
+                    r.history_samples_omitted = r.history_samples_omitted.saturating_add(1);
+                }
+            }
+        });
+    }
+}
+
+/// Seven boundaries belonging to one successful history worker response.
+#[derive(Clone, Copy)]
+pub(crate) struct HistoryWorkerTiming([Instant; 7]);
+
+pub(crate) enum HistoryWorkerStep {
+    Prepared = 1,
+    TilesLoaded,
+    MetadataLoaded,
+    CursorPersisted,
+    SessionAccepted,
+    ReplyReady,
+}
+
+impl HistoryWorkerTiming {
+    pub(crate) fn begin() -> Option<Self> {
+        start().map(|at| Self([at; 7]))
+    }
+
+    pub(crate) fn mark(timing: &mut Option<Self>, step: HistoryWorkerStep) {
+        if let Some(timing) = timing {
+            timing.0[step as usize] = Instant::now();
+        }
+    }
+}
+
+struct HistorySample {
+    sequence: u64,
+    exporting: bool,
+    admission: Instant,
+    worker: HistoryWorkerTiming,
+    received: Instant,
+    adopted: Instant,
+    presented: Instant,
+}
+
+impl HistorySample {
+    fn print(&self, owner: &str) {
+        let [
+            started,
+            prepared,
+            loaded,
+            metadata,
+            persisted,
+            accepted,
+            ready,
+        ] = self.worker.0;
+        let micros = |end: Instant, begin: Instant| {
+            end.saturating_duration_since(begin)
+                .as_nanos()
+                .div_ceil(1000)
+        };
+        let export = if self.exporting { "active" } else { "inactive" };
+        // Admission is stamped after try_send succeeds. A worker may begin
+        // before that stamp; expose the overlap instead of claiming queue wait.
+        println!(
+            "performance-history-sample owner={owner} sequence={} export={export} worker_before_admission={} queue_wait_us={} prepare_us={} tile_load_us={} metadata_us={} persist_us={} session_accept_us={} preview_reply_us={} worker_total_us={} reply_wait_us={} adoption_publish_us={} after_adoption_us={} total_us={} claim=cpu-api-only",
+            self.sequence,
+            started < self.admission,
+            micros(started, self.admission),
+            micros(prepared, started),
+            micros(loaded, prepared),
+            micros(metadata, loaded),
+            micros(persisted, metadata),
+            micros(accepted, persisted),
+            micros(ready, accepted),
+            micros(ready, started),
+            micros(self.received, ready),
+            micros(self.adopted, self.received),
+            micros(self.presented, self.adopted),
+            micros(self.presented, self.admission),
+        );
     }
 }
 
@@ -187,6 +300,8 @@ struct Recorder {
     history_queued: u64,
     history_adopted: u64,
     history_presented: u64,
+    history_samples: Vec<HistorySample>,
+    history_samples_omitted: u64,
 }
 
 thread_local! {
@@ -202,6 +317,8 @@ fn with_recorder(f: impl FnOnce(&mut Recorder)) {
             history_queued: 0,
             history_adopted: 0,
             history_presented: 0,
+            history_samples: Vec::with_capacity(HISTORY_SAMPLE_CAPACITY),
+            history_samples_omitted: 0,
         }));
     });
 }
@@ -269,6 +386,15 @@ pub(crate) fn flush(owner: &str) {
         println!(
             "performance-history owner={owner} queued={} changed_adopted={} adoption_frame_presented={} claim=cpu-api-only",
             recorder.history_queued, recorder.history_adopted, recorder.history_presented
+        );
+        for sample in &recorder.history_samples {
+            sample.print(owner);
+        }
+        println!(
+            "performance-history-samples owner={owner} recorded={} omitted={} capacity={HISTORY_SAMPLE_CAPACITY} reserved_bytes={} scope=changed-presented-history",
+            recorder.history_samples.len(),
+            recorder.history_samples_omitted,
+            recorder.history_samples.capacity() * std::mem::size_of::<HistorySample>()
         );
     }
 }
