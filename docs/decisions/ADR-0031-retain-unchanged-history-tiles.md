@@ -1,7 +1,7 @@
 # ADR-0031: Retain unchanged GPU tiles during history adoption
 
-Status: implemented; installed 4K before/after and restart passed. Page/tree
-fallback acceptance remains pending at the user's stop request.
+Status: accepted for unchanged tile/cache retention. Installed 4K before/after,
+restart, and page/tree fallback acceptance passed. Broader latency gates remain open.
 
 Undo/Redo and asynchronous edits previously uploaded the union of every old
 and new CPU tile, including byte-identical tiles. History cursor moves also
@@ -74,3 +74,32 @@ copy at `target/history-upload/page/page-scratch.ntdr` is prepared but has not
 been launched or modified. Next, verify page-size and layer-tree fallback
 restoration, then examine remaining adoption CPU copies and UI-thread surface
 waiting. Do not mark the broader performance or Sprint 1–3 gates complete.
+
+## 2026-09-06 page/tree fallback acceptance
+
+Work resumed on the same verified installed binary. The prepared crop scratch
+was opened normally, then Undo grew its page from 2×2 to the original 16×16.
+Fit showed the original green/red pixels, the translucent locked-layer pixel
+and blue artwork outside the page. Save/normal Close and an independent point
+oracle passed all signed/locked/hidden tiles, page/PPI, snapshot 1/history 4 and
+PNG. An ordinary restart displayed the same result; Redo restored the 2×2 crop,
+including artwork translated outside it, then Save/Close verified snapshot
+2/history 4. Both transitions logged full rebuild, zero retained and seven
+uploaded tiles (including clearing old keys).
+
+Another restart confirmed the crop. Deleting its nonempty ink layer removed
+page and off-page ink while preserving the locked and hidden layers. Save/Close
+verified snapshot 5/history 5 and the entire remaining tile/tree/page/PNG state
+against independently filtered fixture points. The deleted state reopened
+normally; Undo recreated the missing raster and all its artwork. Save/Close
+verified snapshot 2/history 5, and a final ordinary restart/Close passed again.
+Deletion/restoration used full rebuilds with four/six uploads, respectively.
+
+All five sessions reported joined writers and empty stderr. Evidence is under
+`target/history-upload/page/`: `grow`, `shrink`, `layers`, `restore`, `final`
+app logs; `grow-verify.log`, `shrink-verify.log`, `deleted-verify.log`,
+`restore-verify.log`, `final-verify.log`. The existing page fixture gained a
+`verify-deleted` manual oracle; focused example Clippy/build passed. No automated
+UI tests, production changes, or dependencies were added for this acceptance.
+These are installed mouse/keyboard and independent durable/PNG checks, not
+quantitative GPU readback, physical pen or first-visible-pixel evidence.

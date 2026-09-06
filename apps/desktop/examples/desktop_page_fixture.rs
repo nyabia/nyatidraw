@@ -87,15 +87,36 @@ fn expected(stage: u8) -> Result<TileSnapshot> {
     TileSnapshot::from_tiles(tiles).map_err(|e| format!("fixture: {e:?}").into())
 }
 
-fn verify(project: &Path, stage: u8, snapshot: u128, nodes: usize) -> Result<()> {
+fn verify(
+    project: &Path,
+    stage: u8,
+    snapshot: u128,
+    nodes: usize,
+    ink_deleted: bool,
+) -> Result<()> {
     let db = ProjectDb::open(project)?;
     let reopened = db.load_reopened()?.ok_or("missing artwork")?;
     let page = canvas(stage)?;
+    let mut expected_tree = tree();
+    let mut expected_tiles = expected(stage)?;
+    if ink_deleted {
+        let mut root = expected_tree.root().clone();
+        root.children
+            .retain(|node| !matches!(node, LayerTreeNode::Raster(layer) if layer.id == LayerId(1)));
+        expected_tree = LayerTree::new(root).map_err(|e| format!("deleted tree: {e:?}"))?;
+        expected_tiles = TileSnapshot::from_tiles(
+            expected_tiles
+                .iter()
+                .filter(|(key, _)| key.layer != LayerId(1))
+                .map(|(key, tile)| (key, tile.pixels().to_vec())),
+        )
+        .map_err(|e| format!("deleted tiles: {e:?}"))?;
+    }
     if reopened.current_snapshot() != SnapshotId(snapshot)
         || reopened.history().node_count() != nodes
         || db.load_canvas_spec()? != page
-        || db.load_layer_tree()? != Some(tree())
-        || reopened.current_tiles() != &expected(stage)?
+        || db.load_layer_tree()? != Some(expected_tree)
+        || reopened.current_tiles() != &expected_tiles
     {
         return Err("page/pixels/tree/history mismatch".into());
     }
@@ -104,6 +125,7 @@ fn verify(project: &Path, stage: u8, snapshot: u128, nodes: usize) -> Result<()>
     let mut pixels = vec![0; (page.width_px * page.height_px * 4) as usize];
     for (layer, [x, y], color) in points(stage) {
         if layer != LayerId(3)
+            && !(ink_deleted && layer == LayerId(1))
             && x >= 0
             && y >= 0
             && u32::try_from(x)? < page.width_px
@@ -128,7 +150,7 @@ fn verify(project: &Path, stage: u8, snapshot: u128, nodes: usize) -> Result<()>
         return Err("PNG differs from independent page pixels/dimensions".into());
     }
     println!(
-        "page-verify stage={stage} size={}x{} ppi=96 snapshot={snapshot} history={nodes} tiles=exact signed=exact locked_hidden=exact png=exact",
+        "page-verify stage={stage} size={}x{} ppi=96 snapshot={snapshot} history={nodes} tiles=exact signed=exact locked_hidden=exact png=exact ink_deleted={ink_deleted}",
         page.width_px, page.height_px
     );
     Ok(())
@@ -157,11 +179,12 @@ fn main() -> Result<()> {
             println!("page-fixture created={}", project.display());
             Ok(())
         }
-        "verify" => verify(
+        "verify" | "verify-deleted" => verify(
             project,
             args.get(3).ok_or("stage")?.parse()?,
             args.get(4).ok_or("snapshot")?.parse()?,
             args.get(5).ok_or("nodes")?.parse()?,
+            mode == "verify-deleted",
         ),
         "reexport" => {
             if !project.is_file() {
