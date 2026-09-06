@@ -54,4 +54,32 @@ Velopack에 적용을 요청한다. 업데이트 후 현재 프로젝트 경로�
 GitHub Windows runner에서 기존 테스트·Clippy·release 빌드까지 통과했다.
 [Website 배포](https://github.com/nyabia/nyatidraw/actions/runs/34016306291) 성공 후
 공개 홈페이지 HTTP 200과 문서 제목을 확인했다.
-설치/업데이트 검증 결과는 통과 후 별도로 추가한다.
+
+2026-09-06 `f602bf7`의 [Windows alpha release](https://github.com/nyabia/nyatidraw/actions/runs/34017520413)는
+기존 핵심 테스트·fmt·Clippy·DX release 빌드·패키징·Release 초안 업로드까지 통과했다.
+[0.1.0-alpha.3](https://github.com/nyabia/nyatidraw/releases/tag/v0.1.0-alpha.3)을 게시했다.
+설치 파일은 12,851,581 bytes, 업데이트 전체 패키지는 8,390,013 bytes다.
+
+- Windows 11 x64의 이 개발 머신에서 alpha.1/alpha.2 설치와 기본 그림의 저장·종료·재열기를 확인했다.
+  GitHub 산출물 alpha.3 설치 파일도 종료 코드 0으로 설치됐다. 시작 메뉴 바로가기를 생성한다.
+- 게시 전에는 초안에서 받은 패키지를 기존 alpha.2의 패키지 폴더에 준비하여 적용 경로를 확인했다.
+  PNG 목적지를 검증용 빈 디렉터리로 막으면 저장 확인 창을 표시하고 alpha.2가 유지됐다.
+  프로젝트는 저장됐으며, 방해물을 별도 검증 폴더로 보존 이동하고 PNG를 복원한 뒤
+  ‘프로젝트 다시 열기’와 ‘저장 후 업데이트’로 alpha.3 적용/재시작에 성공했다.
+- 게시 후 alpha.2를 다시 설치하여 새 패키지가 없는 상태에서 실행했다.
+  앱의 인증 없는 GitHub 소스가 alpha.3을 실제로 내려받고 준비 상태를 표시했다.
+  다운로드 SHA256은 피드와 동일한 `e722d33b34e27b33f7cf623a5d1ec09f90bf6dd6dbdbafc6f87166dc5720cbd8`.
+  저장 후 업데이트로 다시 alpha.3이 실행됐고, 한글/공백을 포함한 현재 프로젝트 경로가 전달됐다.
+- 업데이트 전후 프로젝트 내용 root는
+  `ffb174f805a9da89f226223d3370fdb0cfe19dfd7b80393427da1272eaf03f33`으로 같았다.
+  PNG SHA256은 `7dcb436606b18e15e05fdff8be554269c80754392ba80127db536f0758068dff`로 유지됐다.
+- 별도 SDK 실행 검증은 통신 거부와 동일 크기 손상 패키지를 거부했고 설치 manifest를 보존했다.
+  앱 프로세스에 임시 프록시를 주는 전체 UI 통신 실패 검증은 실행 정책에 차단되어 수행하지 못했다.
+
+원본 로그/해시는 `target/public-alpha-acceptance/`에 있으며 Git에는 포함하지 않는다.
+개발 도구나 WebView2가 없는 깨끗한 Windows 머신, 전원 차단 중 업데이트, 실제 펜·고주사율,
+탐색기 Open With는 미검증이다. 이 결과를 해당 환경의 증거로 확대하지 않는다.
+
+Pages 환경의 deployment branch 정책은 `main` 브랜치와 `v*-alpha.*` 태그를 허용한다.
+릴리스 이벤트의 실행 ref는 태그이므로 태그 정책이 없으면 checkout을 main으로 지정해도
+배포가 거절된다. 첫 릴리스에서 이를 확인하고 알파 태그 정책을 추가했다.

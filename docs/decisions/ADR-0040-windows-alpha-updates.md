@@ -40,8 +40,9 @@ package. The repository's own license has not yet been assigned.
   copied installed manifest was unchanged. This is SDK failure-path evidence,
   not a whole-machine offline UI test or power-loss test.
 - Raw local evidence is ignored under `target/public-alpha-acceptance/` and
-  `target/public-alpha-tools/`. Cloud packaging and the actual published-feed
-  A-to-B saved-close update still need the acceptance result in `docs/releasing.md`.
+  `target/public-alpha-tools/`. Cloud packaging, saved-close alpha.2-to-alpha.3
+  update, export-failure blocking/recovery, and the actual published GitHub feed
+  download/apply all passed; exact artifacts and hashes are in `docs/releasing.md`.
 
 This evidence does not verify physical-pen latency, a clean Windows VM without
 WebView2, Explorer Open With, or any non-Windows backend.

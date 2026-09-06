@@ -4,8 +4,8 @@ NyatiDraw는 Godot 프로젝트의 PNG를 빠르게 열고 수정하기 위한 W
 래스터 드로잉 편집기입니다. 편집 가능한 `.ntdr` 프로젝트를 PNG 옆에 두고,
 저장 시 프로젝트의 내구성 있는 스냅샷과 PNG export를 별도 실패 영역으로 처리합니다.
 
-현재 Windows x64 알파판을 준비하고 있습니다.
-[홈페이지](https://nyabia.github.io/nyatidraw/)에서 배포 현황을 확인할 수 있습니다.
+현재 Windows x64 알파판 **0.1.0-alpha.3**을 배포하고 있습니다.
+[홈페이지](https://nyabia.github.io/nyatidraw/)에서 설치 파일을 받을 수 있습니다.
 Windows 외 플랫폼·고급 브러시·애니메이션·벡터 기능은 후속 범위입니다.
 
 ## 설치와 기본 사용
