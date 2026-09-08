@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <title>NyatiDraw — N and pencil</title>
+  <rect x="2" y="2" width="60" height="60" rx="12" fill="#303030"/>
+  <rect x="14" y="15" width="8" height="35" rx="2" fill="#f2f2f2"/>
+  <polygon points="22,15 42,38 42,50 22,27" fill="#f2f2f2"/>
+  <rect x="42" y="14" width="8" height="29" rx="2" fill="#f2f2f2"/>
+  <polygon points="42,46 50,46 46,54" fill="#f2f2f2"/>
+</svg>

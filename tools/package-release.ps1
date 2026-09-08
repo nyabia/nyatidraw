@@ -26,6 +26,7 @@ New-Item -ItemType Directory -Force $output | Out-Null
 $stage = Join-Path $output 'stage'
 New-Item -ItemType Directory $stage | Out-Null
 Copy-Item (Join-Path $source '*') $stage -Recurse
+Rename-Item -LiteralPath (Join-Path $stage 'nyatidraw-desktop.exe') -NewName 'nyatidraw.exe'
 $notices = [Text.StringBuilder]::new()
 [void]$notices.AppendLine('NyatiDraw — third-party notices')
 Push-Location $repositoryRoot
@@ -49,18 +50,20 @@ foreach ($name in @('LICENSE-MIT', 'LICENSE-APACHE')) {
 }
 $versionText = (Get-Item -LiteralPath $tool).VersionInfo.ProductVersion
 if ($versionText -notmatch '^1\.2\.0(?:\+|$)') { throw 'Expected Velopack packager 1.2.0.' }
-& $Dotnet $tool pack --packId NyatiDraw.Alpha --packVersion $Version --packDir $stage --mainExe nyatidraw-desktop.exe --packTitle 'NyatiDraw Alpha' --packAuthors nyabia --channel alpha --runtime win-x64 --framework webview2 --delta None --shortcuts StartMenuRoot --outputDir $output
+# Keep the new identity off the legacy Alpha feed: its shipped updater does not
+# filter package IDs. Alpha is a release maturity label, not an install identity.
+& $Dotnet $tool pack --packId NyatiDraw --packVersion $Version --packDir $stage --mainExe nyatidraw.exe --packTitle NyatiDraw --packAuthors nyabia --channel nyatidraw-alpha --runtime win-x64 --framework webview2 --delta None --shortcuts StartMenuRoot --icon (Join-Path $repositoryRoot 'apps/desktop/assets/nyatidraw.ico') --outputDir $output
 if ($LASTEXITCODE -ne 0) { throw 'Installer packaging failed.' }
 $setup = Get-ChildItem -LiteralPath $output -Filter '*Setup.exe' -File | Select-Object -First 1
 if (-not $setup) { throw 'Installer was not produced.' }
 # Stable website-facing filename; retain the tool-generated update feeds/packages.
-if ($setup.Name -ne 'NyatiDraw-Alpha-win-Setup.exe') {
-    Move-Item -LiteralPath $setup.FullName -Destination (Join-Path $output 'NyatiDraw-Alpha-win-Setup.exe')
+if ($setup.Name -ne 'NyatiDraw-win-Setup.exe') {
+    Move-Item -LiteralPath $setup.FullName -Destination (Join-Path $output 'NyatiDraw-win-Setup.exe')
 }
-$assetManifest = Join-Path $output 'assets.alpha.json'
+$assetManifest = Join-Path $output 'assets.nyatidraw-alpha.json'
 $assets = Get-Content -LiteralPath $assetManifest -Raw | ConvertFrom-Json
 foreach ($asset in $assets) {
-    if ($asset.Type -eq 'Installer') { $asset.RelativeFileName = 'NyatiDraw-Alpha-win-Setup.exe' }
+    if ($asset.Type -eq 'Installer') { $asset.RelativeFileName = 'NyatiDraw-win-Setup.exe' }
 }
 ConvertTo-Json -InputObject @($assets) | Set-Content -LiteralPath $assetManifest -Encoding utf8NoBOM
 $sums = Get-ChildItem -LiteralPath $output -File | Sort-Object Name | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name }

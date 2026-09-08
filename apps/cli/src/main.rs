@@ -37,6 +37,15 @@ fn run() -> Result<(), String> {
         .and_then(|command| command.into_string().ok())
         .ok_or_else(usage)?;
     match command.as_str() {
+        "migrate-copy" => {
+            let source = required_path(&mut args, "legacy project path")?;
+            let target = required_path(&mut args, "new .ntdr path")?;
+            no_extra_args(&mut args)?;
+            nyatidraw_project_redb::migrate_legacy_copy(&source, &target)
+                .map_err(|error| error.to_string())?;
+            println!("migration complete; source preserved; PNG export not performed");
+            Ok(())
+        }
         "validate" => {
             let project = required_path(&mut args, "project path")?;
             no_extra_args(&mut args)?;
@@ -276,7 +285,8 @@ fn no_extra_args(args: &mut impl Iterator<Item = OsString>) -> Result<(), String
 fn usage() -> String {
     concat!(
         "usage: nyatidraw-cli validate <project.redb> | ",
-        "export <project.redb> <output.ppm> <layer-id> | diagnostic-smoke"
+        "export <project.redb> <output.ppm> <layer-id> | ",
+        "migrate-copy <source.ntdr> <new.ntdr> | diagnostic-smoke"
     )
     .to_owned()
 }

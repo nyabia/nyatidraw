@@ -236,6 +236,7 @@ pub enum ProjectOpenError {
     Io { path: PathBuf, message: String },
     Locked { path: PathBuf },
     InvalidNonEmpty { path: PathBuf },
+    LegacyContainer { path: PathBuf },
     Corrupt { path: PathBuf, message: String },
 }
 
@@ -247,6 +248,11 @@ impl fmt::Display for ProjectOpenError {
             Self::InvalidNonEmpty { path } => {
                 write!(f, "non-empty invalid project preserved: {}", path.display())
             }
+            Self::LegacyContainer { path } => write!(
+                f,
+                "legacy project preserved: {}. Convert to a new file with nyatidraw-cli migrate-copy <source.ntdr> <new.ntdr>",
+                path.display()
+            ),
             Self::Corrupt { path, message } => {
                 write!(f, "corrupt project at {}: {message}", path.display())
             }
@@ -287,3 +293,7 @@ pub const SELECTION_STROKE_SCHEMA_VERSION: u64 = 3;
 
 /// Adds immutable per-snapshot page dimensions and atomic page/cursor restoration.
 pub const CANVAS_HISTORY_SCHEMA_VERSION: u64 = 4;
+
+/// Storage capability bit, independent of the existing metadata-history level.
+/// Old writers reject the combined marker before touching compressed projects.
+pub const COMPRESSED_TILE_SCHEMA_FLAG: u64 = 0x100;

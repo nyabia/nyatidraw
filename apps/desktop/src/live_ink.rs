@@ -37,6 +37,18 @@ pub(crate) struct CanvasViewportSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CanvasCommandQueueFull;
 
+/// Native navigation is an ordered input stream, not an optimistic UI edit.
+/// Sharing the bounded FIFO keeps zoom, UI commands and lifecycle boundaries
+/// ordered; only adjacent native pan deltas may be combined.
+#[derive(Debug)]
+pub(crate) enum CanvasCommand {
+    Ui(CommandEnvelope),
+    NativeViewport {
+        id: CommandId,
+        command: nyatidraw_api::ViewportCommand,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum CanvasViewportPublishError {
     InvalidGeometry,
@@ -136,7 +148,7 @@ struct LiveInkInner {
     layout: OnceLock<crate::layout_store::LayoutStore>,
     raw_input: Mutex<RawInputState>,
     canvas_viewport: Mutex<CanvasViewportSnapshot>,
-    editor_commands: Mutex<VecDeque<CommandEnvelope>>,
+    editor_commands: Mutex<VecDeque<CanvasCommand>>,
     command_capacity: usize,
     next_command_id: AtomicU64,
     protocol: Mutex<ProtocolMailbox>,
@@ -285,6 +297,12 @@ impl LiveInkBridge {
             .layout
             .get()
             .and_then(crate::layout_store::LayoutStore::notice)
+    }
+
+    pub(crate) fn submit_panel_heights(&self, heights: &crate::layout_store::PanelHeights) {
+        if let Some(store) = self.inner.layout.get() {
+            store.submit_heights(heights);
+        }
     }
 
     pub(crate) fn flush_layout(&self) {
@@ -463,11 +481,11 @@ impl LiveInkBridge {
         if commands.len() >= self.inner.command_capacity {
             return Err(CanvasCommandQueueFull);
         }
-        commands.push_back(CommandEnvelope {
+        commands.push_back(CanvasCommand::Ui(CommandEnvelope {
             id,
             based_on,
             command,
-        });
+        }));
         drop(commands);
         self.request_redraw();
         Ok(id)
@@ -490,7 +508,54 @@ impl LiveInkBridge {
         self.push_editor_command(based_on, command)
     }
 
-    pub(crate) fn drain_editor_commands(&self, output: &mut Vec<CommandEnvelope>) {
+    pub(crate) fn push_native_viewport(
+        &self,
+        command: nyatidraw_api::ViewportCommand,
+    ) -> Result<(), CanvasCommandQueueFull> {
+        let mut commands = self
+            .inner
+            .editor_commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.workspace_failed() || self.is_closing() || self.is_saving_as() {
+            return Err(CanvasCommandQueueFull);
+        }
+        if let (
+            Some(CanvasCommand::NativeViewport {
+                command:
+                    nyatidraw_api::ViewportCommand::PanBy {
+                        logical_x: x,
+                        logical_y: y,
+                    },
+                ..
+            }),
+            nyatidraw_api::ViewportCommand::PanBy {
+                logical_x,
+                logical_y,
+            },
+        ) = (commands.back_mut(), command)
+            && let (Some(next_x), Some(next_y)) =
+                (x.checked_add(logical_x), y.checked_add(logical_y))
+        {
+            *x = next_x;
+            *y = next_y;
+            drop(commands);
+            self.request_redraw();
+            return Ok(());
+        }
+        if commands.len() >= self.inner.command_capacity {
+            return Err(CanvasCommandQueueFull);
+        }
+        let id = CommandId(u128::from(
+            self.inner.next_command_id.fetch_add(1, Ordering::Relaxed),
+        ));
+        commands.push_back(CanvasCommand::NativeViewport { id, command });
+        drop(commands);
+        self.request_redraw();
+        Ok(())
+    }
+
+    pub(crate) fn drain_editor_commands(&self, output: &mut Vec<CanvasCommand>) {
         output.clear();
         let mut commands = self
             .inner
@@ -1215,6 +1280,86 @@ impl LiveInkBridge {
 mod tests {
     use super::*;
     use nyatidraw_input::PenButtons;
+
+    #[test]
+    fn native_navigation_preserves_delta_and_order_without_rebasing_ui_edits() {
+        // Product risk: flooding native input must not lose movement, reorder
+        // it across zoom/edits, or remove artwork commands' revision guards.
+        use nyatidraw_api::ViewportCommand;
+        let bridge = LiveInkBridge::with_capacity(8, LayerId(7));
+        for _ in 0..4096 {
+            bridge
+                .push_native_viewport(ViewportCommand::PanBy {
+                    logical_x: 2,
+                    logical_y: -1,
+                })
+                .unwrap();
+        }
+        bridge
+            .push_native_viewport(ViewportCommand::ZoomSteps(1))
+            .unwrap();
+        bridge
+            .push_ui_editor_command(EditorCommand::Project(nyatidraw_api::ProjectCommand::Save))
+            .unwrap();
+        bridge
+            .push_native_viewport(ViewportCommand::PanBy {
+                logical_x: -3,
+                logical_y: 4,
+            })
+            .unwrap();
+        let mut commands = Vec::new();
+        bridge.drain_editor_commands(&mut commands);
+        assert!(matches!(
+            commands.as_slice(),
+            [
+                CanvasCommand::NativeViewport {
+                    command: ViewportCommand::PanBy {
+                        logical_x: 8192,
+                        logical_y: -4096,
+                    },
+                    ..
+                },
+                CanvasCommand::NativeViewport {
+                    command: ViewportCommand::ZoomSteps(1),
+                    ..
+                },
+                CanvasCommand::Ui(CommandEnvelope {
+                    based_on: Revision(0),
+                    ..
+                }),
+                CanvasCommand::NativeViewport {
+                    command: ViewportCommand::PanBy {
+                        logical_x: -3,
+                        logical_y: 4,
+                    },
+                    ..
+                },
+            ]
+        ));
+
+        for _ in 0..bridge.inner.command_capacity {
+            bridge
+                .push_native_viewport(ViewportCommand::ZoomSteps(1))
+                .unwrap();
+        }
+        assert!(
+            bridge
+                .push_native_viewport(ViewportCommand::ZoomSteps(-1))
+                .is_err()
+        );
+        bridge.reset_for_project_activation();
+        bridge.drain_editor_commands(&mut commands);
+        assert!(
+            commands.is_empty(),
+            "navigation must not cross project replacement"
+        );
+        assert!(bridge.begin_close());
+        assert!(
+            bridge
+                .push_native_viewport(ViewportCommand::ZoomSteps(1))
+                .is_err()
+        );
+    }
 
     #[test]
     fn stale_render_geometry_cannot_reenable_input_after_resize_or_hide() {

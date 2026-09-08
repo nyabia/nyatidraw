@@ -5,9 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+default = ["legacy-migration"]
 # Enables a subprocess-only transaction pause seam used by the scratch crash
 # probe. This is deliberately absent from normal and release production builds.
 diagnostic = []
+legacy-migration = ["dep:redb-legacy", "dep:blake3"]
 
 [[example]]
 name = "crash_recovery_probe"
@@ -20,9 +22,12 @@ nyatidraw-history.workspace = true
 nyatidraw-project.workspace = true
 nyatidraw-stroke.workspace = true
 nyatidraw-tiles.workspace = true
-redb = "=2.6.3"
+redb = "=4.2.0"
+redb-legacy = { package = "redb", version = "=2.6.3", optional = true }
+blake3 = { workspace = true, optional = true }
 
 [dev-dependencies]
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
 nyatidraw-brush.workspace = true
 nyatidraw-editor.workspace = true
 nyatidraw-input.workspace = true

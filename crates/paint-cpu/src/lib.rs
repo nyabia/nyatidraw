@@ -11,7 +11,7 @@ mod selection;
 mod transform;
 pub use selection::{
     EditError, EditLimits, SelectionMask, SelectionPaint, SelectionPaintResult, SelectionSource,
-    WandRequest, lasso_selection, paint_selection, wand_selection,
+    WandRequest, clear_raster, lasso_selection, paint_selection, wand_selection,
 };
 pub use transform::{transform_raster, translate_artwork};
 

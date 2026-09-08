@@ -74,6 +74,7 @@ pub struct Config {
     pub(crate) disable_file_drop_handler: bool,
     pub(crate) disable_dma_buf_on_wayland: bool,
     pub(crate) additional_windows_args: Option<String>,
+    pub(crate) parent_composition: bool,
     pub(crate) tray_icon_show_window_on_click: bool,
     pub(crate) navigation_handler: Option<NavigationHandler>,
 
@@ -130,9 +131,17 @@ impl Config {
             disable_dma_buf_on_wayland: true,
             on_window: None,
             additional_windows_args: None,
+            parent_composition: false,
             tray_icon_show_window_on_click: true,
             navigation_handler: None,
         }
+    }
+
+    /// Windows-only opt-in: compose web content above native sibling surfaces.
+    /// The application must maintain the returned composition input host region.
+    pub fn with_parent_composition(mut self, enabled: bool) -> Self {
+        self.parent_composition = enabled;
+        self
     }
 
     /// set the directory from which assets will be searched in release mode

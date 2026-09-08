@@ -4,6 +4,7 @@
 
 mod drag_drop;
 mod util;
+mod composition;
 
 use std::{
   borrow::Cow, cell::RefCell, collections::HashSet, fmt::Write, fs, path::PathBuf, rc::Rc,
@@ -60,6 +61,7 @@ pub(crate) struct InnerWebView {
   pub controller: ICoreWebView2Controller,
   pub webview: ICoreWebView2,
   pub env: ICoreWebView2Environment,
+  composition: Option<composition::CompositionHost>,
   // Store FileDropController in here to make sure it gets dropped when
   // the webview gets dropped, otherwise we'll have a memory leak
   #[allow(dead_code)]
@@ -68,6 +70,7 @@ pub(crate) struct InnerWebView {
 
 impl Drop for InnerWebView {
   fn drop(&mut self) {
+    self.composition.take();
     let _ = unsafe { self.controller.Close() };
     if self.is_child {
       let _ = unsafe { DestroyWindow(self.hwnd) };
@@ -113,7 +116,11 @@ impl InnerWebView {
   ) -> Result<Self> {
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
 
-    let hwnd = Self::create_container_hwnd(parent, &attributes, is_child)?;
+    if pl_attrs.parent_composition && is_child {
+      return Err(windows::core::Error::from(E_INVALIDARG).into());
+    }
+
+    let hwnd = Self::create_container_hwnd(parent, &attributes, is_child, pl_attrs.parent_composition)?;
 
     let drop_handler = attributes.drag_drop_handler.take();
     let bounds = attributes.bounds;
@@ -134,7 +141,16 @@ impl InnerWebView {
     } else {
       Self::create_environment(&attributes, pl_attrs.clone())?
     };
-    let controller = Self::create_controller(hwnd, &env, attributes.incognito, background_color)?;
+    let composition = if pl_attrs.parent_composition {
+      Some(composition::CompositionHost::new(parent, hwnd, &env, attributes.incognito)?)
+    } else {
+      None
+    };
+    let controller = if let Some(host) = &composition {
+      host.controller.cast::<ICoreWebView2Controller>()?
+    } else {
+      Self::create_controller(hwnd, &env, attributes.incognito, background_color)?
+    };
     let webview = Self::init_webview(
       parent,
       hwnd,
@@ -164,6 +180,7 @@ impl InnerWebView {
       is_child,
       webview,
       env,
+      composition,
       drag_drop_controller,
     };
 
@@ -176,11 +193,16 @@ impl InnerWebView {
     Ok(w)
   }
 
+  pub fn composition_input_hwnd(&self) -> Option<isize> {
+    self.composition.as_ref().map(|_| self.hwnd.0 as isize)
+  }
+
   #[inline]
   fn create_container_hwnd(
     parent: HWND,
     attributes: &WebViewAttributes,
     is_child: bool,
+    parent_composition: bool,
   ) -> Result<HWND> {
     unsafe extern "system" fn default_window_proc(
       hwnd: HWND,
@@ -248,7 +270,9 @@ impl InnerWebView {
 
     let hwnd = unsafe {
       CreateWindowExW(
-        WINDOW_EX_STYLE::default(),
+        // Composition visuals are attached to the parent, not this input
+        // sink, which intentionally owns no visual pixels of its own.
+        if parent_composition { WS_EX_NOREDIRECTIONBITMAP } else { WINDOW_EX_STYLE::default() },
         class_name,
         PCWSTR::null(),
         window_styles,
@@ -1673,6 +1697,9 @@ impl InnerWebView {
   }
 
   pub fn reparent(&self, parent: isize) -> Result<()> {
+    if self.composition.is_some() {
+      return Err(windows::core::Error::from(E_NOTIMPL).into());
+    }
     let parent = HWND(parent as _);
 
     unsafe {

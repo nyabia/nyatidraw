@@ -1,4 +1,4 @@
-//! Per-user alpha associations, touched only by Velopack's fast lifecycle hooks.
+//! Per-user product associations, touched only by Velopack's fast lifecycle hooks.
 use std::{io, path::Path};
 use velopack::locator::{LocationContext, auto_locate_app_manifest};
 use windows::{
@@ -15,15 +15,11 @@ use windows::{
     core::PCWSTR,
 };
 
-const OWNER: &str = "NyatiDrawAlphaOwner";
-const DEFAULT_OWNER: &str = "NyatiDrawAlphaDefaultOwner";
+const OWNER: &str = "NyatiDrawOwner";
+const DEFAULT_OWNER: &str = "NyatiDrawDefaultOwner";
 const FORMATS: [(&str, &str, &str); 2] = [
-    (".png", "NyatiDraw.Alpha.PNG.1", "NyatiDraw Alpha PNG"),
-    (
-        ".ntdr",
-        "NyatiDraw.Alpha.Project.1",
-        "NyatiDraw Alpha Project",
-    ),
+    (".png", "NyatiDraw.PNG.1", "NyatiDraw PNG"),
+    (".ntdr", "NyatiDraw.Project.1", "NyatiDraw Project"),
 ];
 
 pub(crate) fn register() {
@@ -44,7 +40,7 @@ fn run(remove: bool) {
 
 fn update(remove: bool) -> Result<(), Box<dyn std::error::Error>> {
     let locator = auto_locate_app_manifest(LocationContext::FromCurrentExe)?;
-    if locator.get_is_portable() || locator.get_manifest_id() != "NyatiDraw.Alpha" {
+    if locator.get_is_portable() || locator.get_manifest_id() != "NyatiDraw" {
         return Ok(());
     }
     let Some(classes) = Key::open(HKEY_CURRENT_USER, "Software\\Classes", !remove)? else {
@@ -68,16 +64,16 @@ fn update_in(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root_text = path_text(root)?;
     let updater = path_text(&root.join("Update.exe"))?;
-    let executable = path_text(&root.join("current/nyatidraw-desktop.exe"))?;
-    let command = format!("\"{updater}\" start nyatidraw-desktop.exe -- \"%1\"");
+    let executable = path_text(&root.join("current/nyatidraw.exe"))?;
+    let command = format!("\"{updater}\" start nyatidraw.exe -- \"%1\"");
     let icon = format!("\"{executable}\",0");
     for (extension, prog_id, title) in FORMATS {
         let values = [
             ("", "", title),
             ("DefaultIcon", "", icon.as_str()),
-            ("Application", "ApplicationName", "NyatiDraw Alpha"),
+            ("Application", "ApplicationName", "NyatiDraw"),
             ("Application", "ApplicationIcon", icon.as_str()),
-            ("Application", "AppUserModelId", "velopack.NyatiDraw.Alpha"),
+            ("Application", "AppUserModelId", "velopack.NyatiDraw"),
             ("shell\\open\\command", "", command.as_str()),
         ];
         let existing = Key::open(registry, prog_id, false)?;

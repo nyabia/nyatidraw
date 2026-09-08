@@ -3,11 +3,6 @@ on:
   push:
     tags: ['v*-alpha.*']
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Package version, for example 0.1.0-alpha.1'
-        required: true
-        type: string
 permissions:
   contents: read
 concurrency:
@@ -32,10 +27,10 @@ jobs:
         with:
           persist-credentials: false
       - name: Resolve release version
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          $version = if ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { $env:GITHUB_REF_NAME -replace '^v','' }
+          if ($env:GITHUB_REF_TYPE -ne 'tag') { throw 'Release requires an existing version tag; select a tag for manual execution.' }
+          if ($env:GITHUB_REF_NAME -notmatch '^v\d+\.\d+\.\d+-alpha\.\d+$') { throw 'Invalid release tag' }
+          $version = $env:GITHUB_REF_NAME.Substring(1)
           if ($version -notmatch '^\d+\.\d+\.\d+-alpha\.\d+$') { throw 'Invalid alpha version' }
           "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
       - name: Install pinned Rust
@@ -60,12 +55,29 @@ jobs:
           ./tools/build-dev.ps1
       - name: Package installer and update feed
         run: ./tools/package-release.ps1 -Version $env:RELEASE_VERSION
-      - name: Upload draft alpha release
+      - name: Upload assets and publish alpha release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $files = Get-ChildItem "target/releases/$env:RELEASE_VERSION" -File | ForEach-Object FullName
-          $notes = "Windows x64 alpha. Install and update acceptance is required before publication. See docs/public-alpha-plan-2026-09-06.md."
-          $notes | Set-Content target/release-notes.txt -Encoding utf8NoBOM
-          gh release create "v$env:RELEASE_VERSION" @files --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --draft --prerelease --title "NyatiDraw $env:RELEASE_VERSION" --notes-file target/release-notes.txt
+          if (-not $files) { throw 'No release assets were produced.' }
+          $notes = "Windows x64 alpha. Automated source checks and packaging passed. Hardware and installation coverage is documented in docs/releasing.md; CI does not replace those checks."
+          $notesFile = "docs/releases/$env:RELEASE_VERSION.md"
+          if (-not (Test-Path -LiteralPath $notesFile)) {
+            $notesFile = 'target/release-notes.txt'
+            $notes | Set-Content $notesFile -Encoding utf8NoBOM
+          }
+          # Keep partially uploaded assets private. Never create a missing tag or overwrite an existing release.
+          gh release create "v$env:RELEASE_VERSION" @files --repo $env:GITHUB_REPOSITORY --verify-tag --draft --prerelease --title "NyatiDraw $env:RELEASE_VERSION" --notes-file $notesFile --generate-notes
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release edit "v$env:RELEASE_VERSION" --repo $env:GITHUB_REPOSITORY --verify-tag --draft=false --prerelease --latest=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  website:
+    needs: package
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    # GITHUB_TOKEN release events do not start another workflow. Call Pages directly.
+    uses: ./.github/workflows/pages.yml

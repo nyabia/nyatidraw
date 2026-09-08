@@ -1,5 +1,21 @@
 # 프로젝트, 저장, export
 
+## 최신 저장 크기 변경
+
+타일 codec 1(Zstd 무손실), 프로젝트 capability bit `0x100`, 새 프로젝트의
+root별 타일 참조 회수가 추가됐다. 기존 raw 파일도 알파 일회성 변환에서 무손실
+재압축하고 새 DB로 재구성한다. SQLite 실제 앱 전환은 하지 않는다. 아래 초기 설계의 codec 0 전용/회수 미구현
+설명은 이 부분에 한해 [ADR-0048](decisions/ADR-0048-compressed-tile-storage.md)과
+[압축 실측](measurements/compressed-tile-storage.md)이 대체한다.
+[최신 redb/SQLite 비교](measurements/storage-candidates.md) 이후 실제 저장소를
+redb 4.2.0으로 올렸다. Persy는 조사 후보로만 남긴다. 사용자 승인에 따라 알파의
+구형 컨테이너 또는 `meta/tile_storage_revision=1`이 없는 파일은 열 때 자동
+변환한다. 이미 redb 4로 변환된 파일도 대상이다. 검증된 복사본만 같은 경로에
+게시하고 원본은 `.pre-redb4-<nonce>.bak`으로 보존한다. 완료 표시가 있는 파일은
+매번 다시 변환하지 않는다. 픽셀·히스토리·레이어·캔버스 밖 데이터는 보존한다.
+[ADR-0049](decisions/ADR-0049-redb4-alpha-upgrade.md)와
+[실제 어댑터 실측](measurements/redb4-native-adapter.md)을 참고한다.
+
 ## 목표 사용자 규약
 
 ```text
@@ -19,8 +35,8 @@ portrait.png       colocated game-ready export target
 CLI 산출물은 explicit PPM이며, desktop은 colocated alpha PNG를 별도 worker로 저장한다.
 PNG activation/Save/restart와 export 실패 복구의 실행 근거는 구현 현황 문서에 기록한다.
 
-현재 native backend는 `redb 2.6.3`을 사용한다. 이 선택은 headless recovery
-slice에는 유효하지만 production format 안정화 선언은 아니다.
+현재 native backend는 `redb 4.2.0`을 사용한다. `redb 2.6.3`은 알파 자동 변환
+전용 feature에만 남긴다. 이것은 장기 포맷 호환성 유지 약속이 아니다.
 
 ## 논리 객체 모델
 

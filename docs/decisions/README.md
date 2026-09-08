@@ -50,3 +50,7 @@
 | 종료 가능한 단일 인스턴스 | [비동기 activation pipe 취소와 deadline](ADR-0043-activation-pipe-shutdown.md) |
 | Sparse CPU 합성 | [전체 raster 임시 버퍼 대신 타일/page 교차 행 합성](ADR-0044-tile-intersection-cpu-composite.md) |
 | Windows 렌더 격리 | [Render actor, HWND 생존과 비동기 종료](ADR-0045-windows-render-actor-lifetime.md) |
+| Web UI 합성 | [Windows composition host와 후속 플랫폼 어댑터 계약](ADR-0046-web-ui-over-native-canvas.md) |
+| 히스토리/도구 창 | [128단계 우회, 세 패널 분리와 목업 단축키 복원](ADR-0047-bounded-history-and-brush-panels.md) |
+| 저장 크기 | [타일 무손실 압축, 참조 회수와 최신 redb/SQLite 비교](ADR-0048-compressed-tile-storage.md) |
+| 현재 저장소 | [redb 4.2와 제거 가능한 알파 자동 변환](ADR-0049-redb4-alpha-upgrade.md) |

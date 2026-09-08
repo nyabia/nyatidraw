@@ -15,7 +15,12 @@ if (-not $Offline) {
     $releases = Invoke-RestMethod 'https://api.github.com/repos/nyabia/nyatidraw/releases?per_page=30' -Headers $headers
     $release = $releases | Where-Object { -not $_.draft -and $_.tag_name -match '^v\d+\.\d+\.\d+-alpha\.\d+$' } | Select-Object -First 1
     if ($release) {
-        $asset = $release.assets | Where-Object name -EQ 'NyatiDraw-Alpha-win-Setup.exe' | Select-Object -First 1
+        $asset = $release.assets | Where-Object name -EQ 'NyatiDraw-win-Setup.exe' | Select-Object -First 1
+        # Historical published releases keep their existing download until a new
+        # NyatiDraw-identity installer is published; never rename old assets.
+        if (-not $asset) {
+            $asset = $release.assets | Where-Object name -EQ 'NyatiDraw-Alpha-win-Setup.exe' | Select-Object -First 1
+        }
         if ($asset) { @{ version=$release.tag_name; url=$asset.browser_download_url } | ConvertTo-Json | Set-Content $releaseFile -Encoding utf8NoBOM }
     }
 }

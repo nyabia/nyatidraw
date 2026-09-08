@@ -10,7 +10,8 @@ use nyatidraw_stroke::{
     StrokeCommitId, StrokeSelection,
 };
 use nyatidraw_tiles::{
-    ContentRoot, ObjectHash, TILE_EDGE, TileBounds, TileKey, TileSnapshot, TileSnapshotError,
+    ContentRoot, ObjectHash, TILE_BYTE_LEN, TILE_EDGE, TileBounds, TileKey, TileSnapshot,
+    TileSnapshotError,
 };
 
 const RECORD_MAGIC: [u8; 8] = *b"NYREC001";
@@ -66,14 +67,32 @@ impl Envelope {
 
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut output = Vec::with_capacity(self.payload.len().saturating_add(52));
+        self.encode_payload(0, &self.payload)
+    }
+
+    /// Losslessly encodes a tile for storage, falling back to raw if compression
+    /// fails or does not reduce size. Hashes always describe original bytes.
+    #[must_use]
+    pub fn encode_for_storage(&self) -> Vec<u8> {
+        if self.kind == RecordKind::Tile
+            && self.payload.len() == TILE_BYTE_LEN
+            && let Ok(compressed) = zstd::bulk::compress(&self.payload, 1)
+            && compressed.len() < self.payload.len()
+        {
+            return self.encode_payload(1, &compressed);
+        }
+        self.encode()
+    }
+
+    fn encode_payload(&self, codec: u8, payload: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(payload.len().saturating_add(52));
         output.extend_from_slice(&RECORD_MAGIC);
         output.push(self.kind as u8);
         output.extend_from_slice(&self.schema_version.to_le_bytes());
-        output.push(0);
+        output.push(codec);
         output.extend_from_slice(&self.uncompressed_len.to_le_bytes());
         output.extend_from_slice(&self.checksum.0);
-        output.extend_from_slice(&self.payload);
+        output.extend_from_slice(payload);
         output
     }
 
@@ -99,12 +118,32 @@ impl Envelope {
             return Err(WireError::UnsupportedSchema(schema_version));
         }
         let codec = decoder.u8()?;
-        if codec != 0 {
+        if codec > 1 || (codec == 1 && expected_kind != RecordKind::Tile) {
             return Err(WireError::UnsupportedCodec(codec));
         }
         let uncompressed_len = decoder.u64()?;
         let checksum = ObjectHash(decoder.array()?);
-        let payload = decoder.remaining().to_vec();
+        let stored = decoder.remaining();
+        let payload = if codec == 1 {
+            // Never allocate from an untrusted declared length or frame size.
+            if uncompressed_len != TILE_BYTE_LEN as u64 || stored.len() >= TILE_BYTE_LEN {
+                return Err(WireError::LengthMismatch);
+            }
+            let frame_len = zstd::zstd_safe::find_frame_compressed_size(stored)
+                .map_err(|_| WireError::LengthMismatch)?;
+            if frame_len != stored.len() {
+                return Err(WireError::TrailingBytes);
+            }
+            let mut pixels = vec![0; TILE_BYTE_LEN];
+            let written = zstd::bulk::decompress_to_buffer(stored, &mut pixels[..])
+                .map_err(|_| WireError::LengthMismatch)?;
+            if written != TILE_BYTE_LEN {
+                return Err(WireError::LengthMismatch);
+            }
+            pixels
+        } else {
+            stored.to_vec()
+        };
         if u64::try_from(payload.len()).ok() != Some(uncompressed_len) {
             return Err(WireError::LengthMismatch);
         }
@@ -137,6 +176,73 @@ impl TryFrom<u8> for RecordKind {
             8 => Ok(Self::LayerTree),
             9 => Ok(Self::CanvasSpec),
             _ => Err(WireError::InvalidEnum),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tile_codec_tests {
+    use super::*;
+
+    #[test]
+    fn forged_manifest_cannot_redirect_reclamation_to_unrelated_artwork() {
+        let snapshot = TileSnapshot::from_tiles([(
+            TileKey::from_pixel(LayerId(1), 128, -128, 0),
+            vec![127; TILE_BYTE_LEN],
+        )])
+        .unwrap();
+        let mut bytes = encode_root_manifest(&snapshot);
+        assert!(decode_root_manifest(&bytes).is_ok());
+        *bytes.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            decode_root_manifest(&bytes),
+            Err(WireError::RootMismatch)
+        ));
+    }
+
+    #[test]
+    fn tile_codec_preserves_exact_artwork_and_rejects_unbounded_or_corrupt_frames() {
+        // Product risk: compression must preserve every channel, including RGB
+        // under zero alpha, and hostile frames must not allocate arbitrary RAM.
+        let mut random = vec![0; TILE_BYTE_LEN];
+        let mut seed = 123_456_789_u32;
+        for byte in &mut random {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *byte = seed.to_le_bytes()[0];
+        }
+        for pixels in [vec![0; TILE_BYTE_LEN], vec![127; TILE_BYTE_LEN], random] {
+            let envelope = Envelope::new(RecordKind::Tile, pixels.clone());
+            for bytes in [envelope.encode(), envelope.encode_for_storage()] {
+                let decoded = Envelope::decode(&bytes, RecordKind::Tile).unwrap();
+                assert_eq!(decoded.payload, pixels);
+                assert_eq!(decoded.checksum, envelope.checksum);
+                assert!(bytes.len() <= pixels.len() + 52);
+            }
+        }
+        let valid = Envelope::new(RecordKind::Tile, vec![127; TILE_BYTE_LEN]).encode_for_storage();
+        assert_eq!(valid[11], 1);
+        let mut cases = Vec::new();
+        let mut bytes = valid.clone();
+        bytes[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
+        cases.push(bytes);
+        let mut bytes = valid.clone();
+        bytes[20] ^= 1;
+        cases.push(bytes);
+        let mut bytes = valid.clone();
+        bytes.push(0);
+        cases.push(bytes);
+        cases.push(valid[..valid.len() - 1].to_vec());
+        let mut bytes = valid.clone();
+        bytes[11] = 255;
+        cases.push(bytes);
+        let mut bytes = valid;
+        bytes.truncate(52);
+        bytes.extend(zstd::bulk::compress(&vec![1; TILE_BYTE_LEN + 1], 1).unwrap());
+        cases.push(bytes);
+        for bytes in cases {
+            assert!(Envelope::decode(&bytes, RecordKind::Tile).is_err());
         }
     }
 }
@@ -561,6 +667,11 @@ pub fn decode_root_manifest(bytes: &[u8]) -> Result<RootManifest, WireError> {
     decoder.finish()?;
     if tiles.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err(WireError::InvalidData("root entries not canonical"));
+    }
+    // The first 48 bytes are the claimed root ID/hash. Verify the remaining
+    // canonical manifest before reference collection can trust its tile keys.
+    if ObjectHash::digest_tagged(b"nyatidraw-content-root-v1", &bytes[48..]) != root.hash {
+        return Err(WireError::RootMismatch);
     }
     Ok(RootManifest { root, tiles })
 }

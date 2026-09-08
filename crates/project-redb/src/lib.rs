@@ -5,7 +5,13 @@
 use std::path::{Path, PathBuf};
 
 mod canvas_history;
+mod history_retention;
 mod layer_history;
+#[cfg(feature = "legacy-migration")]
+mod migration;
+mod object_retention;
+#[cfg(feature = "legacy-migration")]
+pub use migration::migrate_legacy_copy;
 
 #[cfg(feature = "diagnostic")]
 use std::{
@@ -19,18 +25,18 @@ use nyatidraw_api::{CanvasSpec, ContentRootId, HistoryNodeId, SnapshotId};
 use nyatidraw_document::LayerTree;
 use nyatidraw_history::{History, HistoryNode};
 use nyatidraw_project::{
-    CANVAS_HISTORY_SCHEMA_VERSION, Envelope, LAYER_HISTORY_SCHEMA_VERSION,
-    MAX_LAYER_TREE_RECORD_BYTES, OpenMode, ProjectCommitBatch, ProjectHistoryCursor,
-    ProjectOpenError, ProjectRepository, ProjectStructuralBatch, RecordKind, ReopenedProject,
-    RootManifest, SCHEMA_VERSION, SELECTION_STROKE_SCHEMA_VERSION, decode_history_cursor,
-    decode_history_node, decode_initial_history_cursor, decode_layer_tree, decode_project_head,
-    decode_root_manifest, decode_stroke_commit, encode_history_cursor, encode_history_node,
-    encode_initial_history_cursor, encode_layer_tree, encode_project_head, encode_root_manifest,
-    encode_stroke_commit, open_mode,
+    CANVAS_HISTORY_SCHEMA_VERSION, COMPRESSED_TILE_SCHEMA_FLAG, Envelope,
+    LAYER_HISTORY_SCHEMA_VERSION, MAX_LAYER_TREE_RECORD_BYTES, OpenMode, ProjectCommitBatch,
+    ProjectHistoryCursor, ProjectOpenError, ProjectRepository, ProjectStructuralBatch, RecordKind,
+    ReopenedProject, RootManifest, SCHEMA_VERSION, SELECTION_STROKE_SCHEMA_VERSION,
+    decode_history_cursor, decode_history_node, decode_initial_history_cursor, decode_layer_tree,
+    decode_project_head, decode_root_manifest, decode_stroke_commit, encode_history_cursor,
+    encode_history_node, encode_initial_history_cursor, encode_layer_tree, encode_project_head,
+    encode_root_manifest, encode_stroke_commit, open_mode,
 };
 use nyatidraw_stroke::{MaterializationStrategy, materialize_with_strategy};
 use nyatidraw_tiles::{ContentRoot, ObjectHash, TileObject, TileSnapshot};
-use redb::{Database, DatabaseError, Durability, ReadableTable, TableDefinition};
+use redb::{Database, DatabaseError, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
@@ -97,16 +103,52 @@ enum CommitFailurePoint {
 
 #[derive(Debug)]
 pub struct ProjectDb {
-    db: Database,
+    db: ProjectDatabase,
     path: PathBuf,
+}
+
+// A read-only preflight prevents redb's writable-open/drop allocator bookkeeping
+// from modifying an otherwise clean but application-invalid project.
+enum ProjectDatabase {
+    Writable(Database),
+    Validation(redb::ReadOnlyDatabase),
+}
+
+impl std::fmt::Debug for ProjectDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProjectDatabase")
+    }
+}
+
+impl ProjectDatabase {
+    fn begin_read(&self) -> Result<redb::ReadTransaction, redb::TransactionError> {
+        match self {
+            Self::Writable(db) => db.begin_read(),
+            Self::Validation(db) => db.begin_read(),
+        }
+    }
+
+    fn begin_write(&self) -> Result<redb::WriteTransaction, redb::TransactionError> {
+        match self {
+            Self::Writable(db) => db.begin_write(),
+            Self::Validation(_) => Err(redb::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "validation is read-only",
+            ))
+            .into()),
+        }
+    }
 }
 
 impl ProjectDb {
     /// Opens a project, initializing only a missing or exactly empty file.
+    /// During alpha, legacy containers are automatically converted through a
+    /// validated sibling copy and the old file is retained as a `.bak`.
     ///
     /// A marked existing project is fully decoded through its current head
     /// before this returns. A corrupt record therefore never becomes a valid
-    /// empty project and the original file is left in place.
+    /// empty project. Clean application-invalid files are checked read-only;
+    /// unclean database recovery may need redb's allocator repair writes.
     ///
     /// # Errors
     ///
@@ -115,7 +157,52 @@ impl ProjectDb {
     /// marked project whose committed graph fails validation, and `Io` for
     /// storage failures.
     pub fn open(path: &Path) -> Result<Self, ProjectOpenError> {
+        Self::open_inner(path, true)
+    }
+
+    fn open_inner(path: &Path, allow_retention: bool) -> Result<Self, ProjectOpenError> {
         let mode = open_mode(path)?;
+        if mode == OpenMode::OpenExisting {
+            match redb::ReadOnlyDatabase::open(path) {
+                Ok(db) => {
+                    let check = Self {
+                        db: ProjectDatabase::Validation(db),
+                        path: path.to_owned(),
+                    };
+                    check.validate_existing()?;
+                    #[cfg(feature = "legacy-migration")]
+                    if allow_retention && migration::needs_repack(&check)? {
+                        drop(check);
+                        migration::upgrade_alpha_in_place(path)?;
+                        return Self::open_inner(path, allow_retention);
+                    }
+                }
+                #[cfg(feature = "legacy-migration")]
+                Err(DatabaseError::UpgradeRequired(_)) => {
+                    migration::upgrade_alpha_in_place(path)?;
+                    return Self::open_inner(path, allow_retention);
+                }
+                // A crash may require redb to repair its allocator. Its normal
+                // writer path below retains the existing recovery semantics.
+                Err(DatabaseError::RepairAborted) => {}
+                Err(DatabaseError::DatabaseAlreadyOpen) => {
+                    return Err(ProjectOpenError::Locked {
+                        path: path.to_owned(),
+                    });
+                }
+                #[cfg(not(feature = "legacy-migration"))]
+                Err(DatabaseError::UpgradeRequired(_)) => {
+                    return Err(ProjectOpenError::LegacyContainer {
+                        path: path.to_owned(),
+                    });
+                }
+                Err(_) => {
+                    return Err(ProjectOpenError::InvalidNonEmpty {
+                        path: path.to_owned(),
+                    });
+                }
+            }
+        }
         let db = match mode {
             OpenMode::Initialize => Database::create(path).map_err(|error| match error {
                 DatabaseError::DatabaseAlreadyOpen => ProjectOpenError::Locked {
@@ -127,6 +214,9 @@ impl ProjectDb {
                 },
             })?,
             OpenMode::OpenExisting => Database::open(path).map_err(|error| match error {
+                DatabaseError::UpgradeRequired(_) => ProjectOpenError::LegacyContainer {
+                    path: path.to_owned(),
+                },
                 DatabaseError::DatabaseAlreadyOpen => ProjectOpenError::Locked {
                     path: path.to_owned(),
                 },
@@ -135,24 +225,59 @@ impl ProjectDb {
                 },
             })?,
         };
-        let this = Self {
-            db,
+        let mut this = Self {
+            db: ProjectDatabase::Writable(db),
             path: path.to_owned(),
         };
         if mode == OpenMode::Initialize {
             this.write_marker()?;
-        } else if !this.has_valid_marker()? {
-            return Err(ProjectOpenError::InvalidNonEmpty {
-                path: path.to_owned(),
-            });
+            // Only a newly initialized, tiny metadata-only DB is compacted.
+            // redb can otherwise retain a ~1MiB first-transaction allocation.
+            // Never run this on ordinary Save/Open/Close of existing artwork.
+            if let ProjectDatabase::Writable(db) = &mut this.db {
+                db.compact().map_err(|error| ProjectOpenError::Io {
+                    path: path.to_owned(),
+                    message: error.to_string(),
+                })?;
+            }
         } else {
-            this.load_canvas_spec()?;
-            this.load_layer_tree()?;
-            this.load_reopened()?;
-            this.validate_layer_history()?;
-            this.validate_canvas_history()?;
+            this.validate_existing()?;
+            // The read-only preflight can defer to writable crash recovery.
+            // Once repaired and validated, apply the same one-time alpha repack.
+            #[cfg(feature = "legacy-migration")]
+            if allow_retention && migration::needs_repack(&this)? {
+                drop(this);
+                migration::upgrade_alpha_in_place(path)?;
+                return Self::open_inner(path, allow_retention);
+            }
+            // Validate old artwork/metadata before a destructive retention
+            // migration. Invalid projects must remain untouched.
+            if allow_retention
+                && this.load_persisted_history_nodes()?.len() > nyatidraw_history::HISTORY_LIMIT
+            {
+                let mut transaction = this.db.begin_write().map_err(|error| this.io(error))?;
+                transaction
+                    .set_durability(Durability::Immediate)
+                    .map_err(|error| this.io(error))?;
+                this.retain_history(&transaction)?;
+                transaction.commit().map_err(|error| this.io(error))?;
+            }
         }
         Ok(this)
+    }
+
+    fn validate_existing(&self) -> Result<(), ProjectOpenError> {
+        if !self.has_valid_marker()? {
+            return Err(ProjectOpenError::InvalidNonEmpty {
+                path: self.path.clone(),
+            });
+        }
+        self.load_canvas_spec()?;
+        self.load_layer_tree()?;
+        self.load_reopened()?;
+        self.validate_layer_history()?;
+        self.validate_canvas_history()?;
+        Ok(())
     }
 
     /// Atomically stores one closed stroke, both immutable tile roots, and its
@@ -219,7 +344,9 @@ impl ProjectDb {
     ) -> Result<(), ProjectOpenError> {
         self.validate_structural_lineage(batch)?;
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
-        transaction.set_durability(Durability::Immediate);
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(|error| self.io(error))?;
         self.capture_snapshot_layers(
             &transaction,
             batch.snapshot_id,
@@ -235,13 +362,7 @@ impl ProjectDb {
             store_tile_objects(&mut objects, &batch.before).map_err(|error| self.io(error))?;
             store_tile_objects(&mut objects, &batch.after).map_err(|error| self.io(error))?;
         }
-        {
-            let mut roots = transaction
-                .open_table(ROOTS)
-                .map_err(|error| self.io(error))?;
-            store_root(&mut roots, &batch.before).map_err(|error| self.io(error))?;
-            store_root(&mut roots, &batch.after).map_err(|error| self.io(error))?;
-        }
+        self.store_roots(&transaction, &batch.before, &batch.after)?;
         {
             let mut history = transaction
                 .open_table(HISTORY)
@@ -359,7 +480,9 @@ impl ProjectDb {
     ) -> Result<(), ProjectOpenError> {
         self.validate_commit_lineage(batch)?;
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
-        transaction.set_durability(Durability::Immediate);
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(|error| self.io(error))?;
         self.capture_snapshot_layers(
             &transaction,
             batch.snapshot_id,
@@ -384,7 +507,8 @@ impl ProjectDb {
             metadata
                 .insert(
                     "schema_version",
-                    current.max(SELECTION_STROKE_SCHEMA_VERSION),
+                    (current & !COMPRESSED_TILE_SCHEMA_FLAG).max(SELECTION_STROKE_SCHEMA_VERSION)
+                        | (current & COMPRESSED_TILE_SCHEMA_FLAG),
                 )
                 .map_err(|error| self.io(error))?;
         }
@@ -397,13 +521,7 @@ impl ProjectDb {
             store_tile_objects(&mut objects, &batch.materialized.after)
                 .map_err(|error| self.io(error))?;
         }
-        {
-            let mut roots = transaction
-                .open_table(ROOTS)
-                .map_err(|error| self.io(error))?;
-            store_root(&mut roots, &batch.before).map_err(|error| self.io(error))?;
-            store_root(&mut roots, &batch.materialized.after).map_err(|error| self.io(error))?;
-        }
+        self.store_roots(&transaction, &batch.before, &batch.materialized.after)?;
         {
             let mut strokes = transaction
                 .open_table(STROKES)
@@ -497,6 +615,18 @@ impl ProjectDb {
         transaction: redb::WriteTransaction,
         control: &CommitControl,
     ) -> Result<(), ProjectOpenError> {
+        self.retain_history(&transaction)?;
+        {
+            let mut metadata = transaction.open_table(META).map_err(|e| self.io(e))?;
+            let version = metadata
+                .get("schema_version")
+                .map_err(|e| self.io(e))?
+                .ok_or_else(|| self.corrupt("schema marker missing"))?
+                .value();
+            metadata
+                .insert("schema_version", version | COMPRESSED_TILE_SCHEMA_FLAG)
+                .map_err(|e| self.io(e))?;
+        }
         match control {
             #[cfg(test)]
             CommitControl::Failure(CommitFailurePoint::BeforeCommitAbort) => {
@@ -839,7 +969,9 @@ impl ProjectDb {
         let layers = self.cursor_layer_record(cursor)?;
         let canvas = self.cursor_canvas_record(cursor)?;
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
-        transaction.set_durability(Durability::Immediate);
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(|error| self.io(error))?;
         if let Some(canvas) = canvas {
             let mut metadata = transaction
                 .open_table(META)
@@ -969,7 +1101,9 @@ impl ProjectDb {
             .validate()
             .map_err(|error| self.io(format!("invalid canvas spec: {error:?}")))?;
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
-        transaction.set_durability(Durability::Immediate);
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(|error| self.io(error))?;
         {
             let mut table = transaction
                 .open_table(META)
@@ -994,7 +1128,9 @@ impl ProjectDb {
             .map_err(|error| self.io(format!("layer tree cannot be encoded: {error}")))?;
         let bytes = Envelope::new(RecordKind::LayerTree, payload).encode();
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
-        transaction.set_durability(Durability::Immediate);
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(|error| self.io(error))?;
         {
             let mut state = transaction
                 .open_table(STATE)
@@ -1212,17 +1348,31 @@ impl ProjectDb {
 
     fn write_marker(&self) -> Result<(), ProjectOpenError> {
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
-        transaction.set_durability(Durability::Immediate);
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(|error| self.io(error))?;
         {
             let mut table = transaction
                 .open_table(META)
                 .map_err(|error| self.io(error))?;
             table
-                .insert("schema_version", SCHEMA_VERSION)
+                .insert(
+                    "schema_version",
+                    SCHEMA_VERSION | COMPRESSED_TILE_SCHEMA_FLAG,
+                )
                 .map_err(|error| self.io(error))?;
+            table
+                .insert(object_retention::REFERENCE_VERSION_KEY, 1)
+                .map_err(|e| self.io(e))?;
+            table
+                .insert("tile_storage_revision", 1)
+                .map_err(|e| self.io(e))?;
             write_canvas_metadata(&mut table, CanvasSpec::DEFAULT)
                 .map_err(|error| self.io(error))?;
         }
+        transaction
+            .open_table(object_retention::TILE_ROOT_REFS)
+            .map_err(|e| self.io(e))?;
         transaction.commit().map_err(|error| self.io(error))
     }
 
@@ -1238,7 +1388,7 @@ impl ProjectDb {
             .map_err(|error| self.io(error))?
             .is_some_and(|value| {
                 matches!(
-                    value.value(),
+                    value.value() & !COMPRESSED_TILE_SCHEMA_FLAG,
                     SCHEMA_VERSION
                         | LAYER_HISTORY_SCHEMA_VERSION
                         | SELECTION_STROKE_SCHEMA_VERSION
@@ -1340,8 +1490,14 @@ fn store_tile_objects(
     snapshot: &TileSnapshot,
 ) -> Result<(), redb::StorageError> {
     for (_, tile) in snapshot.iter() {
-        let envelope = Envelope::new(RecordKind::Tile, tile.pixels().to_vec()).encode();
-        table.insert(tile.hash().0.as_slice(), envelope.as_slice())?;
+        if let Some(existing) = table.get(tile.hash().0.as_slice())?
+            && let Ok(envelope) = Envelope::decode(existing.value(), RecordKind::Tile)
+            && envelope.payload == tile.pixels()
+        {
+            continue;
+        }
+        let envelope = Envelope::new(RecordKind::Tile, tile.pixels().to_vec()).encode_for_storage();
+        insert_changed_envelope(table, tile.hash().0.as_slice(), &envelope)?;
     }
     Ok(())
 }
@@ -1351,7 +1507,24 @@ fn store_root(
     snapshot: &TileSnapshot,
 ) -> Result<(), redb::StorageError> {
     let envelope = Envelope::new(RecordKind::ContentRoot, encode_root_manifest(snapshot)).encode();
-    table.insert(snapshot.root().hash.0.as_slice(), envelope.as_slice())?;
+    insert_changed_envelope(table, snapshot.root().hash.0.as_slice(), &envelope)?;
+    Ok(())
+}
+
+fn insert_changed_envelope(
+    table: &mut redb::Table<'_, &[u8], &[u8]>,
+    key: &[u8],
+    envelope: &[u8],
+) -> Result<(), redb::StorageError> {
+    // Immutable hashes often recur in both roots and in subsequent commits.
+    // Compare the full record, not just key presence: a damaged existing value
+    // must still be replaced by the canonical record, as before this shortcut.
+    let unchanged = table
+        .get(key)?
+        .is_some_and(|value| value.value() == envelope);
+    if !unchanged {
+        table.insert(key, envelope)?;
+    }
     Ok(())
 }
 
@@ -1568,6 +1741,328 @@ mod tests {
         )
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)] // One end-to-end artwork/backup/schema invariant.
+    fn legacy_raw_artwork_reopens_exactly_and_new_writes_gate_old_readers() {
+        // Product risk: automatic alpha recompression must preserve artwork and
+        // its original backup; old writers must not read the compressed schema.
+        let path = temp("raw-compatibility");
+        let first = prepared_batch();
+        let db = ProjectDb::open(&path).unwrap();
+        db.commit(&first).unwrap();
+        let tx = db.db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(OBJECTS).unwrap();
+            let records: Vec<_> = table
+                .iter()
+                .unwrap()
+                .map(|entry| {
+                    let (key, value) = entry.unwrap();
+                    (
+                        key.value().to_vec(),
+                        Envelope::decode(value.value(), RecordKind::Tile)
+                            .unwrap()
+                            .encode(),
+                    )
+                })
+                .collect();
+            for (key, bytes) in records {
+                table.insert(key.as_slice(), bytes.as_slice()).unwrap();
+            }
+        }
+        {
+            let mut meta = tx.open_table(META).unwrap();
+            meta.insert("schema_version", SCHEMA_VERSION).unwrap();
+            meta.remove(object_retention::REFERENCE_VERSION_KEY)
+                .unwrap();
+            meta.remove("tile_storage_revision").unwrap();
+        }
+        tx.delete_table(object_retention::TILE_ROOT_REFS).unwrap();
+        tx.commit().unwrap();
+        drop(db);
+        let raw_records = |path: &Path| {
+            let db = redb::ReadOnlyDatabase::open(path).unwrap();
+            let tx = db.begin_read().unwrap();
+            let objects = tx
+                .open_table(OBJECTS)
+                .unwrap()
+                .iter()
+                .unwrap()
+                .map(|entry| {
+                    let (key, value) = entry.unwrap();
+                    (key.value().to_vec(), value.value().to_vec())
+                })
+                .collect::<Vec<_>>();
+            let marker = tx
+                .open_table(META)
+                .unwrap()
+                .get("schema_version")
+                .unwrap()
+                .unwrap()
+                .value();
+            (objects, marker)
+        };
+        let original = raw_records(&path);
+        #[cfg(feature = "legacy-migration")]
+        let original_file = std::fs::read(&path).unwrap();
+        let db = ProjectDb::open(&path).unwrap();
+        assert_eq!(
+            db.load_reopened().unwrap().unwrap().current_tiles(),
+            &first.materialized.after
+        );
+        drop(db);
+        #[cfg(not(feature = "legacy-migration"))]
+        assert_eq!(raw_records(&path), original);
+        #[cfg(feature = "legacy-migration")]
+        {
+            let rebuilt = raw_records(&path);
+            assert_eq!(rebuilt.1, original.1 | COMPRESSED_TILE_SCHEMA_FLAG);
+            assert_eq!(rebuilt.0.len(), original.0.len());
+            let mut before_len = 0;
+            let mut after_len = 0;
+            for ((old_key, old), (new_key, new)) in original.0.iter().zip(&rebuilt.0) {
+                assert_eq!(old_key, new_key);
+                assert_eq!(
+                    Envelope::decode(old, RecordKind::Tile).unwrap(),
+                    Envelope::decode(new, RecordKind::Tile).unwrap()
+                );
+                before_len += old.len();
+                after_len += new.len();
+            }
+            assert!(after_len < before_len);
+            migration::tests::remove_verified_backup(&path, &original_file);
+        }
+        let db = ProjectDb::open(&path).unwrap();
+        let mut second = prepared_batch_from(
+            first.snapshot_id,
+            first.materialized.after.clone(),
+            SnapshotId(8),
+            HistoryNodeId(9),
+            99,
+            20,
+        );
+        second.history_node.parent = Some(first.history_node.id);
+        db.commit(&second).unwrap();
+        let read = db.db.begin_read().unwrap();
+        let marker = read
+            .open_table(META)
+            .unwrap()
+            .get("schema_version")
+            .unwrap()
+            .unwrap()
+            .value();
+        assert_eq!(marker, SCHEMA_VERSION | COMPRESSED_TILE_SCHEMA_FLAG);
+        assert!(!matches!(marker, 1..=4));
+        drop(read);
+        drop(db);
+        assert_eq!(
+            ProjectDb::open(&path)
+                .unwrap()
+                .load_reopened()
+                .unwrap()
+                .unwrap()
+                .current_tiles(),
+            &second.materialized.after
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn retention_preserves_artwork_metadata_and_128_undo_steps_across_restart() {
+        // Product risk: evicting history must not drop current/off-page pixels,
+        // split page/layer state, or publish a partially pruned transaction.
+        fn tiles(index: u8) -> TileSnapshot {
+            TileSnapshot::from_tiles([
+                (
+                    TileKey::from_pixel(LayerId(20), 128, -140, 22),
+                    vec![index; TILE_BYTE_LEN],
+                ),
+                (
+                    TileKey::from_pixel(LayerId(20), 128, 0, 0),
+                    vec![255; TILE_BYTE_LEN],
+                ),
+                (
+                    TileKey::from_pixel(LayerId(20), 128, 128, 0),
+                    vec![255; TILE_BYTE_LEN],
+                ),
+            ])
+            .unwrap()
+        }
+        fn tree(index: u8) -> LayerTree {
+            let mut tree = layer_tree_fixture();
+            tree.rename(
+                LayerTreeNodeId::Raster(LayerId(20)),
+                &format!("Layer {index}"),
+            )
+            .unwrap();
+            tree
+        }
+        fn page(index: u8) -> CanvasSpec {
+            CanvasSpec {
+                width_px: 1000 + u32::from(index),
+                height_px: 800,
+                pixels_per_inch: 72,
+            }
+        }
+        if let Some(path) = std::env::var_os("NYATIDRAW_RETENTION_REOPEN") {
+            let database = ProjectDb::open(Path::new(&path)).unwrap();
+            let reopened = database.load_reopened().unwrap().unwrap();
+            assert_eq!(reopened.history().node_count(), 128);
+            assert_eq!(reopened.current_tiles(), &tiles(132));
+            {
+                use redb::ReadableTableMetadata;
+                let tx = database.db.begin_read().unwrap();
+                assert_eq!(tx.open_table(ROOTS).unwrap().len().unwrap(), 129);
+                // One shared object must survive reclamation of old roots,
+                // even though it appears at two coordinates per root.
+                assert_eq!(tx.open_table(OBJECTS).unwrap().len().unwrap(), 130);
+            }
+            let mut session = HeadlessStrokeSession::from_reopened(reopened);
+            for index in (4..132).rev() {
+                let movement = session.prepare_undo_cursor().unwrap();
+                let cursor = movement.target();
+                database.persist_history_cursor(cursor).unwrap();
+                let restored = database.load_cursor_tiles(cursor).unwrap();
+                assert_eq!(restored, tiles(index));
+                assert_eq!(
+                    database.load_cursor_layer_tree(cursor).unwrap(),
+                    Some(tree(index))
+                );
+                assert_eq!(
+                    database.load_cursor_canvas_spec(cursor).unwrap(),
+                    page(index)
+                );
+                session
+                    .accept_history_cursor_move(movement, restored)
+                    .unwrap();
+            }
+            assert!(session.prepare_undo_cursor().is_err());
+            for _ in 0..128 {
+                let movement = session.prepare_redo_cursor().unwrap();
+                database.persist_history_cursor(movement.target()).unwrap();
+                let restored = database.load_cursor_tiles(movement.target()).unwrap();
+                session
+                    .accept_history_cursor_move(movement, restored)
+                    .unwrap();
+            }
+            assert_eq!(session.tiles(), &tiles(132));
+            return;
+        }
+        let path = temp("retention-128");
+        let database = ProjectDb::open(&path).unwrap();
+        database.persist_layer_tree(&tree(0)).unwrap();
+        let mut session = HeadlessStrokeSession::new(SnapshotId(0), TileSnapshot::empty());
+        for index in 1..=132_u8 {
+            let batch = session
+                .prepare_structural_change(
+                    SnapshotId(u128::from(index)),
+                    HistoryNodeId(u128::from(index)),
+                    u64::from(index),
+                    tiles(index),
+                )
+                .unwrap();
+            if index == 129 {
+                assert!(
+                    database
+                        .commit_structural_inner(
+                            &batch,
+                            Some(&tree(index)),
+                            Some(page(index)),
+                            &CommitControl::Failure(CommitFailurePoint::BeforeCommitAbort)
+                        )
+                        .is_err()
+                );
+                let before = database.load_reopened().unwrap().unwrap();
+                assert_eq!(before.history().node_count(), 128);
+                assert_eq!(before.current_tiles(), &tiles(128));
+                assert_eq!(
+                    before.history().initial_root(),
+                    TileSnapshot::empty().root().id
+                );
+                database.validate_layer_history().unwrap();
+                database.validate_canvas_history().unwrap();
+            }
+            database
+                .commit_structural_inner(
+                    &batch,
+                    Some(&tree(index)),
+                    Some(page(index)),
+                    &CommitControl::Normal,
+                )
+                .unwrap();
+            session.accept_structural_change(&batch).unwrap();
+            assert!(session.history().node_count() <= 128);
+        }
+        drop(session);
+        drop(database);
+        #[cfg(feature = "legacy-migration")]
+        let legacy_original = {
+            // The existing full-history child acceptance must also pass through
+            // the real alpha v2 -> v3 auto-conversion, not only fresh redb 4 files.
+            let legacy = path.with_extension("v2.ntdr");
+            migration::tests::write_v2_copy(&path, &legacy);
+            std::fs::remove_file(&path).unwrap();
+            std::fs::rename(&legacy, &path).unwrap();
+            std::fs::read(&path).unwrap()
+        };
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::retention_preserves_artwork_metadata_and_128_undo_steps_across_restart",
+                "--nocapture",
+            ])
+            .env("NYATIDRAW_RETENTION_REOPEN", &path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "fresh process validates all 128 steps");
+        #[cfg(feature = "legacy-migration")]
+        migration::tests::remove_verified_backup(&path, &legacy_original);
+        let database = ProjectDb::open(&path).unwrap();
+        let mut session =
+            HeadlessStrokeSession::from_reopened(database.load_reopened().unwrap().unwrap());
+        for _ in 0..3 {
+            let movement = session.prepare_undo_cursor().unwrap();
+            database.persist_history_cursor(movement.target()).unwrap();
+            let restored = database.load_cursor_tiles(movement.target()).unwrap();
+            session
+                .accept_history_cursor_move(movement, restored)
+                .unwrap();
+        }
+        let prepared = prepared_batch_from(
+            session.current_snapshot(),
+            session.tiles().clone(),
+            SnapshotId(140),
+            HistoryNodeId(140),
+            902,
+            700,
+        );
+        let batch = ProjectCommitBatch::new(
+            prepared.snapshot_id,
+            prepared.before,
+            prepared.stroke,
+            prepared.materialized,
+            HistoryNode {
+                parent: session.history().head(),
+                ..prepared.history_node
+            },
+        )
+        .unwrap();
+        database.commit(&batch).unwrap();
+        session.accept_committed(&batch).unwrap();
+        let expected = session.tiles().clone();
+        let expected_count = session.history().node_count();
+        drop(database);
+        let database = ProjectDb::open(&path).unwrap();
+        let reopened = database.load_reopened().unwrap().unwrap();
+        assert_eq!(reopened.current_tiles(), &expected);
+        assert_eq!(reopened.history().node_count(), expected_count);
+        assert_eq!(database.load_layer_tree().unwrap(), Some(tree(129)));
+        assert_eq!(database.load_canvas_spec().unwrap(), page(129));
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
     fn branched_batch(
         parent: &ProjectCommitBatch,
         snapshot_id: SnapshotId,
@@ -1595,6 +2090,53 @@ mod tests {
             history_node,
         )
         .expect("branch fixture remains a valid materialized transition")
+    }
+
+    #[test]
+    fn repeated_object_writes_repair_damaged_records_and_preserve_reopened_history() {
+        // Product risk: skipping an existing hash must not retain damaged
+        // artwork/root bytes or lose a durable history transition.
+        for kind in [RecordKind::Tile, RecordKind::ContentRoot] {
+            let path = temp("immutable-write-repair");
+            let first = prepared_batch();
+            let second = branched_batch(&first, SnapshotId(3), HistoryNodeId(4), 84, 20);
+            let database = ProjectDb::open(&path).unwrap();
+            database.commit(&first).unwrap();
+            let transaction = database.db.begin_write().unwrap();
+            {
+                let (definition, key) = if kind == RecordKind::Tile {
+                    (
+                        OBJECTS,
+                        first.materialized.after.iter().next().unwrap().1.hash(),
+                    )
+                } else {
+                    (ROOTS, first.materialized.after.root().hash)
+                };
+                transaction
+                    .open_table(definition)
+                    .unwrap()
+                    .insert(key.0.as_slice(), b"damaged-record".as_slice())
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+            // The caller still owns canonical immutable before pixels. As in
+            // the original writer, persisting them repairs the altered value.
+            database.commit(&second).unwrap();
+            drop(database);
+            let database = ProjectDb::open(&path).unwrap();
+            let reopened = database.load_reopened().unwrap().unwrap();
+            assert_eq!(reopened.history().node_count(), 2);
+            assert_eq!(
+                database.load_current().unwrap().unwrap().materialized.after,
+                second.materialized.after
+            );
+            drop(database);
+            println!(
+                "immutable-write-scratch kind={kind:?} bytes={}",
+                std::fs::metadata(&path).unwrap().len()
+            );
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
@@ -1920,7 +2462,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .value(),
-            SELECTION_STROKE_SCHEMA_VERSION,
+            SELECTION_STROKE_SCHEMA_VERSION | COMPRESSED_TILE_SCHEMA_FLAG,
             "Undo must not downgrade a project with selected redo branches"
         );
         drop(transaction);
@@ -2311,7 +2853,7 @@ mod tests {
         let mut transaction = database
             .begin_write()
             .expect("begin legacy migration mutation");
-        transaction.set_durability(Durability::Immediate);
+        transaction.set_durability(Durability::Immediate).unwrap();
         {
             let mut metadata = transaction.open_table(META).expect("open metadata");
             for key in [
@@ -2328,17 +2870,27 @@ mod tests {
             .expect("commit legacy migration fixture");
         drop(database);
 
-        let before = std::fs::read(&path).expect("fingerprint legacy project");
+        let metadata = |path: &Path| {
+            let db = redb::ReadOnlyDatabase::open(path).unwrap();
+            let tx = db.begin_read().unwrap();
+            tx.open_table(META)
+                .unwrap()
+                .iter()
+                .unwrap()
+                .map(|entry| {
+                    let (key, value) = entry.unwrap();
+                    (key.value().to_owned(), value.value())
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = metadata(&path);
         let database = ProjectDb::open(&path).expect("open legacy project");
         assert_eq!(
             database.load_canvas_spec().expect("load legacy default"),
             CanvasSpec::DEFAULT
         );
         drop(database);
-        assert_eq!(
-            std::fs::read(&path).expect("fingerprint opened legacy project"),
-            before
-        );
+        assert_eq!(metadata(&path), before);
         let _ = std::fs::remove_file(path);
     }
 
@@ -2435,7 +2987,7 @@ mod tests {
 
             let database = Database::open(&path).expect("open raw corruption fixture");
             let mut transaction = database.begin_write().expect("begin raw mutation");
-            transaction.set_durability(Durability::Immediate);
+            transaction.set_durability(Durability::Immediate).unwrap();
             {
                 let mut state = transaction.open_table(STATE).expect("state table");
                 state
@@ -2762,7 +3314,7 @@ mod tests {
     fn mutate_record(path: &Path, batch: &ProjectCommitBatch, mutation: Corruption) {
         let database = Database::open(path).expect("open redb corruption fixture");
         let mut transaction = database.begin_write().expect("write corruption fixture");
-        transaction.set_durability(Durability::Immediate);
+        transaction.set_durability(Durability::Immediate).unwrap();
         let corrupt = [0_u8];
         match mutation {
             Corruption::RemoveHead => mutate_snapshot(&mut transaction, batch, None),

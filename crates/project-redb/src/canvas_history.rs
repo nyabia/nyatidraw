@@ -4,6 +4,7 @@ use super::{
     ProjectHistoryCursor, ProjectOpenError, ReadableTable, RecordKind, SNAPSHOTS, SnapshotId,
     TableDefinition, decode_envelope, write_canvas_metadata,
 };
+use nyatidraw_project::COMPRESSED_TILE_SCHEMA_FLAG;
 use std::collections::BTreeSet;
 
 pub(super) const SNAPSHOT_CANVAS: TableDefinition<&[u8], &[u8]> =
@@ -19,7 +20,9 @@ impl ProjectDb {
         Ok(metadata
             .get("schema_version")
             .map_err(|error| self.io(error))?
-            .is_some_and(|value| value.value() == CANVAS_HISTORY_SCHEMA_VERSION))
+            .is_some_and(|value| {
+                value.value() & !COMPRESSED_TILE_SCHEMA_FLAG == CANVAS_HISTORY_SCHEMA_VERSION
+            }))
     }
 
     /// Loads the page belonging to a validated cursor. Pre-upgrade snapshots
@@ -71,7 +74,9 @@ impl ProjectDb {
             metadata
                 .get("schema_version")
                 .map_err(|error| self.io(error))?
-                .is_some_and(|value| value.value() == CANVAS_HISTORY_SCHEMA_VERSION)
+                .is_some_and(|value| {
+                    value.value() & !COMPRESSED_TILE_SCHEMA_FLAG == CANVAS_HISTORY_SCHEMA_VERSION
+                })
         };
         if !enabled && canvas.is_none() {
             return Ok(());

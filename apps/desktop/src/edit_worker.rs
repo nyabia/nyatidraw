@@ -45,6 +45,12 @@ pub(crate) fn execute(
             | EditCommand::CropPageToSelection
     );
     let paint = match command {
+        EditCommand::ClearActiveLayer => {
+            transformed = Some(
+                nyatidraw_paint_cpu::clear_raster(session.tiles(), tree, target).map_err(reject)?,
+            );
+            None
+        }
         EditCommand::ResizePage { size } => {
             let next = CanvasSpec {
                 width_px: size[0],

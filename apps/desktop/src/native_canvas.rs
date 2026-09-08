@@ -52,8 +52,8 @@ const LIVE_BRUSH: BrushPreset = BrushPreset {
     id: BrushPresetId(1),
     schema_version: 1,
     engine_version: ROUND_BRUSH_ENGINE_VERSION,
-    size_px: 28.0,
-    opacity: 0.92,
+    size_px: 5.0,
+    opacity: 1.0,
     flow: 0.38,
     spacing_ratio: 0.12,
 };
@@ -854,7 +854,7 @@ struct ActiveCanvas {
     background_painter: GpuRoundDabPainter,
     scene: GpuCompositeScene,
     stroke: StrokePipeline,
-    commands: Vec<CommandEnvelope>,
+    commands: Vec<crate::live_ink::CanvasCommand>,
     view: RendererView,
     active_layer: LayerId,
     next_layer_node_id: u128,
@@ -1654,7 +1654,15 @@ impl ActiveCanvas {
             .live_ink
             .drain_editor_commands(&mut self.commands);
         let commands = std::mem::take(&mut self.commands);
-        for envelope in commands {
+        for command in commands {
+            let envelope = match command {
+                crate::live_ink::CanvasCommand::Ui(envelope) => envelope,
+                crate::live_ink::CanvasCommand::NativeViewport { id, command } => CommandEnvelope {
+                    id,
+                    based_on: self.projection.current().revision,
+                    command: EditorCommand::Viewport(command),
+                },
+            };
             self.apply_command(envelope, width, height, scale);
         }
         // This one-frame compatibility is only for a Save queued just before
@@ -1963,6 +1971,24 @@ impl ActiveCanvas {
                             };
                             self.stroke.live_ink.set_navigation_tool(false);
                         }
+                        ToolCommand::CycleSelectionFamily => {
+                            self.drawing.tool = match self.drawing.tool {
+                                DrawingTool::Move => DrawingTool::Wand,
+                                DrawingTool::Wand => DrawingTool::Lasso,
+                                _ => DrawingTool::Move,
+                            };
+                            self.stroke
+                                .live_ink
+                                .set_navigation_tool(self.drawing.tool == DrawingTool::Move);
+                        }
+                        ToolCommand::CycleFillFamily => {
+                            self.drawing.tool = if self.drawing.tool == DrawingTool::Fill {
+                                DrawingTool::Gradient
+                            } else {
+                                DrawingTool::Fill
+                            };
+                            self.stroke.live_ink.set_navigation_tool(false);
+                        }
                         ToolCommand::SetSizeTenths(size) if (1..=2_000).contains(&size) => {
                             self.drawing.size_tenths = size;
                         }
@@ -2018,7 +2044,7 @@ impl ActiveCanvas {
         let mut tree = self.scene.tree().clone();
         let mut active = self.active_layer;
         let next_id = self.next_layer_node_id;
-        let white = matches!(command, LayerCommand::AddWhiteBackground);
+        let mut white_layer = None;
         match command {
             LayerCommand::AddRaster | LayerCommand::AddGroup => {
                 let is_group = matches!(command, LayerCommand::AddGroup);
@@ -2089,30 +2115,23 @@ impl ActiveCanvas {
                     .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
             }
             LayerCommand::AddWhiteBackground => {
-                if self
-                    .cpu_tiles
-                    .keys()
-                    .any(|key| key.layer == BACKGROUND_LAYER)
-                {
-                    return Ok(false);
-                }
-                if tree
-                    .ancestors(nyatidraw_api::LayerTreeNodeId::Raster(BACKGROUND_LAYER))
-                    .is_none()
-                {
-                    tree.insert(
-                        tree.root_id(),
-                        0,
-                        LayerTreeNode::Raster(empty_raster(BACKGROUND_LAYER, "Background".into())),
-                    )
-                    .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
-                }
+                let _ = next_id
+                    .checked_add(1)
+                    .ok_or(CommandRejectReason::RevisionExhausted)?;
+                let layer = LayerId(next_id);
+                tree.insert(
+                    tree.root_id(),
+                    0,
+                    LayerTreeNode::Raster(empty_raster(layer, "White".into())),
+                )
+                .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
+                white_layer = Some(layer);
             }
             LayerCommand::SetActive(_) | LayerCommand::ToggleSolo(_) => {
                 unreachable!("session commands handled separately")
             }
         }
-        if &tree == self.scene.tree() && !white {
+        if &tree == self.scene.tree() && white_layer.is_none() {
             return Ok(false);
         }
         self.scene
@@ -2120,7 +2139,11 @@ impl ActiveCanvas {
             .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
         let (reply, received) = sync_channel(1);
         self.enqueue_artwork(
-            WorkerRequest::CommitLayerTree { tree, white, reply },
+            WorkerRequest::CommitLayerTree {
+                tree,
+                white_layer,
+                reply,
+            },
             received,
             Some(active),
         )
@@ -3067,6 +3090,22 @@ fn valid_active_layer(tree: &LayerTree, preferred: LayerId) -> LayerId {
 }
 
 pub(crate) fn default_layer_tree() -> LayerTree {
+    LayerTree::new(GroupNode {
+        id: ROOT_GROUP,
+        name: "Root".into(),
+        visible: true,
+        opacity_u16: u16::MAX,
+        children: vec![LayerTreeNode::Raster(empty_raster(
+            LIVE_LAYER,
+            "Layer 1".into(),
+        ))],
+    })
+    .expect("new document has one transparent raster layer")
+}
+
+/// Older projects without layer metadata used this topology. Never reinterpret
+/// their existing pixels using the new-document default (which would hide layer 2).
+pub(crate) fn legacy_layer_tree() -> LayerTree {
     let raster = |id, name: &str| {
         LayerTreeNode::Raster(LayerNode {
             id,
@@ -3138,25 +3177,30 @@ fn next_default_node_name(tree: &LayerTree, group_name: bool) -> String {
     }
 }
 
-fn opaque_white_background_tiles(canvas: CanvasSpec) -> TileSnapshot {
+fn opaque_white_layer_tiles(canvas: CanvasSpec, layer: LayerId) -> TileSnapshot {
     let columns = canvas.width_px.div_ceil(TILE_EDGE);
     let rows = canvas.height_px.div_ceil(TILE_EDGE);
-    let white_tile = vec![u8::MAX; TILE_BYTE_LEN];
     TileSnapshot::from_tiles((0..rows).flat_map(|y| {
-        let white_tile = white_tile.clone();
         (0..columns).map(move |x| {
+            let mut pixels = vec![0; TILE_BYTE_LEN];
+            let width = (canvas.width_px - x * TILE_EDGE).min(TILE_EDGE) as usize;
+            let height = (canvas.height_px - y * TILE_EDGE).min(TILE_EDGE) as usize;
+            for row in 0..height {
+                let start = row * TILE_EDGE as usize * 4;
+                pixels[start..start + width * 4].fill(u8::MAX);
+            }
             (
                 TileKey {
-                    layer: BACKGROUND_LAYER,
+                    layer,
                     mip: 0,
                     x: i32::try_from(x).expect("document tile column fits i32"),
                     y: i32::try_from(y).expect("document tile row fits i32"),
                 },
-                white_tile.clone(),
+                pixels,
             )
         })
     }))
-    .expect("built-in white background tiles are canonical")
+    .expect("white raster tiles are canonical")
 }
 
 fn enqueue_synthetic_durability_probe(live_ink: &LiveInkBridge) -> Result<(), String> {
@@ -3273,8 +3317,8 @@ impl StrokePipeline {
             drawing: DrawingConfig {
                 edit_settings: nyatidraw_api::EditSettings::default(),
                 tool: DrawingTool::Brush,
-                size_tenths: 280,
-                opacity_u16: 60_292,
+                size_tenths: 50,
+                opacity_u16: u16::MAX,
                 color: LIVE_BRUSH_COLOR.0,
             },
             closed_strokes: 0,
@@ -3985,7 +4029,7 @@ enum WorkerRequest {
     },
     CommitLayerTree {
         tree: LayerTree,
-        white: bool,
+        white_layer: Option<LayerId>,
         reply: SyncSender<Result<ArtworkOutcome, EditFailure>>,
     },
     ExportPng {
@@ -4075,10 +4119,9 @@ fn open_materialization_session(
             path.display()
         )
     })?;
-    let layer_tree = db
+    let stored_layer_tree = db
         .load_layer_tree()
-        .map_err(|error| format!("layer-tree-reopen:path={}:error={error}", path.display()))?
-        .unwrap_or_else(default_layer_tree);
+        .map_err(|error| format!("layer-tree-reopen:path={}:error={error}", path.display()))?;
     let persisted_canvas = db
         .load_canvas_spec()
         .map_err(|error| format!("canvas-reopen:path={}:error={error}", path.display()))?;
@@ -4088,6 +4131,32 @@ fn open_materialization_session(
             path.display()
         )
     })?;
+    let layer_tree = if let Some(tree) = stored_layer_tree {
+        tree
+    } else if reopened.is_some() {
+        legacy_layer_tree()
+    } else {
+        // Explicit synthetic probes exercise group and cross-layer invariants;
+        // their fixture must not dictate the user-facing new-document defaults.
+        let tree = if [
+            PROTOCOL_PROBE_ENV,
+            HISTORY_PROBE_ENV,
+            INPUT_SAFETY_PROBE_ENV,
+            "NAYATI_SYNTHETIC_INK",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+        {
+            legacy_layer_tree()
+        } else {
+            default_layer_tree()
+        };
+        // Persist the initial topology before the first stroke so undo-to-empty
+        // and later process reopen use the same baseline, not a future default.
+        db.persist_layer_tree(&tree)
+            .map_err(|error| format!("initial-layer-tree:{error}"))?;
+        tree
+    };
 
     if let Some(reopened) = reopened {
         let initial_tiles = reopened.current_tiles().clone();
@@ -4690,7 +4759,7 @@ fn materialization_loop(
                             .map_err(|error| {
                                 EditFailure::Fatal(format!("history-tree-load:{error}"))
                             })?
-                            .unwrap_or_else(default_layer_tree);
+                            .unwrap_or_else(legacy_layer_tree);
                         let canvas = db.load_cursor_canvas_spec(target).map_err(|error| {
                             EditFailure::Fatal(format!("history-page-load:{error}"))
                         })?;
@@ -4759,7 +4828,11 @@ fn materialization_loop(
                 }
                 continue;
             }
-            WorkerRequest::CommitLayerTree { tree, white, reply } => {
+            WorkerRequest::CommitLayerTree {
+                tree,
+                white_layer,
+                reply,
+            } => {
                 let result = (|| -> Result<HistoryMove, String> {
                     let next = next_id
                         .checked_add(1)
@@ -4783,10 +4856,10 @@ fn materialization_loop(
                             )
                             .map_err(|error| format!("subtree tiles: {error:?}"))?
                     };
-                    if white {
+                    if let Some(layer) = white_layer {
                         after = after
                             .with_replacements(
-                                opaque_white_background_tiles(preview_canvas)
+                                opaque_white_layer_tiles(preview_canvas, layer)
                                     .iter()
                                     .map(|(key, tile)| (key, tile.pixels().to_vec())),
                             )
@@ -5279,6 +5352,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn white_raster_cannot_overwrite_other_layers_or_leak_beyond_page_edges() {
+        // Product risk: a reserved layer ID can overwrite ink, and opaque tile
+        // padding can reveal unwanted white artwork after canvas expansion.
+        for (width_px, height_px, layer) in [
+            (1, 1, LayerId(101)),
+            (128, 128, LayerId(203)),
+            (129, 257, LayerId(999)),
+        ] {
+            let snapshot = opaque_white_layer_tiles(
+                CanvasSpec {
+                    width_px,
+                    height_px,
+                    pixels_per_inch: 96,
+                },
+                layer,
+            );
+            let mut white_pixels = 0_u64;
+            for (key, tile) in snapshot.iter() {
+                assert_eq!(key.layer, layer);
+                assert_eq!(key.mip, 0);
+                let origin_x = u32::try_from(key.x).unwrap() * TILE_EDGE;
+                let origin_y = u32::try_from(key.y).unwrap() * TILE_EDGE;
+                for (index, pixel) in tile.pixels().chunks_exact(4).enumerate() {
+                    let x = origin_x + u32::try_from(index).unwrap() % TILE_EDGE;
+                    let y = origin_y + u32::try_from(index).unwrap() / TILE_EDGE;
+                    if x < width_px && y < height_px {
+                        assert_eq!(pixel, [255; 4]);
+                        white_pixels += 1;
+                    } else {
+                        assert_eq!(pixel, [0; 4]);
+                    }
+                }
+            }
+            assert_eq!(white_pixels, u64::from(width_px) * u64::from(height_px));
+        }
+    }
+
+    #[test]
     fn deferred_gpu_work_cannot_recopy_or_roll_back_durable_tiles_and_history() {
         // Product risk: retrying old GPU work must not overwrite newer CPU
         // artwork/history, or run after a new upload clears its preview guard.
@@ -5470,7 +5581,110 @@ mod tests {
     }
 
     #[test]
+    fn clear_layer_keeps_undo_and_reopens_empty_pixels_without_deleting_layer() {
+        // Product risk: clear must be a durable, undoable pixel operation,
+        // including outside-page pixels, never deletion of the layer itself.
+        const REOPEN: &str = "NYATIDRAW_TEST_CLEAR_REOPEN";
+        if let Some(path) = std::env::var_os(REOPEN) {
+            let (_, tiles, tree, _, _, _) =
+                open_materialization_session(&ProjectLocation::UntitledRecovery(path.into()))
+                    .expect("fresh process reopens cleared document");
+            assert!(tiles.is_empty());
+            assert_eq!(tree, default_layer_tree());
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "nyatidraw-clear-test-{}-{}.ntdr",
+            std::process::id(),
+            system_timestamp_ns(),
+        ));
+        let location = ProjectLocation::UntitledRecovery(path.clone());
+        let (mut session, _, tree, _, mut next_id, sink) =
+            open_materialization_session(&location).expect("scratch project");
+        let db = match &sink {
+            ProjectSink::UntitledRecovery { db, .. } | ProjectSink::ExplicitProject { db, .. } => {
+                db
+            }
+        };
+        let before = TileSnapshot::from_tiles([-20, 0, 300].map(|x| {
+            (
+                TileKey {
+                    layer: LIVE_LAYER,
+                    mip: 0,
+                    x,
+                    y: 0,
+                },
+                vec![255; TILE_BYTE_LEN],
+            )
+        }))
+        .expect("signed artwork fixture");
+        let seed = session
+            .prepare_structural_change(
+                SnapshotId(next_id),
+                HistoryNodeId(next_id),
+                1,
+                before.clone(),
+            )
+            .expect("seed artwork");
+        db.commit_structural_with_layer_tree(&seed, &tree)
+            .expect("save seed");
+        session
+            .accept_structural_change(&seed)
+            .expect("accept seed");
+        next_id += 1;
+        let outcome = crate::edit_worker::execute(
+            EditCommand::ClearActiveLayer,
+            LIVE_LAYER,
+            nyatidraw_api::CanvasSpec::DEFAULT,
+            &tree,
+            &mut None,
+            &mut session,
+            &mut next_id,
+            db,
+        )
+        .ok()
+        .expect("clear commits successfully");
+        assert!(outcome.tiles.expect("clear changed pixels").is_empty());
+        let undo = session.prepare_undo_cursor().expect("clear undo exists");
+        let restored = db.load_cursor_tiles(undo.target()).expect("undo pixels");
+        assert_eq!(restored.root(), before.root());
+        db.persist_history_cursor(undo.target()).expect("save undo");
+        session
+            .accept_history_cursor_move(undo, restored)
+            .expect("accept undo");
+        let redo = session.prepare_redo_cursor().expect("clear redo exists");
+        let cleared = db.load_cursor_tiles(redo.target()).expect("redo pixels");
+        assert!(cleared.is_empty());
+        db.persist_history_cursor(redo.target()).expect("save redo");
+        session
+            .accept_history_cursor_move(redo, cleared)
+            .expect("accept redo");
+        drop(session);
+        drop(sink);
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "native_canvas::tests::clear_layer_keeps_undo_and_reopens_empty_pixels_without_deleting_layer"])
+            .env(REOPEN, &path).status().expect("start fresh verifier");
+        assert!(status.success());
+        std::fs::remove_file(path).expect("remove scratch fixture");
+    }
+
+    #[test]
     fn untitled_recovery_reopens_exact_cpu_tiles_after_lifecycle_restart() {
+        const REOPEN_PATH: &str = "NYATIDRAW_TEST_NEW_DOCUMENT_REOPEN";
+        const REOPEN_ROOT: &str = "NYATIDRAW_TEST_NEW_DOCUMENT_ROOT";
+        if let Some(path) = std::env::var_os(REOPEN_PATH) {
+            // A fresh test process must see the same baseline and artwork;
+            // dropping handles in the original process alone is not that proof.
+            let (_, tiles, tree, _, _, _) =
+                open_materialization_session(&ProjectLocation::UntitledRecovery(path.into()))
+                    .expect("new process reopens committed document");
+            assert_eq!(tree, default_layer_tree());
+            assert_eq!(
+                format!("{:?}", tiles.root()),
+                std::env::var(REOPEN_ROOT).expect("parent supplied expected content root"),
+            );
+            return;
+        }
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
@@ -5480,8 +5694,12 @@ mod tests {
         ));
         let location = ProjectLocation::UntitledRecovery(path.clone());
 
-        let (mut session, _, _, _, next_id, sink) =
+        let (mut session, initial_tiles, initial_tree, _, next_id, sink) =
             open_materialization_session(&location).expect("fresh untitled recovery store opens");
+        // Product risk: changing defaults must not introduce hidden/background
+        // artwork or change the baseline hierarchy on undo and reopen.
+        assert!(initial_tiles.is_empty());
+        assert_eq!(initial_tree, default_layer_tree());
         let begin = sample(1, PointerPhase::Begin, 128.0, 128.0);
         let end = sample(2, PointerPhase::End, 260.0, 196.0);
         let mut evaluator = RoundBrushEvaluator::new(0x4e41_5941_5449);
@@ -5517,8 +5735,25 @@ mod tests {
         drop(session);
         drop(sink);
 
-        let (_, reopened_tiles, _, _, _, reopened_sink) = open_materialization_session(&location)
-            .expect("same process-lifetime recovery path reopens after suspend/resume");
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "native_canvas::tests::untitled_recovery_reopens_exact_cpu_tiles_after_lifecycle_restart",
+                "--nocapture",
+            ])
+            .env(REOPEN_PATH, &path)
+            .env(REOPEN_ROOT, format!("{:?}", expected_tiles.root()))
+            .status()
+            .expect("spawn independent document reopen verifier");
+        assert!(
+            child.success(),
+            "new process must preserve artwork and initial layer tree"
+        );
+
+        let (_, reopened_tiles, reopened_tree, _, _, reopened_sink) =
+            open_materialization_session(&location)
+                .expect("same process-lifetime recovery path reopens after suspend/resume");
+        assert_eq!(reopened_tree, initial_tree);
         assert_eq!(reopened_tiles.root(), expected_tiles.root());
         assert_eq!(reopened_tiles.len(), expected_tiles.len());
         for (key, expected) in expected_tiles.iter() {

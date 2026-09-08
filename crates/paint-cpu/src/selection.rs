@@ -479,6 +479,37 @@ fn paint_pixel(paint: SelectionPaint, x: u32, y: u32) -> [u8; 4] {
     }
 }
 
+/// Clears one raster across all signed tiles, keeping every other layer exact.
+///
+/// # Errors
+/// Rejects missing or locked layers without modifying the immutable source.
+pub fn clear_raster(
+    snapshot: &TileSnapshot,
+    tree: &LayerTree,
+    target: LayerId,
+) -> Result<SelectionPaintResult, EditError> {
+    let layer = find_raster(tree.root(), target).ok_or(EditError::UnknownLayer)?;
+    if layer.locked {
+        return Err(EditError::LockedLayer);
+    }
+    let changed_tiles: Vec<_> = snapshot
+        .iter()
+        .filter(|(key, _)| key.layer == target)
+        .map(|(key, _)| key)
+        .collect();
+    let after = snapshot
+        .with_replacements(
+            changed_tiles
+                .iter()
+                .map(|key| (*key, vec![0; TILE_BYTE_LEN])),
+        )
+        .map_err(EditError::Tiles)?;
+    Ok(SelectionPaintResult {
+        after,
+        changed_tiles,
+    })
+}
+
 /// Paints source-over into selected pixels of one unlocked raster. Untouched
 /// layers, off-page tiles and padding within a boundary tile remain exact.
 ///
@@ -647,6 +678,37 @@ mod tests {
             x,
             y: 0,
         }
+    }
+
+    #[test]
+    fn clear_raster_preserves_other_layers_and_removes_signed_outside_pixels() {
+        // Product risk: clearing a layer must not delete another layer, leave
+        // invisible off-page pixels behind, or mutate a locked layer/history.
+        let original = TileSnapshot::from_tiles(
+            [key(1, -20), key(1, 0), key(1, 300), key(2, 0)]
+                .map(|key| (key, vec![255; TILE_BYTE_LEN])),
+        )
+        .expect("fixture tiles");
+        let root = original.root();
+        let cleared = clear_raster(&original, &tree(false), LayerId(1)).expect("clear");
+        assert_eq!(cleared.changed_tiles.len(), 3);
+        assert_eq!(cleared.after.len(), 1);
+        assert_eq!(cleared.after.get(key(2, 0)), original.get(key(2, 0)));
+        assert_eq!(original.root(), root);
+        assert!(
+            clear_raster(&cleared.after, &tree(false), LayerId(1))
+                .expect("empty clear")
+                .changed_tiles
+                .is_empty()
+        );
+        assert!(matches!(
+            clear_raster(&original, &tree(true), LayerId(1)),
+            Err(EditError::LockedLayer)
+        ));
+        assert!(matches!(
+            clear_raster(&original, &tree(false), LayerId(99)),
+            Err(EditError::UnknownLayer)
+        ));
     }
 
     #[test]

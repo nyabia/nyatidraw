@@ -6,3 +6,4 @@ asset_dir = "assets"
 identifier = "io.nyati.draw"
 publisher = "NyatiDraw"
 short_description = "Native ink drawing application"
+icon = ["assets/nyatidraw.ico", "assets/nyatidraw.png"]

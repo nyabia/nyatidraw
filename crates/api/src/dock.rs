@@ -16,6 +16,8 @@ pub enum PanelKind {
     CanvasActions,
     Viewport,
     QuickColors,
+    ToolProperties,
+    BrushSizes,
 }
 
 impl PanelKind {
@@ -29,7 +31,7 @@ impl PanelKind {
         )
     }
 
-    const REQUIRED: [Self; 7] = [
+    const REQUIRED: [Self; 9] = [
         Self::Canvas,
         Self::Tools,
         Self::Navigator,
@@ -37,6 +39,8 @@ impl PanelKind {
         Self::Brush,
         Self::Color,
         Self::History,
+        Self::ToolProperties,
+        Self::BrushSizes,
     ];
 }
 
@@ -159,10 +163,10 @@ impl DockTree {
             second: Box::new(DockNode::Split {
                 axis: DockAxis::Horizontal,
                 first_per_mille: 80,
-                first: Box::new(DockNode::Panel(PanelKind::Brush)),
+                first: Box::new(Self::brush_stack(DockNode::Panel(PanelKind::Brush))),
                 second: Box::new(DockNode::Split {
                     axis: DockAxis::Horizontal,
-                    first_per_mille: 860,
+                    first_per_mille: 820,
                     first: Box::new(DockNode::Panel(PanelKind::Canvas)),
                     second: Box::new(DockNode::Split {
                         axis: DockAxis::Vertical,
@@ -190,6 +194,22 @@ impl DockTree {
     #[must_use]
     pub const fn root(&self) -> &DockNode {
         &self.root
+    }
+
+    /// Expands the former combined brush panel without moving other docks.
+    #[must_use]
+    pub fn brush_stack(subtools: DockNode) -> DockNode {
+        DockNode::Split {
+            axis: DockAxis::Vertical,
+            first_per_mille: 350,
+            first: Box::new(subtools),
+            second: Box::new(DockNode::Split {
+                axis: DockAxis::Vertical,
+                first_per_mille: 400,
+                first: Box::new(DockNode::Panel(PanelKind::ToolProperties)),
+                second: Box::new(DockNode::Panel(PanelKind::BrushSizes)),
+            }),
+        }
     }
 
     #[must_use]

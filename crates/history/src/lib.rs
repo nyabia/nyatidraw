@@ -6,6 +6,9 @@ use nyatidraw_api::{ContentRootId, HistoryNodeId};
 use nyatidraw_brush::RecordedStroke;
 use nyatidraw_stroke::StrokeCommitId;
 
+/// Temporary product policy until disk-paged history is implemented.
+pub const HISTORY_LIMIT: usize = 128;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationRecord {
     Stroke {
@@ -59,6 +62,64 @@ pub struct History {
 }
 
 impl History {
+    /// Retains at most 128 operations, prioritizing the current undo path.
+    /// Other connected branches fill remaining slots, newest child IDs first.
+    /// Returns the old node that becomes the new non-undoable baseline.
+    ///
+    /// # Panics
+    /// Panics only if private graph links violate the invariants checked by
+    /// construction and append (a referenced node is absent).
+    pub fn enforce_limit(&mut self) -> Option<HistoryNodeId> {
+        if self.nodes.len() <= HISTORY_LIMIT {
+            return None;
+        }
+        let mut keep = BTreeSet::new();
+        let mut cursor = self.head;
+        let mut oldest = None;
+        while let Some(id) = cursor {
+            if keep.len() == HISTORY_LIMIT {
+                break;
+            }
+            keep.insert(id);
+            oldest = Some(id);
+            cursor = self.nodes[&id].parent;
+        }
+        let baseline = cursor;
+        if baseline.is_some() {
+            let node = self
+                .nodes
+                .get_mut(&oldest.expect("nonempty retained path"))
+                .expect("validated graph");
+            self.initial_root = node.before_root;
+            node.parent = None;
+        } else {
+            let mut pending = std::collections::VecDeque::from([None]);
+            while let Some(parent) = pending.pop_front() {
+                if let Some(children) = self.children.get(&parent) {
+                    for id in children.iter().rev().copied() {
+                        if keep.contains(&id) || keep.len() < HISTORY_LIMIT {
+                            keep.insert(id);
+                            pending.push_back(Some(id));
+                        }
+                    }
+                }
+            }
+        }
+        self.nodes.retain(|id, _| keep.contains(id));
+        self.children.clear();
+        for node in self.nodes.values() {
+            self.children
+                .entry(node.parent)
+                .or_default()
+                .insert(node.id);
+        }
+        baseline
+    }
+
+    pub fn nodes(&self) -> impl Iterator<Item = &HistoryNode> {
+        self.nodes.values()
+    }
+
     #[must_use]
     pub fn new(initial_root: ContentRootId) -> Self {
         Self {

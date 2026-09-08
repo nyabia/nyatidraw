@@ -1638,6 +1638,7 @@ pub(crate) struct PlatformSpecificWebViewAttributes {
   extension_path: Option<PathBuf>,
   default_context_menus: bool,
   environment: Option<ICoreWebView2Environment>,
+  parent_composition: bool,
 }
 
 #[cfg(windows)]
@@ -1653,12 +1654,17 @@ impl Default for PlatformSpecificWebViewAttributes {
       browser_extensions_enabled: false,
       extension_path: None,
       environment: None,
+      parent_composition: false,
     }
   }
 }
 
 #[cfg(windows)]
 pub trait WebViewBuilderExtWindows {
+  /// Opt in to a windowless WebView visual above the parent's child windows.
+  /// The input HWND remains separate and may be region-shaped by the host.
+  /// Supported for full-parent webviews only; reparenting is not supported.
+  fn with_parent_composition(self, enabled: bool) -> Self;
   /// Pass additional args to WebView2 upon creating the webview.
   ///
   /// ## Warning
@@ -1733,6 +1739,10 @@ pub trait WebViewBuilderExtWindows {
 
 #[cfg(windows)]
 impl WebViewBuilderExtWindows for WebViewBuilder<'_> {
+  fn with_parent_composition(mut self, enabled: bool) -> Self {
+    self.platform_specific.parent_composition = enabled;
+    self
+  }
   fn with_additional_browser_args<S: Into<String>>(mut self, additional_args: S) -> Self {
     self.platform_specific.additional_browser_args = Some(additional_args.into());
     self
@@ -2215,6 +2225,9 @@ pub enum MemoryUsageLevel {
 /// Additional methods on `WebView` that are specific to Windows.
 #[cfg(target_os = "windows")]
 pub trait WebViewExtWindows {
+  /// App-owned input sink HWND, only for parent composition hosting.
+  /// Its window region does not clip the independently hosted web visual.
+  fn composition_input_hwnd(&self) -> Option<isize>;
   /// Returns the WebView2 controller.
   fn controller(&self) -> ICoreWebView2Controller;
 
@@ -2250,6 +2263,9 @@ pub trait WebViewExtWindows {
 
 #[cfg(target_os = "windows")]
 impl WebViewExtWindows for WebView {
+  fn composition_input_hwnd(&self) -> Option<isize> {
+    self.webview.composition_input_hwnd()
+  }
   fn controller(&self) -> ICoreWebView2Controller {
     self.webview.controller.clone()
   }

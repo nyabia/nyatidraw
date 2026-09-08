@@ -19,16 +19,18 @@ use windows::{
         Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT, ScreenToClient},
         System::LibraryLoader::GetModuleHandleW,
         UI::HiDpi::GetDpiForWindow,
-        UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, VK_SPACE},
+        UI::Input::KeyboardAndMouse::{
+            GetCapture, GetKeyState, ReleaseCapture, SetCapture, VK_SPACE,
+        },
         UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         UI::WindowsAndMessaging::{
             CREATESTRUCTW, CS_HREDRAW, CS_OWNDC, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
             DestroyWindow, GWLP_USERDATA, GetClientRect, GetMessagePos, GetMessageTime, GetParent,
-            GetWindowLongPtrW, HWND_TOP, IDC_ARROW, LoadCursorW, MSG, PostMessageW, RegisterClassW,
-            SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer, SetWindowLongPtrW, SetWindowPos,
-            ShowWindow, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_ERASEBKGND,
-            WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+            GetWindowLongPtrW, HWND_BOTTOM, IDC_ARROW, LoadCursorW, MSG, PostMessageW,
+            RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer, SetWindowLongPtrW,
+            SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE,
+            WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+            WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
             WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SIZE,
             WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
         },
@@ -61,6 +63,9 @@ pub(crate) struct DesktopCanvasHandle {
 }
 
 impl DesktopCanvasHandle {
+    pub(crate) fn input_router_hwnd(&self) -> isize {
+        self.hwnd.0 as isize
+    }
     pub(crate) fn create(
         parent_window: &Arc<dioxus_desktop::tao::window::Window>,
         live_ink: &LiveInkBridge,
@@ -170,7 +175,8 @@ impl DesktopCanvasHandle {
         scale: f64,
     ) {
         if self.live_ink.is_closing() {
-            self.hide();
+            // Retain the last frame below the composition-hosted close dialog.
+            // Input admission is already closed; geometry resumes on reopen.
             return;
         }
         let values = [x_css, y_css, width_css, height_css, scale];
@@ -191,7 +197,7 @@ impl DesktopCanvasHandle {
         if let Err(error) = unsafe {
             SetWindowPos(
                 self.hwnd,
-                Some(HWND_TOP),
+                Some(HWND_BOTTOM),
                 x,
                 y,
                 width,
@@ -202,8 +208,8 @@ impl DesktopCanvasHandle {
             eprintln!("desktop-shell event=canvas-position-failed error={error}");
             return;
         }
-        // WebView2 is created after the canvas child. Raising and showing the
-        // canvas here establishes the required sibling z-order.
+        // The region-shaped web input sink stays above this child; the parent
+        // DirectComposition visual draws web chrome above both HWNDs.
         // SAFETY: the child HWND is owned by this desktop window.
         let _ = unsafe { ShowWindow(self.hwnd, SW_SHOWNA) };
         if let Some(state) = unsafe { canvas_state(self.hwnd) } {
@@ -215,6 +221,13 @@ impl DesktopCanvasHandle {
         self.live_ink.invalidate_canvas_viewport();
         // SAFETY: hiding a live or already-destroyed child is harmless.
         let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+    }
+
+    pub(crate) fn repaint_underlay(&self) {
+        // A changed web input region can invalidate the swapchain's visible
+        // area even if canvas bounds stayed fixed. A fully covered child may
+        // never receive WM_PAINT, so wake the actor directly (still coalesced).
+        self.lifetime.0.wake();
     }
 
     pub(crate) fn open_path(&self, path: std::path::PathBuf) -> Result<(), String> {
@@ -500,7 +513,9 @@ impl CanvasWindowState {
             WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP | WM_POINTERCAPTURECHANGED => {
                 self.pen.observe(message)
             }
-            WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP => self.mouse.observe(message),
+            WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP | WM_CAPTURECHANGED => {
+                self.mouse.observe(message)
+            }
             _ => false,
         }
     }
@@ -523,6 +538,8 @@ impl CanvasWindowState {
     }
 }
 
+// Keep capture transitions visibly after the final state access in this dispatcher.
+#[allow(clippy::too_many_lines)]
 unsafe extern "system" fn canvas_wnd_proc(
     hwnd: HWND,
     message: u32,
@@ -568,10 +585,12 @@ unsafe extern "system" fn canvas_wnd_proc(
     // SAFETY: the pointer was installed at WM_NCCREATE and remains owned by
     // this HWND until WM_NCDESTROY.
     if message == WM_NAYATI_CLOSE {
-        // These calls may synchronously reenter the window procedure. Hide
-        // the native sibling and release capture before borrowing its state.
-        let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
-        let _ = unsafe { ReleaseCapture() };
+        // The web visual is above the canvas now, so keep its last frame
+        // visible behind the close dialog. Release only our capture, before
+        // borrowing state because the API can synchronously reenter here.
+        if unsafe { GetCapture() } == hwnd {
+            let _ = unsafe { ReleaseCapture() };
+        }
     }
     let state = unsafe { canvas_state(hwnd) };
     if let Some(state) = state {
@@ -640,15 +659,40 @@ unsafe extern "system" fn canvas_wnd_proc(
                     return LRESULT(0);
                 }
                 let msg = current_message(hwnd, message, wparam, lparam);
-                if state.observe_viewport(hwnd, &msg) {
+                let capture_was_active =
+                    state.viewport.drag.is_some() || state.mouse.active.is_some();
+                let viewport_handled = state.observe_viewport(hwnd, &msg);
+                if viewport_handled {
+                    if state.viewport.drag.is_some() && state.mouse.active.is_some() {
+                        // Navigation taking over the same HWND capture does
+                        // not generate capture loss; explicitly cancel paint.
+                        state.mouse.capture_lost(msg.time);
+                    }
                     state.live_ink.request_redraw();
-                    return LRESULT(0);
-                }
-                if state.observe_input(&msg) {
+                } else if state.observe_input(&msg) {
                     // Admission already requests a wakeup. This is idempotent
                     // for capture/phase-only paths, without entering rendering
                     // from this input dispatch.
                     state.live_ink.request_redraw();
+                }
+                let capture_is_active =
+                    state.viewport.drag.is_some() || state.mouse.active.is_some();
+                // No state access after capture APIs: ReleaseCapture can
+                // synchronously dispatch WM_CAPTURECHANGED to this procedure.
+                if !capture_was_active && capture_is_active {
+                    // SAFETY: this is the live canvas HWND whose navigation
+                    // drag or decoded mouse Begin was admitted.
+                    let _ = unsafe { SetCapture(hwnd) };
+                } else if capture_was_active && !capture_is_active {
+                    // SAFETY: only release this canvas's capture. End/Cancel
+                    // took active before this call, so reentry cannot cancel
+                    // a successfully closed stroke or manufacture an End.
+                    if unsafe { GetCapture() } == hwnd {
+                        let _ = unsafe { ReleaseCapture() };
+                    }
+                }
+                if viewport_handled {
+                    return LRESULT(0);
                 }
             }
             _ => {}
@@ -668,6 +712,7 @@ struct WindowsViewportInput {
     live_ink: LiveInkBridge,
     drag: Option<ViewportDrag>,
     zoom_wheel_remainder: i32,
+    pan_remainder: [f64; 2],
 }
 
 impl WindowsViewportInput {
@@ -681,6 +726,7 @@ impl WindowsViewportInput {
             live_ink,
             drag: None,
             zoom_wheel_remainder: 0,
+            pan_remainder: [0.0; 2],
         }
     }
 
@@ -698,23 +744,13 @@ impl WindowsViewportInput {
                         nyatidraw_api::ToolCommand::CycleBrushFamily,
                     )),
                     0x47 => Some(nyatidraw_api::EditorCommand::Tool(
-                        nyatidraw_api::ToolCommand::Select(nyatidraw_api::DrawingTool::Move),
+                        nyatidraw_api::ToolCommand::CycleSelectionFamily,
                     )),
                     0x45 => Some(nyatidraw_api::EditorCommand::Tool(
                         nyatidraw_api::ToolCommand::Select(nyatidraw_api::DrawingTool::Eraser),
                     )),
-                    0x57 => Some(nyatidraw_api::EditorCommand::Tool(
-                        nyatidraw_api::ToolCommand::Select(nyatidraw_api::DrawingTool::Wand),
-                    )),
-                    0x4c => Some(nyatidraw_api::EditorCommand::Tool(
-                        nyatidraw_api::ToolCommand::Select(nyatidraw_api::DrawingTool::Lasso),
-                    )),
                     0x46 => Some(nyatidraw_api::EditorCommand::Tool(
-                        nyatidraw_api::ToolCommand::Select(if shift_is_down() {
-                            nyatidraw_api::DrawingTool::Gradient
-                        } else {
-                            nyatidraw_api::DrawingTool::Fill
-                        }),
+                        nyatidraw_api::ToolCommand::CycleFillFamily,
                     )),
                     0x53 => Some(nyatidraw_api::EditorCommand::Project(
                         nyatidraw_api::ProjectCommand::Save,
@@ -738,26 +774,18 @@ impl WindowsViewportInput {
                 self.drag = Some(ViewportDrag {
                     last_client_px: client_point(message.lParam),
                 });
-                // SAFETY: capture is scoped to this live child HWND and is
-                // released on button-up or capture loss during destruction.
-                let _ = unsafe { SetCapture(hwnd) };
                 true
             }
             WM_LBUTTONDOWN if self.live_ink.navigation_tool() || space_is_down() => {
                 self.drag = Some(ViewportDrag {
                     last_client_px: client_point(message.lParam),
                 });
-                // SAFETY: capture is scoped to this live child HWND and is
-                // released on button-up or capture loss.
-                let _ = unsafe { SetCapture(hwnd) };
                 true
             }
             WM_POINTERDOWN if self.live_ink.navigation_tool() || space_is_down() => {
                 self.drag = Some(ViewportDrag {
                     last_client_px: screen_message_point(hwnd, message.lParam),
                 });
-                // SAFETY: capture is scoped to this live child HWND.
-                let _ = unsafe { SetCapture(hwnd) };
                 true
             }
             WM_POINTERUPDATE if self.drag.is_some() => {
@@ -766,52 +794,32 @@ impl WindowsViewportInput {
                 true
             }
             WM_MOUSEMOVE => {
-                let Some(drag) = self.drag.as_mut() else {
+                if self.drag.is_none() {
                     return false;
-                };
-                let point = client_point(message.lParam);
-                let delta = [
-                    point[0].saturating_sub(drag.last_client_px[0]),
-                    point[1].saturating_sub(drag.last_client_px[1]),
-                ];
-                drag.last_client_px = point;
-                if delta == [0, 0] {
-                    return true;
                 }
-                let scale = f64::from(
-                    // SAFETY: this is the live canvas child handling the
-                    // message; its DPI is valid for the duration of dispatch.
-                    unsafe { GetDpiForWindow(hwnd) }.max(96),
-                ) / 96.0;
-                self.pan(
-                    saturating_i32(f64::from(delta[0]) / scale),
-                    saturating_i32(f64::from(delta[1]) / scale),
-                );
+                self.move_drag(hwnd, client_point(message.lParam));
                 true
             }
             WM_MBUTTONUP => {
-                if self.drag.take().is_some() {
-                    // SAFETY: balances the capture started for the viewport
-                    // drag. A prior external release is harmless.
-                    let _ = unsafe { ReleaseCapture() };
-                }
+                self.move_drag(hwnd, client_point(message.lParam));
+                self.drag = None;
                 true
             }
             WM_LBUTTONUP if self.drag.is_some() => {
+                self.move_drag(hwnd, client_point(message.lParam));
                 self.drag = None;
-                // SAFETY: balances capture from a Space/Move left-button drag.
-                let _ = unsafe { ReleaseCapture() };
                 true
             }
             WM_POINTERUP if self.drag.is_some() => {
+                self.move_drag(hwnd, screen_message_point(hwnd, message.lParam));
                 self.drag = None;
-                // SAFETY: balances capture from a pen Move/Space drag.
-                let _ = unsafe { ReleaseCapture() };
                 true
             }
             WM_CAPTURECHANGED => {
                 self.drag = None;
-                true
+                // Paint owns an independent active phase and must receive
+                // capture loss even when navigation had no active drag.
+                false
             }
             WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
                 let delta = wheel_delta(message.wParam);
@@ -843,13 +851,12 @@ impl WindowsViewportInput {
                         });
                     }
                 } else {
-                    let distance = saturating_i32(
-                        f64::from(delta) / f64::from(Self::WHEEL_DELTA) * Self::WHEEL_PAN_LOGICAL,
-                    );
+                    let distance =
+                        f64::from(delta) / f64::from(Self::WHEEL_DELTA) * Self::WHEEL_PAN_LOGICAL;
                     if message.message == WM_MOUSEHWHEEL || flags & Self::MK_SHIFT_MASK != 0 {
-                        self.pan(-distance, 0);
+                        self.pan(-distance, 0.0);
                     } else {
-                        self.pan(0, distance);
+                        self.pan(0.0, distance);
                     }
                 }
                 true
@@ -858,7 +865,14 @@ impl WindowsViewportInput {
         }
     }
 
-    fn pan(&self, logical_x: i32, logical_y: i32) {
+    fn pan(&mut self, delta_x: f64, delta_y: f64) {
+        // Keep sub-logical-pixel movement at fractional DPI instead of rounding
+        // every native event (which loses slow drags and high-resolution wheels).
+        let x = self.pan_remainder[0] + delta_x;
+        let y = self.pan_remainder[1] + delta_y;
+        let logical_x = saturating_i32(x.trunc());
+        let logical_y = saturating_i32(y.trunc());
+        self.pan_remainder = [x - f64::from(logical_x), y - f64::from(logical_y)];
         if logical_x != 0 || logical_y != 0 {
             self.command(nyatidraw_api::ViewportCommand::PanBy {
                 logical_x,
@@ -883,19 +897,17 @@ impl WindowsViewportInput {
             // SAFETY: this is the live child handling the message.
             unsafe { GetDpiForWindow(hwnd) }.max(96),
         ) / 96.0;
-        self.pan(
-            saturating_i32(f64::from(delta[0]) / scale),
-            saturating_i32(f64::from(delta[1]) / scale),
-        );
+        self.pan(f64::from(delta[0]) / scale, f64::from(delta[1]) / scale);
     }
 
-    fn command(&self, command: nyatidraw_api::ViewportCommand) {
-        if self
-            .live_ink
-            .push_ui_editor_command(nyatidraw_api::EditorCommand::Viewport(command))
-            .is_err()
-        {
-            eprintln!("desktop-input event=viewport-command-dropped reason=queue-full");
+    fn command(&mut self, command: nyatidraw_api::ViewportCommand) {
+        if self.live_ink.push_native_viewport(command).is_err() {
+            self.drag = None;
+            self.pan_remainder = [0.0; 2];
+            self.zoom_wheel_remainder = 0;
+            self.live_ink.publish_activation_notice(
+                "화면 이동 입력을 처리하지 못해 이동을 중단했습니다. 다시 드래그해주세요.".into(),
+            );
         }
     }
 }
@@ -984,6 +996,7 @@ pub(crate) struct CanvasSurfaceRenderer {
     live_ink: LiveInkBridge,
     configured: bool,
     first_presented: bool,
+    last_presented: Option<wgpu::Texture>,
 }
 
 impl Drop for CanvasSurfaceRenderer {
@@ -1070,6 +1083,7 @@ impl CanvasSurfaceRenderer {
             live_ink,
             configured: false,
             first_presented: false,
+            last_presented: None,
         })
     }
 
@@ -1082,6 +1096,12 @@ impl CanvasSurfaceRenderer {
         } = geometry;
         if self.configured && self.geometry_epoch == epoch {
             return;
+        }
+        if self.config.width != width
+            || self.config.height != height
+            || self.scale.to_bits() != scale.to_bits()
+        {
+            self.clear_retained_frame();
         }
         self.geometry_epoch = epoch;
         self.canvas.set_geometry_epoch(epoch);
@@ -1097,6 +1117,7 @@ impl CanvasSurfaceRenderer {
     }
 
     pub(crate) fn activate_project(&mut self, path: std::path::PathBuf) -> Result<(), String> {
+        self.clear_retained_frame();
         self.canvas.activate_project(
             &self.device,
             &self.queue,
@@ -1166,6 +1187,9 @@ impl CanvasSurfaceRenderer {
         self.presenter
             .present(&self.device, &self.queue, &display.texture, &target);
         frame.present();
+        // Retain only a GPU handle, never a CPU readback or durable copy. The
+        // close overlay can expose the surface after ActiveCanvas is drained.
+        self.last_presented = Some(display.texture.clone());
         frame_mark(FrameMark::PresentEnd);
         drop(present_timing);
         // Admission changes only after this frame was submitted for present.
@@ -1192,6 +1216,45 @@ impl CanvasSurfaceRenderer {
                 self.config.height,
             );
         }
+        Ok(())
+    }
+
+    pub(crate) fn clear_retained_frame(&mut self) {
+        self.last_presented = None;
+    }
+
+    /// Refreshes exposed surface pixels while the close worker owns artwork.
+    /// This does not render the document, admit input, publish a viewport or
+    /// report an artwork/latency measurement. The actor calls it only on wakes.
+    pub(crate) fn present_retained_frame(&mut self) -> Result<(), String> {
+        if !self.configured {
+            return Ok(());
+        }
+        let Some(texture) = self.last_presented.as_ref() else {
+            return Ok(());
+        };
+        // One bounded retry handles surface invalidation caused by native
+        // window-region changes without scheduling a continuous redraw loop.
+        let acquired = match self.surface.get_current_texture() {
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                self.surface.configure(&self.device, &self.config);
+                self.surface.get_current_texture()
+            }
+            result => result,
+        };
+        let frame = match acquired {
+            Ok(frame) => frame,
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                return Err("WGPU surface is out of memory".into());
+            }
+            Err(_) => return Ok(()),
+        };
+        let target = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.presenter
+            .present(&self.device, &self.queue, texture, &target);
+        frame.present();
         Ok(())
     }
 }
@@ -1351,6 +1414,9 @@ impl WindowsMouseInput {
     }
 
     fn observe(&mut self, message: &MSG) -> bool {
+        if message.message == WM_CAPTURECHANGED {
+            return self.capture_lost(message.time);
+        }
         // SAFETY: `message` is a live stack value for this call only.
         if let Err(error) = unsafe {
             nyatidraw_input_platform::record_win32_mouse_message_into(
@@ -1367,6 +1433,13 @@ impl WindowsMouseInput {
             admitted |= self.admit(event);
         }
         admitted
+    }
+
+    fn capture_lost(&mut self, timestamp_ms: u32) -> bool {
+        // Drop the platform recorder's down/history state as well as the
+        // stroke. A later hover/Up cannot resume or finish a cancelled stroke.
+        self.batch = nyatidraw_input_platform::WindowsMouseMessageBuffer::default();
+        self.cancel(timestamp_ms)
     }
 
     fn admit(&mut self, event: nyatidraw_input_platform::WindowsMouseEvent) -> bool {

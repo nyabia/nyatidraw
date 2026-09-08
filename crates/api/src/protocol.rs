@@ -32,6 +32,9 @@ pub enum EditSource {
 /// Completed document-space gestures; raw pointer samples never enter this lane.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EditCommand {
+    /// Clears every pixel of the active raster, including off-page artwork.
+    /// Keeps the layer and its properties; independent of selection.
+    ClearActiveLayer,
     /// Change the output extent, preserving every signed artwork pixel.
     ResizePage {
         size: [u32; 2],
@@ -132,6 +135,8 @@ pub enum ToolCommand {
     CancelGesture,
     Select(DrawingTool),
     CycleBrushFamily,
+    CycleSelectionFamily,
+    CycleFillFamily,
     SetSizeTenths(u16),
     SetOpacityU16(u16),
     SetColor([u8; 4]),
@@ -310,7 +315,7 @@ pub struct LayerProjection {
 /// The writer already owns the reconstructed in-memory history session, so a
 /// projection walks at most this many parent links and never asks the UI to
 /// enumerate project storage.
-pub const HISTORY_PROJECTION_MAX_ENTRIES: usize = 64;
+pub const HISTORY_PROJECTION_MAX_ENTRIES: usize = 128;
 
 /// The semantic operation represented by a history row.
 ///
@@ -428,9 +433,9 @@ impl UiProjection {
                 ..ViewportProjection::default()
             },
             drawing_tool: DrawingTool::Brush,
-            brush_size_tenths: 280,
-            recent_brush_sizes: vec![280],
-            brush_opacity_u16: 60_292,
+            brush_size_tenths: 50,
+            recent_brush_sizes: vec![50],
+            brush_opacity_u16: u16::MAX,
             brush_color: [26, 199, 232, 255],
             recent_colors: vec![[26, 199, 232, 255]],
             edit_settings: EditSettings::default(),

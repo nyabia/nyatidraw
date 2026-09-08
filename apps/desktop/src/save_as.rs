@@ -88,7 +88,13 @@ pub(crate) fn copy_closed_project(source: &Path, target: &Path) -> Result<(), St
     let tree = database
         .load_layer_tree()
         .map_err(|error| error.to_string())?
-        .unwrap_or_else(crate::native_canvas::default_layer_tree);
+        .unwrap_or_else(|| {
+            if reopened.is_some() {
+                crate::native_canvas::legacy_layer_tree()
+            } else {
+                crate::native_canvas::default_layer_tree()
+            }
+        });
     let surface = nyatidraw_paint_cpu::flatten_layer_tree_rgba8(&tiles, &tree, canvas)
         .map_err(|error| format!("PNG 합성: {error:?}"))?;
     drop(database);

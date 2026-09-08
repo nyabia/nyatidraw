@@ -324,15 +324,21 @@ fn run(inner: &Inner) {
             // Apply all semantic requests accepted before admission stopped;
             // suspend then joins any close/save-as/artwork workers on this
             // actor thread while the UI continues pumping DXGI messages.
-            renderer.canvas.begin_close(
-                renderer.config.width,
-                renderer.config.height,
-                renderer.scale,
-            );
+            // An existing close already drained admission. Repeating it on
+            // the suspended canvas would republish a retained export failure
+            // after the user acknowledged it and selected exit.
+            if !closing {
+                renderer.canvas.begin_close(
+                    renderer.config.width,
+                    renderer.config.height,
+                    renderer.scale,
+                );
+            }
             renderer.canvas.suspend();
             break;
         }
         if work.controls.reopen {
+            renderer.clear_retained_frame();
             renderer
                 .canvas
                 .reopen_after_close_failure(&renderer.device, &renderer.queue);
@@ -351,6 +357,11 @@ fn run(inner: &Inner) {
         }
         if closing {
             renderer.canvas.poll_close();
+            if work.wake
+                && let Err(error) = renderer.present_retained_frame()
+            {
+                inner.live_ink.publish_workspace_error(error);
+            }
         } else if let Err(error) = renderer.render() {
             inner.live_ink.publish_workspace_error(error);
         }

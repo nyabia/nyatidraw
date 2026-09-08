@@ -5,81 +5,66 @@ use nyatidraw_api::{
     EditorCommand, GroupId, LayerCommand, LayerProjection, LayerTreeNodeId, Revision, UiProjection,
 };
 
-pub(super) fn use_layer_drag_probe() {
+// Pointer capture does not require the composition WebView's OS/OLE drag host.
+// Only a completed, revision-bound semantic drop crosses IPC, never pointer moves.
+pub(super) fn use_layer_pointer_drag(mut error: Signal<Option<String>>) {
     let live_ink = use_context::<LiveInkBridge>();
     use_effect(move || {
-        let Ok(mode) = std::env::var("NAYATI_LAYER_DRAG_PROBE") else {
-            return;
-        };
-        if !matches!(
-            mode.as_str(),
-            "inside" | "below" | "above" | "group" | "cancel" | "stale"
-        ) {
-            eprintln!("desktop-layers event=drag-probe-failed mode={mode} error=unsupported-mode");
-            return;
-        }
-        let Some(project) = std::env::args_os().nth(1).map(std::path::PathBuf::from) else {
-            eprintln!(
-                "desktop-layers event=drag-probe-failed mode={mode} error=missing-project-argument"
-            );
-            return;
-        };
-        // Windows canonical paths may carry a verbatim prefix; compare both
-        // sides in the same representation and fail closed on lookup errors.
-        let (Ok(project), Ok(temporary)) =
-            (project.canonicalize(), std::env::temp_dir().canonicalize())
-        else {
-            eprintln!(
-                "desktop-layers event=drag-probe-failed mode={mode} error=scratch-path-resolution"
-            );
-            return;
-        };
-        let Some(directory) = project.parent() else {
-            eprintln!(
-                "desktop-layers event=drag-probe-failed mode={mode} error=missing-project-parent"
-            );
-            return;
-        };
-        if !directory.starts_with(&temporary)
-            || !directory.join(".nyatidraw-scratch-export-probe").is_file()
-        {
-            eprintln!(
-                "desktop-layers event=drag-probe-failed mode={mode} error=unmarked-or-outside-temp"
-            );
-            return;
-        }
-        println!("desktop-layers event=drag-probe-started mode={mode}");
         let live_ink = live_ink.clone();
         spawn(async move {
-            let script = include_str!("layer_drag_probe.js").replace("__PROBE_MODE__", &mode);
-            let mut evaluation = document::eval(&script);
-            let result = loop {
-                let result = evaluation.recv::<String>().await;
-                if matches!(&result, Ok(message) if message == "ready?") {
-                    // Reopened rows can precede initial Fit on the render actor.
-                    // Wait for its presented mapping, then let JS wait for that
-                    // authoritative revision in the DOM before starting a drag.
-                    let ready_revision = live_ink
-                        .canvas_viewport_snapshot()
-                        .origin_client_px
-                        .map(|_| live_ink.protocol_snapshot().0.revision.0);
-                    if let Err(error) = evaluation.send(ready_revision) {
-                        break Err(error);
-                    }
-                } else {
-                    break result;
+            let mut events = document::eval(include_str!("layer_pointer_drag.js"));
+            while let Ok([source, target, position, revision]) = events.recv::<[String; 4]>().await
+            {
+                let (Some(source), Some(target), Ok(revision)) = (
+                    node_key(&source),
+                    node_key(&target),
+                    revision.parse::<u64>(),
+                ) else {
+                    continue;
+                };
+                let position = match position.as_str() {
+                    "above" => DropPosition::Above,
+                    "inside" => DropPosition::Inside,
+                    "below" => DropPosition::Below,
+                    _ => continue,
+                };
+                let current = live_ink.protocol_snapshot().0;
+                if current.revision != Revision(revision) {
+                    error.set(Some(
+                        "드래그 중 문서가 변경됐습니다. 다시 끌어 주세요.".into(),
+                    ));
+                    continue;
                 }
-            };
-            match result {
-                Ok(result) => println!(
-                    "desktop-layers event=drag-probe-complete mode={mode} result={result} browser_events=synthetic physical_drag_proof=false"
-                ),
-                Err(error) => {
-                    eprintln!("desktop-layers event=drag-probe-failed mode={mode} error={error}");
+                let (Some(source), Some(target)) = (
+                    current.layers.iter().find(|layer| layer.id == source),
+                    current.layers.iter().find(|layer| layer.id == target),
+                ) else {
+                    continue;
+                };
+                let drag = LayerDrag::begin(source, current.revision);
+                if let Some(command) = drop_command(&current, drag, target, position) {
+                    match live_ink
+                        .push_editor_command(current.revision, EditorCommand::Layer(command))
+                    {
+                        Ok(_) => error.set(None),
+                        Err(reason) => {
+                            error.set(Some(format!("레이어를 이동하지 못했습니다: {reason:?}")));
+                        }
+                    }
                 }
             }
         });
     });
+}
+
+fn node_key(key: &str) -> Option<LayerTreeNodeId> {
+    let (kind, id) = key.split_once('-')?;
+    let id = id.parse().ok()?;
+    match kind {
+        "r" => Some(LayerTreeNodeId::Raster(nyatidraw_api::LayerId(id))),
+        "g" => Some(LayerTreeNodeId::Group(GroupId(id))),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,7 +73,6 @@ pub(super) struct LayerDrag {
     parent: GroupId,
     index: usize,
     revision: Revision,
-    hovered: Option<(LayerTreeNodeId, DropPosition)>,
 }
 
 impl LayerDrag {
@@ -98,7 +82,6 @@ impl LayerDrag {
             parent: layer.parent,
             index: layer.index,
             revision,
-            hovered: None,
         }
     }
 }
@@ -221,96 +204,68 @@ fn drop_command(
     })
 }
 
-#[component]
-pub(super) fn LayerDropTargets(
-    layer: LayerProjection,
-    projection: Signal<UiProjection>,
-    drag: Signal<Option<LayerDrag>>,
-    error: Signal<Option<String>>,
-) -> Element {
-    if drag.read().is_none() {
-        return rsx! {};
-    }
-    let group = matches!(layer.id, LayerTreeNodeId::Group(_));
-    rsx! {
-        div { class: if group { "layer-drop-targets group" } else { "layer-drop-targets" },
-            LayerDropZone { layer: layer.clone(), position: DropPosition::Above, projection, drag, error }
-            if group {
-                LayerDropZone { layer: layer.clone(), position: DropPosition::Inside, projection, drag, error }
-            }
-            LayerDropZone { layer, position: DropPosition::Below, projection, drag, error }
-        }
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[component]
-fn LayerDropZone(
-    layer: LayerProjection,
-    position: DropPosition,
-    projection: Signal<UiProjection>,
-    mut drag: Signal<Option<LayerDrag>>,
-    mut error: Signal<Option<String>>,
-) -> Element {
-    let live_ink = use_context::<LiveInkBridge>();
-    let command = (*drag.read())
-        .and_then(|source| drop_command(&projection.read(), source, &layer, position));
-    let valid = command.is_some();
-    let target = (layer.id, position);
-    let active = valid
-        && drag
-            .read()
-            .is_some_and(|source| source.hovered == Some(target));
-    let label = match position {
-        DropPosition::Above => "위로 이동",
-        DropPosition::Inside => "그룹 안에 넣기",
-        DropPosition::Below => "아래로 이동",
-    };
-    let position_class = match position {
-        DropPosition::Above => "above",
-        DropPosition::Inside => "inside",
-        DropPosition::Below => "below",
-    };
-    rsx! {
-        div {
-            class: "layer-drop-zone {position_class}", class: if active { "active" } else if valid { "available" } else { "unavailable" },
-            title: "{label}",
-            ondragover: move |event| {
-                event.stop_propagation();
-                if valid { event.prevent_default(); }
-                let current = *drag.read();
-                if let Some(mut source) = current {
-                    let hovered = valid.then_some(target);
-                    if source.hovered != hovered {
-                        source.hovered = hovered;
-                        drag.set(Some(source));
-                    }
-                }
-            },
-            ondragleave: move |_| {
-                let current = *drag.read();
-                if let Some(mut source) = current && source.hovered == Some(target) {
-                    source.hovered = None;
-                    drag.set(Some(source));
-                }
-            },
-            ondrop: move |event| {
-                event.prevent_default();
-                event.stop_propagation();
-                let current = *drag.read();
-                drag.set(None);
-                if let Some(source) = current {
-                    let current_projection = projection.read();
-                    if let Some(command) = drop_command(&current_projection, source, &layer, position) {
-                        match live_ink.push_editor_command(source.revision, EditorCommand::Layer(command)) {
-                            Ok(_) => error.set(None),
-                            Err(reason) => error.set(Some(format!("레이어를 이동하지 못했습니다: {reason:?}"))),
-                        }
-                    } else if source.revision != current_projection.revision {
-                        error.set(Some("드래그 중 문서가 변경됐습니다. 다시 끌어 주세요.".into()));
-                    }
-                }
-            },
-            if active { span { "{label}" } }
+    #[test]
+    fn drop_indices_preserve_compositing_order_and_reject_stale_or_cyclic_moves() {
+        // Product risk: reversed visual order or a bad reparent index changes
+        // artwork composition; stale/cyclic drops must never mutate the tree.
+        let row = |key, parent, index| {
+            let id = node_key(key).unwrap();
+            LayerProjection {
+                id,
+                parent: GroupId(parent),
+                index,
+                depth: 1,
+                kind: if matches!(id, LayerTreeNodeId::Group(_)) {
+                    nyatidraw_api::LayerProjectionKind::Group
+                } else {
+                    nyatidraw_api::LayerProjectionKind::Raster
+                },
+                name: key.into(),
+                visible: true,
+                reference: false,
+                opacity_u16: u16::MAX,
+            }
+        };
+        let projection = UiProjection {
+            revision: Revision(12),
+            layers: vec![
+                row("r-1", 100, 0),
+                row("r-2", 100, 1),
+                row("g-10", 100, 2),
+                row("g-11", 10, 0),
+            ],
+            ..UiProjection::default()
+        };
+        for (source, target, position, destination) in [
+            (0, 1, DropPosition::Above, Some((100, 1))),
+            (1, 0, DropPosition::Below, Some((100, 0))),
+            (0, 2, DropPosition::Inside, Some((10, 1))),
+            (2, 3, DropPosition::Inside, None),
+            (0, 0, DropPosition::Above, None),
+            (0, 1, DropPosition::Below, None),
+        ] {
+            let drag = LayerDrag::begin(&projection.layers[source], projection.revision);
+            let expected = destination.map(|(parent, index)| LayerCommand::Reorder {
+                node: drag.node,
+                new_parent: GroupId(parent),
+                index,
+            });
+            assert_eq!(
+                drop_command(&projection, drag, &projection.layers[target], position),
+                expected
+            );
+            let stale = LayerDrag {
+                revision: Revision(11),
+                ..drag
+            };
+            assert_eq!(
+                drop_command(&projection, stale, &projection.layers[target], position),
+                None
+            );
         }
     }
 }

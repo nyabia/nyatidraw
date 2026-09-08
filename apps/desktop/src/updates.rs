@@ -113,6 +113,12 @@ impl Updater {
             self.publish(Status::Development);
             return;
         };
+        if manager.get_app_id() != "NyatiDraw" {
+            self.publish(Status::Failed(
+                "이 설치의 제품 ID가 일치하지 않습니다".into(),
+            ));
+            return;
+        }
         // A completed package remains useful when the next launch is offline.
         if let Some(asset) = manager.get_update_pending_restart() {
             self.ready(manager, asset);
@@ -120,6 +126,10 @@ impl Updater {
         }
         match manager.check_for_updates() {
             Ok(UpdateCheck::UpdateAvailable(update)) => {
+                if update.TargetFullRelease.PackageId != manager.get_app_id() {
+                    self.publish(Status::Failed("다른 제품의 업데이트를 거부했습니다".into()));
+                    return;
+                }
                 self.publish(Status::Downloading);
                 match manager.download_updates(&update, None) {
                     Ok(()) => self.ready(manager, update.TargetFullRelease.clone()),
@@ -138,6 +148,11 @@ impl Updater {
     }
 
     fn ready(&self, manager: UpdateManager, asset: VelopackAsset) {
+        // Also validate packages found in the local cache after an offline launch.
+        if asset.PackageId != manager.get_app_id() {
+            self.publish(Status::Failed("다른 제품의 업데이트를 거부했습니다".into()));
+            return;
+        }
         let version = asset.Version.clone();
         {
             let mut state = self

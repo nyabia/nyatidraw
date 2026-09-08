@@ -11,7 +11,7 @@ nyatidraw-document.workspace = true
 nyatidraw-editor.workspace = true
 nyatidraw-input.workspace = true
 nyatidraw-project.workspace = true
-nyatidraw-project-redb.workspace = true
+nyatidraw-project-redb = { workspace = true, features = ["legacy-migration"] }
 nyatidraw-stroke.workspace = true
 nyatidraw-tiles.workspace = true
 

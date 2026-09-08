@@ -364,7 +364,7 @@ impl WebviewInstance {
                     window.inner_size().height,
                 )),
             })
-            .with_transparent(cfg.window.window.transparent)
+            .with_transparent(cfg.window.window.transparent || (cfg!(windows) && cfg.parent_composition))
             .with_url("dioxus://index.html/")
             .with_ipc_handler(ipc_handler)
             .with_navigation_handler(move |var| {
@@ -406,6 +406,7 @@ impl WebviewInstance {
         {
             use wry::WebViewBuilderExtWindows;
             webview = webview.with_browser_accelerator_keys(false);
+            webview = webview.with_parent_composition(cfg.parent_composition);
         }
 
         if !cfg.disable_file_drop_handler {

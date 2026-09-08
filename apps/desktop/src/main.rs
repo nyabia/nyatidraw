@@ -1,5 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+#[cfg(windows)]
+mod canvas_host;
 mod color_picker;
 #[cfg(windows)]
 mod desktop_canvas;
@@ -43,10 +45,8 @@ use nyatidraw_api::{
 };
 use preview::LayerThumbnailFrame;
 
-const BACKGROUND_LAYER: LayerId = LayerId(2);
 const INK_LAYER: LayerId = LayerId(1);
 const ROOT_GROUP: GroupId = GroupId(100);
-const INK_GROUP: GroupId = GroupId(10);
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 const STYLES: &str = include_str!("../assets/styles.css");
@@ -302,17 +302,9 @@ fn handle_editor_shortcut(live_ink: &LiveInkBridge, key: &str, shift: bool) -> b
     } else if key.eq_ignore_ascii_case("b") {
         Some(EditorCommand::Tool(ToolCommand::CycleBrushFamily))
     } else if key.eq_ignore_ascii_case("g") {
-        Some(EditorCommand::Tool(ToolCommand::Select(DrawingTool::Move)))
-    } else if key.eq_ignore_ascii_case("w") {
-        Some(EditorCommand::Tool(ToolCommand::Select(DrawingTool::Wand)))
-    } else if key.eq_ignore_ascii_case("l") {
-        Some(EditorCommand::Tool(ToolCommand::Select(DrawingTool::Lasso)))
+        Some(EditorCommand::Tool(ToolCommand::CycleSelectionFamily))
     } else if key.eq_ignore_ascii_case("f") {
-        Some(EditorCommand::Tool(ToolCommand::Select(if shift {
-            DrawingTool::Gradient
-        } else {
-            DrawingTool::Fill
-        })))
+        Some(EditorCommand::Tool(ToolCommand::CycleFillFamily))
     } else if key.eq_ignore_ascii_case("e") {
         Some(EditorCommand::Tool(ToolCommand::Select(
             DrawingTool::Eraser,
@@ -340,41 +332,17 @@ fn initial_ui_projection() -> UiProjection {
     projection.document_title = "Untitled".into();
     projection.workspace = WorkspaceProjection::Ready;
     projection.active_layer = Some(INK_LAYER);
-    projection.layers = vec![
-        LayerProjection {
-            id: LayerTreeNodeId::Group(INK_GROUP),
-            parent: ROOT_GROUP,
-            index: 1,
-            depth: 1,
-            kind: LayerProjectionKind::Group,
-            name: "Ink group".into(),
-            visible: true,
-            reference: false,
-            opacity_u16: u16::MAX,
-        },
-        LayerProjection {
-            id: LayerTreeNodeId::Raster(INK_LAYER),
-            parent: INK_GROUP,
-            index: 0,
-            depth: 2,
-            kind: LayerProjectionKind::Raster,
-            name: "Ink".into(),
-            visible: true,
-            reference: false,
-            opacity_u16: u16::MAX,
-        },
-        LayerProjection {
-            id: LayerTreeNodeId::Raster(BACKGROUND_LAYER),
-            parent: ROOT_GROUP,
-            index: 0,
-            depth: 1,
-            kind: LayerProjectionKind::Raster,
-            name: "Background".into(),
-            visible: true,
-            reference: false,
-            opacity_u16: u16::MAX,
-        },
-    ];
+    projection.layers = vec![LayerProjection {
+        id: LayerTreeNodeId::Raster(INK_LAYER),
+        parent: ROOT_GROUP,
+        index: 0,
+        depth: 1,
+        kind: LayerProjectionKind::Raster,
+        name: "Layer 1".into(),
+        visible: true,
+        reference: false,
+        opacity_u16: u16::MAX,
+    }];
     projection
 }
 
@@ -553,6 +521,7 @@ fn ToolbarContents(panel: PanelKind, ui_projection: Signal<UiProjection>) -> Ele
 #[component]
 fn CanvasActions() -> Element {
     let live_ink = use_context::<LiveInkBridge>();
+    let clear_ink = live_ink.clone();
     let transform_ink = live_ink.clone();
     let page_ink = live_ink.clone();
     let transform_panel::TransformPanelOpen(mut transform_open) = use_context();
@@ -560,20 +529,23 @@ fn CanvasActions() -> Element {
     let error = use_signal(|| Option::<String>::None);
     let white_ink = live_ink;
     rsx! {
+                button { class: "command", title: "현재 레이어 전체 비우기 · 캔버스 밖 포함 · 실행 취소 가능", onclick: move |_| {
+                    send_editor_command(&clear_ink, EditorCommand::Edit(nyatidraw_api::EditCommand::ClearActiveLayer), error);
+                }, UiIcon { name: "clear-layer" } span { class: "command-label", "비우기" } }
                 button { class: "command", title: "흰 배경 추가", onclick: move |_| {
                     send_editor_command(&white_ink, EditorCommand::Layer(LayerCommand::AddWhiteBackground), error);
                 }, UiIcon { name: "white" } span { class: "command-label", "흰 배경" } }
                 button { class: "command", title: "선택 영역 또는 현재 레이어 변형", onclick: move |_| {
                     page_open.set(false);
                     transform_open.set(true);
-                    send_dock_command(&transform_ink, DockCommand::ActivatePanel(PanelKind::Brush));
+                    send_dock_command(&transform_ink, DockCommand::ActivatePanel(PanelKind::ToolProperties));
                 },
                     UiIcon { name: "transform" } span { class: "command-label", "변형" }
                 }
                 button { class: "command", title: "페이지 크기 및 선택 영역에 맞추기", onclick: move |_| {
                     transform_open.set(false);
                     page_open.set(true);
-                    send_dock_command(&page_ink, DockCommand::ActivatePanel(PanelKind::Brush));
+                    send_dock_command(&page_ink, DockCommand::ActivatePanel(PanelKind::ToolProperties));
                 }, span { class: "command-label", "페이지" } }
     }
 }
@@ -674,8 +646,12 @@ fn dock_stack_height(node: &DockNode) -> Option<u16> {
             PanelKind::Navigator => Some(200),
             PanelKind::CanvasActions | PanelKind::QuickColors => Some(110),
             PanelKind::Viewport => Some(265),
-            PanelKind::Tools | PanelKind::Brush => Some(620),
-            PanelKind::Color | PanelKind::Layers | PanelKind::History => Some(300),
+            PanelKind::Tools => Some(620),
+            PanelKind::Brush => Some(220),
+            PanelKind::ToolProperties => Some(230),
+            PanelKind::BrushSizes | PanelKind::Color | PanelKind::Layers | PanelKind::History => {
+                Some(300)
+            }
         },
         DockNode::Tabs { panels, .. } => panels
             .iter()
@@ -738,12 +714,25 @@ fn DockNodeView(node: DockNode, ui_projection: Signal<UiProjection>) -> Element 
                 collect_side_stack(*second, &mut nodes);
                 return rsx! { SideStack { nodes, ui_projection } };
             }
-            let first_style = format!("flex: {first_per_mille} 1 0;");
-            let second_style = format!("flex: {} 1 0;", 1000_u16.saturating_sub(first_per_mille));
+            let first_min = dock_drag::minimum_width(&first);
+            let second_min = dock_drag::minimum_width(&second);
+            let split_key = dock_drag::split_key(&first, &second);
+            let first_style = format!("flex: {first_per_mille} 1 0; min-width: {first_min}px;");
+            let second_style = format!(
+                "flex: {} 1 0; min-width: {second_min}px;",
+                1000_u16.saturating_sub(first_per_mille)
+            );
             rsx! {
                 section { class: "{class}",
                     div { class: "dock-child", style: "{first_style}",
                         DockNodeView { node: *first, ui_projection }
+                    }
+                    if axis == DockAxis::Horizontal {
+                        div { class: "dock-resizer", role: "separator", tabindex: 0,
+                            aria_label: "패널 너비 조절", aria_orientation: "vertical",
+                            aria_valuenow: "{first_per_mille}", aria_valuemin: "20", aria_valuemax: "980",
+                            "data-dock-resize": "{split_key}", "data-first-min": "{first_min}", "data-second-min": "{second_min}"
+                        }
                     }
                     div { class: "dock-child", style: "{second_style}",
                         DockNodeView { node: *second, ui_projection }
@@ -771,24 +760,38 @@ fn collect_side_stack(node: DockNode, nodes: &mut Vec<DockNode>) {
 
 #[component]
 fn SideStack(nodes: Vec<DockNode>, ui_projection: Signal<UiProjection>) -> Element {
+    let heights = use_context::<Signal<layout_store::PanelHeights>>();
     let len = nodes.len();
     let entries: Vec<_> = nodes
         .into_iter()
         .enumerate()
         .map(|(index, node)| {
+            let panel = dock_drag::height_panel(&node);
+            let height = heights
+                .read()
+                .get(panel)
+                .unwrap_or_else(|| dock_stack_height(&node).unwrap_or(200));
+            let is_last = index + 1 == len;
             let style = if index + 1 == len {
-                "flex: 1 0 160px;".to_owned()
+                "flex: 1 0 160px; min-height: 160px;".to_owned()
             } else {
-                format!("flex: 0 1 {}px;", dock_stack_height(&node).unwrap_or(200))
+                format!("flex: 0 0 {height}px; min-height: 64px;")
             };
-            (node, style)
+            (node, style, panel_slug(panel), is_last, height)
         })
         .collect();
     rsx! {
         section { class: "dock-split dock-vertical side-stack",
-            for (node, style) in entries {
+            for (node, style, slug, is_last, height) in entries {
                 div { class: "dock-child", style,
                     DockNodeView { node, ui_projection }
+                }
+                if !is_last {
+                    div { class: "dock-resizer dock-height-resizer", role: "separator", tabindex: 0,
+                        aria_label: "패널 높이 조절", aria_orientation: "horizontal",
+                        aria_valuenow: "{height}", aria_valuemin: "64", aria_valuemax: "4096",
+                        "data-dock-resize": "{slug}", "data-resize-axis": "height"
+                    }
                 }
             }
         }
@@ -883,6 +886,8 @@ fn panel_ready_contents(panel: PanelKind, ui_projection: Signal<UiProjection>) -
         PanelKind::Navigator => rsx! { NavigatorPanel { ui_projection } },
         PanelKind::Layers => rsx! { LayersPanel { ui_projection } },
         PanelKind::Brush => rsx! { BrushPanel { ui_projection } },
+        PanelKind::ToolProperties => rsx! { ToolPropertiesPanel { ui_projection } },
+        PanelKind::BrushSizes => rsx! { BrushSizesPanel { ui_projection } },
         PanelKind::Color => rsx! { ColorPanel { ui_projection } },
         PanelKind::History => rsx! { HistoryPanel { ui_projection } },
         PanelKind::CanvasActions | PanelKind::Viewport | PanelKind::QuickColors => rsx! {
@@ -958,7 +963,7 @@ fn HistoryPanel(ui_projection: Signal<UiProjection>) -> Element {
 
 fn history_operation_label(operation: HistoryOperationLabel) -> &'static str {
     match operation {
-        HistoryOperationLabel::Initial => "시작",
+        HistoryOperationLabel::Initial => "보관 시작점",
         HistoryOperationLabel::Stroke => "스트로크",
         HistoryOperationLabel::Structural => "구조 변경",
     }
@@ -970,8 +975,8 @@ fn ToolsPanel(ui_projection: Signal<UiProjection>) -> Element {
     rsx! {
         nav { class: "tool-list", aria_label: "도구",
             ToolButton { label: "이동", icon: "move", shortcut: "g", tool: Some(DrawingTool::Move), active: active == DrawingTool::Move }
-            ToolButton { label: "마법봉", icon: "wand", shortcut: "w", tool: Some(DrawingTool::Wand), active: active == DrawingTool::Wand }
-            ToolButton { label: "올가미", icon: "lasso", shortcut: "l", tool: Some(DrawingTool::Lasso), active: active == DrawingTool::Lasso }
+            ToolButton { label: "마법봉", icon: "wand", shortcut: "g", tool: Some(DrawingTool::Wand), active: active == DrawingTool::Wand }
+            ToolButton { label: "올가미", icon: "lasso", shortcut: "g", tool: Some(DrawingTool::Lasso), active: active == DrawingTool::Lasso }
             span { class: "tool-separator" }
             ToolButton { label: "연필", icon: "pencil", shortcut: "b", tool: Some(DrawingTool::Pencil), active: active == DrawingTool::Pencil }
             ToolButton { label: "펜", icon: "pen", shortcut: "b", tool: Some(DrawingTool::Pen), active: active == DrawingTool::Pen }
@@ -980,7 +985,7 @@ fn ToolsPanel(ui_projection: Signal<UiProjection>) -> Element {
             ToolButton { label: "지우개", icon: "eraser", shortcut: "e", tool: Some(DrawingTool::Eraser), active: active == DrawingTool::Eraser }
             span { class: "tool-separator" }
             ToolButton { label: "채우기", icon: "bucket", shortcut: "f", tool: Some(DrawingTool::Fill), active: active == DrawingTool::Fill }
-            ToolButton { label: "그라데이션", icon: "gradient", shortcut: "Shift f", tool: Some(DrawingTool::Gradient), active: active == DrawingTool::Gradient }
+            ToolButton { label: "그라데이션", icon: "gradient", shortcut: "f", tool: Some(DrawingTool::Gradient), active: active == DrawingTool::Gradient }
         }
     }
 }
@@ -1014,6 +1019,17 @@ fn ToolButton(
 
 #[component]
 fn BrushPanel(ui_projection: Signal<UiProjection>) -> Element {
+    rsx! {
+        div { class: "subtool-list",
+            SubtoolButton { name: "연필", tool: Some(DrawingTool::Pencil), active: ui_projection.read().drawing_tool == DrawingTool::Pencil }
+            SubtoolButton { name: "G펜", tool: Some(DrawingTool::Pen), active: ui_projection.read().drawing_tool == DrawingTool::Pen }
+            SubtoolButton { name: "마커펜", tool: Some(DrawingTool::Brush), active: ui_projection.read().drawing_tool == DrawingTool::Brush }
+        }
+    }
+}
+
+#[component]
+fn ToolPropertiesPanel(ui_projection: Signal<UiProjection>) -> Element {
     let transform_panel::TransformPanelOpen(transform_open) = use_context();
     let page_panel::PagePanelOpen(page_open) = use_context();
     if page_open() {
@@ -1026,22 +1042,21 @@ fn BrushPanel(ui_projection: Signal<UiProjection>) -> Element {
         return rsx! { EditToolPanel { ui_projection } };
     }
     let current_size = ui_projection.read().brush_size_tenths;
-    let display_size = f32::from(current_size) / 10.0;
-    let opacity = u32::from(ui_projection.read().brush_opacity_u16) * 100 / u32::from(u16::MAX);
+    let opacity =
+        (u32::from(ui_projection.read().brush_opacity_u16) * 100 + 32_767) / u32::from(u16::MAX);
     rsx! {
-        div { class: "brush-panel",
-            div { class: "subtool-list",
-                SubtoolButton { name: "마커펜", tool: Some(DrawingTool::Brush), active: ui_projection.read().drawing_tool == DrawingTool::Brush }
-                SubtoolButton { name: "G펜", tool: Some(DrawingTool::Pen), active: ui_projection.read().drawing_tool == DrawingTool::Pen }
-                SubtoolButton { name: "뭉개기", tool: None, active: false }
-            }
-            div { class: "tool-properties",
-                div { class: "brush-sample unavailable", title: "실제 브러시 미리보기는 준비 중", span { class: "unavailable-label", "미리보기 준비 중" } }
-                div { class: "property-row", span { "브러시 크기" } span { class: "property-value", "{display_size:.1}" } }
-                OpacityControl { percent: opacity }
-            }
+        div { class: "tool-properties", onkeydown: move |event| event.stop_propagation(),
+            BrushSizeControl { size_tenths: current_size }
+            OpacityControl { percent: opacity }
+        }
+    }
+}
+
+#[component]
+fn BrushSizesPanel(ui_projection: Signal<UiProjection>) -> Element {
+    let current_size = ui_projection.read().brush_size_tenths;
+    rsx! {
             div { class: "brush-sizes",
-                div { class: "section-caption", "브러시 크기" }
                 div { class: "recent-sizes", aria_label: "최근 브러시 크기",
                     for size in ui_projection.read().recent_brush_sizes.iter().copied() {
                         BrushSizeButton { key: "{size}", size_tenths: size, dot: brush_dot(i32::from(size) / 10), recent: true, active: current_size == size }
@@ -1053,6 +1068,40 @@ fn BrushPanel(ui_projection: Signal<UiProjection>) -> Element {
                     }
                 }
             }
+    }
+}
+
+#[component]
+fn BrushSizeControl(size_tenths: u16) -> Element {
+    let live_ink = use_context::<LiveInkBridge>();
+    let error = use_signal(|| Option::<String>::None);
+    let mut draft = use_signal(|| format!("{:.1}", f32::from(size_tenths) / 10.0));
+    use_effect(use_reactive((&size_tenths,), move |(size,)| {
+        draft.set(format!("{:.1}", f32::from(size) / 10.0));
+    }));
+    let mut commit = move || {
+        if let Ok(value) = draft().parse::<f32>()
+            && value.is_finite()
+        {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let size = (value.clamp(0.1, 200.0) * 10.0).round() as u16;
+            send_editor_command(
+                &live_ink,
+                EditorCommand::Tool(ToolCommand::SetSizeTenths(size)),
+                error,
+            );
+            draft.set(format!("{:.1}", f32::from(size) / 10.0));
+            return;
+        }
+        draft.set(format!("{:.1}", f32::from(size_tenths) / 10.0));
+    };
+    rsx! {
+        label { class: "property-row", span { "크기" }
+            input { class: "property-number", r#type: "number", min: "0.1", max: "200", step: "0.1", value: "{draft}", aria_label: "브러시 크기 px",
+                oninput: move |event| draft.set(event.value()),
+                onchange: move |_| commit(),
+            }
+            span { "px" }
         }
     }
 }
@@ -1151,12 +1200,30 @@ fn EditToolPanel(ui_projection: Signal<UiProjection>) -> Element {
 #[component]
 fn OpacityControl(percent: u32) -> Element {
     let live_ink = use_context::<LiveInkBridge>();
+    let slider_ink = live_ink.clone();
     let error = use_signal(|| Option::<String>::None);
+    let mut draft = use_signal(|| percent.to_string());
+    use_effect(use_reactive((&percent,), move |(value,)| {
+        draft.set(value.to_string());
+    }));
     rsx! {
-        div { class: "property-row",
+        label { class: "property-row",
             span { "불투명도" }
-            span { class: "property-value", "{percent}" }
+            input { class: "property-number", r#type: "number", min: "1", max: "100", step: "1", value: "{draft}", aria_label: "브러시 불투명도 %",
+                oninput: move |event| draft.set(event.value()),
+                onchange: move |_| {
+                    if let Ok(value) = draft().parse::<u32>() {
+                        let value = value.clamp(1, 100);
+                        let scaled = (value * u32::from(u16::MAX) + 50) / 100;
+                        send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::SetOpacityU16(u16::try_from(scaled).expect("bounded opacity"))), error);
+                        draft.set(value.to_string());
+                    } else { draft.set(percent.to_string()); }
+                },
+            }
+            span { "%" }
             input {
+                class: "property-range",
+                aria_label: "브러시 불투명도 슬라이더",
                 r#type: "range",
                 min: "1",
                 max: "100",
@@ -1165,7 +1232,7 @@ fn OpacityControl(percent: u32) -> Element {
                     if let Ok(value) = event.value().parse::<u32>() {
                         let scaled = ((value.min(100) * u32::from(u16::MAX)) / 100).max(1);
                         if let Ok(opacity) = u16::try_from(scaled) {
-                            send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::SetOpacityU16(opacity)), error);
+                            send_editor_command(&slider_ink, EditorCommand::Tool(ToolCommand::SetOpacityU16(opacity)), error);
                         }
                     }
                 }
@@ -1361,7 +1428,6 @@ fn ColorPanel(ui_projection: Signal<UiProjection>) -> Element {
 
 #[component]
 fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
-    layer_drag::use_layer_drag_probe();
     let live_ink = use_context::<LiveInkBridge>();
     let add_raster_ink = live_ink.clone();
     let add_group_ink = live_ink.clone();
@@ -1376,7 +1442,7 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
     let solo_node = ui_projection.read().solo_node;
     let error = use_signal(|| Option::<String>::None);
     let collapsed_groups = use_signal(BTreeSet::<GroupId>::new);
-    let mut layer_drag = use_signal(|| Option::<layer_drag::LayerDrag>::None);
+    layer_drag::use_layer_pointer_drag(error);
     let collapsed_snapshot = collapsed_groups.read().clone();
     let thumbnails = live_ink.layer_thumbnail_snapshot();
     let mut hidden_below = None;
@@ -1399,14 +1465,10 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
         .collect();
     rsx! {
         div { class: "layers-panel",
-            ondragend: move |_| layer_drag.set(None),
-            onkeydown: move |event| {
-                if event.key() == Key::Escape { layer_drag.set(None); }
-            },
             div { class: "layer-actions",
                 button { title: "래스터 레이어 추가", onclick: move |_| {
                     send_editor_command(&add_raster_ink, EditorCommand::Layer(LayerCommand::AddRaster), error);
-                }, UiIcon { name: "layer" } }
+                }, UiIcon { name: "plus" } }
                 button { title: "그룹 추가", onclick: move |_| {
                     send_editor_command(&add_group_ink, EditorCommand::Layer(LayerCommand::AddGroup), error);
                 }, UiIcon { name: "folder" } }
@@ -1437,7 +1499,7 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
                             LayerTreeNodeId::Raster(layer_id) => thumbnails.frame(layer_id),
                             LayerTreeNodeId::Group(_) => None,
                         };
-                        rsx! { LayerRow { key: "{layer.id:?}", layer, thumbnail, active, solo_node, error, collapsed_groups, layer_drag, ui_projection } }
+                        rsx! { LayerRow { key: "{layer.id:?}", layer, thumbnail, active, solo_node, error, collapsed_groups } }
                     }
                 }
             }
@@ -1459,8 +1521,6 @@ fn LayerRow(
     solo_node: Option<LayerTreeNodeId>,
     error: Signal<Option<String>>,
     mut collapsed_groups: Signal<BTreeSet<GroupId>>,
-    mut layer_drag: Signal<Option<layer_drag::LayerDrag>>,
-    ui_projection: Signal<UiProjection>,
 ) -> Element {
     let live_ink = use_context::<LiveInkBridge>();
     let active_ink = live_ink.clone();
@@ -1468,6 +1528,7 @@ fn LayerRow(
     let opacity_ink = live_ink.clone();
     let rename_ink = live_ink.clone();
     let mut rename_error = error;
+    let mut renaming = use_signal(|| false);
     let solo_ink = live_ink.clone();
     let delete_ink = live_ink.clone();
     let id = layer.id;
@@ -1484,6 +1545,7 @@ fn LayerRow(
     rsx! {
         div { class: if is_group { "layer-row group" } else if is_active { "layer-row active" } else { "layer-row" }, style: "padding-left:{indent}px",
             "data-layer-key": "{layer_key}", "data-parent": "{layer.parent.0}", "data-index": "{layer.index}",
+            "data-depth": "{layer.depth}",
             button { class: "layer-eye", title: "보기/숨기기", onclick: move |_| {
                 let visible = !layer.visible;
                 send_editor_command(&visibility_ink, EditorCommand::Layer(LayerCommand::SetVisibility { node: id, visible }), error);
@@ -1516,14 +1578,7 @@ fn LayerRow(
                 span { class: "layer-tree", if layer.depth > 1 { "└" } else { "" } }
             }
             span { class: if is_group { "layer-thumb group-thumb" } else { "layer-thumb raster-thumb" },
-                draggable: "true", title: "끌어서 레이어 순서 또는 그룹 변경",
-                ondragstart: move |_| {
-                    let current = ui_projection.read();
-                    if let Some(source) = current.layers.iter().find(|layer| layer.id == id) {
-                        layer_drag.set(Some(layer_drag::LayerDrag::begin(source, current.revision)));
-                    }
-                },
-                ondragend: move |_| layer_drag.set(None),
+                title: "끌어서 레이어 순서 또는 그룹 변경",
                 if let Some(thumbnail) = thumbnail {
                     img {
                         class: "layer-thumb-image",
@@ -1545,6 +1600,10 @@ fn LayerRow(
                 input {
                     class: "layer-name",
                     aria_label: "레이어 이름",
+                    title: "끌어서 이동 · 더블클릭하여 이름 변경",
+                    readonly: !renaming(),
+                    ondoubleclick: move |_| renaming.set(true),
+                    onblur: move |_| renaming.set(false),
                     value: "{layer.name}",
                     maxlength: "128",
                     spellcheck: "false",
@@ -1576,7 +1635,6 @@ fn LayerRow(
                 onclick: move |_| send_editor_command(&delete_ink, EditorCommand::Layer(LayerCommand::Delete(id)), error),
                 "×"
             }
-            layer_drag::LayerDropTargets { layer: layer.clone(), projection: ui_projection, drag: layer_drag, error }
         }
     }
 }
@@ -1613,43 +1671,44 @@ fn SharedCanvas() -> Element {
     });
     #[cfg(windows)]
     let canvas_host = use_context::<desktop_canvas::DesktopCanvasHandle>();
+    #[cfg(windows)]
+    let desktop = dioxus_desktop::use_window();
 
     #[cfg(windows)]
     use_effect(move || {
+        use dioxus_desktop::wry::WebViewExtWindows as _;
         let canvas_host = canvas_host.clone();
+        let input_hwnd = desktop.webview.composition_input_hwnd();
         spawn(async move {
             if startup_diagnostics {
                 println!("desktop-layout event=observer-started observer={observer_id}");
             }
-            let mut observer = document::eval(
-                r"
-                const element = document.getElementById('shared-gpu-canvas');
-                if (!element) {
-                    dioxus.send(['missing', [0, 0, 0, 0, 1], false]);
-                    throw new Error('native canvas placeholder missing');
+            let Some(input_hwnd) = input_hwnd else {
+                eprintln!("desktop-layout event=composition-host-missing");
+                canvas_host.hide();
+                return;
+            };
+            let router = match canvas_host::windows::CanvasInputRouter::new(
+                canvas_host.input_router_hwnd(),
+                input_hwnd,
+            ) {
+                Ok(router) => router,
+                Err(error) => {
+                    eprintln!("desktop-layout event=input-router-failed error={error}");
+                    canvas_host.hide();
+                    return;
                 }
-                const publish = () => {
-                    const rect = element.getBoundingClientRect();
-                    dioxus.send(['geometry', [
-                        rect.left,
-                        rect.top,
-                        rect.width,
-                        rect.height,
-                        window.devicePixelRatio || 1
-                    ], element.isConnected && document.getElementById('shared-gpu-canvas') === element]);
-                };
-                const resizeObserver = new ResizeObserver(publish);
-                resizeObserver.observe(element);
-                window.addEventListener('resize', publish);
-                publish();
-                await new Promise(() => {});
-                ",
-            );
+            };
+            let mut observer = document::eval(include_str!("canvas_host/observe.js"));
             let mut first_message = true;
             let mut first_anomaly = true;
+            let mut last_bounds = None;
             loop {
-                match observer.recv::<(String, [f64; 5], bool)>().await {
-                    Ok((kind, [x, y, width, height, scale], connected)) => {
+                match observer
+                    .recv::<(String, [f64; 5], bool, Vec<[f64; 4]>)>()
+                    .await
+                {
+                    Ok((kind, [x, y, width, height, scale], connected, ui_regions)) => {
                         let anomaly = kind != "geometry" || !connected;
                         if startup_diagnostics && (first_message || (anomaly && first_anomaly)) {
                             println!(
@@ -1658,8 +1717,28 @@ fn SharedCanvas() -> Element {
                             first_message = false;
                             first_anomaly &= !anomaly;
                         }
-                        if kind == "geometry" {
-                            canvas_host.set_geometry(x, y, width, height, scale);
+                        if kind == "geometry" && connected {
+                            let layout = canvas_host::HostLayout {
+                                canvas: [x, y, width, height, scale],
+                                ui_regions,
+                            };
+                            if let Err(error) = canvas_host::windows::apply_input_layout(
+                                input_hwnd, &router, &layout,
+                            ) {
+                                eprintln!(
+                                    "desktop-layout event=composition-layout-failed error={error}"
+                                );
+                                break;
+                            }
+                            // Overlays only change hit testing. Do not resize or hide
+                            // the GPU child when a close dialog changes UI regions.
+                            if last_bounds != Some(layout.canvas) {
+                                canvas_host.set_geometry(x, y, width, height, scale);
+                                last_bounds = Some(layout.canvas);
+                            }
+                            canvas_host.repaint_underlay();
+                        } else {
+                            break;
                         }
                     }
                     Err(error) => {
@@ -1671,6 +1750,7 @@ fn SharedCanvas() -> Element {
                 }
             }
             canvas_host.hide();
+            canvas_host::windows::restore_input(&router);
         });
     });
 
@@ -1705,6 +1785,16 @@ fn UiIcon(name: &'static str) -> Element {
         "fit" => &["M8 3H3v5", "M16 3h5v5", "M21 16v5h-5", "M8 21H3v-5"],
         "minus" => &["M5 12h14"],
         "plus" => &["M12 5v14", "M5 12h14"],
+        "clear-layer" => &[
+            "M12 2v4",
+            "M12 18v4",
+            "M2 12h4",
+            "M18 12h4",
+            "m5 5 3 3",
+            "m16 16 3 3",
+            "m5 19 3-3",
+            "m16 8 3-3",
+        ],
         "rotate" => &["M20 11a8 8 0 1 0-2 6", "M20 4v7h-7"],
         "move" => &["M12 2v20", "m8-4 4-4-4-4", "M2 12h20", "m4-8-4 4 4 4"],
         "wand" => &[
@@ -1755,6 +1845,8 @@ fn panel_label(panel: PanelKind) -> &'static str {
         PanelKind::Navigator => "내비게이터",
         PanelKind::Layers => "레이어",
         PanelKind::Brush => "세부 도구",
+        PanelKind::ToolProperties => "도구 속성",
+        PanelKind::BrushSizes => "크기 빠른 선택",
         PanelKind::Color => "색상",
         PanelKind::History => "히스토리",
         PanelKind::CanvasActions => "캔버스 작업",
@@ -1770,6 +1862,8 @@ fn panel_slug(panel: PanelKind) -> &'static str {
         PanelKind::Navigator => "navigator",
         PanelKind::Layers => "layers",
         PanelKind::Brush => "brush",
+        PanelKind::ToolProperties => "tool-properties",
+        PanelKind::BrushSizes => "brush-sizes",
         PanelKind::Color => "color",
         PanelKind::History => "history",
         PanelKind::CanvasActions => "canvas-actions",

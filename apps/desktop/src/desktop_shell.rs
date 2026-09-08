@@ -59,8 +59,21 @@ fn launch_with_instance(
                 .with_inner_size(dioxus_desktop::LogicalSize::new(1280.0, 800.0))
                 .with_maximized(true),
         )
+        .with_icon(
+            dioxus_desktop::tao::window::Icon::from_rgba(
+                include_bytes!("../assets/nyatidraw.rgba").to_vec(),
+                64,
+                64,
+            )
+            .expect("checked-in NyatiDraw icon is 64 by 64 RGBA"),
+        )
         .with_menu(None::<dioxus_desktop::muda::Menu>)
-        .with_background_color((24, 24, 24, 255))
+        .with_parent_composition(cfg!(windows))
+        .with_background_color(if cfg!(windows) {
+            (0, 0, 0, 0)
+        } else {
+            (24, 24, 24, 255)
+        })
         .with_on_window(move |window, vdom: &mut VirtualDom| {
             vdom.insert_any_root_context(Box::new(context_ink.clone()));
 

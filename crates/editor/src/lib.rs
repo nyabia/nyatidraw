@@ -276,6 +276,7 @@ impl HeadlessStrokeSession {
         };
         self.current_cursor = cursor;
         self.cursors.insert(cursor.history_head, cursor);
+        self.limit_history();
         Ok(())
     }
 
@@ -316,7 +317,18 @@ impl HeadlessStrokeSession {
         };
         self.current_cursor = cursor;
         self.cursors.insert(cursor.history_head, cursor);
+        self.limit_history();
         Ok(())
+    }
+
+    fn limit_history(&mut self) {
+        if let Some(baseline) = self.history.enforce_limit() {
+            let mut cursor = self.cursors[&Some(baseline)];
+            cursor.history_head = None;
+            self.cursors.insert(None, cursor);
+        }
+        self.cursors
+            .retain(|id, _| id.is_none_or(|id| self.history.node(id).is_some()));
     }
 
     /// Prepares a non-destructive undo cursor move.
@@ -467,7 +479,7 @@ impl HeadlessStrokeSession {
             cursor = node.parent;
         }
 
-        let has_older_entries = cursor.is_some() || entries.len() == HISTORY_PROJECTION_MAX_ENTRIES;
+        let has_older_entries = cursor.is_some();
         if !has_older_entries {
             entries.push(HistoryEntryProjection {
                 operation: HistoryOperationLabel::Initial,

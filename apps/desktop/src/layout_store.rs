@@ -8,9 +8,9 @@ use std::{
     thread::JoinHandle,
 };
 
-const MAGIC: &[u8; 8] = b"NYDOCK02";
+const MAGIC: &[u8; 8] = b"NYDOCK03";
 const MAX_BYTES: usize = 4096;
-const PANELS: [PanelKind; 10] = [
+const PANELS: [PanelKind; 12] = [
     PanelKind::Canvas,
     PanelKind::Tools,
     PanelKind::Navigator,
@@ -21,7 +21,104 @@ const PANELS: [PanelKind; 10] = [
     PanelKind::CanvasActions,
     PanelKind::Viewport,
     PanelKind::QuickColors,
+    PanelKind::ToolProperties,
+    PanelKind::BrushSizes,
 ];
+
+fn settings_path() -> Option<PathBuf> {
+    std::env::var_os("NAYATI_LAYOUT_PATH")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("LOCALAPPDATA").map(|base| {
+                PathBuf::from(base)
+                    .join("NyatiDraw")
+                    .join("workspace.layout")
+            })
+        })
+}
+
+/// Small workspace-only sizing preferences. Zero means use the content default.
+#[derive(Clone, PartialEq)]
+pub(crate) struct PanelHeights {
+    values: [u16; 12],
+    writable: bool,
+}
+
+impl PanelHeights {
+    pub(crate) fn load() -> Self {
+        let mut result = Self {
+            values: [0; 12],
+            writable: true,
+        };
+        let Some(path) = settings_path().map(|path| path.with_extension("heights")) else {
+            result.writable = false;
+            return result;
+        };
+        let loaded = (|| -> std::io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            File::open(path)?.take(33).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })();
+        match loaded {
+            Ok(bytes)
+                if (bytes.len() == 28 && bytes.starts_with(b"NYHIGH01"))
+                    || (bytes.len() == 32 && bytes.starts_with(b"NYHIGH02")) =>
+            {
+                for (index, pair) in bytes[8..].chunks_exact(2).enumerate() {
+                    let height = u16::from_le_bytes([pair[0], pair[1]]);
+                    if height != 0 && !(64..=4096).contains(&height) {
+                        result.writable = false;
+                        result.values = [0; 12];
+                        break;
+                    }
+                    result.values[index] = height;
+                }
+                if bytes.starts_with(b"NYHIGH01") {
+                    // Old height covered all three sections, not subtools alone.
+                    result.values[4] = 0;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => result.writable = false,
+        }
+        if !result.writable {
+            eprintln!("native-layout event=height-load-failed existing-preferences-preserved");
+        }
+        result
+    }
+
+    pub(crate) fn get(&self, panel: PanelKind) -> Option<u16> {
+        PANELS
+            .iter()
+            .position(|value| *value == panel)
+            .map(|index| self.values[index])
+            .filter(|height| *height != 0)
+    }
+
+    pub(crate) fn set(&mut self, panel: PanelKind, height: u16) -> std::io::Result<()> {
+        if !self.writable || !(64..=4096).contains(&height) {
+            return Err(std::io::Error::other(
+                "panel height preferences unavailable",
+            ));
+        }
+        let mut values = self.values;
+        let index = PANELS
+            .iter()
+            .position(|value| *value == panel)
+            .ok_or_else(|| std::io::Error::other("unknown panel"))?;
+        values[index] = height;
+        self.values = values;
+        Ok(())
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut bytes = b"NYHIGH02".to_vec();
+        for value in self.values {
+            bytes.extend(value.to_le_bytes());
+        }
+        bytes
+    }
+}
 
 pub(crate) fn encode(tree: &DockTree) -> Vec<u8> {
     fn node(value: &DockNode, bytes: &mut Vec<u8>) {
@@ -106,7 +203,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DockTree, DockLayoutError> {
         })
     }
     let legacy = bytes.starts_with(b"NYDOCK01");
-    if bytes.len() > MAX_BYTES || !(bytes.starts_with(MAGIC) || legacy) {
+    let combined_brush = legacy || bytes.starts_with(b"NYDOCK02");
+    if bytes.len() > MAX_BYTES || !(bytes.starts_with(MAGIC) || combined_brush) {
         return Err(DockLayoutError::CorruptPayload);
     }
     let mut remaining = &bytes[MAGIC.len()..];
@@ -121,9 +219,32 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DockTree, DockLayoutError> {
             .map(|_| panel(&mut remaining))
             .collect::<Result<Vec<_>, _>>()?
     };
-    let root = node(&mut remaining, 0)?;
+    let mut root = node(&mut remaining, 0)?;
     if !remaining.is_empty() {
         return Err(DockLayoutError::CorruptPayload);
+    }
+    if combined_brush {
+        fn expand(node: DockNode) -> DockNode {
+            match node {
+                DockNode::Panel(PanelKind::Brush) => DockTree::brush_stack(node),
+                DockNode::Tabs { ref panels, .. } if panels.contains(&PanelKind::Brush) => {
+                    DockTree::brush_stack(node)
+                }
+                DockNode::Split {
+                    axis,
+                    first_per_mille,
+                    first,
+                    second,
+                } => DockNode::Split {
+                    axis,
+                    first_per_mille,
+                    first: Box::new(expand(*first)),
+                    second: Box::new(expand(*second)),
+                },
+                _ => node,
+            }
+        }
+        root = expand(root);
     }
     DockTree::with_top(root, top)
 }
@@ -139,6 +260,7 @@ struct Shared {
 }
 struct State {
     latest: Vec<u8>,
+    pending_heights: Option<Vec<u8>>,
     pending: bool,
     writing: bool,
     stopping: bool,
@@ -148,15 +270,7 @@ struct State {
 impl LayoutStore {
     pub(crate) fn open(notify: Arc<dyn Fn() + Send + Sync>) -> (Self, DockTree) {
         // The explicit override keeps scratch acceptance away from user preferences.
-        let path = std::env::var_os("NAYATI_LAYOUT_PATH")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("LOCALAPPDATA").map(|base| {
-                    PathBuf::from(base)
-                        .join("NyatiDraw")
-                        .join("workspace.layout")
-                })
-            });
+        let path = settings_path();
         let (tree, notice) = match path.as_deref().map(load) {
             Some(Ok(Some(tree))) => {
                 println!("native-layout event=loaded");
@@ -181,6 +295,7 @@ impl LayoutStore {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 latest: encode(&tree),
+                pending_heights: None,
                 pending: false,
                 writing: false,
                 stopping: false,
@@ -192,23 +307,30 @@ impl LayoutStore {
         let worker = std::thread::Builder::new().name("nyatidraw-layout".into()).spawn(move || {
             loop {
                 let mut state = task.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                while !state.pending && !state.stopping {
+                while !state.pending && state.pending_heights.is_none() && !state.stopping {
                     state = task.changed.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
-                if !state.pending { break; }
-                let bytes = state.latest.clone();
+                if !state.pending && state.pending_heights.is_none() { break; }
+                let bytes = state.pending.then(|| state.latest.clone());
+                let heights = state.pending_heights.take();
                 state.pending = false;
                 state.writing = true;
                 drop(state);
                 let result = path.as_deref().ok_or_else(|| std::io::Error::other("user settings path missing"))
-                    .and_then(|path| replace(path, &bytes));
+                    .and_then(|path| {
+                        if let Some(bytes) = &bytes { replace(path, bytes)?; }
+                        if let Some(heights) = &heights { replace(&path.with_extension("heights"), heights)?; }
+                        Ok(())
+                    });
                 let mut state = task.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.writing = false;
                 state.notice = result.err().map(|error| {
                     eprintln!("native-layout event=save-failed error={error}");
                     "화면 배치를 저장하지 못했습니다. 배치를 다시 변경하거나 기본 배치로 복원해 재시도하세요. 작품 저장은 별개입니다.".into()
                 });
-                if state.notice.is_none() { println!("native-layout event=saved bytes={}", bytes.len()); }
+                if state.notice.is_none() {
+                    println!("native-layout event=saved bytes={} heights={}", bytes.as_ref().map_or(0, Vec::len), heights.is_some());
+                }
                 task.changed.notify_all();
                 drop(state);
                 notify();
@@ -253,6 +375,18 @@ impl LayoutStore {
             .clone()
     }
 
+    pub(crate) fn submit_heights(&self, heights: &PanelHeights) {
+        if self.worker.is_none() {
+            return;
+        }
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_heights = Some(heights.encode());
+        self.shared.changed.notify_one();
+    }
+
     /// Only the background close owner waits; UI and renderer merely submit.
     pub(crate) fn flush(&self) {
         let mut state = self
@@ -260,7 +394,7 @@ impl LayoutStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while state.pending || state.writing {
+        while state.pending || state.pending_heights.is_some() || state.writing {
             state = self
                 .shared
                 .changed

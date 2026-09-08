@@ -1,0 +1,180 @@
+release=true redb=4.2.0 sqlite=3.53.2 repetitions=3 edits=160 open_samples=32
+capturing=sprite
+case=sprite final_records=565 logical_bytes=86027
+case=sprite backend=redb round=0 empty_bytes=40960
+live_main_bytes=299008 live_aux_bytes=0
+last_write_close_ms=8.479
+commit_ms n=160 p50=2.417 p95=2.849 p99=4.378
+warm_open_ms n=32 p50=2.310 p95=2.537 p99=2.543
+all_records_ms n=32 p50=0.511 p95=0.604 p99=0.630
+read_only_close_ms n=32 p50=7.035 p95=8.158 p99=8.326
+closed_aux_bytes=0
+file_bytes=278528 compacted_bytes=200704 compact_ms=30.764
+case=sprite backend=sqlite-delete round=0 empty_bytes=8192
+live_main_bytes=122880 live_aux_bytes=0
+last_write_close_ms=0.175
+commit_ms n=160 p50=7.860 p95=8.838 p99=10.505
+warm_open_ms n=32 p50=0.326 p95=0.485 p99=0.505
+all_records_ms n=32 p50=0.468 p95=0.859 p99=0.869
+read_only_close_ms n=32 p50=0.034 p95=0.053 p99=0.053
+closed_aux_bytes=0
+file_bytes=122880 compacted_bytes=98304 compact_ms=8.679
+case=sprite backend=sqlite-wal round=0 empty_bytes=8192
+live_main_bytes=8192 live_aux_bytes=4020960
+last_write_close_ms=4.657
+commit_ms n=160 p50=2.082 p95=2.350 p99=6.146
+warm_open_ms n=32 p50=1.672 p95=2.429 p99=2.490
+all_records_ms n=32 p50=0.364 p95=0.565 p99=0.595
+read_only_close_ms n=32 p50=0.733 p95=0.868 p99=0.904
+closed_aux_bytes=0
+file_bytes=122880 compacted_bytes=98304 compact_ms=7.156
+case=sprite backend=sqlite-delete round=1 empty_bytes=8192
+live_main_bytes=122880 live_aux_bytes=0
+last_write_close_ms=0.130
+commit_ms n=160 p50=7.827 p95=8.851 p99=11.969
+warm_open_ms n=32 p50=0.448 p95=0.519 p99=0.677
+all_records_ms n=32 p50=0.721 p95=0.949 p99=1.244
+read_only_close_ms n=32 p50=0.048 p95=0.055 p99=0.063
+closed_aux_bytes=0
+file_bytes=122880 compacted_bytes=98304 compact_ms=9.021
+case=sprite backend=sqlite-wal round=1 empty_bytes=8192
+live_main_bytes=8192 live_aux_bytes=4020960
+last_write_close_ms=4.858
+commit_ms n=160 p50=2.106 p95=2.638 p99=3.865
+warm_open_ms n=32 p50=1.744 p95=2.536 p99=6.197
+all_records_ms n=32 p50=0.397 p95=0.754 p99=0.949
+read_only_close_ms n=32 p50=0.764 p95=1.090 p99=1.094
+closed_aux_bytes=0
+file_bytes=122880 compacted_bytes=98304 compact_ms=7.662
+case=sprite backend=redb round=1 empty_bytes=40960
+live_main_bytes=299008 live_aux_bytes=0
+last_write_close_ms=8.581
+commit_ms n=160 p50=2.337 p95=2.721 p99=4.238
+warm_open_ms n=32 p50=2.315 p95=2.493 p99=6.493
+all_records_ms n=32 p50=0.321 p95=0.725 p99=0.775
+read_only_close_ms n=32 p50=6.857 p95=8.552 p99=8.702
+closed_aux_bytes=0
+file_bytes=278528 compacted_bytes=200704 compact_ms=29.511
+case=sprite backend=sqlite-wal round=2 empty_bytes=8192
+live_main_bytes=8192 live_aux_bytes=4020960
+last_write_close_ms=7.427
+commit_ms n=160 p50=2.080 p95=2.492 p99=3.464
+warm_open_ms n=32 p50=1.796 p95=2.693 p99=3.075
+all_records_ms n=32 p50=0.379 p95=0.773 p99=0.848
+read_only_close_ms n=32 p50=0.848 p95=1.370 p99=4.335
+closed_aux_bytes=0
+file_bytes=122880 compacted_bytes=98304 compact_ms=7.077
+case=sprite backend=redb round=2 empty_bytes=40960
+live_main_bytes=299008 live_aux_bytes=0
+last_write_close_ms=8.511
+commit_ms n=160 p50=2.446 p95=3.413 p99=4.383
+warm_open_ms n=32 p50=2.371 p95=3.707 p99=3.906
+all_records_ms n=32 p50=0.406 p95=0.687 p99=0.691
+read_only_close_ms n=32 p50=7.143 p95=9.515 p99=10.902
+closed_aux_bytes=0
+file_bytes=278528 compacted_bytes=200704 compact_ms=31.368
+case=sprite backend=sqlite-delete round=2 empty_bytes=8192
+live_main_bytes=122880 live_aux_bytes=0
+last_write_close_ms=0.106
+commit_ms n=160 p50=7.702 p95=8.487 p99=9.501
+warm_open_ms n=32 p50=0.373 p95=0.508 p99=0.524
+all_records_ms n=32 p50=0.759 p95=1.076 p99=1.079
+read_only_close_ms n=32 p50=0.043 p95=0.056 p99=0.060
+closed_aux_bytes=0
+file_bytes=122880 compacted_bytes=98304 compact_ms=9.306
+capturing=noise16
+case=noise16 final_records=682 logical_bytes=8270218
+case=noise16 backend=redb round=0 empty_bytes=40960
+live_main_bytes=13111296 live_aux_bytes=0
+last_write_close_ms=7.067
+commit_ms n=160 p50=2.867 p95=4.467 p99=5.426
+warm_open_ms n=32 p50=2.216 p95=2.436 p99=2.455
+all_records_ms n=32 p50=4.375 p95=6.660 p99=6.912
+read_only_close_ms n=32 p50=7.063 p95=8.634 p99=8.663
+closed_aux_bytes=0
+file_bytes=13111296 compacted_bytes=9900032 compact_ms=26.082
+case=noise16 backend=sqlite-delete round=0 empty_bytes=8192
+live_main_bytes=9097216 live_aux_bytes=0
+last_write_close_ms=0.303
+commit_ms n=160 p50=8.599 p95=10.020 p99=11.917
+warm_open_ms n=32 p50=0.351 p95=0.603 p99=1.178
+all_records_ms n=32 p50=9.579 p95=12.537 p99=13.734
+read_only_close_ms n=32 p50=0.046 p95=0.082 p99=0.109
+closed_aux_bytes=0
+file_bytes=9097216 compacted_bytes=8994816 compact_ms=129.452
+case=noise16 backend=sqlite-wal round=0 empty_bytes=8192
+live_main_bytes=9097216 live_aux_bytes=4272280
+last_write_close_ms=6.057
+commit_ms n=160 p50=2.614 p95=4.734 p99=44.231
+warm_open_ms n=32 p50=1.618 p95=2.576 p99=2.909
+all_records_ms n=32 p50=9.696 p95=12.060 p99=12.636
+read_only_close_ms n=32 p50=0.755 p95=1.077 p99=1.123
+closed_aux_bytes=0
+file_bytes=9097216 compacted_bytes=8994816 compact_ms=126.213
+case=noise16 backend=sqlite-delete round=1 empty_bytes=8192
+live_main_bytes=9097216 live_aux_bytes=0
+last_write_close_ms=0.257
+commit_ms n=160 p50=8.778 p95=10.362 p99=34.924
+warm_open_ms n=32 p50=0.377 p95=0.620 p99=0.788
+all_records_ms n=32 p50=10.665 p95=15.503 p99=16.014
+read_only_close_ms n=32 p50=0.047 p95=0.077 p99=0.134
+closed_aux_bytes=0
+file_bytes=9097216 compacted_bytes=8994816 compact_ms=134.929
+case=noise16 backend=sqlite-wal round=1 empty_bytes=8192
+live_main_bytes=9097216 live_aux_bytes=4272280
+last_write_close_ms=7.005
+commit_ms n=160 p50=2.647 p95=4.524 p99=15.520
+warm_open_ms n=32 p50=1.888 p95=2.530 p99=2.562
+all_records_ms n=32 p50=10.018 p95=14.382 p99=15.207
+read_only_close_ms n=32 p50=0.788 p95=1.785 p99=1.844
+closed_aux_bytes=0
+file_bytes=9097216 compacted_bytes=8994816 compact_ms=130.645
+case=noise16 backend=redb round=1 empty_bytes=40960
+live_main_bytes=13111296 live_aux_bytes=0
+last_write_close_ms=6.877
+commit_ms n=160 p50=2.653 p95=3.917 p99=5.074
+warm_open_ms n=32 p50=2.219 p95=44.008 p99=45.059
+all_records_ms n=32 p50=4.078 p95=5.854 p99=6.165
+read_only_close_ms n=32 p50=7.066 p95=104.745 p99=141.766
+closed_aux_bytes=0
+file_bytes=13111296 compacted_bytes=9900032 compact_ms=23.969
+case=noise16 backend=sqlite-wal round=2 empty_bytes=8192
+live_main_bytes=9097216 live_aux_bytes=4272280
+last_write_close_ms=7.437
+commit_ms n=160 p50=2.637 p95=4.796 p99=15.172
+warm_open_ms n=32 p50=2.034 p95=4.806 p99=4.883
+all_records_ms n=32 p50=12.281 p95=14.618 p99=19.285
+read_only_close_ms n=32 p50=0.860 p95=1.249 p99=1.254
+closed_aux_bytes=0
+file_bytes=9097216 compacted_bytes=8994816 compact_ms=128.178
+case=noise16 backend=redb round=2 empty_bytes=40960
+live_main_bytes=13111296 live_aux_bytes=0
+last_write_close_ms=7.112
+commit_ms n=160 p50=2.690 p95=4.359 p99=5.066
+warm_open_ms n=32 p50=2.178 p95=2.403 p99=2.635
+all_records_ms n=32 p50=3.723 p95=5.203 p99=6.083
+read_only_close_ms n=32 p50=6.805 p95=7.481 p99=10.892
+closed_aux_bytes=0
+file_bytes=13111296 compacted_bytes=9900032 compact_ms=24.023
+case=noise16 backend=sqlite-delete round=2 empty_bytes=8192
+live_main_bytes=9097216 live_aux_bytes=0
+last_write_close_ms=0.496
+commit_ms n=160 p50=8.735 p95=10.263 p99=11.858
+warm_open_ms n=32 p50=0.377 p95=0.681 p99=0.939
+all_records_ms n=32 p50=11.338 p95=14.921 p99=14.944
+read_only_close_ms n=32 p50=0.048 p95=0.162 p99=0.174
+closed_aux_bytes=0
+file_bytes=9097216 compacted_bytes=8994816 compact_ms=152.621
+crash backend=redb stage=before exact=PASS process_recovery_ms=26.448
+crash_closed_aux_bytes=0
+crash backend=redb stage=after exact=PASS process_recovery_ms=35.241
+crash_closed_aux_bytes=0
+crash backend=sqlite-delete stage=before exact=PASS process_recovery_ms=20.518
+crash_closed_aux_bytes=12824
+crash backend=sqlite-delete stage=after exact=PASS process_recovery_ms=16.677
+crash_closed_aux_bytes=0
+crash backend=sqlite-wal stage=before exact=PASS process_recovery_ms=18.029
+crash_closed_aux_bytes=0
+crash backend=sqlite-wal stage=after exact=PASS process_recovery_ms=23.554
+crash_closed_aux_bytes=0
+PASS: exact records, child-process reopen, and commit-boundary kills; scratch removed
