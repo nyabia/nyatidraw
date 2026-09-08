@@ -869,7 +869,7 @@ struct ActiveCanvas {
     projection: ProjectionState,
     cpu_tiles: BTreeMap<TileKey, Vec<u8>>,
     latest_preview_generation: BTreeMap<TileKey, u64>,
-    deferred_completions: Vec<ClosedStrokeCompletion>,
+    deferred_uploads: Vec<DeferredTileUpload>,
     gpu_live_generation: Option<(u64, LiveStrokeToken, bool)>,
     async_publication_base_revision: Option<Revision>,
     close_raw_probe_staged: bool,
@@ -1012,7 +1012,7 @@ impl ActiveCanvas {
             projection,
             cpu_tiles,
             latest_preview_generation: BTreeMap::new(),
-            deferred_completions: Vec::new(),
+            deferred_uploads: Vec::new(),
             gpu_live_generation: None,
             async_publication_base_revision: None,
             close_raw_probe_staged: false,
@@ -2580,22 +2580,20 @@ impl ActiveCanvas {
 
     fn apply_materialized_tiles(&mut self) {
         let mut trace = crate::performance::MaterializedTrace::begin();
-        let previously_deferred = self.deferred_completions.len();
-        self.stroke
-            .materializer
-            .drain_completed(&mut self.deferred_completions);
-        trace.add_completed(self.deferred_completions.len() - previously_deferred);
+        let mut completed = Vec::new();
+        self.stroke.materializer.drain_completed(&mut completed);
+        trace.add_completed(completed.len());
+        let latest_history = adopt_materialized_completions(
+            &mut self.cpu_tiles,
+            &mut self.deferred_uploads,
+            completed,
+            |bytes| trace.add_cpu_clone(bytes),
+        );
         let active_layer = self.scene.active_live_stroke().map(LiveStrokeToken::layer);
         let mut deferred = Vec::new();
-        let mut latest_history = None;
-        for completion in self.deferred_completions.drain(..) {
-            if let Some(history) = completion.history {
-                latest_history = Some(history);
-            }
+        for completion in self.deferred_uploads.drain(..) {
             let mut remaining = Vec::new();
             for (key, pixels) in completion.tiles {
-                trace.add_cpu_clone(pixels.len());
-                self.cpu_tiles.insert(key, pixels.clone());
                 let newer_preview = self
                     .latest_preview_generation
                     .get(&key)
@@ -2629,15 +2627,14 @@ impl ActiveCanvas {
                 }
             }
             if !remaining.is_empty() {
-                deferred.push(ClosedStrokeCompletion {
+                deferred.push(DeferredTileUpload {
                     ordinal: completion.ordinal,
                     stroke_generation: completion.stroke_generation,
                     tiles: remaining,
-                    history: None,
                 });
             }
         }
-        self.deferred_completions = deferred;
+        self.deferred_uploads = deferred;
         if let Some(history) = latest_history {
             self.projection.stage_history(history);
             self.publish_committed_history();
@@ -4399,6 +4396,40 @@ struct ClosedStrokeCompletion {
     history: Option<HistoryProjection>,
 }
 
+/// GPU-only retirement work; its CPU payload and history were already adopted.
+struct DeferredTileUpload {
+    ordinal: u64,
+    stroke_generation: u64,
+    tiles: Vec<(TileKey, Vec<u8>)>,
+}
+
+/// Adopt every fresh durable payload, even when a newer GPU preview hides it.
+/// Append after older GPU work: uploading a new generation first could remove
+/// its preview guard and let an older deferred upload overwrite it afterward.
+fn adopt_materialized_completions(
+    cpu_tiles: &mut BTreeMap<TileKey, Vec<u8>>,
+    pending_uploads: &mut Vec<DeferredTileUpload>,
+    completed: impl IntoIterator<Item = ClosedStrokeCompletion>,
+    mut record_cpu_clone: impl FnMut(usize),
+) -> Option<HistoryProjection> {
+    let mut latest_history = None;
+    for completion in completed {
+        if let Some(history) = completion.history {
+            latest_history = Some(history);
+        }
+        for (key, pixels) in &completion.tiles {
+            record_cpu_clone(pixels.len());
+            cpu_tiles.insert(*key, pixels.clone());
+        }
+        pending_uploads.push(DeferredTileUpload {
+            ordinal: completion.ordinal,
+            stroke_generation: completion.stroke_generation,
+            tiles: completion.tiles,
+        });
+    }
+    latest_history
+}
+
 /// Publishes the CPU payload which retires a committed live GPU preview.
 ///
 /// This must never wait: a saturated UI-facing lane can occur while the event
@@ -5246,6 +5277,72 @@ pub(crate) fn system_timestamp_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_gpu_work_cannot_recopy_or_roll_back_durable_tiles_and_history() {
+        // Product risk: retrying old GPU work must not overwrite newer CPU
+        // artwork/history, or run after a new upload clears its preview guard.
+        for fresh_count in 0_u64..=2 {
+            let key = TileKey {
+                layer: LIVE_LAYER,
+                mip: 0,
+                x: -1,
+                y: 2,
+            };
+            let mut cpu = BTreeMap::from([(key, vec![1; TILE_BYTE_LEN])]);
+            let mut pending = vec![DeferredTileUpload {
+                ordinal: 1,
+                stroke_generation: 1,
+                tiles: vec![(key, vec![1; TILE_BYTE_LEN])],
+            }];
+            let fresh = (2..2 + fresh_count).map(|generation| {
+                let mut history = HistoryProjection::initial();
+                history.has_older_entries = generation == 3;
+                ClosedStrokeCompletion {
+                    ordinal: generation,
+                    stroke_generation: generation,
+                    tiles: vec![(key, vec![u8::try_from(generation).unwrap(); TILE_BYTE_LEN])],
+                    history: Some(history),
+                }
+            });
+            let mut copied = Vec::new();
+            let history = adopt_materialized_completions(&mut cpu, &mut pending, fresh, |bytes| {
+                copied.push(bytes);
+            });
+            assert_eq!(
+                copied,
+                vec![TILE_BYTE_LEN; usize::try_from(fresh_count).unwrap()]
+            );
+            assert_eq!(
+                cpu[&key],
+                vec![u8::try_from(1 + fresh_count).unwrap(); TILE_BYTE_LEN]
+            );
+            assert_eq!(
+                history.map(|history| history.has_older_entries),
+                (fresh_count != 0).then_some(fresh_count == 2)
+            );
+            assert_eq!(
+                pending
+                    .iter()
+                    .map(|upload| upload.stroke_generation)
+                    .collect::<Vec<_>>(),
+                (1..=1 + fresh_count).collect::<Vec<_>>()
+            );
+
+            // Another render can retry all pending GPU work; none of it is
+            // accepted as fresh CPU/history authority or copied a second time.
+            let before = cpu.clone();
+            let copied_before = copied.len();
+            assert!(
+                adopt_materialized_completions(&mut cpu, &mut pending, [], |bytes| copied
+                    .push(bytes))
+                .is_none()
+            );
+            assert_eq!(cpu, before);
+            assert_eq!(copied.len(), copied_before);
+            assert_eq!(pending.first().unwrap().tiles[0].1, vec![1; TILE_BYTE_LEN]);
+        }
+    }
 
     #[test]
     fn save_as_preserves_source_and_every_redo_snapshot_after_closed_copy() {
