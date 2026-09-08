@@ -60,7 +60,15 @@ reinstall hooks also ran successfully, preserving foreign registrations and
 artwork. However, file-handle and external WMI evidence showed Codex's packaged
 execution environment redirected the installed files into its LocalCache while
 the ProgIDs reached real user Classes and referenced the conventional path.
-Explorer did not offer the app in Open With. This is not ordinary Windows
-installation acceptance. An Explorer-launched installation outside that context
-and explicit shell activation remain the release gate; no Codex-specific path
-workaround belongs in the product. See the [integration record](../status-plan-2026-09-08.md).
+Explorer initially did not offer the app in Open With. This was not ordinary
+Windows installation acceptance; no Codex-specific path workaround was added.
+
+After user confirmation, an external Explorer-launched alpha.4 Setup produced
+the conventional files (verified by WMI) and launched the conventional app path.
+Explorer then offered NyatiDraw Alpha for both PNG and NTDR. Each Open With
+action passed a Korean/space-named fixture path to a new conventional process;
+the paired document/history rendered, ordinary Close exited, and an independent
+verifier confirmed original bytes, every history snapshot, and PNG bytes.
+Existing PNG UserChoice and the development NTDR default survived. This closes
+the current-machine shell gate, not clean-VM, power-loss, or conventional-path
+update/uninstall coverage. See the [integration record](../status-plan-2026-09-08.md).

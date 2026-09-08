@@ -52,7 +52,7 @@ alpha.3은 라이선스 결정 전에 패키징했으므로 두 전문은 Releas
 
 ## 현재 실측 증거
 
-### 2026-09-08 alpha.4 로컬 후보 — 게시 보류
+### 2026-09-08 alpha.4 로컬 후보 — 설치 수용 완료, 아직 미게시
 
 Save As, activation 종료, 파일 연결 소유권 변경의 핵심 검사와 DX release 빌드,
 scratch export/recovery·durability 실행 및 실제 저장 대화상자/별도 프로세스 verifier를
@@ -61,9 +61,13 @@ scratch export/recovery·durability 실행 및 실제 저장 대화상자/별도
 
 Codex에서 실행한 설치·업데이트·제거는 파일 시스템 리디렉션 내부에서 성공했다.
 외부 WMI에는 일반 설치 경로의 실행 파일이 없고, Codex LocalCache에만 있었다.
-실제 사용자 registry의 Open With 명령은 일반 경로를 가리키므로 이 성공을
-탐색기 실행 성공으로 확대할 수 없다. 일반 탐색기에서 설치 후 파일 연결로 PNG pair를
-열어야 게시 가능하다. 현재 태그/Release 게시/홈페이지 다운로드 전환은 하지 않았다.
+실제 사용자 registry의 Open With 명령은 일반 경로를 가리키므로 그 성공만으로는
+탐색기 실행 성공이 아니었다. 이후 사용자 확인을 받고 외부 탐색기에서 Setup을 실행했다.
+일반 설치 경로의 파일을 WMI로 확인했고, PNG와 NTDR의 Open With 모두 일반 설치판으로
+열렸다. paired history/off-page 타일 표시와 Save·정상 종료·별도 verifier의 원본/history/
+PNG bytes 보존 검증을 통과했다. PNG 기본 앱과 기존 개발판 NTDR 기본 연결은 유지됐다.
+업데이트/제거/재설치 사이클의 앞선 증거는 Codex 리디렉션 환경에 한정한다.
+현재 태그/Release 게시/홈페이지 다운로드 전환은 하지 않았다.
 
 ### alpha.3 기존 기록과 증거 한계
 

@@ -66,7 +66,7 @@
 - alpha.4 설치 경로의 실행 파일에서도 위 durability 실행과 한글/공백 PNG pair 열기,
   정상 종료·별도 verifier 재검사를 통과했다. 단, 아래 설치 격리 한계가 적용된다.
 
-## alpha.4 후보와 남은 설치 게이트
+## alpha.4 후보와 설치 검증
 
 `target/releases/0.1.0-alpha.4/`에 로컬 후보를 생성했다. 아직 게시하지 않았다.
 설치 파일은 12,901,252 bytes, 전체 업데이트 패키지는 8,439,684 bytes다.
@@ -92,7 +92,26 @@ Open With 완료 증거가 아니다. 기존 alpha.3 설치 기록도 이 실행
 고려해야 하며 깨끗한 머신 증거로 해석하지 않는다. Codex 전용 경로를 제품 코드에
 하드코딩하지 않는다.
 
-남은 게시 게이트는 일반 탐색기에서 Setup 실행 → 외부 WMI에서 실제 설치 경로 확인 →
-Open With로 PNG pair 열기 → 정상 종료·재열기다. Windows UI 설치는 사용자 확인 후
-진행하며, 보안 경고 우회가 필요하면 사용자가 직접 처리한다. 실제 펜·고주사율·다중
-모니터·깨끗한 Windows VM 검증은 여전히 별도다.
+### 사용자 확인 후 외부 Explorer 설치: 통과
+
+09-08 사용자 확인을 받고 일반 Explorer에서 같은 alpha.4 Setup을 실행했다.
+외부 WMI가 이제 일반 `%LOCALAPPDATA%/NyatiDraw.Alpha/current/nyatidraw-desktop.exe`
+(17,157,632 bytes)와 `Update.exe` (3,866,112 bytes)를 확인했다. 첫 실행 프로세스도
+LocalCache가 아닌 이 일반 설치 경로였다.
+
+- Explorer PNG Open With에 **NyatiDraw Alpha**가 나타났다. 한글/공백 이름의
+  scratch PNG를 선택하면 일반 설치판에 PNG 경로가 하나의 인자로 전달됐고,
+  paired `.ntdr`의 history와 페이지 밖 녹색 타일이 렌더됐다.
+- 이 실행에서 Save → PNG 완료 표시 → Alt+F4 → 프로세스 종료를 확인했다.
+  별도 `desktop_save_as_fixture verify`가 원본 bytes 불변, 3개 history snapshot의
+  타일·metadata, PNG bytes 일치를 확인했다.
+- Explorer NTDR Open With에도 Alpha가 나타났다. 같은 `.ntdr`를 선택하면 새 프로세스에
+  NTDR 경로가 전달되고 같은 작품/history가 열렸다. 다시 정상 종료 후 verifier 통과.
+- PNG UserChoice는 기존 `Honeyview.png`, NTDR 기본값은 기존 개발판
+  `NyatiDraw.Project.1`로 유지됐다. 기본 앱을 강제로 전환하지 않았다.
+
+이로써 일반 설치·두 파일 연결·정상 재열기 게이트는 이 개발 머신에서 통과했다.
+alpha.3 → alpha.4 업데이트/제거/재설치의 앞선 증거는 여전히 Codex 리디렉션 환경에
+한정되며, 일반 설치에서 그 사이클까지 반복했다고 주장하지 않는다.
+실제 펜·고주사율·다중 모니터·깨끗한 Windows VM·전원 차단은 미검증이다.
+로컬 alpha.4 준비와 현재 머신 수용을 마쳤으며 공개 태그/Release/홈페이지 전환은 하지 않았다.
