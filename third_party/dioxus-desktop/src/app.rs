@@ -325,6 +325,28 @@ impl App {
         view.desktop_context.query.send(result);
     }
 
+    // Optional triage accepts no payload text and emits each fixed stage once.
+    pub(crate) fn handle_startup_edits(&self, msg: IpcMessage, id: WindowId) {
+        if !crate::edits::startup_diagnostics() || !self.webviews.contains_key(&id) {
+            return;
+        }
+        let Ok((stage, bytes, headless)) =
+            serde_json::from_value::<(String, u64, bool)>(msg.params())
+        else {
+            return;
+        };
+        let (stage, bit) = match stage.as_str() {
+            "entry" => ("entry", 1),
+            "return" => ("return", 2),
+            "throw" => ("throw", 4),
+            _ => return,
+        };
+        static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        if SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+            println!("desktop-startup event=first-raf-edits stage={stage} bytes={bytes} headless={headless}");
+        }
+    }
+
     #[cfg(all(feature = "devtools", debug_assertions))]
     pub fn handle_hot_reload_msg(&mut self, msg: dioxus_devtools::DevserverMsg) {
         use std::time::Duration;

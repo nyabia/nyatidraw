@@ -122,6 +122,9 @@ pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, mut desktop_config: 
                             IpcMethod::UserEvent => {}
                             IpcMethod::Query => app.handle_query_msg(msg, id),
                             IpcMethod::BrowserOpen => app.handle_browser_open(msg),
+                            IpcMethod::Other("nyatidraw_startup_edits") => {
+                                app.handle_startup_edits(msg, id)
+                            }
                             IpcMethod::Other(_) => {}
                         },
                     },

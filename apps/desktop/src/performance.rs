@@ -332,6 +332,7 @@ fn record(stage: Stage, at: Instant, exporting: bool) {
 
 pub(crate) fn input_dequeued(at: Option<Instant>) {
     if let Some(at) = at {
+        trace_dequeued(at);
         let exporting = EXPORTING.load(Ordering::Relaxed);
         record(Stage::InputDequeue, at, exporting);
         with_recorder(|recorder| {
@@ -357,6 +358,7 @@ pub(crate) fn presented() {
 }
 
 pub(crate) fn flush(owner: &str) {
+    flush_frame_trace(owner);
     let recorder = RECORDER.with(|cell| cell.borrow_mut().take());
     let Some(recorder) = recorder else {
         return;
@@ -397,4 +399,277 @@ pub(crate) fn flush(owner: &str) {
             recorder.history_samples.capacity() * std::mem::size_of::<HistorySample>()
         );
     }
+}
+
+// Independent of the histograms: bounded, opt-in correlation, not a frame
+// profiler or proof that a submitted image contains a particular input batch.
+const FRAME_TRACE_CAPACITY: usize = 128;
+const FRAME_TRACE_TAIL_US: u128 = 8_000;
+static FRAME_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+pub(crate) enum FrameMark {
+    Render,
+    SceneBegin,
+    SceneEnd,
+    AcquireBegin,
+    AcquireEnd,
+    PresentBegin,
+    PresentEnd,
+}
+
+#[derive(Clone, Copy)]
+struct TraceInput {
+    admission: Instant,
+    first_dequeue: Instant,
+    last_dequeue: Instant,
+    first_batch: u64,
+    batches: u64,
+    exporting_at_first_dequeue: bool,
+    crossed_control_boundary: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FrameSample {
+    id: u64,
+    wake: Instant,
+    end: Instant,
+    marks: [Option<Instant>; 7],
+    input: Option<TraceInput>,
+    dequeues: u64,
+    exporting_at_wake: bool,
+    control_boundary: bool,
+}
+
+struct FrameTrace {
+    sequence: u64,
+    current: Option<FrameSample>,
+    pending: Option<TraceInput>,
+    samples: Box<[Option<FrameSample>]>,
+    stored: usize,
+    omitted: u64,
+    below_threshold: u64,
+    // Only this recorded thread is observed; helper-thread tails have no trace.
+    unframed_dequeues_in_recorded_thread: u64,
+    presented: u64,
+    skipped: u64,
+    control_only: u64,
+    coalesced_presentations: u64,
+}
+
+thread_local! {
+    static FRAME_TRACE: RefCell<Option<Box<FrameTrace>>> = const { RefCell::new(None) };
+}
+
+/// One actor mailbox batch, including control-only and skipped render batches.
+/// Wake is observed AFTER the mailbox lock is released, not producer wake time.
+pub(crate) struct FrameBatch(bool);
+
+impl FrameBatch {
+    pub(crate) fn begin(control_boundary: bool) -> Self {
+        if !*FRAME_TRACE_ENABLED.get_or_init(|| {
+            start().is_some() && std::env::var("NAYATI_FRAME_TRACE").as_deref() == Ok("1")
+        }) {
+            return Self(false);
+        }
+        let now = Instant::now();
+        FRAME_TRACE.with(|cell| {
+            let mut trace = cell.borrow_mut();
+            let trace = trace.get_or_insert_with(|| {
+                Box::new(FrameTrace {
+                    sequence: 0,
+                    current: None,
+                    pending: None,
+                    samples: vec![None; FRAME_TRACE_CAPACITY].into_boxed_slice(),
+                    stored: 0,
+                    omitted: 0,
+                    below_threshold: 0,
+                    unframed_dequeues_in_recorded_thread: 0,
+                    presented: 0,
+                    skipped: 0,
+                    control_only: 0,
+                    coalesced_presentations: 0,
+                })
+            });
+            if control_boundary && let Some(pending) = trace.pending.as_mut() {
+                pending.crossed_control_boundary = true;
+            }
+            trace.sequence = trace.sequence.saturating_add(1);
+            trace.current = Some(FrameSample {
+                id: trace.sequence,
+                wake: now,
+                end: now,
+                marks: [None; 7],
+                input: None,
+                dequeues: 0,
+                exporting_at_wake: EXPORTING.load(Ordering::Relaxed),
+                control_boundary,
+            });
+        });
+        Self(true)
+    }
+}
+
+pub(crate) fn frame_mark(mark: FrameMark) {
+    if FRAME_TRACE_ENABLED.get() != Some(&true) {
+        return;
+    }
+    FRAME_TRACE.with(|cell| {
+        if let Some(trace) = cell.borrow_mut().as_mut()
+            && let Some(current) = trace.current.as_mut()
+        {
+            current.marks[mark as usize] = Some(Instant::now());
+        }
+    });
+}
+
+fn trace_dequeued(admission: Instant) {
+    if FRAME_TRACE_ENABLED.get() != Some(&true) {
+        return;
+    }
+    FRAME_TRACE.with(|cell| {
+        let mut trace = cell.borrow_mut();
+        let Some(trace) = trace.as_mut() else { return };
+        let Some(current) = trace.current.as_mut() else {
+            trace.unframed_dequeues_in_recorded_thread =
+                trace.unframed_dequeues_in_recorded_thread.saturating_add(1);
+            return;
+        };
+        current.dequeues = current.dequeues.saturating_add(1);
+        let now = Instant::now();
+        let pending = trace.pending.get_or_insert(TraceInput {
+            admission,
+            first_dequeue: now,
+            last_dequeue: now,
+            first_batch: current.id,
+            batches: 0,
+            exporting_at_first_dequeue: EXPORTING.load(Ordering::Relaxed),
+            crossed_control_boundary: current.control_boundary,
+        });
+        pending.admission = pending.admission.min(admission);
+        pending.last_dequeue = now;
+        pending.batches = pending.batches.saturating_add(1);
+    });
+}
+
+impl Drop for FrameBatch {
+    fn drop(&mut self) {
+        if !self.0 {
+            return;
+        }
+        FRAME_TRACE.with(|cell| {
+            let mut trace = cell.borrow_mut();
+            let Some(trace) = trace.as_mut() else { return };
+            let Some(mut sample) = trace.current.take() else {
+                return;
+            };
+            sample.end = Instant::now();
+            sample.input = trace.pending;
+            let present = sample.marks[FrameMark::PresentEnd as usize];
+            if present.is_some() {
+                trace.presented = trace.presented.saturating_add(1);
+                if sample.input.is_some_and(|input| input.batches > 1) {
+                    trace.coalesced_presentations = trace.coalesced_presentations.saturating_add(1);
+                }
+            } else if sample.marks[FrameMark::Render as usize].is_some() {
+                trace.skipped = trace.skipped.saturating_add(1);
+            } else {
+                trace.control_only = trace.control_only.saturating_add(1);
+            }
+            let input_tail = sample.input.is_some_and(|input| {
+                present
+                    .unwrap_or(sample.end)
+                    .saturating_duration_since(input.admission)
+                    .as_micros()
+                    >= FRAME_TRACE_TAIL_US
+            });
+            let tail = sample.end.duration_since(sample.wake).as_micros() >= FRAME_TRACE_TAIL_US;
+            let unpresented = sample.dequeues > 0 && present.is_none();
+            if tail || input_tail || unpresented {
+                if trace.stored < FRAME_TRACE_CAPACITY {
+                    trace.samples[trace.stored] = Some(sample);
+                    trace.stored += 1;
+                } else {
+                    trace.omitted = trace.omitted.saturating_add(1);
+                }
+            } else {
+                trace.below_threshold = trace.below_threshold.saturating_add(1);
+            }
+            if present.is_some() {
+                trace.pending = None;
+            }
+        });
+    }
+}
+
+impl FrameSample {
+    fn print(self, owner: &str) {
+        // Signed offsets preserve admission/dequeue carried from an older batch.
+        // -1 is not a sentinel: absent boundaries are printed as `None`.
+        let offset = |at: Instant| -> i128 {
+            if at >= self.wake {
+                i128::try_from(at.duration_since(self.wake).as_micros()).unwrap_or(i128::MAX)
+            } else {
+                -i128::try_from(self.wake.duration_since(at).as_micros()).unwrap_or(i128::MAX)
+            }
+        };
+        let marks = self.marks.map(|at| at.map(offset));
+        let status = if self.marks[FrameMark::PresentEnd as usize].is_some() {
+            "present-request-returned"
+        } else if self.marks[FrameMark::Render as usize].is_some() {
+            "render-without-present"
+        } else {
+            "control-only"
+        };
+        let input = self.input;
+        let admission_to_present = input.and_then(|input| {
+            self.marks[FrameMark::PresentEnd as usize]
+                .map(|end| end.saturating_duration_since(input.admission).as_micros())
+        });
+        println!(
+            "performance-frame owner={owner} batch={} status={status} control_boundary={} export_at_wake={} offsets_us_render_scene_begin_scene_end_acquire_begin_acquire_end_present_begin_present_end={marks:?} end_us={} dequeues={} input_first_batch={:?} input_batches={:?} admission_offset_us={:?} first_dequeue_offset_us={:?} last_dequeue_offset_us={:?} export_at_first_dequeue={:?} crossed_control_boundary={:?} admission_to_present_us={admission_to_present:?} claim=cpu-api-correlation-not-artwork-proof",
+            self.id,
+            self.control_boundary,
+            self.exporting_at_wake,
+            offset(self.end),
+            self.dequeues,
+            input.map(|i| i.first_batch),
+            input.map(|i| i.batches),
+            input.map(|i| offset(i.admission)),
+            input.map(|i| offset(i.first_dequeue)),
+            input.map(|i| offset(i.last_dequeue)),
+            input.map(|i| i.exporting_at_first_dequeue),
+            input.map(|i| i.crossed_control_boundary),
+        );
+    }
+}
+
+fn flush_frame_trace(owner: &str) {
+    let trace = FRAME_TRACE.with(|cell| {
+        let mut trace = cell.borrow_mut();
+        // If flush is requested while a batch is active, defer trace output
+        // until a later flush after FrameBatch::drop accounts for that batch.
+        // Histogram flushing remains independent.
+        if trace.as_ref().is_some_and(|trace| trace.current.is_some()) {
+            return None;
+        }
+        trace.take()
+    });
+    let Some(trace) = trace else { return };
+    for sample in trace.samples.iter().flatten() {
+        sample.print(owner);
+    }
+    println!(
+        "performance-frames owner={owner} batches={} recorded={} omitted={} below_threshold={} pending_unpresented_batches={} unframed_dequeues_in_recorded_thread={} presented={} skipped={} control_only={} coalesced_presentations={} capacity={FRAME_TRACE_CAPACITY} threshold_us={FRAME_TRACE_TAIL_US} selection=first-qualifying wake=mailbox-observed scope=actor-thread-lifetime helper_threads=unobserved",
+        trace.sequence,
+        trace.stored,
+        trace.omitted,
+        trace.below_threshold,
+        trace.pending.map_or(0, |input| input.batches),
+        trace.unframed_dequeues_in_recorded_thread,
+        trace.presented,
+        trace.skipped,
+        trace.control_only,
+        trace.coalesced_presentations,
+    );
 }

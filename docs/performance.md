@@ -468,3 +468,12 @@ surface retirement→HWND 파괴를 확인했다. 별도 프로세스의 전체 
 6개 모두 통과했다. 모든 phase의 dequeue/present 계수 차이는 0이고 flush pending은
 0이다. [변경 후 전체 분포](measurements/desktop-render-isolation-after-2026-09-08.json)와
 [통합 기록](status-performance-2026-09-08.md)에 원본 위치·판정·한계를 남겼다.
+
+## 2026-09-08 bounded frame correlation
+
+후속 진단은 [별도 기록](status-frame-triage-2026-09-08.md)과
+[실행별 JSON](measurements/desktop-frame-triage-2026-09-08.json)에 둔다. 동일 batch의
+actor 관찰/input dequeue/scene/acquire/present 경계를 연결했으며 고정 128건 중
+처음 qualifying tail만 남긴다. 무입력 scene 뒤 다음 입력이 대기한 표본과 현재
+acquire가 느린 표본이 모두 있어 원인을 저장 하나로 확정하지 않는다. 두 scratch의
+재실행 tile·PNG 대조는 통과했지만 최초 가시 픽셀·물리 펜 증거는 아니다.

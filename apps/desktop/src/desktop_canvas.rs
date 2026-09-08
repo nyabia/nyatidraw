@@ -1117,7 +1117,8 @@ impl CanvasSurfaceRenderer {
     }
 
     pub(crate) fn render(&mut self) -> Result<(), String> {
-        use crate::performance::{Span, Stage};
+        use crate::performance::{FrameMark, Span, Stage, frame_mark};
+        frame_mark(FrameMark::Render);
         self.canvas.poll_save_as(&self.device, &self.queue);
         if !self.configured {
             return Ok(());
@@ -1129,10 +1130,12 @@ impl CanvasSurfaceRenderer {
             return Ok(());
         }
         let _frame_timing = Span::new(Stage::Frame);
-        let Some(display) = self
+        frame_mark(FrameMark::SceneBegin);
+        let display = self
             .canvas
-            .render(self.config.width, self.config.height, self.scale)
-        else {
+            .render(self.config.width, self.config.height, self.scale);
+        frame_mark(FrameMark::SceneEnd);
+        let Some(display) = display else {
             return Ok(());
         };
         if self.live_ink.canvas_viewport_snapshot().geometry_epoch != self.geometry_epoch {
@@ -1140,7 +1143,10 @@ impl CanvasSurfaceRenderer {
         }
 
         let acquire_timing = Span::new(Stage::SurfaceAcquire);
-        let frame = match self.surface.get_current_texture() {
+        frame_mark(FrameMark::AcquireBegin);
+        let acquired = self.surface.get_current_texture();
+        frame_mark(FrameMark::AcquireEnd);
+        let frame = match acquired {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                 self.surface.configure(&self.device, &self.config);
@@ -1153,12 +1159,14 @@ impl CanvasSurfaceRenderer {
         };
         drop(acquire_timing);
         let present_timing = Span::new(Stage::SurfacePresent);
+        frame_mark(FrameMark::PresentBegin);
         let target = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.presenter
             .present(&self.device, &self.queue, &display.texture, &target);
         frame.present();
+        frame_mark(FrameMark::PresentEnd);
         drop(present_timing);
         // Admission changes only after this frame was submitted for present.
         // This is not first-visible-pixel proof. A concurrent geometry change

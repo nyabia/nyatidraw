@@ -4,6 +4,7 @@ License: MIT OR Apache-2.0.
 
 NyatiDraw modifies src/config.rs and src/launch.rs to allow asynchronous
 native-renderer retirement before event-loop exit or panic propagation.
-Optional startup triage logs in src/app.rs and src/edits.rs record first-stage
-initialization and acknowledgement without changing retry behavior.
+Optional startup triage in src/app.rs, src/edits.rs, src/protocol.rs and the
+src/launch.rs IPC route records first-stage initialization, interpreter calls
+and acknowledgement without changing retry behavior.
 See NYATIDRAW.md for provenance and the exact scope of this local patch.

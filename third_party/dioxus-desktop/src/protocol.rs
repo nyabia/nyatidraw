@@ -149,6 +149,45 @@ fn index_request(
 fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> String {
     let edits_path = edit_state.wry_queue.edits_path();
     let expected_key = edit_state.wry_queue.required_server_key();
+    let startup_probe = if crate::edits::startup_diagnostics() {
+        r#"
+    // Optional NyatiDraw triage: preserve the original call and thrown value.
+    {
+        const original = window.interpreter.rafEdits;
+        let first = true;
+        window.interpreter.rafEdits = function (...args) {
+            if (!first) return Reflect.apply(original, this, args);
+            first = false;
+            let bytes = 0;
+            let headless = false;
+            try {
+                const length = args[0]?.byteLength;
+                bytes = Number.isSafeInteger(length) && length >= 0 ? length : 0;
+                headless = this.headless === true;
+            } catch (_) {}
+            const report = stage => {
+                try {
+                    window.ipc.postMessage(JSON.stringify({
+                        method: 'nyatidraw_startup_edits',
+                        params: [stage, bytes, headless]
+                    }));
+                } catch (_) {}
+            };
+            report('entry');
+            try {
+                const result = Reflect.apply(original, this, args);
+                report('return');
+                return result;
+            } catch (error) {
+                report('throw');
+                throw error;
+            }
+        };
+    }
+"#
+    } else {
+        ""
+    };
 
     format!(
         r#"
@@ -161,6 +200,7 @@ fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> St
 
     // The native interpreter extends the sledgehammer interpreter with a few extra methods that we use for IPC
     window.interpreter = new NativeInterpreter("{BASE_URI}", {headless});
+    {startup_probe}
 
     // Wait for the page to load before sending the initialize message
     window.onload = function() {{

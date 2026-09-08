@@ -167,6 +167,9 @@ pending batch는 0이다. Batch 수와 input sample 수는 서로 다른 단위�
 
 ## 바로 이어가는 작업
 
+아래 진단의 구현·실행 결과는 [후속 기록](status-frame-triage-2026-09-08.md)에
+분리한다. 기존 12회 전후 측정은 변경하지 않는다.
+
 - 프레임 ID별 bounded 진단으로 actor batch 관찰, input dequeue, scene,
   surface acquire/present를 연결한다. 별개 분포의 최대값을 같은 프레임이라고
   추측하거나 percentile 차이를 구간 시간으로 해석하지 않는다.

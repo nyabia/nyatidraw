@@ -300,6 +300,13 @@ fn run(inner: &Inner) {
         }
         let work = pending.take_batch();
         drop(pending); // GPU, project and HWND operations never hold this lock.
+        let _frame_batch = crate::performance::FrameBatch::begin(
+            work.retire
+                || work.controls.close
+                || work.controls.reopen
+                || work.controls.save_as
+                || !work.activations.is_empty(),
+        );
         renderer.resize_geometry(work.geometry);
         if work.controls.save_as
             && let Some(path) = inner.live_ink.take_save_as()

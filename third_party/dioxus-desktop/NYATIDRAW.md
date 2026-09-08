@@ -30,11 +30,16 @@ does not reenter the exiting/panicked App state. When retirement completes,
 the original exit or panic resumes. A panic is neither silently swallowed nor
 converted into success. Without a guard, ordinary behavior is unchanged.
 
-Optional startup triage instrumentation in `src/app.rs` and `src/edits.rs` is enabled
+Optional startup triage instrumentation in `src/app.rs`, `src/edits.rs`,
+`src/protocol.rs` and the IPC dispatch in `src/launch.rs` is enabled
 only by `NAYATI_STARTUP_DIAGNOSTICS`. It records first initialization, edit queue,
 socket send/acknowledgement, and UI poll completion without payloads, URLs or
 authentication keys. It does not change acknowledgement or retry behavior and
-is removable independently of the exit gate. The intermittent pre-observer
+is removable independently of the exit gate. The first interpreter `rafEdits`
+entry/return/throw wrapper is injected only when that flag is enabled, preserves
+the original receiver, arguments, return and thrown value, and reports only a
+fixed stage, byte length and headless boolean. With the flag disabled it adds
+no interpreter script or IPC. The intermittent pre-observer
 startup stall is not diagnosed or claimed fixed by this instrumentation.
 
 The public custom-event callback cannot implement this: it receives no mutable
