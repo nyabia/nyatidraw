@@ -297,10 +297,7 @@ fn composite_group(
     for child in &group.children {
         match child {
             LayerTreeNode::Raster(layer) if layer.visible => {
-                let source = snapshot
-                    .crop_base_layer_rgba8_to_canvas(layer.id, canvas)
-                    .map_err(CpuCompositeError::Flatten)?;
-                composite_surface(destination, &source.pixels, layer.opacity_u16);
+                composite_raster_tiles(snapshot, layer.id, canvas, destination, layer.opacity_u16)?;
             }
             LayerTreeNode::Group(child_group) if child_group.visible => {
                 let mut source = vec![0; destination.len()];
@@ -308,6 +305,59 @@ fn composite_group(
                 composite_surface(destination, &source, child_group.opacity_u16);
             }
             LayerTreeNode::Raster(_) | LayerTreeNode::Group(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Blend only a raster's tile/page intersections. Missing tiles are transparent
+/// identity, so materializing and scanning a full-page raster adds no pixels.
+/// Group surfaces remain isolated: their opacity still applies exactly once.
+fn composite_raster_tiles(
+    snapshot: &TileSnapshot,
+    layer: nyatidraw_api::LayerId,
+    canvas: nyatidraw_api::CanvasSpec,
+    destination: &mut [u8],
+    opacity: u16,
+) -> Result<(), CpuCompositeError> {
+    use nyatidraw_tiles::TILE_EDGE;
+
+    // Match crop_base_layer_rgba8_to_canvas even for tiles outside the page
+    // and zero-opacity layers: unsupported mip data must not become hidden.
+    if let Some((key, _)) = snapshot
+        .iter()
+        .find(|(key, _)| key.layer == layer && key.mip != 0)
+    {
+        return Err(CpuCompositeError::Flatten(FlattenError::UnsupportedMip {
+            mip: key.mip,
+        }));
+    }
+    let edge = usize::try_from(TILE_EDGE).expect("tile edge fits usize");
+    let width = usize::try_from(canvas.width_px).expect("validated page width fits usize");
+    for (key, tile) in snapshot.iter().filter(|(key, _)| key.layer == layer) {
+        let tile_left = i64::from(key.x) * i64::from(TILE_EDGE);
+        let tile_top = i64::from(key.y) * i64::from(TILE_EDGE);
+        let left = tile_left.max(0);
+        let top = tile_top.max(0);
+        let right = (tile_left + i64::from(TILE_EDGE)).min(i64::from(canvas.width_px));
+        let bottom = (tile_top + i64::from(TILE_EDGE)).min(i64::from(canvas.height_px));
+        if left >= right || top >= bottom {
+            continue;
+        }
+        let source_x = usize::try_from(left - tile_left).expect("intersection is within tile");
+        let source_y = usize::try_from(top - tile_top).expect("intersection is within tile");
+        let x = usize::try_from(left).expect("intersection is within page");
+        let y = usize::try_from(top).expect("intersection is within page");
+        let row_bytes = usize::try_from(right - left).expect("intersection is within tile") * 4;
+        let rows = usize::try_from(bottom - top).expect("intersection is within tile");
+        for row in 0..rows {
+            let source_start = ((source_y + row) * edge + source_x) * 4;
+            let destination_start = ((y + row) * width + x) * 4;
+            composite_surface(
+                &mut destination[destination_start..destination_start + row_bytes],
+                &tile.pixels()[source_start..source_start + row_bytes],
+                opacity,
+            );
         }
     }
     Ok(())
@@ -679,6 +729,119 @@ fn normalized_byte(value: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn full_page_reference_composite(
+        snapshot: &TileSnapshot,
+        group: &GroupNode,
+        canvas: nyatidraw_api::CanvasSpec,
+        output: &mut [u8],
+    ) -> Result<(), CpuCompositeError> {
+        for child in &group.children {
+            match child {
+                LayerTreeNode::Raster(layer) if layer.visible => {
+                    let raster = snapshot
+                        .crop_base_layer_rgba8_to_canvas(layer.id, canvas)
+                        .map_err(CpuCompositeError::Flatten)?;
+                    composite_surface(output, &raster.pixels, layer.opacity_u16);
+                }
+                LayerTreeNode::Group(group) if group.visible => {
+                    let mut isolated = vec![0; output.len()];
+                    full_page_reference_composite(snapshot, group, canvas, &mut isolated)?;
+                    composite_surface(output, &isolated, group.opacity_u16);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tile_row_composite_preserves_crop_rounding_group_isolation_and_mip_errors() {
+        // Product risk: replacing full-page raster intermediates must not
+        // change saved pixels, leak signed outside tiles, or hide corrupt mips.
+        use nyatidraw_api::{CanvasSpec, ContentRootId, GroupId, LayerId};
+        use nyatidraw_document::LayerNode;
+        use nyatidraw_tiles::{TILE_BYTE_LEN, TileKey};
+
+        for (width, height, opacity, hidden, mip) in [
+            (1, 1, 0, false, 0),
+            (129, 131, 1, false, 0),
+            (257, 129, 32_768, false, 0),
+            (256, 257, 65_535, false, 0),
+            (129, 129, 32_767, true, 0),
+            (1, 1, 0, false, 1),
+            (1, 1, 65_535, true, 1),
+        ] {
+            let canvas = CanvasSpec {
+                width_px: width,
+                height_px: height,
+                pixels_per_inch: 96,
+            };
+            let raster = |id, visible| {
+                LayerTreeNode::Raster(LayerNode {
+                    id: LayerId(id),
+                    name: format!("{id}"),
+                    visible,
+                    locked: false,
+                    reference: id == 2,
+                    opacity_u16: opacity,
+                    content_root: ContentRootId(0),
+                })
+            };
+            let tree = LayerTree::new(GroupNode {
+                id: GroupId(100),
+                name: "Root".into(),
+                visible: true,
+                opacity_u16: u16::MAX,
+                children: vec![
+                    raster(1, true),
+                    LayerTreeNode::Group(GroupNode {
+                        id: GroupId(101),
+                        name: "Isolated".into(),
+                        visible: true,
+                        opacity_u16: 32_768,
+                        children: vec![raster(2, !hidden), raster(3, true)],
+                    }),
+                ],
+            })
+            .unwrap();
+            let mut entries = Vec::new();
+            for layer in [1, 2] {
+                for (x, y) in [
+                    (i32::MIN, 0),
+                    (-1, -1),
+                    (0, 0),
+                    (1, 0),
+                    (0, 1),
+                    (i32::MAX, i32::MAX),
+                ] {
+                    let mut bytes = vec![0; TILE_BYTE_LEN];
+                    for (index, pixel) in bytes.chunks_exact_mut(4).enumerate() {
+                        let alpha = u8::try_from(index % 256).unwrap();
+                        pixel.copy_from_slice(&[alpha / 2, alpha / 3, alpha, alpha]);
+                    }
+                    entries.push((
+                        TileKey {
+                            layer: LayerId(layer),
+                            mip: if layer == 2 { mip } else { 0 },
+                            x,
+                            y,
+                        },
+                        bytes,
+                    ));
+                }
+            }
+            let snapshot = TileSnapshot::from_tiles(entries).unwrap();
+            let mut expected = vec![0; usize::try_from(width * height * 4).unwrap()];
+            let expected_result =
+                full_page_reference_composite(&snapshot, tree.root(), canvas, &mut expected);
+            let actual = flatten_layer_tree_rgba8(&snapshot, &tree, canvas);
+            match expected_result {
+                Ok(()) => assert_eq!(actual.unwrap().pixels, expected),
+                Err(error) => assert_eq!(actual, Err(error)),
+            }
+        }
+    }
     use nyatidraw_api::{ContentRootId, GroupId, LayerId};
     use nyatidraw_document::{GroupNode, LayerNode, LayerTree, LayerTreeNode};
     use nyatidraw_tiles::{TILE_BYTE_LEN, TileKey, TileSnapshot};

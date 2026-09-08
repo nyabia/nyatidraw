@@ -1,0 +1,51 @@
+{
+  "date": "2026-09-08",
+  "published_at": "2026-09-08T21:24:30+09:00",
+  "worktree_base_commit": "444b286b1072a9a8b089d14959004669edbb4cba",
+  "after_source_sha256": "e7ec41ef633a589437816af3bbeea75f288536cbd753e0b952a6b0d746464f3a",
+  "benchmark_source_sha256": "e6d7a235be352610382d2a0056da93e30b9010a4bb22f647af5321797ba4df25",
+  "hardware": "AMD Ryzen 7 5800X3D 8-Core Processor",
+  "os": "Microsoft Windows 11 Pro 10.0.26200 x64",
+  "backend": "CPU only; no GPU or desktop event processing",
+  "profile": "cargo --release; Rust 1.96.0; no profile overrides",
+  "command": "cargo run --locked -p nyatidraw-paint-cpu --example layer_composite_cost --release",
+  "after_command_note": "One --offline run without --locked reconciled the concurrently introduced local dioxus-desktop 0.7.9 patch; lock diff only removed its registry source/checksum. That package is not a dependency of this benchmark.",
+  "boundary": "flatten_layer_tree_rgba8 including output/group/raster intermediate allocations, cropping and compositing; excludes fixture creation, warmup, byte comparison, output destruction, PNG encoding, project I/O, queue and physical input/display",
+  "sampling": "20 consecutive samples per case before and after; 1 warmup per case excluded; nearest-rank p50/p95/p99; no measured samples removed",
+  "limitations": "One session each side, separated while independent desktop baseline ran. No desktop benchmark/build overlapped these CPU timings; other system activity and CPU temperature/frequency were not controlled. This is not the export-interference or physical-input gate.",
+  "optimization": "Blend only visible raster tile/page intersection rows using the unchanged integer source-over function. Retain isolated group buffers and group opacity order. Eliminate one full-page raster temporary and full-page transparent traversal per raster.",
+  "canvas": { "width": 3840, "height": 2160, "ppi": 96 },
+  "validation": {
+    "same_run_output": "Every timed output byte-compared to its untimed warmup",
+    "cross_version_checksums": "Equal additive checksums for both fixtures; correctness additionally covered by exact full-page reference oracle",
+    "core_tests": "13 passed; crop/rounding/group/reference/hidden/zero-opacity/unsupported-mip table included",
+    "clippy": "cargo clippy --locked -p nyatidraw-paint-cpu --all-targets -- -D warnings passed",
+    "separate_process_artwork_reopen": "Integrated render build 43f09e17e98d868f8de25e3aeec606ff7e9e74ee8acbb98e18f1cec30be43805 passed four window-lifecycle independent verifiers, existing desktop durability smoke and actual Save As followed by separate-process exact tile/history/PNG verification; see status-performance-2026-09-08.md. This is distinct from CPU timing."
+  },
+  "cases": [
+    {
+      "name": "sparse8",
+      "layers": 8,
+      "tiles": 135,
+      "checksum": 365049856,
+      "layer_opacity_u16": 40000,
+      "isolated_group_opacity_u16": 50000,
+      "before_ms": [492.8319, 465.1867, 502.3735, 507.1567, 507.9944, 512.1858, 468.5363, 488.6323, 456.785, 472.0334, 536.56, 554.055, 535.4501, 552.4989, 560.5141, 551.3494, 550.584, 543.1757, 540.893, 538.4294],
+      "after_ms": [83.1767, 76.0015, 78.4819, 80.1398, 70.1359, 68.8872, 68.9912, 67.5768, 72.4598, 76.9133, 78.2354, 72.1314, 68.3375, 75.9768, 74.9731, 75.6591, 74.9668, 77.7747, 81.6836, 99.2429],
+      "before_percentiles_ms": { "p50": 512.1858, "p95": 554.055, "p99": 560.5141 },
+      "after_percentiles_ms": { "p50": 75.6591, "p95": 83.1767, "p99": 99.2429 }
+    },
+    {
+      "name": "dense2",
+      "layers": 2,
+      "tiles": 1020,
+      "checksum": 1998950400,
+      "layer_opacity_u16": 40000,
+      "isolated_group_opacity_u16": 50000,
+      "before_ms": [198.7536, 198.9473, 191.9691, 203.3974, 191.9299, 195.8262, 181.0892, 192.0198, 201.3957, 186.4973, 198.4055, 191.0008, 198.603, 196.9353, 189.6724, 204.038, 189.925, 183.7234, 200.4939, 185.8829],
+      "after_ms": [139.8096, 149.1926, 141.3985, 151.9476, 155.1406, 139.7969, 146.0065, 151.0564, 149.3591, 152.7188, 171.6999, 156.1463, 164.2712, 172.8269, 163.6957, 160.9036, 152.0457, 150.1882, 148.4912, 148.9219],
+      "before_percentiles_ms": { "p50": 192.0198, "p95": 203.3974, "p99": 204.038 },
+      "after_percentiles_ms": { "p50": 151.0564, "p95": 171.6999, "p99": 172.8269 }
+    }
+  ]
+}
