@@ -359,3 +359,112 @@ Nearest-rank percentile이며 [전체 측정 JSON](measurements/color-export-4k-
 `target/color-export-cost.log`다. 사용자 다운로드와 다른 desktop 부하는 통제하지
 않았다. 단일 warm file-cache run이고 이전 export와 직접 비교한 장면이 아니므로
 개선율, export 간섭 gate 또는 설치판 지연 합격을 주장하지 않는다.
+
+## 2026-09-08 CPU sparse layer 합성
+
+[ADR-0044](decisions/ADR-0044-tile-intersection-cpu-composite.md)의 변경 전후
+동일 4K fixture를 Windows 11 Pro 10.0.26200 / Ryzen 7 5800X3D / Rust 1.96.0
+release / CPU backend에서 각각 warmup 1회 제외 후 20회 측정했다.
+Nearest-rank percentile, 단위는 ms다.
+
+| 장면 | 전 p50 | 전 p95 | 전 p99 | 후 p50 | 후 p95 | 후 p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| Sparse 8 layers / 135 tiles | 512.186 | 554.055 | 560.514 | 75.659 | 83.177 | 99.243 |
+| Dense 2 layers / 1,020 tiles | 192.020 | 203.397 | 204.038 | 151.056 | 171.700 | 172.827 |
+
+출력/group/raster 중간 버퍼 할당과 합성만 포함한다. PNG 인코딩, 파일 I/O,
+GPU, 큐, 실제 입력/표시는 포함하지 않는다. Group opacity와 정수 반올림은
+보존하고 raster 전체 page 버퍼와 빈 영역 순회를 제거했다. 기존 알고리즘을
+oracle로 삼은 byte-exact 핵심 검사와 crate 13 tests/Clippy가 통과했다.
+측정 fixture의 전후 checksum도 같지만 checksum만으로 정확성을 주장하지 않는다.
+
+[모든 표본·환경·소스 hash](measurements/cpu-layer-composite-4k-2026-09-08.json)를
+보존한다. 장면별 단일 세션 20회이고 기타 시스템 부하/CPU 온도는 통제하지 않았다.
+전체 앱 지연 또는 export 간섭 gate 통과가 아니다. Desktop 변경 후 저장·재시작
+대조 진행 상황은 [통합 기록](status-performance-2026-09-08.md)을 따른다.
+
+## 2026-09-08 render isolation 변경 전 기준선
+
+이번 호스트는 앞선 9월 5일 Intel 호스트와 다르므로 이전 숫자와 전후 비교하지
+않는다. Windows 11 Pro 10.0.26200 / Ryzen 7 5800X3D / RTX 3080
+driver 32.0.15.9621 / DX12 Mailbox / 1353×953 scale 1이다. WMI의 60Hz는
+실제 표시 cadence 측정이 아니다. 검증된 alpha.4 stage DX 0.7.9 release를 쓰고
+설치판을 변경하지 않았다. 4K/2레이어/64px round, 32×121 direct-admission
+명목 240Hz 입력이며 시작 전에 창을 활성화/확인했다. Fixture 준비와 별도
+verifier는 debug 실행으로 측정 구간 밖에서 수행했다.
+
+| 실행 | export 구간 | 입력 묶음 수 | p50 상한 ms | p95 상한 ms | p99 상한 ms | max ms |
+|---|---|---:|---:|---:|---:|---:|
+| baseline 1 | inactive | 3836 | 1.471 | 2.559 | 4.351 | 14.987 |
+| baseline 2 | inactive | 3830 | 1.343 | 2.431 | 5.887 | 14.640 |
+| baseline 3 | inactive | 3829 | 1.343 | 2.303 | 6.911 | 16.335 |
+| export 1 | inactive | 2060 | 1.407 | 2.303 | 3.071 | 4.448 |
+| export 1 | active | 1797 | 1.471 | 2.431 | 6.911 | 24.602 |
+| export 2 | inactive | 2107 | 1.343 | 2.175 | 3.199 | 5.783 |
+| export 2 | active | 1750 | 1.407 | 2.559 | 8.703 | 14.208 |
+| export 3 | inactive | 2086 | 1.407 | 2.303 | 3.327 | 12.900 |
+| export 3 | active | 1769 | 1.471 | 2.559 | 8.703 | 14.815 |
+
+입력 묶음의 앱 admission→present API 반환 시간이며 histogram 상한이다.
+6회 모두 sample sequence/phase, 정상 Close/writer join, history 33 및 별도
+프로세스 replay의 전체 tiles/PNG 일치를 확인했다. Warmup은 제외하지 않았다.
+동시 desktop 부하는 통제하지 않았고 실행 간 percentile을 평균하지 않는다.
+Surface acquire p95 상한은 11~13µs로 짧으므로 worker 분리의 지연 개선을
+사전에 단정하지 않는다. 아직 변경 후 결과가 아니며 물리 펜/OS dispatch/
+첫 가시 픽셀/고주사율/장시간 지연 gate를 입증하지 않는다.
+
+`export=active`는 입력 접수 순간이 아닌 **dequeue 순간**의 export flag이며
+그 분류를 present 표본까지 유지한다. 일반 구간은 각 span 시작 순간 기준이다.
+기준선 6회는 모든 phase에서 dequeue와 present 표본 수가 같고 flush 시 pending
+batch는 0이었다. 계측 일반형은 skipped frame의 여러 dequeue를 가장 오래된 pending
+timestamp 하나로 합칠 수 있으며 Close/Save As 보조 스레드의 tail 처리까지 완전한
+계측을 보장하지 않는다. 따라서 여기의 정상 steady workload 결과를 파일 전환/
+강제 종료 경로의 지연으로 확대 해석하지 않는다. JSON은 phase별 계수를 명시한다.
+
+[전체 분포와 실행 파일 hash](measurements/desktop-render-isolation-before-2026-09-08.json),
+원본 `target/render-isolation-before/{baseline,export}-{1,2,3}/{out,err,verify}.log`.
+
+## 2026-09-08 render isolation 변경 후 비교
+
+같은 호스트·fixture·시작 marker·release profile로 일반 3회와 export 동시 3회를
+추가 수행했다. DX bundle SHA256은
+`45231e273722b54640e4a433a1a9116c3ccb7cd99e441903de801de29e884134`다.
+Renderer actor와 CPU tile-intersection 합성이 함께 바뀐 비교이며 두 변경의
+기여를 분리하지 않는다. Startup 진단 flag는 껐지만 추가 mounted IPC와 tagged
+geometry 메시지는 남아 있다. 설치판은 교체하지 않았다.
+
+| 실행 | export 구간 | 입력 묶음 수 | p50 상한 ms | p95 상한 ms | p99 상한 ms | max ms |
+|---|---|---:|---:|---:|---:|---:|
+| baseline 1 | inactive | 3823 | 1.407 | 2.431 | 5.119 | 15.370 |
+| baseline 2 | inactive | 3821 | 1.343 | 2.303 | 7.935 | 16.944 |
+| baseline 3 | inactive | 3829 | 1.343 | 2.303 | 5.887 | 20.149 |
+| export 1 | inactive | 2476 | 1.407 | 2.303 | 3.839 | 22.420 |
+| export 1 | active | 1359 | 1.407 | 2.559 | 11.775 | 32.064 |
+| export 2 | inactive | 2460 | 1.407 | 2.303 | 3.455 | 50.543 |
+| export 2 | active | 1373 | 1.407 | 2.559 | 10.239 | 22.336 |
+| export 3 | inactive | 2466 | 1.407 | 2.175 | 3.455 | 14.056 |
+| export 3 | active | 1377 | 1.407 | 2.303 | 8.191 | 50.923 |
+
+**입력 지연이 일관되게 개선됐다고 결론 내리지 않는다.** 일반 p95는 비슷하고,
+export-active p99는 앞선 6.911/8.703/8.703ms에서 11.775/10.239/8.191ms로
+혼재한다. 최대 약 51ms의 outlier도 남았다. 따라서 UI thread에서 surface 작업을
+분리했다는 구조적 사실과 저지연 gate 통과는 다른 판단이다. OS 부하/온도는
+통제하지 않았고 서로 다른 프레임의 stage percentile을 빼서 병목 시간을 계산할
+수 없다. Raw per-frame correlation이나 실제 펜/화면 표시 증거도 아니다.
+
+반면 export CPU 합성 span은 다음처럼 줄었다. 각 run 33회, 단위는 ms이며
+각각의 histogram 상한이다. PNG encode/sync 비용은 이 표에 포함하지 않는다.
+
+| 실행 | 전 p50 | 전 p95 | 전 p99 | 후 p50 | 후 p95 | 후 p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| export 1 | 122.879 | 155.647 | 159.494 | 77.823 | 93.421 | 93.421 |
+| export 2 | 122.879 | 139.263 | 151.903 | 73.727 | 105.169 | 105.169 |
+| export 3 | 126.975 | 139.263 | 142.856 | 73.727 | 90.111 | 94.746 |
+
+Export-active로 분류되는 입력 묶음 자체도 줄었다. 서로 동일한 입력 시점 집합을
+비교한 것이 아니므로 active/inactive p99를 직접 속도 개선율로 읽지 않는다.
+모든 6회에서 32×121 입력 완료, snapshot 33 PNG export와 정상 Close,
+surface retirement→HWND 파괴를 확인했다. 별도 프로세스의 전체 tiles/PNG 대조도
+6개 모두 통과했다. 모든 phase의 dequeue/present 계수 차이는 0이고 flush pending은
+0이다. [변경 후 전체 분포](measurements/desktop-render-isolation-after-2026-09-08.json)와
+[통합 기록](status-performance-2026-09-08.md)에 원본 위치·판정·한계를 남겼다.

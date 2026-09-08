@@ -2,12 +2,16 @@
 param(
     [Parameter(Mandatory)] [ValidateSet('baseline', 'export')] [string] $Mode,
     [Parameter(Mandatory)] [ValidateRange(1, 99)] [int] $Run,
-    [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$')] [string] $Campaign = 'performance-foreground'
+    [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$')] [string] $Campaign = 'performance-foreground',
+    [string] $ExecutablePath,
+    [string] $FixturePath
 )
 $ErrorActionPreference = 'Stop'
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $fixture = Join-Path $repositoryRoot 'target\release\examples\desktop_performance_fixture.exe'
 $executable = Join-Path $env:LOCALAPPDATA 'Programs\NyatiDraw Development\NyatiDraw.exe'
+if ($ExecutablePath) { $executable = (Resolve-Path -LiteralPath $ExecutablePath).Path }
+if ($FixturePath) { $fixture = (Resolve-Path -LiteralPath $FixturePath).Path }
 $runRoot = Join-Path $repositoryRoot "target\$Campaign\$Mode-$Run"
 if (Test-Path -LiteralPath $runRoot) { throw "Run folder already exists: $runRoot" }
 if (-not (Test-Path -LiteralPath $executable) -or -not (Test-Path -LiteralPath $fixture)) {

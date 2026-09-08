@@ -191,13 +191,20 @@ Space+펜/마우스, Move 도구로 패닝한다.
 - Physical pen under panel rerender, live resize/DPI, and first-visible/present
   timing acceptance.
 - Development install update/remove의 소유권·artwork 보존은 ADR-0033에서 검증했다.
-  실제 Explorer acceptance와 recovery dialog focus/capture는 남아 있다.
-  설치된 release의 positional activation
-  probe에서는 secondary exit, primary PID 유지, 이전 project unlock, 대상 project의
-  `Locked` 상태까지 확인했다. Explorer `Open with`와 실제 foreground 결과는 아직
-  수동 미검증이다.
+  Alpha.4의 일반 Windows 설치와 Explorer PNG/NTDR `Open with`는
+  [09-08 수용](../status-plan-2026-09-08.md)에서 확인했다. 기본 PNG 앱과 개발판
+  NTDR 연결은 유지했다. 깨끗한 Windows VM, 일반 설치의 update/remove 전체 사이클과
+  recovery dialog focus/capture는 남아 있다.
 - Startup/Undo/reopen 및 현재 16-bit PNG export 간섭 분포, UI thread surface 대기
-  격리와 장시간 resize/minimize/Save acceptance가 남아 있다.
+  격리의 장시간 resize/minimize/Save acceptance가 남아 있다. 동일 4K 조건의 전후
+  6회씩 측정과 12개 프로젝트의 별도 재열기/PNG 대조는 완료했지만 입력 p99는
+  혼재하고 약 51ms outlier가 남아 저지연 gate 통과로 세지 않는다. 간헐적인 첫
+  UI observer 이전 초기화 정체도 미해결이다.
+  [ADR-0045](../decisions/ADR-0045-windows-render-actor-lifetime.md)에서 renderer를
+  별도 actor로 옮겼고 release의 4회 resize/minimize/restore, 초기 Close와
+  surface retirement→HWND 파괴, 별도 재열기/PNG 대조를 통과했다. 이는 장시간
+  soak나 실제 펜/DPI 증거가 아니다. [현재 측정](../status-performance-2026-09-08.md)은
+  이번 RTX 3080 호스트의 기준선을 따로 기록하며 이전 Intel 수치와 혼합하지 않는다.
 - Zoom-out mip, advanced blend modes, multi-window docks, vector/text/workspace sync는
   Sprint 4 이후 범위다.
 

@@ -31,17 +31,32 @@ def summarize(root: Path) -> dict:
                 row = dict(part.split("=", 1) for part in line.split()[1:])
                 rows.append({k: int(v) if v.isdigit() else v for k, v in row.items()})
         lateness = [int(v) for v in re.findall(r"max_schedule_lateness_us=(\d+)", text)]
+        accounting = []
+        for phase in ("inactive", "active"):
+            counts = {
+                stage: sum(row.get("count", 0) for row in rows
+                           if row.get("stage") == stage and row.get("export") == phase)
+                for stage in ("input_batch_to_dequeue", "input_batch_to_present_request")
+            }
+            dequeued = counts["input_batch_to_dequeue"]
+            presented = counts["input_batch_to_present_request"]
+            accounting.append({"export": phase, "dequeued_batches": dequeued,
+                               "present_request_samples": presented,
+                               "difference": dequeued - presented})
         runs.append({
             "run": log.parent.name, "mode": completion[0][0],
             "input": "synthetic-paced-direct-admission", "strokes": 32, "samples": 3872,
             "max_schedule_lateness_us": max(lateness),
             "explicit_start_marker": "event=awaiting-start" in text,
             "reopen_export_verified": True, "stderr": errors.strip(), "rows": rows,
+            "input_accounting": accounting,
+            "pending_batch_at_flush": sum(row.get("input_batch_without_present", 0) for row in rows),
         })
     if not runs:
         raise ValueError("no run logs")
     return {"metadata": json.loads((root / "metadata.json").read_text(encoding="utf-8-sig")),
             "percentiles": "per-run nearest-rank histogram upper bounds; no cross-run averaging",
+            "input_classification": "Export phase is latched at dequeue, not admission. InputPresent retains the oldest pending batch until a successful present API return; skipped frames may coalesce multiple dequeues. Counts are reported, not assumed equal. Close/SaveAs tail work on unflushed helper threads is outside these steady-state distributions.",
             "runs": runs}
 
 

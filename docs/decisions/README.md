@@ -48,3 +48,5 @@
 | 다른 이름으로 저장 | [닫힌 프로젝트 전체 복사와 no-clobber 게시](ADR-0041-save-as.md) |
 | 알파 설치 파일 연결 | [안정적인 실행 경로와 등록 소유권](ADR-0042-alpha-file-associations.md) |
 | 종료 가능한 단일 인스턴스 | [비동기 activation pipe 취소와 deadline](ADR-0043-activation-pipe-shutdown.md) |
+| Sparse CPU 합성 | [전체 raster 임시 버퍼 대신 타일/page 교차 행 합성](ADR-0044-tile-intersection-cpu-composite.md) |
+| Windows 렌더 격리 | [Render actor, HWND 생존과 비동기 종료](ADR-0045-windows-render-actor-lifetime.md) |

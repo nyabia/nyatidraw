@@ -3,7 +3,7 @@
 문서 기준 시각: 2026-09-08T21:24:30+09:00
 
 Date: 2026-09-08
-Status: Implemented; runtime acceptance and performance campaign pending
+Status: Implemented and measured; intermittent startup stall and input tail remain open
 
 ## Decision
 
@@ -159,9 +159,13 @@ logging is off; they are not claimed to preserve bit-identical timing.
 
 The final DX release build passed (17.76 seconds), with executable SHA-256
 `45231e273722b54640e4a433a1a9116c3ccb7cd99e441903de801de29e884134`.
-Its matched post-change performance campaign has started with diagnostic logging
-disabled; results remain pending. The RTX 3080 baseline had little surface-acquire
-waiting; no speedup is inferred merely from thread separation. These results do
+Its matched six-run post-change campaign completed with diagnostic logging disabled.
+All six normal-close projects passed separate-process exact tile/PNG replay checks,
+with history 33, uninterrupted sample sequences, matching dequeue/present counts
+and no pending input batch at flush. Export CPU composition improved, but input p99
+was mixed and maxima reached about 51ms; this is not a low-latency gate pass.
+The RTX 3080 baseline had little surface-acquire waiting; no speedup is inferred
+merely from thread separation. These results do
 not establish installed Windows behavior, physical-pen latency, first-visible
 pixels, power-loss survival, 120 Hz, or completion of the startup-stability gate.
 The [integration record](../status-performance-2026-09-08.md) retains the full

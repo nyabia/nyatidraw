@@ -3,6 +3,10 @@
 2026-09-06, source `97d9670`. **설계 초안이며 구현·수용 완료가 아니다.**
 현재 UI thread surface 대기를 줄이는 다음 작업의 범위와 안전 조건을 정리한다.
 
+2026-09-08 구현은 [ADR-0045](decisions/ADR-0045-windows-render-actor-lifetime.md),
+수용·측정 현황은 [통합 기록](status-performance-2026-09-08.md)을 따른다.
+아래 내용은 변경 전 소유권 검토 기록으로 보존한다.
+
 ## 현재 경로
 
 `desktop_canvas.rs`의 `CanvasWindowState`가 입력 adapter와
