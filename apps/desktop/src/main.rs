@@ -7,6 +7,8 @@ mod desktop_shell;
 mod dock_drag;
 mod edit_gesture;
 mod edit_worker;
+#[cfg(windows)]
+mod file_associations;
 mod layer_drag;
 mod layout_store;
 mod live_ink;
@@ -16,6 +18,7 @@ mod performance;
 mod performance_probe;
 mod performance_workload;
 mod preview;
+mod save_as;
 #[cfg(windows)]
 mod single_instance;
 mod transform_panel;
@@ -61,6 +64,9 @@ struct NavigatorDrag {
 fn main() {
     #[cfg(windows)]
     velopack::VelopackApp::build()
+        .on_after_install_fast_callback(|_| file_associations::register())
+        .on_after_update_fast_callback(|_| file_associations::register())
+        .on_before_uninstall_fast_callback(|_| file_associations::unregister())
         .set_auto_apply_on_startup(false)
         .run();
     PROCESS_START.get_or_init(Instant::now);
@@ -374,6 +380,9 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
                 }, "기본 화면 배치" }
             }
             FileButtons {}
+            if live_ink.is_saving_as() {
+                span { class: "export-status", role: "status", "다른 이름으로 저장 중…" }
+            }
             button { class: "command", title: "저장 (S)", onclick: move |_| {
                 send_editor_command(&save_ink, EditorCommand::Project(ProjectCommand::Save), error);
             }, UiIcon { name: "save" } span { class: "command-label", "저장" } span { class: "shortcut", "S" } }
@@ -458,10 +467,10 @@ fn FileButtons() -> Element {
         let mut busy = use_signal(|| false);
         let window = dioxus_desktop::window().window.clone();
         return rsx! {
-            for new_file in [false, true] {
+            for file_action in [0_u8, 1, 2] {
                 button {
                     class: "command", disabled: busy() || host.is_none(),
-                    title: if new_file { "새 그림의 저장 위치 선택" } else { "PNG 또는 NyatiDraw 프로젝트 열기" },
+                    title: match file_action { 1 => "새 그림의 저장 위치 선택", 2 => "현재 그림과 모든 실행 취소 기록을 다른 이름으로 저장", _ => "PNG 또는 NyatiDraw 프로젝트 열기" },
                     onclick: {
                         let host = host.clone();
                         let live_ink = live_ink.clone();
@@ -474,8 +483,8 @@ fn FileButtons() -> Element {
                                 if busy() { return; }
                                 busy.set(true);
                                 let dialog = rfd::AsyncFileDialog::new().set_parent(window.as_ref());
-                                let selected = if new_file {
-                                    dialog.set_title("새 그림 저장 위치").add_filter("NyatiDraw 프로젝트", &["ntdr"])
+                                let selected = if file_action != 0 {
+                                    dialog.set_title(if file_action == 2 { "다른 이름으로 저장" } else { "새 그림 저장 위치" }).add_filter("NyatiDraw 프로젝트", &["ntdr"])
                                         .set_file_name("새 그림.ntdr").save_file().await
                                 } else {
                                     dialog.set_title("그림 열기").add_filter("그림 / 프로젝트", &["png", "ntdr"])
@@ -483,13 +492,13 @@ fn FileButtons() -> Element {
                                 };
                                 if let Some(file) = selected {
                                     let mut path = file.path().to_path_buf();
-                                    if new_file && path.extension().is_none() { path.set_extension("ntdr"); }
-                                    let result = if new_file && !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("ntdr")) {
+                                    if file_action != 0 && path.extension().is_none() { path.set_extension("ntdr"); }
+                                    let result = if file_action != 0 && !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("ntdr")) {
                                         Err("새 그림은 .ntdr 확장자로 저장해주세요".into())
-                                    } else if new_file && (path.exists() || path.with_extension("png").exists()) {
+                                    } else if file_action != 0 && (path.exists() || path.with_extension("png").exists()) {
                                         Err("같은 이름의 그림이 있습니다. 다른 이름을 선택하거나 기존 그림을 열어주세요".into())
                                     } else if let Some(host) = host {
-                                        host.open_path(path)
+                                        if file_action == 2 { host.save_as(path) } else { host.open_path(path) }
                                     } else { Err("캔버스가 아직 준비되지 않았습니다".into()) };
                                     if let Err(error) = result { live_ink.publish_activation_notice(error); }
                                 }
@@ -497,7 +506,8 @@ fn FileButtons() -> Element {
                             }
                         }
                     },
-                    if new_file { span { "새 그림" } }
+                    if file_action == 2 { span { "다른 이름으로 저장" } }
+                    else if file_action == 1 { span { "새 그림" } }
                     else { UiIcon { name: "folder" } span { "열기" } }
                 }
             }

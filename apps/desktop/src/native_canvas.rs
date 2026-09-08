@@ -374,12 +374,23 @@ fn absolute_activation_path(path: PathBuf) -> PathBuf {
     }
 }
 
+type SaveAsWorker = (JoinHandle<()>, Receiver<Result<PathBuf, String>>);
+
+struct AdmissionGuard(LiveInkBridge);
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.0.finish_save_as();
+    }
+}
+
 pub(crate) struct SharedGpuCanvas {
     live_ink: LiveInkBridge,
     project_location: ProjectLocation,
     state: CanvasState,
     rendered_frames: u64,
     close_worker: Option<JoinHandle<()>>,
+    save_as_worker: Option<SaveAsWorker>,
     performance_probe: Option<crate::performance_probe::PerformanceProbe>,
 }
 
@@ -398,6 +409,7 @@ impl SharedGpuCanvas {
             state: CanvasState::Suspended,
             rendered_frames: 0,
             close_worker: None,
+            save_as_worker: None,
             performance_probe: None,
         }
     }
@@ -442,6 +454,10 @@ impl SharedGpuCanvas {
         if let Some(worker) = self.close_worker.take() {
             let _ = worker.join();
         }
+        if let Some((worker, _)) = self.save_as_worker.take() {
+            let _ = worker.join();
+            self.live_ink.finish_save_as();
+        }
         self.live_ink.invalidate_canvas_viewport();
         println!("native-shell event=gpu-canvas-suspend");
         self.state = CanvasState::Suspended;
@@ -454,7 +470,7 @@ impl SharedGpuCanvas {
         }
         let state = std::mem::replace(&mut self.state, CanvasState::Suspended);
         let CanvasState::Active(mut canvas) = state else {
-            self.live_ink.publish_close_status(CloseStatus::Ready);
+            self.publish_close_result();
             return;
         };
         // Honor semantic requests admitted before Close, especially Save.
@@ -539,6 +555,144 @@ impl SharedGpuCanvas {
         }
     }
 
+    pub(crate) fn save_as(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        path: PathBuf,
+        size: [u32; 2],
+        scale: f64,
+    ) -> Result<(), String> {
+        crate::save_as::validate_target(&path)?;
+        if self.save_as_worker.is_some() || self.live_ink.workspace_failed() {
+            return Err("저장 중이거나 원본 저장에 실패했습니다".into());
+        }
+        let CanvasState::Active(canvas) = &mut self.state else {
+            return Err("캔버스가 준비되지 않았습니다".into());
+        };
+        // Drain admitted native samples before same-frame semantic requests.
+        canvas.render(size[0], size[1], scale);
+        let state = std::mem::replace(&mut self.state, CanvasState::Suspended);
+        self.performance_probe.take();
+        let source = match &self.project_location {
+            ProjectLocation::Explicit { path, .. } | ProjectLocation::UntitledRecovery(path) => {
+                path.clone()
+            }
+        };
+        let live_ink = self.live_ink.clone();
+        let (sent, received) = sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("nyatidraw-save-as".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(state); // Joins artwork, durable writer, and independent PNG work.
+                    if live_ink.workspace_failed() {
+                        Err("원본 프로젝트 저장에 실패해 다른 이름으로 저장을 중단했습니다".into())
+                    } else {
+                        crate::save_as::copy_closed_project(&source, &path).map(|()| path)
+                    }
+                }))
+                .unwrap_or_else(|_| {
+                    let error =
+                        "저장 작업이 예기치 않게 종료됐습니다. 원본을 확인해주세요".to_owned();
+                    live_ink.publish_workspace_error(error.clone());
+                    Err(error)
+                });
+                let _ = sent.send(result);
+                live_ink.request_redraw();
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                if !self.live_ink.workspace_failed() {
+                    let previous_export = self.live_ink.export_status_snapshot();
+                    self.live_ink.reset_for_project_activation();
+                    self.live_ink
+                        .restore_export_failure_after_reopen(previous_export);
+                    match ActiveCanvas::new(device, queue, &self.live_ink, &self.project_location) {
+                        Ok(canvas) => self.state = CanvasState::Active(Box::new(canvas)),
+                        Err(error) => {
+                            self.live_ink.publish_workspace_error(error);
+                            self.state = CanvasState::Failed;
+                        }
+                    }
+                }
+                return Err(format!("저장 작업 시작 실패: {error}"));
+            }
+        };
+        self.save_as_worker = Some((worker, received));
+        Ok(())
+    }
+
+    pub(crate) fn poll_save_as(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let Some((_, received)) = &self.save_as_worker else {
+            return;
+        };
+        let result = match received.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("저장 작업이 예기치 않게 종료됐습니다".into())
+            }
+        };
+        if let Some((worker, _)) = self.save_as_worker.take() {
+            let _ = worker.join();
+        }
+        let previous = self.project_location.clone();
+        // The source export has finished by this join. Keep its failure if
+        // copy/open fails and the source remains the active project.
+        let previous_export = self.live_ink.export_status_snapshot();
+        // Never clear a failed durable-write latch or claim the new document.
+        if self.live_ink.workspace_failed() {
+            self.state = CanvasState::Failed;
+            self.live_ink.finish_save_as();
+            self.live_ink
+                .publish_activation_notice(result.err().unwrap_or_else(|| "원본 저장 실패".into()));
+            return;
+        }
+        let (target, mut failure) = match result {
+            Ok(path) => (
+                ProjectLocation::Explicit {
+                    path,
+                    bootstrap_png: None,
+                },
+                None,
+            ),
+            Err(error) => (previous.clone(), Some(error)),
+        };
+        self.live_ink.reset_for_project_activation();
+        match ActiveCanvas::new(device, queue, &self.live_ink, &target) {
+            Ok(canvas) => {
+                self.state = CanvasState::Active(Box::new(canvas));
+                self.project_location = target;
+            }
+            Err(error) => {
+                failure = Some(format!("복사본 열기 실패 (완료된 파일 유지): {error}"));
+                self.live_ink.reset_for_project_activation();
+                match ActiveCanvas::new(device, queue, &self.live_ink, &previous) {
+                    Ok(canvas) => self.state = CanvasState::Active(Box::new(canvas)),
+                    Err(error) => {
+                        self.state = CanvasState::Failed;
+                        self.live_ink
+                            .publish_workspace_error(format!("원본 다시 열기 실패: {error}"));
+                    }
+                }
+            }
+        }
+        if self.project_location.same_storage(&previous) {
+            self.live_ink
+                .restore_export_failure_after_reopen(previous_export);
+        }
+        #[cfg(windows)]
+        if let ProjectLocation::Explicit { path, .. } = &self.project_location {
+            crate::updates::set_project_path(path.clone());
+        }
+        self.live_ink.finish_save_as();
+        if let Some(error) = failure {
+            self.live_ink.publish_activation_notice(error);
+        }
+    }
+
     /// Replaces the durable document only on the child HWND's UI thread.
     /// Dropping the old active canvas synchronously drains its bounded writer
     /// FIFO and joins export work before its redb lock is released. A target
@@ -549,7 +703,12 @@ impl SharedGpuCanvas {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         path: PathBuf,
+        size: [u32; 2],
+        scale: f64,
     ) -> Result<(), String> {
+        if self.live_ink.is_saving_as() || self.live_ink.workspace_failed() {
+            return Err("저장 작업 또는 원본 저장 오류를 먼저 확인해주세요".into());
+        }
         let target = ProjectLocation::from_positional_path(path)?
             .ok_or_else(|| "unsupported activation extension".to_owned())?;
         if self.project_location.same_storage(&target) {
@@ -557,6 +716,19 @@ impl SharedGpuCanvas {
             return Ok(());
         }
         preflight_project_activation(&target)?;
+        // Reuse the same atomic admission boundary as Save As so neither lane
+        // can append behind the final render/drain and disappear on reset.
+        let target_path = match &target {
+            ProjectLocation::Explicit { path, .. } | ProjectLocation::UntitledRecovery(path) => {
+                path.clone()
+            }
+        };
+        self.live_ink.queue_save_as(target_path)?;
+        self.live_ink.take_save_as();
+        let _admission = AdmissionGuard(self.live_ink.clone());
+        if let CanvasState::Active(canvas) = &mut self.state {
+            canvas.render(size[0], size[1], scale);
+        }
         self.performance_probe.take();
         let previous = self.project_location.clone();
         println!(
@@ -566,6 +738,28 @@ impl SharedGpuCanvas {
         );
         // Assignment drops `ActiveCanvas` before accepting any target writer.
         self.state = CanvasState::Suspended;
+        if self.live_ink.workspace_failed() {
+            self.state = CanvasState::Failed;
+            return Err("원본 프로젝트 저장에 실패했습니다. 원본 경로와 오류를 유지합니다".into());
+        }
+        if matches!(
+            self.live_ink.export_status_snapshot(),
+            ExportStatus::Failed { .. }
+        ) {
+            // Preserve both the source identity and its independent PNG error.
+            self.live_ink
+                .restore_export_failure_after_reopen(self.live_ink.export_status_snapshot());
+            match ActiveCanvas::new(device, queue, &self.live_ink, &previous) {
+                Ok(canvas) => self.state = CanvasState::Active(Box::new(canvas)),
+                Err(error) => {
+                    self.live_ink.publish_workspace_error(error);
+                    self.state = CanvasState::Failed;
+                }
+            }
+            return Err(
+                "원본 PNG 저장에 실패했습니다. 재시도하거나 다른 이름으로 저장해주세요".into(),
+            );
+        }
         self.live_ink.reset_for_project_activation();
         self.project_location = target;
         match ActiveCanvas::new(device, queue, &self.live_ink, &self.project_location) {
@@ -675,6 +869,7 @@ struct ActiveCanvas {
     next_layer_node_id: u128,
     project_title: String,
     project_export_path: Option<PathBuf>,
+    pending_initial_viewport: Option<ViewportCommand>,
     pending_save: Option<u64>,
     artwork_job: Option<ArtworkJob>,
     selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
@@ -816,6 +1011,8 @@ impl ActiveCanvas {
             next_layer_node_id,
             project_title: project_location.title(),
             project_export_path: project_location.export_path(),
+            pending_initial_viewport: (!restoring_projection)
+                .then_some(ViewportCommand::FitDocument),
             pending_save: None,
             artwork_job: None,
             selection: None,
@@ -855,15 +1052,23 @@ impl ActiveCanvas {
     }
 
     fn enqueue_initial_commands(&mut self, live_ink: &LiveInkBridge) {
+        let Some(command) = self.pending_initial_viewport else {
+            return;
+        };
+        if live_ink.is_saving_as() || live_ink.is_closing() {
+            return;
+        }
         let based_on = self.projection.current().revision;
         if live_ink
-            .push_editor_command(
-                based_on,
-                EditorCommand::Viewport(ViewportCommand::FitDocument),
-            )
-            .is_err()
+            .push_editor_command(based_on, EditorCommand::Viewport(command))
+            .is_ok()
         {
-            eprintln!("native-canvas event=initial-fit-rejected reason=queue-full");
+            self.pending_initial_viewport = None;
+            println!("native-canvas event=initial-fit-queued");
+        } else if !live_ink.workspace_failed() {
+            // Keep one pending initialization request if the bounded lane is
+            // full. A later frame retries after the ordinary command drain.
+            live_ink.request_redraw();
         }
     }
 
@@ -1272,6 +1477,12 @@ impl ActiveCanvas {
     fn render(&mut self, width: u32, height: u32, scale: f64) -> Option<RenderedCanvas> {
         if width == 0 || height == 0 {
             return None;
+        }
+        // Save As and activation construct the replacement while admission
+        // remains closed. Queue Fit only after that transaction reopens it.
+        if self.pending_initial_viewport.is_some() {
+            let live_ink = self.stroke.live_ink.clone();
+            self.enqueue_initial_commands(&live_ink);
         }
         self.view.ensure_initialized(
             width,
@@ -2857,7 +3068,7 @@ fn valid_active_layer(tree: &LayerTree, preferred: LayerId) -> LayerId {
     }
 }
 
-fn default_layer_tree() -> LayerTree {
+pub(crate) fn default_layer_tree() -> LayerTree {
     let raster = |id, name: &str| {
         LayerTreeNode::Raster(LayerNode {
             id,
@@ -5034,6 +5245,65 @@ pub(crate) fn system_timestamp_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_as_preserves_source_and_every_redo_snapshot_after_closed_copy() {
+        // Product risk: saving the visible head alone silently destroys redo
+        // artwork; copying while a writer is open can publish a torn database.
+        let directory = std::env::temp_dir().join(format!(
+            "nyatidraw-save-as-test-{}-{}",
+            std::process::id(),
+            system_timestamp_ns()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let source = directory.join("원본.ntdr");
+        let target = directory.join("다른 이름.ntdr");
+        let live_ink = LiveInkBridge::with_capacity(512, LIVE_LAYER);
+        let bootstrap = MaterializationWorker::start(
+            live_ink.clone(),
+            &ProjectLocation::UntitledRecovery(source.clone()),
+        )
+        .unwrap();
+        enqueue_synthetic_durability_probe(&live_ink).unwrap();
+        drop(StrokePipeline::new(live_ink.clone(), bootstrap.worker));
+        assert!(!live_ink.workspace_failed());
+        let database = ProjectDb::open(&source).unwrap();
+        let reopened = database.load_reopened().unwrap().unwrap();
+        let session = HeadlessStrokeSession::from_reopened(reopened);
+        let undo = session.prepare_undo_cursor().unwrap();
+        database.persist_history_cursor(undo.target()).unwrap();
+        database
+            .persist_canvas_spec(CanvasSpec {
+                width_px: 32,
+                height_px: 32,
+                pixels_per_inch: 96,
+            })
+            .unwrap();
+        let expected = database.load_reopened().unwrap().unwrap().into_parts();
+        drop(database);
+        let original = std::fs::read(&source).unwrap();
+        crate::save_as::copy_closed_project(&source, &target).unwrap();
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            original,
+            "Save As must not alter original bytes"
+        );
+        let copied = ProjectDb::open(&target).unwrap();
+        let actual = copied.load_reopened().unwrap().unwrap().into_parts();
+        assert_eq!(actual.current_cursor, expected.current_cursor);
+        assert_eq!(
+            actual.cursors, expected.cursors,
+            "all redo snapshots remain reachable"
+        );
+        assert_eq!(actual.history.node_count(), 32);
+        assert_eq!(actual.current_tiles, expected.current_tiles);
+        assert!(target.with_extension("png").is_file());
+        drop(copied);
+        for path in [&source, &target, &target.with_extension("png")] {
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     #[test]
     fn cpu_snapshot_adoption_cannot_retain_deleted_artwork_or_lose_restored_layers() {

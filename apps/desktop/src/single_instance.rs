@@ -17,19 +17,20 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, HWND,
-            INVALID_HANDLE_VALUE,
+            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED,
+            GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING,
-            PIPE_ACCESS_INBOUND, ReadFile, WriteFile,
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_GENERIC_WRITE,
+            FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_INBOUND, ReadFile, WriteFile,
         },
         System::{
+            IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
             Pipes::{
-                ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_TYPE_BYTE,
-                PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+                ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
+                PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
             },
-            Threading::CreateMutexW,
+            Threading::{CreateEventW, CreateMutexW, WaitForSingleObject},
         },
         UI::WindowsAndMessaging::{PostMessageW, SW_RESTORE, SetForegroundWindow, ShowWindow},
     },
@@ -46,6 +47,8 @@ const MAX_PENDING_ACTIVATIONS: usize = 8;
 const PIPE_BUFFER_BYTES: u32 = 65_536;
 const ROUTE_RETRY_COUNT: usize = 20;
 const ROUTE_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(25);
+const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const CANCEL_POLL_MS: u32 = 25;
 
 /// The first process keeps this guard alive for the desktop runtime.
 pub(crate) struct PrimaryInstance {
@@ -141,19 +144,9 @@ impl Drop for PrimaryInstance {
     fn drop(&mut self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Release);
-        // Wake a listener blocked in ConnectNamedPipe. The empty frame is a
-        // private shutdown nudge and is discarded after the shutdown check.
-        // Retry closes the race where shutdown is set just before the listener
-        // creates its next pipe and blocks in ConnectNamedPipe.
-        let wake = encode_frame(None).expect("empty activation frame is bounded");
-        while self
-            .listener
-            .as_ref()
-            .is_some_and(|listener| !listener.is_finished())
-            && route_frame(&wake).is_err()
-        {
-            thread::sleep(ROUTE_RETRY_SLEEP);
-        }
+        // Both connect and partial-frame reads observe shutdown and cancel
+        // their own overlapped operation. No extra client connection is
+        // needed, including when another client holds the only pipe open.
         if let Some(listener) = self.listener.take() {
             let _ = listener.join();
         }
@@ -297,8 +290,8 @@ fn activation_listener(inbox: ActivationInbox, shutdown: Arc<std::sync::atomic::
         let pipe = unsafe {
             CreateNamedPipeW(
                 PCWSTR(name.as_ptr()),
-                PIPE_ACCESS_INBOUND,
-                PIPE_TYPE_BYTE | PIPE_WAIT,
+                PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES,
                 PIPE_BUFFER_BYTES,
                 PIPE_BUFFER_BYTES,
@@ -310,12 +303,20 @@ fn activation_listener(inbox: ActivationInbox, shutdown: Arc<std::sync::atomic::
             eprintln!("native-shell event=activation-listener-failed stage=create-pipe");
             return;
         }
-        // SAFETY: this thread exclusively owns `pipe` while connecting.
-        let connected = unsafe { ConnectNamedPipe(pipe, None) }.is_ok_and(|()| true)
-            || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+        let connected = pipe_operation(pipe, &shutdown, None, |overlapped| {
+            // SAFETY: the operation and its event live until completion.
+            match unsafe { ConnectNamedPipe(pipe, Some(overlapped)) } {
+                Err(error) if error.code() == ERROR_PIPE_CONNECTED.to_hresult() => Ok(Some(0)),
+                result => result.map(|()| Some(0)),
+            }
+        })
+        .is_ok();
         if connected && !shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            match read_frame(pipe) {
-                Ok(path) => inbox.accept(path),
+            match read_frame(pipe, &shutdown) {
+                Ok(path) if !shutdown.load(std::sync::atomic::Ordering::Acquire) => {
+                    inbox.accept(path);
+                }
+                Ok(_) => {}
                 Err(error) => eprintln!("native-shell event=activation-rejected error={error}"),
             }
         }
@@ -382,7 +383,7 @@ fn encode_frame(path: Option<&std::path::Path>) -> Result<Vec<u8>, String> {
         ));
     }
     let count = u32::try_from(wide.len()).map_err(|_| "activation path length overflow")?;
-    let mut frame = Vec::with_capacity(8 + wide.len().saturating_mul(2));
+    let mut frame = Vec::with_capacity(10 + wide.len().saturating_mul(2));
     frame.extend_from_slice(&WIRE_MAGIC);
     frame.extend_from_slice(&WIRE_VERSION.to_le_bytes());
     frame.extend_from_slice(&count.to_le_bytes());
@@ -392,9 +393,15 @@ fn encode_frame(path: Option<&std::path::Path>) -> Result<Vec<u8>, String> {
     Ok(frame)
 }
 
-fn read_frame(pipe: HANDLE) -> Result<Option<PathBuf>, String> {
+fn read_frame(
+    pipe: HANDLE,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> Result<Option<PathBuf>, String> {
+    // One deadline covers the entire frame, not each fragment. A trickling
+    // client cannot renew its hold on the activation listener indefinitely.
+    let deadline = std::time::Instant::now() + FRAME_TIMEOUT;
     let mut header = [0_u8; 10];
-    read_exact(pipe, &mut header)?;
+    read_exact(pipe, &mut header, shutdown, deadline)?;
     if header[..4] != WIRE_MAGIC {
         return Err("activation wire magic mismatch".into());
     }
@@ -414,7 +421,7 @@ fn read_frame(pipe: HANDLE) -> Result<Option<PathBuf>, String> {
         .checked_mul(2)
         .ok_or("activation payload byte length overflow")?;
     let mut bytes = vec![0_u8; byte_len];
-    read_exact(pipe, &mut bytes)?;
+    read_exact(pipe, &mut bytes, shutdown, deadline)?;
     let units = bytes
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
@@ -439,14 +446,20 @@ fn write_all(pipe: HANDLE, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn read_exact(pipe: HANDLE, bytes: &mut [u8]) -> Result<(), String> {
+fn read_exact(
+    pipe: HANDLE,
+    bytes: &mut [u8],
+    shutdown: &std::sync::atomic::AtomicBool,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
     let mut offset = 0;
     while offset < bytes.len() {
-        let mut read = 0_u32;
-        // SAFETY: the mutable tail lives for this synchronous call and `read`
-        // is valid output storage.
-        unsafe { ReadFile(pipe, Some(&mut bytes[offset..]), Some(&raw mut read), None) }
-            .map_err(|error| format!("read activation frame: {error}"))?;
+        let read = pipe_operation(pipe, shutdown, Some(deadline), |overlapped| {
+            // SAFETY: this tail and OVERLAPPED remain alive until completion,
+            // including the cancellation completion on timeout or shutdown.
+            unsafe { ReadFile(pipe, Some(&mut bytes[offset..]), None, Some(overlapped)) }
+                .map(|()| None)
+        })?;
         let read = usize::try_from(read).map_err(|_| "activation read length")?;
         if read == 0 {
             return Err("activation pipe closed during read".into());
@@ -454,6 +467,90 @@ fn read_exact(pipe: HANDLE, bytes: &mut [u8]) -> Result<(), String> {
         offset = offset.saturating_add(read);
     }
     Ok(())
+}
+
+/// Runs exactly one overlapped operation; every exit retires kernel access
+/// before the borrowed buffer and OVERLAPPED can be dropped or reused.
+fn pipe_operation(
+    pipe: HANDLE,
+    shutdown: &std::sync::atomic::AtomicBool,
+    deadline: Option<std::time::Instant>,
+    issue: impl FnOnce(*mut OVERLAPPED) -> windows::core::Result<Option<u32>>,
+) -> Result<u32, String> {
+    if operation_cancelled(shutdown, deadline) {
+        return Err("activation operation cancelled or timed out".into());
+    }
+    // SAFETY: private manual-reset event with no name or security attributes.
+    let event = unsafe { CreateEventW(None, true, false, None) }
+        .map_err(|error| format!("create activation I/O event: {error}"))?;
+    let mut overlapped = OVERLAPPED {
+        hEvent: event,
+        ..Default::default()
+    };
+    let result = (|| {
+        match issue(&raw mut overlapped) {
+            // ConnectNamedPipe can report an already-connected client without
+            // issuing I/O. Do not query OVERLAPPED completion in that case.
+            Ok(Some(transferred)) => return Ok(transferred),
+            Ok(None) => {}
+            Err(error) if error.code() == ERROR_IO_PENDING.to_hresult() => {
+                loop {
+                    if operation_cancelled(shutdown, deadline) {
+                        // SAFETY: cancel only this operation. Cancellation is
+                        // asynchronous, so wait for its terminal result before
+                        // allowing the caller's buffer or this stack to go away.
+                        let _ = unsafe { CancelIoEx(pipe, Some(&raw const overlapped)) };
+                        let mut transferred = 0;
+                        let _ = unsafe {
+                            GetOverlappedResult(
+                                pipe,
+                                &raw const overlapped,
+                                &raw mut transferred,
+                                true,
+                            )
+                        };
+                        return Err("activation operation cancelled or timed out".into());
+                    }
+                    // SAFETY: event remains owned here throughout the wait.
+                    match unsafe { WaitForSingleObject(event, CANCEL_POLL_MS) } {
+                        WAIT_OBJECT_0 => break,
+                        WAIT_TIMEOUT => {}
+                        _ => {
+                            let _ = unsafe { CancelIoEx(pipe, Some(&raw const overlapped)) };
+                            let mut transferred = 0;
+                            let _ = unsafe {
+                                GetOverlappedResult(
+                                    pipe,
+                                    &raw const overlapped,
+                                    &raw mut transferred,
+                                    true,
+                                )
+                            };
+                            return Err("activation I/O wait failed".into());
+                        }
+                    }
+                }
+            }
+            Err(error) => return Err(format!("activation I/O failed: {error}")),
+        }
+        let mut transferred = 0;
+        // SAFETY: immediate success or the signaled event establishes that
+        // the operation no longer borrows the caller's buffer.
+        unsafe { GetOverlappedResult(pipe, &raw const overlapped, &raw mut transferred, false) }
+            .map_err(|error| format!("activation I/O result: {error}"))?;
+        Ok(transferred)
+    })();
+    // SAFETY: all pending I/O has completed before its private event closes.
+    let _ = unsafe { CloseHandle(event) };
+    result
+}
+
+fn operation_cancelled(
+    shutdown: &std::sync::atomic::AtomicBool,
+    deadline: Option<std::time::Instant>,
+) -> bool {
+    shutdown.load(std::sync::atomic::Ordering::Acquire)
+        || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
 }
 
 fn wide_null(value: &str) -> Vec<u16> {
@@ -495,5 +592,171 @@ mod tests {
     fn activation_frame_rejects_unbounded_path_before_pipe_io() {
         let oversized = OsString::from_wide(&vec![u16::from(b'x'); MAX_PATH_UTF16_UNITS + 1]);
         assert!(encode_frame(Some(std::path::Path::new(&oversized))).is_err());
+    }
+
+    #[test]
+    fn stalled_activation_cannot_hold_shutdown_or_the_next_project_open() {
+        // Product risk: a partial IPC frame can otherwise keep the process
+        // alive forever after the artwork writer has closed, blocking updates.
+        // Real scratch pipes exercise kernel cancellation, not a mock waiter.
+        for (index, cancel) in [false, true].into_iter().enumerate() {
+            let name = format!(r"\\.\pipe\NyatiDraw.Test.{}.{}", std::process::id(), index);
+            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let server_shutdown = shutdown.clone();
+            let server_name = name.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (reading_tx, reading_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let server = thread::spawn(move || {
+                let wide = wide_null(&server_name);
+                let pipe = unsafe {
+                    CreateNamedPipeW(
+                        PCWSTR(wide.as_ptr()),
+                        PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                        PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                        1,
+                        PIPE_BUFFER_BYTES,
+                        PIPE_BUFFER_BYTES,
+                        0,
+                        None,
+                    )
+                };
+                assert_ne!(pipe, INVALID_HANDLE_VALUE);
+                ready_tx.send(()).unwrap();
+                let connected = pipe_operation(pipe, &server_shutdown, None, |overlapped| {
+                    match unsafe { ConnectNamedPipe(pipe, Some(overlapped)) } {
+                        Err(error) if error.code() == ERROR_PIPE_CONNECTED.to_hresult() => {
+                            Ok(Some(0))
+                        }
+                        result => result.map(|()| Some(0)),
+                    }
+                });
+                assert!(connected.is_ok());
+                reading_tx.send(()).unwrap();
+                let result = read_frame(pipe, &server_shutdown);
+                let _ = unsafe { DisconnectNamedPipe(pipe) };
+                let _ = unsafe { CloseHandle(pipe) };
+                done_tx.send(result).unwrap();
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let wide = wide_null(&name);
+            let client = unsafe {
+                CreateFileW(
+                    PCWSTR(wide.as_ptr()),
+                    FILE_GENERIC_WRITE.0,
+                    FILE_SHARE_NONE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    None,
+                )
+            }
+            .unwrap();
+            // Valid header announces a payload, but the client keeps it open
+            // without sending that payload. Neither EOF nor client exit helps.
+            let frame = encode_frame(Some(std::path::Path::new("test.ntdr"))).unwrap();
+            write_all(client, &frame[..10]).unwrap();
+            reading_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            if cancel {
+                shutdown.store(true, std::sync::atomic::Ordering::Release);
+            }
+            let result = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+            // Always disconnect on assertion failure too, so the scratch
+            // server cannot outlive the test due to the original regression.
+            let _ = unsafe { CloseHandle(client) };
+            server.join().unwrap();
+            assert!(
+                result
+                    .unwrap()
+                    .unwrap_err()
+                    .contains("cancelled or timed out")
+            );
+        }
+    }
+
+    #[test]
+    fn idle_listener_cancels_and_completed_frames_leave_pipe_reusable() {
+        // Product risk: fixing shutdown must not disable normal project-open
+        // delivery, including clients that connect before ConnectNamedPipe.
+        let name = wide_null(&format!(
+            r"\\.\pipe\NyatiDraw.Test.Reuse.{}",
+            std::process::id()
+        ));
+        let pipe = unsafe {
+            CreateNamedPipeW(
+                PCWSTR(name.as_ptr()),
+                PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                PIPE_BUFFER_BYTES,
+                PIPE_BUFFER_BYTES,
+                0,
+                None,
+            )
+        };
+        assert_ne!(pipe, INVALID_HANDLE_VALUE);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = shutdown.clone();
+        let cancel = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(50));
+            signal.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let result = pipe_operation(pipe, &shutdown, None, |overlapped| {
+            unsafe { ConnectNamedPipe(pipe, Some(overlapped)) }.map(|()| Some(0))
+        });
+        cancel.join().unwrap();
+        assert!(result.unwrap_err().contains("cancelled or timed out"));
+        let _ = unsafe { DisconnectNamedPipe(pipe) };
+        shutdown.store(false, std::sync::atomic::Ordering::Release);
+
+        for expected in [Some(PathBuf::from(r"E:\그림\한 장.ntdr")), None] {
+            let client_name = name.clone();
+            let frame = encode_frame(expected.as_deref()).unwrap();
+            let client = thread::spawn(move || {
+                // After DisconnectNamedPipe the reused instance must enter
+                // ConnectNamedPipe again before CreateFile can succeed.
+                let deadline = std::time::Instant::now() + FRAME_TIMEOUT;
+                let client = loop {
+                    match unsafe {
+                        CreateFileW(
+                            PCWSTR(client_name.as_ptr()),
+                            FILE_GENERIC_WRITE.0,
+                            FILE_SHARE_NONE,
+                            None,
+                            OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL,
+                            None,
+                        )
+                    } {
+                        Ok(client) => break client,
+                        Err(_) if std::time::Instant::now() < deadline => {
+                            thread::sleep(ROUTE_RETRY_SLEEP);
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                };
+                let result = write_all(client, &frame);
+                let _ = unsafe { CloseHandle(client) };
+                result
+            });
+            let connected = pipe_operation(
+                pipe,
+                &shutdown,
+                Some(std::time::Instant::now() + FRAME_TIMEOUT),
+                |overlapped| match unsafe { ConnectNamedPipe(pipe, Some(overlapped)) } {
+                    Err(error) if error.code() == ERROR_PIPE_CONNECTED.to_hresult() => Ok(Some(0)),
+                    result => result.map(|()| Some(0)),
+                },
+            );
+            let received = connected.and_then(|_| read_frame(pipe, &shutdown));
+            client.join().unwrap().unwrap();
+            let _ = unsafe { DisconnectNamedPipe(pipe) };
+            assert_eq!(received.unwrap(), expected);
+        }
+        let _ = unsafe { CloseHandle(pipe) };
     }
 }

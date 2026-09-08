@@ -40,3 +40,11 @@
 | Windows 셸 | [Open With 소유권 보존](ADR-0033-open-with-progids.md), [초기 포커스 실패](ADR-0035-webview-startup-focus.md) |
 | History 비교 중복 제거 | [CPU/GPU 비교 결과 공유](ADR-0037-compare-history-tiles-once.md) |
 | History 지연 원인 계측 | [작업별 worker/화면 시간 연결](ADR-0038-correlated-history-worker-timing.md) |
+
+## 2026-09-08 다음 알파판
+
+| 범위 | 결정과 근거 |
+|---|---|
+| 다른 이름으로 저장 | [닫힌 프로젝트 전체 복사와 no-clobber 게시](ADR-0041-save-as.md) |
+| 알파 설치 파일 연결 | [안정적인 실행 경로와 등록 소유권](ADR-0042-alpha-file-associations.md) |
+| 종료 가능한 단일 인스턴스 | [비동기 activation pipe 취소와 deadline](ADR-0043-activation-pipe-shutdown.md) |

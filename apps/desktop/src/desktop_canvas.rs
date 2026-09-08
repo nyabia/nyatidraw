@@ -43,6 +43,7 @@ const WM_NAYATI_REDRAW: u32 = WM_APP + 0x4e1;
 // 0x4e2 belongs to the single-instance activation inbox.
 const WM_NAYATI_CLOSE: u32 = WM_APP + 0x4e3;
 const WM_NAYATI_REOPEN: u32 = WM_APP + 0x4e4;
+const WM_NAYATI_SAVE_AS: u32 = WM_APP + 0x4e5;
 const CLOSE_SUBCLASS: usize = 0x4e59;
 const CLOSE_TIMER: usize = 0x4e59;
 
@@ -201,6 +202,20 @@ impl DesktopCanvasHandle {
             return Err("저장을 마친 뒤 파일을 열어주세요".into());
         }
         self.activation.open_from_dialog(path)
+    }
+
+    pub(crate) fn save_as(&self, path: std::path::PathBuf) -> Result<(), String> {
+        crate::save_as::validate_target(&path)?;
+        self.live_ink.queue_save_as(path)?;
+        // SAFETY: posts a payload-free wakeup to the owned child window.
+        if let Err(error) =
+            unsafe { PostMessageW(Some(self.hwnd), WM_NAYATI_SAVE_AS, WPARAM(0), LPARAM(0)) }
+        {
+            self.live_ink.take_save_as();
+            self.live_ink.finish_save_as();
+            return Err(error.to_string());
+        }
+        Ok(())
     }
 
     pub(crate) fn request_close(&self) {
@@ -380,7 +395,7 @@ impl CanvasWindowState {
 
     fn process_activations(&mut self) {
         while let Some(path) = self.activation.take_activation() {
-            if self.live_ink.is_closing() {
+            if self.live_ink.is_closing() || self.live_ink.is_saving_as() {
                 self.live_ink.publish_activation_notice(
                     "저장 후 종료 중입니다. 종료가 끝난 뒤 파일을 다시 열어주세요".into(),
                 );
@@ -411,6 +426,29 @@ impl CanvasWindowState {
         // A UI timer observes thread completion without joining a live worker.
         unsafe { SetTimer(Some(hwnd), CLOSE_TIMER, 50, None) };
         self.poll_close(hwnd);
+    }
+
+    fn process_save_as(&mut self) {
+        let Some(path) = self.live_ink.take_save_as() else {
+            return;
+        };
+        let result = if self.live_ink.is_closing() {
+            Err("종료 중에는 다른 이름으로 저장할 수 없습니다".into())
+        } else if let Some(renderer) = self.renderer.as_mut() {
+            renderer.canvas.save_as(
+                &renderer.device,
+                &renderer.queue,
+                path,
+                [renderer.config.width, renderer.config.height],
+                renderer.scale,
+            )
+        } else {
+            Err("캔버스가 아직 준비되지 않았습니다".into())
+        };
+        if let Err(error) = result {
+            self.live_ink.finish_save_as();
+            self.live_ink.publish_activation_notice(error);
+        }
     }
 
     fn poll_close(&mut self, hwnd: HWND) {
@@ -444,6 +482,14 @@ impl CanvasWindowState {
 
     fn observe_viewport(&mut self, hwnd: HWND, message: &MSG) -> bool {
         self.viewport.observe(hwnd, message)
+    }
+
+    fn reopen_after_close_failure(&mut self) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer
+                .canvas
+                .reopen_after_close_failure(&renderer.device, &renderer.queue);
+        }
     }
 }
 
@@ -502,11 +548,7 @@ unsafe extern "system" fn canvas_wnd_proc(
                 return LRESULT(0);
             }
             WM_NAYATI_REOPEN => {
-                if let Some(renderer) = state.renderer.as_mut() {
-                    renderer
-                        .canvas
-                        .reopen_after_close_failure(&renderer.device, &renderer.queue);
-                }
+                state.reopen_after_close_failure();
                 if !state.live_ink.is_closing() {
                     state.render(hwnd);
                     println!("native-canvas event=close-reopened authority=durable-project");
@@ -532,6 +574,11 @@ unsafe extern "system" fn canvas_wnd_proc(
             }
             message if message == crate::single_instance::activation_message() => {
                 state.process_activations();
+                state.render(hwnd);
+                return LRESULT(0);
+            }
+            WM_NAYATI_SAVE_AS => {
+                state.process_save_as();
                 state.render(hwnd);
                 return LRESULT(0);
             }
@@ -1012,12 +1059,18 @@ impl CanvasSurfaceRenderer {
     }
 
     fn activate_project(&mut self, path: std::path::PathBuf) -> Result<(), String> {
-        self.canvas
-            .activate_project(&self.device, &self.queue, path)
+        self.canvas.activate_project(
+            &self.device,
+            &self.queue,
+            path,
+            [self.config.width, self.config.height],
+            self.scale,
+        )
     }
 
     fn render(&mut self, hwnd: HWND) -> Result<(), String> {
         use crate::performance::{Span, Stage};
+        self.canvas.poll_save_as(&self.device, &self.queue);
         if !self.configured {
             self.resize(hwnd);
         }

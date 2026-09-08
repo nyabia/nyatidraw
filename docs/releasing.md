@@ -52,6 +52,25 @@ alpha.3은 라이선스 결정 전에 패키징했으므로 두 전문은 Releas
 
 ## 현재 실측 증거
 
+### 2026-09-08 alpha.4 로컬 후보 — 게시 보류
+
+Save As, activation 종료, 파일 연결 소유권 변경의 핵심 검사와 DX release 빌드,
+scratch export/recovery·durability 실행 및 실제 저장 대화상자/별도 프로세스 verifier를
+통과했다. [전체 실행 기록](status-plan-2026-09-08.md)에 범위와 해시를 기록했다.
+산출물은 `target/releases/0.1.0-alpha.4/`에 있고 두 라이선스 전문과 타사 고지를 포함한다.
+
+Codex에서 실행한 설치·업데이트·제거는 파일 시스템 리디렉션 내부에서 성공했다.
+외부 WMI에는 일반 설치 경로의 실행 파일이 없고, Codex LocalCache에만 있었다.
+실제 사용자 registry의 Open With 명령은 일반 경로를 가리키므로 이 성공을
+탐색기 실행 성공으로 확대할 수 없다. 일반 탐색기에서 설치 후 파일 연결로 PNG pair를
+열어야 게시 가능하다. 현재 태그/Release 게시/홈페이지 다운로드 전환은 하지 않았다.
+
+### alpha.3 기존 기록과 증거 한계
+
+아래는 당시 실행 기록이다. 09-08에 확인한 Codex 경로 리디렉션 때문에 과거 로컬 설치
+역시 일반 탐색기/깨끗한 Windows 설치를 입증한다고 볼 수 없다. GitHub CI·다운로드·
+내용 hash·실행 프로세스의 저장/업데이트 결과와 일반 OS 설치 증거를 구별한다.
+
 2026-09-06 `b65892f`의 [Windows CI](https://github.com/nyabia/nyatidraw/actions/runs/34016306285)가
 GitHub Windows runner에서 기존 테스트·Clippy·release 빌드까지 통과했다.
 [Website 배포](https://github.com/nyabia/nyatidraw/actions/runs/34016306291) 성공 후

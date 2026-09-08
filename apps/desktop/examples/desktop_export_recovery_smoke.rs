@@ -733,6 +733,10 @@ mod windows_probe {
             }
             command
                 .env_remove("NAYATI_PROJECT_PATH")
+                // A user's inactive Layers tab would prevent the drag probe
+                // component from mounting. Keep every acceptance run on its
+                // own default layout and never read/write user preferences.
+                .env("NAYATI_LAYOUT_PATH", project.with_extension("smoke.layout"))
                 .arg(project)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -790,6 +794,12 @@ mod windows_probe {
             while Instant::now() < deadline {
                 if let Ok(line) = self.lines.recv_timeout(Duration::from_millis(100)) {
                     println!("{line}");
+                    if line.contains("event=drag-probe-failed")
+                        || (line.contains("event=drag-probe-complete")
+                            && line.contains("result=failed:"))
+                    {
+                        return Err(line.into());
+                    }
                     let found = line.contains(marker);
                     self.seen.push(line);
                     if found {

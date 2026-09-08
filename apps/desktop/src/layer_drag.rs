@@ -14,19 +14,40 @@ pub(super) fn use_layer_drag_probe() {
             mode.as_str(),
             "inside" | "below" | "above" | "group" | "cancel" | "stale"
         ) {
+            eprintln!("desktop-layers event=drag-probe-failed mode={mode} error=unsupported-mode");
             return;
         }
         let Some(project) = std::env::args_os().nth(1).map(std::path::PathBuf::from) else {
+            eprintln!(
+                "desktop-layers event=drag-probe-failed mode={mode} error=missing-project-argument"
+            );
+            return;
+        };
+        // Windows canonical paths may carry a verbatim prefix; compare both
+        // sides in the same representation and fail closed on lookup errors.
+        let (Ok(project), Ok(temporary)) =
+            (project.canonicalize(), std::env::temp_dir().canonicalize())
+        else {
+            eprintln!(
+                "desktop-layers event=drag-probe-failed mode={mode} error=scratch-path-resolution"
+            );
             return;
         };
         let Some(directory) = project.parent() else {
+            eprintln!(
+                "desktop-layers event=drag-probe-failed mode={mode} error=missing-project-parent"
+            );
             return;
         };
-        if !directory.starts_with(std::env::temp_dir())
+        if !directory.starts_with(&temporary)
             || !directory.join(".nyatidraw-scratch-export-probe").is_file()
         {
+            eprintln!(
+                "desktop-layers event=drag-probe-failed mode={mode} error=unmarked-or-outside-temp"
+            );
             return;
         }
+        println!("desktop-layers event=drag-probe-started mode={mode}");
         spawn(async move {
             let script = include_str!("layer_drag_probe.js").replace("__PROBE_MODE__", &mode);
             let result = document::eval(&script).recv::<String>().await;

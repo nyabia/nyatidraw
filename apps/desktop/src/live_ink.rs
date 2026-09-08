@@ -150,6 +150,8 @@ struct LiveInkInner {
     navigator: Mutex<NavigatorSnapshot>,
     layer_thumbnails: Mutex<LayerThumbnailSnapshot>,
     activation_notice: Mutex<Option<String>>,
+    save_as_path: Mutex<Option<std::path::PathBuf>>,
+    saving_as: AtomicBool,
     redraw_notifier: Mutex<Option<Notifier>>,
     ui_notifier: Mutex<Option<Notifier>>,
     redraw_requested: AtomicBool,
@@ -328,6 +330,8 @@ impl LiveInkBridge {
                 navigator: Mutex::new(NavigatorSnapshot::default()),
                 layer_thumbnails: Mutex::new(LayerThumbnailSnapshot::default()),
                 activation_notice: Mutex::new(None),
+                save_as_path: Mutex::new(None),
+                saving_as: AtomicBool::new(false),
                 redraw_notifier: Mutex::new(None),
                 ui_notifier: Mutex::new(None),
                 redraw_requested: AtomicBool::new(false),
@@ -343,7 +347,7 @@ impl LiveInkBridge {
     pub(crate) fn push(&self, sample: StylusSample) -> Result<bool, PushError> {
         let performance_start = crate::performance::start();
         let mut raw = self.raw_input();
-        if self.is_closing() {
+        if self.is_closing() || self.inner.saving_as.load(Ordering::Acquire) {
             return Err(PushError::TransitionQueueFull);
         }
         if self.inner.fatal_input_quarantine.load(Ordering::Acquire) {
@@ -457,7 +461,7 @@ impl LiveInkBridge {
             .editor_commands
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.is_closing() {
+        if self.is_closing() || self.inner.saving_as.load(Ordering::Acquire) {
             return Err(CanvasCommandQueueFull);
         }
         if commands.len() >= self.inner.command_capacity {
@@ -644,6 +648,20 @@ impl LiveInkBridge {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .status
+    }
+
+    /// Restore the source's PNG failure after its writer has joined and a new
+    /// writer is being installed with generation zero. Admission must remain
+    /// paused across this boundary; no old worker may publish afterward.
+    pub(crate) fn restore_export_failure_after_reopen(&self, previous: ExportStatus) {
+        if matches!(previous, ExportStatus::Failed { .. }) {
+            self.inner
+                .export
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .status = ExportStatus::Failed { generation: 0 };
+            self.notify_ui();
+        }
     }
 
     /// Publishes monotonic export progress. A delayed worker from an older
@@ -865,6 +883,47 @@ impl LiveInkBridge {
         self.inner.closing.load(Ordering::Acquire)
     }
 
+    pub(crate) fn queue_save_as(&self, path: std::path::PathBuf) -> Result<(), String> {
+        let raw = self.raw_input();
+        let commands = self
+            .inner
+            .editor_commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_closing()
+            || self.workspace_failed()
+            || self.inner.saving_as.swap(true, Ordering::AcqRel)
+        {
+            return Err("현재 저장 작업이 끝난 뒤 다시 시도해주세요".into());
+        }
+        *self
+            .inner
+            .save_as_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
+        drop(commands);
+        drop(raw);
+        self.notify_ui();
+        Ok(())
+    }
+
+    pub(crate) fn take_save_as(&self) -> Option<std::path::PathBuf> {
+        self.inner
+            .save_as_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    pub(crate) fn finish_save_as(&self) {
+        self.inner.saving_as.store(false, Ordering::Release);
+        self.notify_ui();
+    }
+
+    pub(crate) fn is_saving_as(&self) -> bool {
+        self.inner.saving_as.load(Ordering::Acquire)
+    }
+
     pub(crate) fn begin_close(&self) -> bool {
         // Lock both admission lanes so the returned boundary includes every
         // previously accepted sample/command, with no late admission behind it.
@@ -874,6 +933,12 @@ impl LiveInkBridge {
             .editor_commands
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_saving_as() {
+            drop(commands);
+            drop(raw);
+            self.publish_activation_notice("다른 이름으로 저장이 끝난 뒤 종료해주세요".into());
+            return false;
+        }
         let first = !self.inner.closing.swap(true, Ordering::AcqRel);
         drop(commands);
         drop(raw);
@@ -1265,6 +1330,45 @@ mod tests {
     }
 
     #[test]
+    fn save_as_boundary_keeps_admitted_artwork_and_blocks_close_until_completion() {
+        // Product risk: late input/commands must not disappear during document
+        // replacement, and Close must not bypass an in-flight durable copy.
+        let bridge = LiveInkBridge::with_capacity(8, LayerId(7));
+        bridge.push(sample(1, PointerPhase::Begin)).unwrap();
+        bridge.push(sample(2, PointerPhase::End)).unwrap();
+        bridge
+            .push_editor_command(
+                Revision(0),
+                EditorCommand::Project(nyatidraw_api::ProjectCommand::Save),
+            )
+            .unwrap();
+        bridge
+            .queue_save_as(std::path::PathBuf::from("new.ntdr"))
+            .unwrap();
+        assert!(!bridge.begin_close());
+        assert!(!bridge.is_closing());
+        assert!(bridge.push(sample(3, PointerPhase::Begin)).is_err());
+        assert!(
+            bridge
+                .push_editor_command(
+                    Revision(0),
+                    EditorCommand::Project(nyatidraw_api::ProjectCommand::Save)
+                )
+                .is_err()
+        );
+        let mut samples = Vec::new();
+        assert!(bridge.drain_into(&mut samples).is_none());
+        assert_eq!(samples.len(), 2);
+        let mut commands = Vec::new();
+        bridge.drain_editor_commands(&mut commands);
+        assert_eq!(commands.len(), 1);
+        assert!(bridge.take_save_as().is_some());
+        bridge.finish_save_as();
+        assert!(bridge.push(sample(4, PointerPhase::Begin)).is_ok());
+        assert!(!bridge.workspace_failed());
+    }
+
+    #[test]
     fn fatal_workspace_latch_preserves_error_projection_and_quarantines_art_input() {
         let bridge = LiveInkBridge::with_capacity(2, LayerId(7));
         let mut ready = UiProjection::empty();
@@ -1317,6 +1421,31 @@ mod tests {
                 .is_err()
         );
         assert_eq!(bridge.input_safety_stats().quarantined_after_fatal, 1);
+    }
+
+    #[test]
+    fn source_export_failure_survives_reopen_without_blocking_the_next_save() {
+        // Product risk: failed Save As must retain the source PNG warning,
+        // but its new writer's first successful Save must clear that warning.
+        for generation in [1, 99, u64::MAX] {
+            let bridge = LiveInkBridge::with_capacity(2, LayerId(7));
+            bridge.publish_export_status(ExportStatus::Failed { generation });
+            let previous = bridge.export_status_snapshot();
+            bridge.reset_for_project_activation();
+            bridge.restore_export_failure_after_reopen(previous);
+            assert_eq!(
+                bridge.export_status_snapshot(),
+                ExportStatus::Failed { generation: 0 }
+            );
+            for status in [
+                ExportStatus::Waiting { generation: 1 },
+                ExportStatus::Running { generation: 1 },
+                ExportStatus::Current { generation: 1 },
+            ] {
+                bridge.publish_export_status(status);
+                assert_eq!(bridge.export_status_snapshot(), status);
+            }
+        }
     }
 
     #[test]

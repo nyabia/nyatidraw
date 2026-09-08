@@ -62,6 +62,10 @@ mod windows {
         if input_safety_project.exists() {
             fs::remove_file(&input_safety_project)?;
         }
+        let layout = scratch.join("durability-smoke.layout");
+        if layout.exists() {
+            fs::remove_file(layout)?;
+        }
         fs::remove_dir(&scratch)?;
         result
     }
@@ -150,18 +154,36 @@ mod windows {
 
         run_input_safety_smoke(desktop, input_safety_project)?;
         run_active_close_cases(desktop, project)?;
+        run_invalid_project_smoke(desktop, invalid_project)?;
 
+        println!(
+            "desktop-durability-smoke status=passed snapshot={} root={:032x} tiles={} close=exact-pid-wm-close reopen=process-restart invalid_nonempty=preserved-no-fallback invalid_close=retained invalid_cleanup=exact-child-abort-not-graceful",
+            first_snapshot.0, first_root.id.0, first_tiles,
+        );
+        Ok(())
+    }
+
+    fn run_invalid_project_smoke(
+        desktop: &Path,
+        invalid_project: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let invalid_bytes = b"not a Nayati project\0preserve exactly";
         fs::write(invalid_project, invalid_bytes)?;
-        let invalid = run_desktop(
+        let invalid = run_desktop_inner(
             desktop,
             invalid_project,
             StrokeProbe::None,
             false,
             false,
             "event=canvas-startup-failed",
+            Some(invalid_bytes),
         )?;
         require_log(&invalid, "invalid-non-empty-preserved=true")?;
+        require_log(&invalid, "event=close-failed project_saved=false")?;
+        require_log(
+            &invalid,
+            "invalid-close=retained cleanup=exact-child-abort graceful=false",
+        )?;
         if invalid.contains("mode=ephemeral") {
             return Err("invalid explicit project path fell back to ephemeral mode".into());
         }
@@ -169,10 +191,6 @@ mod windows {
             return Err("desktop modified a non-empty invalid project file".into());
         }
 
-        println!(
-            "desktop-durability-smoke status=passed snapshot={} root={:032x} tiles={} close=exact-pid-wm-close reopen=process-restart invalid_nonempty=preserved-no-fallback",
-            first_snapshot.0, first_root.id.0, first_tiles,
-        );
         Ok(())
     }
 
@@ -350,9 +368,33 @@ mod windows {
         input_safety_probe: bool,
         close_after: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        run_desktop_inner(
+            desktop,
+            project,
+            stroke_probe,
+            protocol_probe,
+            input_safety_probe,
+            close_after,
+            None,
+        )
+    }
+
+    fn run_desktop_inner(
+        desktop: &Path,
+        project: &Path,
+        stroke_probe: StrokeProbe,
+        protocol_probe: bool,
+        input_safety_probe: bool,
+        close_after: &str,
+        retained_invalid: Option<&[u8]>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let mut command = Command::new(desktop);
         command
             .env(PROJECT_PATH_ENV, project)
+            .env(
+                "NAYATI_LAYOUT_PATH",
+                project.with_file_name("durability-smoke.layout"),
+            )
             .env_remove(DURABILITY_PROBE_ENV)
             .env_remove(ACTIVE_CLOSE_PROBE_ENV)
             .env_remove(SAVE_PROBE_ENV)
@@ -412,7 +454,13 @@ mod windows {
             line_sender,
         );
 
-        let result = monitor_and_close(&mut child, pid, close_after, &lines);
+        let result = monitor_and_close(
+            &mut child,
+            pid,
+            close_after,
+            &lines,
+            retained_invalid.map(|bytes| (project, bytes)),
+        );
         if result.is_err() {
             let _ = child.kill();
             let _ = child.wait();
@@ -440,6 +488,7 @@ mod windows {
         pid: u32,
         close_after: &str,
         lines: &Receiver<String>,
+        retained_invalid: Option<(&Path, &[u8])>,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let deadline = Instant::now() + RUN_TIMEOUT;
         let mut output = String::new();
@@ -458,6 +507,32 @@ mod windows {
                     post_close_to_pid(pid)?;
                     close_posted = true;
                 }
+            }
+
+            if let Some((project, expected)) = retained_invalid
+                && close_posted
+                && output.contains("event=close-failed project_saved=false")
+                && output.contains("window=retained")
+            {
+                require_log(&output, "invalid-non-empty-preserved=true")?;
+                if output.contains("mode=ephemeral") || fs::read(project)? != expected {
+                    return Err(
+                        "retained invalid project changed or used ephemeral fallback".into(),
+                    );
+                }
+                if child.try_wait()?.is_some() {
+                    return Err("invalid-project close unexpectedly terminated the process".into());
+                }
+                // This is a deliberate abort of the exact scratch child after
+                // proving the failure was retained. It is not graceful close
+                // acceptance and does not exercise the user's close-anyway UI.
+                child.kill()?;
+                child.wait()?;
+                let marker = "invalid-close=retained cleanup=exact-child-abort graceful=false";
+                println!("{marker}");
+                output.push_str(marker);
+                output.push('\n');
+                return Ok(output);
             }
 
             if let Some(status) = child.try_wait()? {
