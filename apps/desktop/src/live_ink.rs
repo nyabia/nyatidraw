@@ -31,6 +31,7 @@ pub(crate) struct CanvasViewportSnapshot {
     pub(crate) zoom: f64,
     pub(crate) rotation_radians: f64,
     pub(crate) revision: u64,
+    pub(crate) geometry_epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,15 +40,7 @@ pub(crate) struct CanvasCommandQueueFull;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum CanvasViewportPublishError {
     InvalidGeometry,
-    SurfaceUnavailable,
-    SurfaceMismatch {
-        surface_width_px: u32,
-        surface_height_px: u32,
-        surface_scale: f64,
-        layout_width_px: u32,
-        layout_height_px: u32,
-        layout_scale: f64,
-    },
+    StaleGeometry,
 }
 
 impl CanvasViewportSnapshot {
@@ -61,6 +54,7 @@ impl CanvasViewportSnapshot {
             zoom: 1.0,
             rotation_radians: 0.0,
             revision: 0,
+            geometry_epoch: 0,
         }
     }
 
@@ -158,6 +152,7 @@ struct LiveInkInner {
     fatal_input_quarantine: AtomicBool,
     navigation_tool: AtomicBool,
     closing: AtomicBool,
+    retiring: AtomicBool,
     close_status: Mutex<CloseStatus>,
 }
 
@@ -338,6 +333,7 @@ impl LiveInkBridge {
                 fatal_input_quarantine: AtomicBool::new(false),
                 navigation_tool: AtomicBool::new(false),
                 closing: AtomicBool::new(false),
+                retiring: AtomicBool::new(false),
                 close_status: Mutex::new(CloseStatus::Open),
             }),
         }
@@ -558,6 +554,13 @@ impl LiveInkBridge {
     /// strictly newer projection. No raw sample, queued command, preview, or
     /// export state from the previous document can cross this boundary.
     pub(crate) fn reset_for_project_activation(&self) {
+        // The next document must submit its own frame before a native Begin
+        // can use a mapping. Surface geometry is still owned by the UI thread.
+        {
+            let mut viewport = self.canvas_viewport();
+            viewport.origin_client_px = None;
+            viewport.revision = viewport.revision.wrapping_add(1);
+        }
         self.inner
             .fatal_input_quarantine
             .store(false, Ordering::Release);
@@ -880,7 +883,7 @@ impl LiveInkBridge {
     }
 
     pub(crate) fn is_closing(&self) -> bool {
-        self.inner.closing.load(Ordering::Acquire)
+        self.inner.closing.load(Ordering::Acquire) || self.inner.retiring.load(Ordering::Acquire)
     }
 
     pub(crate) fn queue_save_as(&self, path: std::path::PathBuf) -> Result<(), String> {
@@ -946,6 +949,21 @@ impl LiveInkBridge {
             self.publish_close_status(CloseStatus::SavingProject);
         }
         first
+    }
+
+    /// Framework teardown cannot reopen admission when an in-flight Save As
+    /// releases its ordinary pause. Both lanes stay closed until process exit.
+    pub(crate) fn begin_retirement(&self) {
+        let raw = self.raw_input();
+        let commands = self
+            .inner
+            .editor_commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.inner.retiring.store(true, Ordering::Release);
+        self.inner.closing.store(true, Ordering::Release);
+        drop(commands);
+        drop(raw);
     }
 
     pub(crate) fn close_status(&self) -> CloseStatus {
@@ -1118,6 +1136,7 @@ impl LiveInkBridge {
             viewport.scale = scale;
             viewport.origin_client_px = None;
             viewport.revision = viewport.revision.wrapping_add(1);
+            viewport.geometry_epoch = viewport.geometry_epoch.wrapping_add(1);
         }
         changed
     }
@@ -1129,8 +1148,12 @@ impl LiveInkBridge {
         pan: Point,
         zoom: f64,
         rotation_radians: f64,
+        geometry_epoch: u64,
     ) -> Result<CanvasViewportSnapshot, CanvasViewportPublishError> {
         let mut viewport = self.canvas_viewport();
+        if viewport.geometry_epoch != geometry_epoch {
+            return Err(CanvasViewportPublishError::StaleGeometry);
+        }
         let candidate = ViewportTransform {
             revision: viewport.revision,
             window_origin_physical: Point { x: 0.0, y: 0.0 },
@@ -1143,62 +1166,15 @@ impl LiveInkBridge {
         if candidate.validate().is_err() {
             return Err(CanvasViewportPublishError::InvalidGeometry);
         }
-        let changed = viewport.pan != pan
+        let changed = viewport.origin_client_px.is_none()
+            || viewport.pan != pan
             || viewport.zoom.to_bits() != zoom.to_bits()
             || viewport.rotation_radians.to_bits() != rotation_radians.to_bits();
         if changed {
+            viewport.origin_client_px = Some(Point { x: 0.0, y: 0.0 });
             viewport.pan = pan;
             viewport.zoom = zoom;
             viewport.rotation_radians = rotation_radians;
-            viewport.revision = viewport.revision.wrapping_add(1);
-        }
-        Ok(*viewport)
-    }
-
-    /// Publishes renderer-owned layout geometry after matching it to the most
-    /// recent custom-paint surface.
-    pub(crate) fn publish_canvas_layout(
-        &self,
-        origin_client_px: Point,
-        width_px: u32,
-        height_px: u32,
-        scale: f64,
-    ) -> Result<CanvasViewportSnapshot, CanvasViewportPublishError> {
-        let mut viewport = self.canvas_viewport();
-        if !origin_client_px.x.is_finite()
-            || !origin_client_px.y.is_finite()
-            || !scale.is_finite()
-            || scale <= 0.0
-            || width_px == 0
-            || height_px == 0
-        {
-            invalidate_origin(&mut viewport);
-            return Err(CanvasViewportPublishError::InvalidGeometry);
-        }
-
-        if viewport.width_px == 0 || viewport.height_px == 0 {
-            invalidate_origin(&mut viewport);
-            return Err(CanvasViewportPublishError::SurfaceUnavailable);
-        }
-
-        if viewport.width_px != width_px
-            || viewport.height_px != height_px
-            || viewport.scale.to_bits() != scale.to_bits()
-        {
-            let error = CanvasViewportPublishError::SurfaceMismatch {
-                surface_width_px: viewport.width_px,
-                surface_height_px: viewport.height_px,
-                surface_scale: viewport.scale,
-                layout_width_px: width_px,
-                layout_height_px: height_px,
-                layout_scale: scale,
-            };
-            invalidate_origin(&mut viewport);
-            return Err(error);
-        }
-
-        if viewport.origin_client_px != Some(origin_client_px) {
-            viewport.origin_client_px = Some(origin_client_px);
             viewport.revision = viewport.revision.wrapping_add(1);
         }
         Ok(*viewport)
@@ -1211,6 +1187,7 @@ impl LiveInkBridge {
             viewport.height_px = 0;
             viewport.origin_client_px = None;
             viewport.revision = viewport.revision.wrapping_add(1);
+            viewport.geometry_epoch = viewport.geometry_epoch.wrapping_add(1);
         }
         self.clear_navigator_viewport();
     }
@@ -1234,16 +1211,66 @@ impl LiveInkBridge {
     }
 }
 
-fn invalidate_origin(viewport: &mut CanvasViewportSnapshot) {
-    if viewport.origin_client_px.take().is_some() {
-        viewport.revision = viewport.revision.wrapping_add(1);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use nyatidraw_input::PenButtons;
+
+    #[test]
+    fn stale_render_geometry_cannot_reenable_input_after_resize_or_hide() {
+        // Product risk: input admitted against an obsolete completed frame
+        // draws into the wrong document coordinates after concurrent resize.
+        let bridge = LiveInkBridge::with_capacity(8, LayerId(7));
+        let pan = Point { x: 0.0, y: 0.0 };
+        bridge.publish_canvas_surface(800, 600, 1.0);
+        let old_epoch = bridge.canvas_viewport_snapshot().geometry_epoch;
+        bridge
+            .publish_renderer_view(pan, 1.0, 0.0, old_epoch)
+            .unwrap();
+        assert!(
+            bridge
+                .canvas_viewport_snapshot()
+                .recorder_mapping()
+                .is_some()
+        );
+        bridge.publish_canvas_surface(1600, 900, 1.5);
+        let resized = bridge.canvas_viewport_snapshot();
+        assert!(resized.recorder_mapping().is_none());
+        assert_eq!(
+            bridge.publish_renderer_view(pan, 2.0, 0.0, old_epoch),
+            Err(CanvasViewportPublishError::StaleGeometry)
+        );
+        assert_eq!(bridge.canvas_viewport_snapshot(), resized);
+        bridge
+            .publish_renderer_view(pan, 1.0, 0.0, resized.geometry_epoch)
+            .unwrap();
+        bridge.invalidate_canvas_viewport();
+        let hidden = bridge.canvas_viewport_snapshot();
+        assert_eq!(
+            bridge.publish_renderer_view(pan, 1.0, 0.0, resized.geometry_epoch),
+            Err(CanvasViewportPublishError::StaleGeometry)
+        );
+        assert_eq!(bridge.canvas_viewport_snapshot(), hidden);
+        assert!(hidden.recorder_mapping().is_none());
+    }
+
+    #[test]
+    fn save_as_completion_cannot_reopen_input_after_framework_retirement() {
+        // Product risk: releasing a Save As pause during emergency teardown
+        // must not admit artwork behind the retiring writer's final drain.
+        let bridge = LiveInkBridge::with_capacity(8, LayerId(7));
+        bridge.queue_save_as("copy.ntdr".into()).unwrap();
+        bridge.begin_retirement();
+        bridge.finish_save_as();
+        bridge.reopen_after_close_failure();
+        assert!(bridge.is_closing());
+        assert!(bridge.push(sample(1, PointerPhase::Begin)).is_err());
+        assert!(
+            bridge
+                .push_ui_editor_command(EditorCommand::Project(nyatidraw_api::ProjectCommand::Save))
+                .is_err()
+        );
+    }
 
     #[test]
     fn edit_admission_never_splits_a_stroke_or_adopts_a_paused_gesture_tail() {

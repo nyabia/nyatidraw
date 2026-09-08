@@ -389,12 +389,17 @@ pub(crate) struct SharedGpuCanvas {
     project_location: ProjectLocation,
     state: CanvasState,
     rendered_frames: u64,
+    geometry_epoch: u64,
     close_worker: Option<JoinHandle<()>>,
     save_as_worker: Option<SaveAsWorker>,
     performance_probe: Option<crate::performance_probe::PerformanceProbe>,
 }
 
 impl SharedGpuCanvas {
+    pub(crate) fn set_geometry_epoch(&mut self, epoch: u64) {
+        self.geometry_epoch = epoch;
+    }
+
     pub(crate) fn new(live_ink: LiveInkBridge) -> Self {
         let project_location = ProjectLocation::from_environment_or_args();
         #[cfg(windows)]
@@ -408,6 +413,7 @@ impl SharedGpuCanvas {
             project_location,
             state: CanvasState::Suspended,
             rendered_frames: 0,
+            geometry_epoch: 0,
             close_worker: None,
             save_as_worker: None,
             performance_probe: None,
@@ -425,7 +431,6 @@ impl SharedGpuCanvas {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) {
-        self.live_ink.invalidate_canvas_viewport();
         let adapter = adapter.get_info();
         println!(
             "native-shell event=gpu-canvas-resume elapsed_ms={} backend={:?} adapter={:?} device_type={:?}",
@@ -571,7 +576,7 @@ impl SharedGpuCanvas {
             return Err("캔버스가 준비되지 않았습니다".into());
         };
         // Drain admitted native samples before same-frame semantic requests.
-        canvas.render(size[0], size[1], scale);
+        canvas.render(size[0], size[1], scale, self.geometry_epoch);
         let state = std::mem::replace(&mut self.state, CanvasState::Suspended);
         self.performance_probe.take();
         let source = match &self.project_location {
@@ -727,7 +732,7 @@ impl SharedGpuCanvas {
         self.live_ink.take_save_as();
         let _admission = AdmissionGuard(self.live_ink.clone());
         if let CanvasState::Active(canvas) = &mut self.state {
-            canvas.render(size[0], size[1], scale);
+            canvas.render(size[0], size[1], scale, self.geometry_epoch);
         }
         self.performance_probe.take();
         let previous = self.project_location.clone();
@@ -810,23 +815,7 @@ impl SharedGpuCanvas {
         let CanvasState::Active(canvas) = &mut self.state else {
             return None;
         };
-        if self.live_ink.publish_canvas_surface(width, height, scale) {
-            let viewport = self.live_ink.canvas_viewport_snapshot();
-            println!(
-                "native-input event=canvas-surface-updated revision={} width={} height={} scale={} input_origin=child-local",
-                viewport.revision, viewport.width_px, viewport.height_px, viewport.scale,
-            );
-        }
-        if let Err(error) =
-            self.live_ink
-                .publish_canvas_layout(Point { x: 0.0, y: 0.0 }, width, height, scale)
-        {
-            eprintln!(
-                "native-input event=canvas-child-layout-rejected error={error:?} admission=reject"
-            );
-            return None;
-        }
-        let display = canvas.render(width, height, scale)?;
+        let display = canvas.render(width, height, scale, self.geometry_epoch)?;
         self.rendered_frames = self.rendered_frames.saturating_add(1);
 
         if self.rendered_frames == 1 {
@@ -849,6 +838,8 @@ impl SharedGpuCanvas {
 pub(crate) struct RenderedCanvas {
     pub(crate) texture: wgpu::Texture,
     pub(crate) history_timing: Option<HistoryTiming>,
+    pub(crate) viewport: Option<ViewportTransform>,
+    pub(crate) geometry_epoch: u64,
 }
 
 enum CanvasState {
@@ -1474,7 +1465,13 @@ impl ActiveCanvas {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn render(&mut self, width: u32, height: u32, scale: f64) -> Option<RenderedCanvas> {
+    fn render(
+        &mut self,
+        width: u32,
+        height: u32,
+        scale: f64,
+        geometry_epoch: u64,
+    ) -> Option<RenderedCanvas> {
         if width == 0 || height == 0 {
             return None;
         }
@@ -1501,6 +1498,8 @@ impl ActiveCanvas {
             return self.scene.display_texture().map(|texture| RenderedCanvas {
                 texture,
                 history_timing: None,
+                viewport: None,
+                geometry_epoch,
             });
         }
 
@@ -1553,14 +1552,6 @@ impl ActiveCanvas {
             return None;
         }
         self.advance_input_safety_probe_after_drain();
-        if let Err(error) = self.stroke.live_ink.publish_renderer_view(
-            self.view.pan,
-            self.view.zoom,
-            self.view.rotation_radians,
-        ) {
-            eprintln!("native-canvas event=viewport-publish-failed error={error:?}");
-            return None;
-        }
         let navigator_viewport =
             navigator_viewport(self.view, width, height, scale, self.canvas_spec);
         if navigator_viewport != self.navigator_viewport {
@@ -1602,11 +1593,6 @@ impl ActiveCanvas {
                 );
                 self.view.rotation_radians = 0.12;
                 self.view.zoom *= 1.08;
-                let _ = self.stroke.live_ink.publish_renderer_view(
-                    self.view.pan,
-                    self.view.zoom,
-                    self.view.rotation_radians,
-                );
             }
             self.synthetic_seed_submitted = true;
         }
@@ -1654,6 +1640,8 @@ impl ActiveCanvas {
         Some(RenderedCanvas {
             texture,
             history_timing,
+            viewport: Some(viewport),
+            geometry_epoch,
         })
     }
 

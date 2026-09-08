@@ -6,7 +6,8 @@ use nyatidraw_api::{
 };
 
 pub(super) fn use_layer_drag_probe() {
-    use_effect(|| {
+    let live_ink = use_context::<LiveInkBridge>();
+    use_effect(move || {
         let Ok(mode) = std::env::var("NAYATI_LAYER_DRAG_PROBE") else {
             return;
         };
@@ -48,9 +49,27 @@ pub(super) fn use_layer_drag_probe() {
             return;
         }
         println!("desktop-layers event=drag-probe-started mode={mode}");
+        let live_ink = live_ink.clone();
         spawn(async move {
             let script = include_str!("layer_drag_probe.js").replace("__PROBE_MODE__", &mode);
-            let result = document::eval(&script).recv::<String>().await;
+            let mut evaluation = document::eval(&script);
+            let result = loop {
+                let result = evaluation.recv::<String>().await;
+                if matches!(&result, Ok(message) if message == "ready?") {
+                    // Reopened rows can precede initial Fit on the render actor.
+                    // Wait for its presented mapping, then let JS wait for that
+                    // authoritative revision in the DOM before starting a drag.
+                    let ready_revision = live_ink
+                        .canvas_viewport_snapshot()
+                        .origin_client_px
+                        .map(|_| live_ink.protocol_snapshot().0.revision.0);
+                    if let Err(error) = evaluation.send(ready_revision) {
+                        break Err(error);
+                    }
+                } else {
+                    break result;
+                }
+            };
             match result {
                 Ok(result) => println!(
                     "desktop-layers event=drag-probe-complete mode={mode} result={result} browser_events=synthetic physical_drag_proof=false"

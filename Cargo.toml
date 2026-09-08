@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["third_party/wry"]
+exclude = ["third_party/wry", "third_party/dioxus-desktop"]
 members = [
     "apps/cli",
     "apps/desktop",
@@ -59,6 +59,7 @@ unsafe_op_in_unsafe_fn = "deny"
 # See third_party/wry/NYATIDRAW.md for provenance and removal criteria.
 [patch.crates-io]
 wry = { path = "third_party/wry" }
+dioxus-desktop = { path = "third_party/dioxus-desktop" }
 
 [workspace.lints.clippy]
 all = "warn"

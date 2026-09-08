@@ -44,6 +44,12 @@ fn launch_with_instance(
     crate::updates::initialize(live_ink.clone());
     live_ink.enable_layout_persistence();
     let context_ink = live_ink.clone();
+    #[cfg(windows)]
+    let exit_host = std::sync::Arc::new(std::sync::Mutex::new(
+        None::<crate::render_host::RenderHost>,
+    ));
+    #[cfg(windows)]
+    let window_exit_host = exit_host.clone();
     let config = Config::new()
         // Windows' native file-drop handler intercepts HTML layer drag/drop.
         .with_disable_drag_drop_handler(true)
@@ -68,9 +74,10 @@ fn launch_with_instance(
                     .take()
                     .expect("Windows launch creates exactly one primary desktop window");
                 match crate::desktop_canvas::DesktopCanvasHandle::create(
-                    window.hwnd(),
+                    &window,
                     &context_ink,
                     instance,
+                    &window_exit_host,
                 ) {
                     Ok(canvas) => vdom.insert_any_root_context(Box::new(canvas)),
                     Err(error) => {
@@ -80,6 +87,15 @@ fn launch_with_instance(
                 }
             }
         });
+
+    #[cfg(windows)]
+    let config = config.with_exit_guard(move || {
+        let host = exit_host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        host.is_none_or(|host| host.exit_ready())
+    });
 
     dioxus::LaunchBuilder::desktop()
         .with_cfg(config)

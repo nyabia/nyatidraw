@@ -1,0 +1,9 @@
+Dioxus Desktop 0.7.9, Dioxus Labs and contributors.
+Upstream: https://github.com/DioxusLabs/dioxus
+License: MIT OR Apache-2.0.
+
+NyatiDraw modifies src/config.rs and src/launch.rs to allow asynchronous
+native-renderer retirement before event-loop exit or panic propagation.
+Optional startup triage logs in src/app.rs and src/edits.rs record first-stage
+initialization and acknowledgement without changing retry behavior.
+See NYATIDRAW.md for provenance and the exact scope of this local patch.

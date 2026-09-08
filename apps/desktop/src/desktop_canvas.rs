@@ -4,7 +4,11 @@
 //! sits above the `WebView` only inside the canvas rectangle, receives raw
 //! `WM_POINTER` and mouse messages, and presents the existing GPU drawing engine.
 
-use std::{ffi::c_void, num::NonZeroIsize, sync::Arc};
+use std::{
+    ffi::c_void,
+    num::NonZeroIsize,
+    sync::{Arc, Mutex},
+};
 
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
@@ -20,11 +24,11 @@ use windows::{
         UI::WindowsAndMessaging::{
             CREATESTRUCTW, CS_HREDRAW, CS_OWNDC, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
             DestroyWindow, GWLP_USERDATA, GetClientRect, GetMessagePos, GetMessageTime, GetParent,
-            GetWindowLongPtrW, HWND_TOP, IDC_ARROW, KillTimer, LoadCursorW, MSG, PostMessageW,
-            RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer, SetWindowLongPtrW,
-            SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE,
-            WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-            WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+            GetWindowLongPtrW, HWND_TOP, IDC_ARROW, LoadCursorW, MSG, PostMessageW, RegisterClassW,
+            SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer, SetWindowLongPtrW, SetWindowPos,
+            ShowWindow, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_ERASEBKGND,
+            WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
             WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SIZE,
             WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
         },
@@ -36,6 +40,7 @@ use crate::{
     elapsed_since_launch,
     live_ink::{CanvasViewportSnapshot, CloseStatus, LiveInkBridge},
     native_canvas::SharedGpuCanvas,
+    render_host::{Geometry, RenderHost, RenderLifetime},
     single_instance::{ActivationInbox, PrimaryInstance},
 };
 
@@ -52,22 +57,27 @@ pub(crate) struct DesktopCanvasHandle {
     hwnd: HWND,
     live_ink: LiveInkBridge,
     activation: ActivationInbox,
+    lifetime: Arc<RenderLifetime>,
 }
 
 impl DesktopCanvasHandle {
     pub(crate) fn create(
-        parent: isize,
+        parent_window: &Arc<dioxus_desktop::tao::window::Window>,
         live_ink: &LiveInkBridge,
         instance: PrimaryInstance,
+        exit_host: &Arc<Mutex<Option<RenderHost>>>,
     ) -> Result<Self, String> {
-        let parent = HWND(parent as *mut c_void);
+        use dioxus_desktop::tao::platform::windows::WindowExtWindows as _;
+        let parent = HWND(parent_window.hwnd() as *mut c_void);
         register_canvas_class()?;
 
-        let state = Box::new(CanvasWindowState::new(live_ink.clone(), instance));
-        let state_ptr = Box::into_raw(state);
+        // WM_NCCREATE takes this Option exactly once. If creation later fails,
+        // WM_NCDESTROY owns the taken box; if NCCREATE never ran, we still own it.
+        let mut transfer = Some(Box::new(CanvasWindowState::new(live_ink.clone(), instance)));
         let instance = module_instance()?;
-        // SAFETY: the registered class uses `canvas_wnd_proc`; `state_ptr`
-        // remains owned by the child HWND and is reclaimed at WM_NCDESTROY.
+        // SAFETY: `transfer` stays live throughout synchronous window creation.
+        // The registered `canvas_wnd_proc` takes its box only at WM_NCCREATE;
+        // adopted state belongs to the HWND until WM_NCDESTROY reclaims it.
         let hwnd = match unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -81,13 +91,11 @@ impl DesktopCanvasHandle {
                 Some(parent),
                 None,
                 Some(instance),
-                Some(state_ptr.cast_const().cast()),
+                Some((&raw mut transfer).cast_const().cast()),
             )
         } {
             Ok(hwnd) => hwnd,
             Err(error) => {
-                // SAFETY: CreateWindowExW failed, so no HWND took ownership.
-                drop(unsafe { Box::from_raw(state_ptr) });
                 return Err(format!("create child canvas HWND: {error}"));
             }
         };
@@ -96,16 +104,14 @@ impl DesktopCanvasHandle {
         // WM_NCCREATE before CreateWindowExW returned.
         let state = unsafe { canvas_state(hwnd) }
             .ok_or_else(|| "child canvas state was not installed".to_owned())?;
-        if let Err(error) = state.initialize_gpu(hwnd) {
-            // SAFETY: this thread created and owns the child window.
-            let _ = unsafe { DestroyWindow(hwnd) };
-            return Err(error);
-        }
+        let host = RenderHost::new(parent_window, hwnd.0 as isize, live_ink.clone());
+        state.host = Some(host.clone());
 
         state.activation.attach_windows(parent, hwnd);
         let close = Box::into_raw(Box::new(CloseWindowState {
             child: hwnd,
             live_ink: live_ink.clone(),
+            host: host.clone(),
         }));
         // SAFETY: the parent and child share this UI thread. The subclass owns
         // the allocation until parent WM_NCDESTROY, independently of child state.
@@ -133,6 +139,11 @@ impl DesktopCanvasHandle {
                 )
             };
         }));
+        *exit_host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(host.clone());
+        unsafe { SetTimer(Some(hwnd), CLOSE_TIMER, 50, None) };
+        state.resize(hwnd);
 
         println!(
             "desktop-shell event=native-canvas-created elapsed_ms={} input=child-hwnd render=wgpu",
@@ -142,7 +153,12 @@ impl DesktopCanvasHandle {
             hwnd,
             live_ink: live_ink.clone(),
             activation: state.activation.clone(),
+            lifetime: Arc::new(RenderLifetime(host)),
         })
+    }
+
+    pub(crate) fn start_render_worker(&self) {
+        self.lifetime.0.start();
     }
 
     pub(crate) fn set_geometry(
@@ -190,9 +206,13 @@ impl DesktopCanvasHandle {
         // canvas here establishes the required sibling z-order.
         // SAFETY: the child HWND is owned by this desktop window.
         let _ = unsafe { ShowWindow(self.hwnd, SW_SHOWNA) };
+        if let Some(state) = unsafe { canvas_state(self.hwnd) } {
+            state.resize(self.hwnd);
+        }
     }
 
     pub(crate) fn hide(&self) {
+        self.live_ink.invalidate_canvas_viewport();
         // SAFETY: hiding a live or already-destroyed child is harmless.
         let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
     }
@@ -259,6 +279,7 @@ impl DesktopCanvasHandle {
 struct CloseWindowState {
     child: HWND,
     live_ink: LiveInkBridge,
+    host: RenderHost,
 }
 
 unsafe extern "system" fn close_wnd_proc(
@@ -293,6 +314,10 @@ unsafe extern "system" fn close_wnd_proc(
             project_path: String::new(),
         });
         let _ = unsafe { PostMessageW(Some(state.child), WM_NAYATI_REOPEN, WPARAM(0), LPARAM(0)) };
+        return LRESULT(0);
+    }
+    if message == WM_CLOSE && !state.host.finished() {
+        state.host.retire();
         return LRESULT(0);
     }
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
@@ -351,7 +376,8 @@ struct CanvasWindowState {
     viewport: WindowsViewportInput,
     mouse: WindowsMouseInput,
     pen: WindowsPenInput,
-    renderer: Option<CanvasSurfaceRenderer>,
+    host: Option<RenderHost>,
+    reopening: bool,
 }
 
 impl CanvasWindowState {
@@ -364,33 +390,41 @@ impl CanvasWindowState {
             live_ink,
             _instance: instance,
             activation,
-            renderer: None,
+            host: None,
+            reopening: false,
         }
     }
 
-    fn initialize_gpu(&mut self, hwnd: HWND) -> Result<(), String> {
-        self.renderer = Some(CanvasSurfaceRenderer::new(hwnd, self.live_ink.clone())?);
-        Ok(())
-    }
-
     fn resize(&mut self, hwnd: HWND) {
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.resize(hwnd);
+        let mut rect = RECT::default();
+        if unsafe { GetClientRect(hwnd, &raw mut rect) }.is_err() {
+            self.live_ink.invalidate_canvas_viewport();
+            return;
+        }
+        let width = u32::try_from(rect.right.saturating_sub(rect.left)).unwrap_or(0);
+        let height = u32::try_from(rect.bottom.saturating_sub(rect.top)).unwrap_or(0);
+        let scale = f64::from(unsafe { GetDpiForWindow(hwnd) }.max(96)) / 96.0;
+        if self.live_ink.publish_canvas_surface(width, height, scale) {
+            println!(
+                "native-input event=canvas-surface-updated width={width} height={height} scale={scale} owner=ui"
+            );
+        }
+        if let Some(host) = &self.host {
+            host.geometry(Geometry {
+                width,
+                height,
+                scale,
+                epoch: self.live_ink.canvas_viewport_snapshot().geometry_epoch,
+            });
         }
     }
 
     fn render(&mut self, hwnd: HWND) {
         self.live_ink.begin_redraw();
-        if self.live_ink.is_closing() {
-            self.poll_close(hwnd);
-            return;
+        if let Some(host) = &self.host {
+            host.wake();
         }
-        if let Some(renderer) = self.renderer.as_mut()
-            && let Err(error) = renderer.render(hwnd)
-        {
-            eprintln!("desktop-canvas event=render-failed error={error}");
-            self.live_ink.publish_workspace_error(error);
-        }
+        self.poll_close(hwnd);
     }
 
     fn process_activations(&mut self) {
@@ -401,25 +435,28 @@ impl CanvasWindowState {
                 );
                 continue;
             }
-            let Some(renderer) = self.renderer.as_mut() else {
+            let Some(host) = self.host.as_ref() else {
                 self.live_ink.publish_activation_notice(
                     "캔버스가 아직 준비되지 않아 파일을 열 수 없습니다".into(),
                 );
                 return;
             };
-            if let Err(error) = renderer.activate_project(path) {
+            if let Err(error) = host.activate(path) {
                 self.live_ink.publish_activation_notice(error);
             }
         }
     }
 
     fn begin_close(&mut self, hwnd: HWND) {
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.canvas.begin_close(
-                renderer.config.width,
-                renderer.config.height,
-                renderer.scale,
-            );
+        if let Some(host) = self.host.as_ref() {
+            if host.has_started() && host.finished() {
+                self.live_ink.publish_close_status(CloseStatus::Failed {
+                    project_saved: false,
+                    project_path: String::new(),
+                });
+            } else {
+                host.close();
+            }
         } else {
             self.live_ink.publish_close_status(CloseStatus::Ready);
         }
@@ -429,42 +466,30 @@ impl CanvasWindowState {
     }
 
     fn process_save_as(&mut self) {
-        let Some(path) = self.live_ink.take_save_as() else {
-            return;
-        };
-        let result = if self.live_ink.is_closing() {
-            Err("종료 중에는 다른 이름으로 저장할 수 없습니다".into())
-        } else if let Some(renderer) = self.renderer.as_mut() {
-            renderer.canvas.save_as(
-                &renderer.device,
-                &renderer.queue,
-                path,
-                [renderer.config.width, renderer.config.height],
-                renderer.scale,
-            )
+        if let Some(host) = &self.host {
+            host.save_as();
         } else {
-            Err("캔버스가 아직 준비되지 않았습니다".into())
-        };
-        if let Err(error) = result {
+            self.live_ink.take_save_as();
             self.live_ink.finish_save_as();
-            self.live_ink.publish_activation_notice(error);
+            self.live_ink
+                .publish_activation_notice("캔버스가 아직 준비되지 않았습니다".into());
         }
     }
 
     fn poll_close(&mut self, hwnd: HWND) {
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.canvas.poll_close();
+        if self.reopening && !self.live_ink.is_closing() {
+            self.reopening = false;
+            let _ = unsafe { ShowWindow(hwnd, SW_SHOWNA) };
+            return;
         }
         match self.live_ink.close_status() {
             CloseStatus::Ready => {
-                let _ = unsafe { KillTimer(Some(hwnd), CLOSE_TIMER) };
                 if let Ok(parent) = unsafe { GetParent(hwnd) } {
                     let _ = unsafe { PostMessageW(Some(parent), WM_CLOSE, WPARAM(0), LPARAM(0)) };
                 }
             }
             CloseStatus::Failed { .. } => {
                 crate::updates::cancel_restart();
-                let _ = unsafe { KillTimer(Some(hwnd), CLOSE_TIMER) };
             }
             _ => {}
         }
@@ -485,10 +510,15 @@ impl CanvasWindowState {
     }
 
     fn reopen_after_close_failure(&mut self) {
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer
-                .canvas
-                .reopen_after_close_failure(&renderer.device, &renderer.queue);
+        if let Some(host) = &self.host {
+            if host.finished() {
+                self.live_ink.publish_activation_notice(
+                    "렌더러가 종료되었습니다. 앱을 종료한 뒤 프로젝트를 다시 열어주세요".into(),
+                );
+                return;
+            }
+            self.reopening = true;
+            host.reopen();
         }
     }
 }
@@ -503,8 +533,17 @@ unsafe extern "system" fn canvas_wnd_proc(
         // SAFETY: WM_NCCREATE lParam is a readable CREATESTRUCTW supplied by
         // CreateWindowExW for this call.
         let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
-        // SAFETY: stores the Box pointer passed as lpCreateParams.
-        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize) };
+        // SAFETY: the creator's stack Option lives for CreateWindowExW. Only
+        // NCCREATE takes it; NCDESTROY exclusively reclaims the resulting box.
+        let transfer = unsafe {
+            &mut *create
+                .lpCreateParams
+                .cast::<Option<Box<CanvasWindowState>>>()
+        };
+        let Some(state) = transfer.take() else {
+            return LRESULT(0);
+        };
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize) };
         return LRESULT(1);
     }
 
@@ -515,14 +554,12 @@ unsafe extern "system" fn canvas_wnd_proc(
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
         if !pointer.is_null() {
             // SAFETY: WM_NCDESTROY reclaims the HWND-owned allocation once.
-            let mut state = unsafe { Box::from_raw(pointer) };
+            let state = unsafe { Box::from_raw(pointer) };
             state.live_ink.invalidate_canvas_viewport();
-            if let Some(renderer) = state.renderer.as_mut() {
-                renderer.canvas.suspend();
-            }
-            // Surface and GPU resources drop before DefWindowProc completes
-            // destruction of their underlying HWND.
-            state.renderer.take();
+            // The actor's strong Tao parent anchor prevents parent/child
+            // destruction until every surface is gone. No join is needed here.
+            debug_assert!(state.host.as_ref().is_none_or(RenderHost::surface_retired));
+            println!("desktop-render event=canvas-hwnd-destroyed surface-retired=true");
         }
         // SAFETY: default final non-client destruction processing.
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
@@ -549,12 +586,6 @@ unsafe extern "system" fn canvas_wnd_proc(
             }
             WM_NAYATI_REOPEN => {
                 state.reopen_after_close_failure();
-                if !state.live_ink.is_closing() {
-                    state.render(hwnd);
-                    println!("native-canvas event=close-reopened authority=durable-project");
-                    // No state access after ShowWindow, which may reenter.
-                    let _ = unsafe { ShowWindow(hwnd, SW_SHOWNA) };
-                }
                 return LRESULT(0);
             }
             WM_SIZE => {
@@ -940,15 +971,17 @@ fn current_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
     }
 }
 
-struct CanvasSurfaceRenderer {
+pub(crate) struct CanvasSurfaceRenderer {
     _instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
+    pub(crate) config: wgpu::SurfaceConfiguration,
     presenter: TexturePresenter,
-    canvas: SharedGpuCanvas,
-    scale: f64,
+    pub(crate) canvas: SharedGpuCanvas,
+    pub(crate) scale: f64,
+    geometry_epoch: u64,
+    live_ink: LiveInkBridge,
     configured: bool,
     first_presented: bool,
 }
@@ -960,12 +993,13 @@ impl Drop for CanvasSurfaceRenderer {
 }
 
 impl CanvasSurfaceRenderer {
-    fn new(hwnd: HWND, live_ink: LiveInkBridge) -> Result<Self, String> {
+    pub(crate) fn new(hwnd: HWND, live_ink: LiveInkBridge) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let raw_window =
             Win32WindowHandle::new(NonZeroIsize::new(hwnd.0 as isize).ok_or("child HWND is null")?);
-        // SAFETY: the child HWND outlives `surface`; CanvasWindowState drops
-        // this renderer before the HWND completes WM_NCDESTROY.
+        // SAFETY: only render_host constructs this renderer. Its worker owns
+        // a strong Tao parent anchor until this surface and all GPU state drop.
+        // Only creation failure (before actor start) explicitly destroys child.
         let surface = unsafe {
             instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
                 raw_display_handle: RawDisplayHandle::Windows(WindowsDisplayHandle::new()),
@@ -1016,7 +1050,7 @@ impl CanvasSurfaceRenderer {
             desired_maximum_frame_latency: 2,
         };
         let presenter = TexturePresenter::new(&device, format);
-        let mut canvas = SharedGpuCanvas::new(live_ink);
+        let mut canvas = SharedGpuCanvas::new(live_ink.clone());
         canvas.resume(&adapter, &device, &queue);
         let info = adapter.get_info();
         println!(
@@ -1032,33 +1066,37 @@ impl CanvasSurfaceRenderer {
             presenter,
             canvas,
             scale: 1.0,
+            geometry_epoch: 0,
+            live_ink,
             configured: false,
             first_presented: false,
         })
     }
 
-    fn resize(&mut self, hwnd: HWND) {
-        let mut rect = RECT::default();
-        // SAFETY: `rect` is writable and hwnd is this renderer's live child.
-        if unsafe { GetClientRect(hwnd, &raw mut rect) }.is_err() {
-            self.configured = false;
+    pub(crate) fn resize_geometry(&mut self, geometry: Geometry) {
+        let Geometry {
+            width,
+            height,
+            scale,
+            epoch,
+        } = geometry;
+        if self.configured && self.geometry_epoch == epoch {
             return;
         }
-        let width = u32::try_from(rect.right.saturating_sub(rect.left)).unwrap_or(0);
-        let height = u32::try_from(rect.bottom.saturating_sub(rect.top)).unwrap_or(0);
+        self.geometry_epoch = epoch;
+        self.canvas.set_geometry_epoch(epoch);
         if width == 0 || height == 0 {
             self.configured = false;
             return;
         }
         self.config.width = width;
         self.config.height = height;
-        // SAFETY: hwnd is the child surface being resized.
-        self.scale = f64::from(unsafe { GetDpiForWindow(hwnd) }.max(96)) / 96.0;
+        self.scale = scale;
         self.surface.configure(&self.device, &self.config);
         self.configured = true;
     }
 
-    fn activate_project(&mut self, path: std::path::PathBuf) -> Result<(), String> {
+    pub(crate) fn activate_project(&mut self, path: std::path::PathBuf) -> Result<(), String> {
         self.canvas.activate_project(
             &self.device,
             &self.queue,
@@ -1068,12 +1106,19 @@ impl CanvasSurfaceRenderer {
         )
     }
 
-    fn render(&mut self, hwnd: HWND) -> Result<(), String> {
+    pub(crate) fn save_as(&mut self, path: std::path::PathBuf) -> Result<(), String> {
+        self.canvas.save_as(
+            &self.device,
+            &self.queue,
+            path,
+            [self.config.width, self.config.height],
+            self.scale,
+        )
+    }
+
+    pub(crate) fn render(&mut self) -> Result<(), String> {
         use crate::performance::{Span, Stage};
         self.canvas.poll_save_as(&self.device, &self.queue);
-        if !self.configured {
-            self.resize(hwnd);
-        }
         if !self.configured {
             return Ok(());
         }
@@ -1090,6 +1135,9 @@ impl CanvasSurfaceRenderer {
         else {
             return Ok(());
         };
+        if self.live_ink.canvas_viewport_snapshot().geometry_epoch != self.geometry_epoch {
+            return Ok(());
+        }
 
         let acquire_timing = Span::new(Stage::SurfaceAcquire);
         let frame = match self.surface.get_current_texture() {
@@ -1112,6 +1160,17 @@ impl CanvasSurfaceRenderer {
             .present(&self.device, &self.queue, &display.texture, &target);
         frame.present();
         drop(present_timing);
+        // Admission changes only after this frame was submitted for present.
+        // This is not first-visible-pixel proof. A concurrent geometry change
+        // still invalidates this publication under the viewport mailbox lock.
+        if let Some(viewport) = display.viewport {
+            let _ = self.live_ink.publish_renderer_view(
+                viewport.pan,
+                viewport.zoom,
+                viewport.rotation_radians,
+                display.geometry_epoch,
+            );
+        }
         crate::performance::presented();
         if let Some(timing) = display.history_timing {
             timing.presented();

@@ -809,6 +809,28 @@ mod windows_probe {
                     break;
                 }
             }
+            if std::env::var("NAYATI_SMOKE_HOLD_FAILURE").as_deref() == Ok("1")
+                && self.child.try_wait()?.is_none()
+            {
+                println!(
+                    "export-recovery event=failure-hold-start pid={} bound_seconds=60 awaited={marker:?} outcome=failed-no-retry",
+                    self.child.id()
+                );
+                let hold_deadline = Instant::now() + Duration::from_mins(1);
+                while Instant::now() < hold_deadline {
+                    if let Ok(line) = self.lines.recv_timeout(Duration::from_millis(100)) {
+                        println!("{line}");
+                        self.seen.push(line);
+                    }
+                    if self.child.try_wait()?.is_some() {
+                        break;
+                    }
+                }
+                println!(
+                    "export-recovery event=failure-hold-ended pid={} outcome=failed-no-retry",
+                    self.child.id()
+                );
+            }
             Err(format!("desktop did not reach {marker}").into())
         }
         fn success(&mut self) -> Result<()> {

@@ -18,6 +18,8 @@ mod performance;
 mod performance_probe;
 mod performance_workload;
 mod preview;
+#[cfg(windows)]
+mod render_host;
 mod save_as;
 #[cfg(windows)]
 mod single_instance;
@@ -98,9 +100,25 @@ fn main() {
 
 #[allow(clippy::too_many_lines)]
 fn app() -> Element {
+    let startup_diagnostics = use_hook(|| {
+        let enabled = std::env::var_os("NAYATI_STARTUP_DIAGNOSTICS").is_some();
+        if enabled {
+            println!("desktop-startup event=root-initial-render");
+        }
+        enabled
+    });
     let live_ink = use_context::<LiveInkBridge>();
     let notifier_ink = live_ink.clone();
     use_hook(move || notifier_ink.set_ui_notifier(dioxus_core::schedule_update()));
+    #[cfg(windows)]
+    {
+        let canvas = try_use_context::<desktop_canvas::DesktopCanvasHandle>();
+        use_hook(move || {
+            if let Some(canvas) = canvas {
+                canvas.start_render_worker();
+            }
+        });
+    }
     #[cfg(windows)]
     {
         let mut update_status = use_context_provider(|| Signal::new(updates::status()));
@@ -151,6 +169,11 @@ fn app() -> Element {
         document::Link { rel: "stylesheet", href: STYLESHEET }
         style { {STYLES} }
         main {
+            onmounted: move |_| {
+                if startup_diagnostics {
+                    println!("desktop-startup event=root-dom-mounted");
+                }
+            },
             class: if has_layout_notice { "app-shell layout-has-notice" } else { "app-shell" },
             "data-dock-revision": "{projected_revision}",
             tabindex: 0,
@@ -1574,6 +1597,20 @@ fn send_editor_command(
 
 #[component]
 fn SharedCanvas() -> Element {
+    let startup_diagnostics = use_hook(|| std::env::var_os("NAYATI_STARTUP_DIAGNOSTICS").is_some());
+    let observer_id = use_hook(|| {
+        static NEXT_OBSERVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_OBSERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if startup_diagnostics {
+            println!("desktop-layout event=canvas-component-created observer={id}");
+        }
+        id
+    });
+    use_drop(move || {
+        if startup_diagnostics {
+            println!("desktop-layout event=canvas-component-dropped observer={observer_id}");
+        }
+    });
     #[cfg(windows)]
     let canvas_host = use_context::<desktop_canvas::DesktopCanvasHandle>();
 
@@ -1581,21 +1618,25 @@ fn SharedCanvas() -> Element {
     use_effect(move || {
         let canvas_host = canvas_host.clone();
         spawn(async move {
+            if startup_diagnostics {
+                println!("desktop-layout event=observer-started observer={observer_id}");
+            }
             let mut observer = document::eval(
                 r"
                 const element = document.getElementById('shared-gpu-canvas');
                 if (!element) {
+                    dioxus.send(['missing', [0, 0, 0, 0, 1], false]);
                     throw new Error('native canvas placeholder missing');
                 }
                 const publish = () => {
                     const rect = element.getBoundingClientRect();
-                    dioxus.send([
+                    dioxus.send(['geometry', [
                         rect.left,
                         rect.top,
                         rect.width,
                         rect.height,
                         window.devicePixelRatio || 1
-                    ]);
+                    ], element.isConnected && document.getElementById('shared-gpu-canvas') === element]);
                 };
                 const resizeObserver = new ResizeObserver(publish);
                 resizeObserver.observe(element);
@@ -1604,8 +1645,30 @@ fn SharedCanvas() -> Element {
                 await new Promise(() => {});
                 ",
             );
-            while let Ok([x, y, width, height, scale]) = observer.recv::<[f64; 5]>().await {
-                canvas_host.set_geometry(x, y, width, height, scale);
+            let mut first_message = true;
+            let mut first_anomaly = true;
+            loop {
+                match observer.recv::<(String, [f64; 5], bool)>().await {
+                    Ok((kind, [x, y, width, height, scale], connected)) => {
+                        let anomaly = kind != "geometry" || !connected;
+                        if startup_diagnostics && (first_message || (anomaly && first_anomaly)) {
+                            println!(
+                                "desktop-layout event=observer-message observer={observer_id} kind={kind} connected={connected} rect=({x},{y},{width},{height}) scale={scale}"
+                            );
+                            first_message = false;
+                            first_anomaly &= !anomaly;
+                        }
+                        if kind == "geometry" {
+                            canvas_host.set_geometry(x, y, width, height, scale);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "desktop-layout event=observer-failed observer={observer_id} error={error}"
+                        );
+                        break;
+                    }
+                }
             }
             canvas_host.hide();
         });
@@ -1614,6 +1677,11 @@ fn SharedCanvas() -> Element {
     rsx! {
         div {
             id: "shared-gpu-canvas",
+            onmounted: move |_| {
+                if startup_diagnostics {
+                    println!("desktop-layout event=canvas-dom-mounted observer={observer_id}");
+                }
+            },
             aria_label: "Persistent native WGPU live ink surface"
         }
     }
