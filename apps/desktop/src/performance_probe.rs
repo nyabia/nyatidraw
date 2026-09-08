@@ -43,15 +43,25 @@ impl PerformanceProbe {
         {
             return None;
         }
+        let overlap = std::env::var("NAYATI_PERFORMANCE_OVERLAP").as_deref() == Ok("1");
+        if overlap && mode == "export" {
+            eprintln!("performance-probe event=start-failed reason=overlap-requires-baseline");
+            return None;
+        }
+        let overlap_label = if overlap {
+            " overlap=true window=4"
+        } else {
+            ""
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let driver_stop = stop.clone();
         let ink = ink.clone();
         let start_marker = project.with_extension("performance-start");
         let launched = thread::Builder::new().name("nyatidraw-perf-input".into()).spawn(move || {
             let result = await_start(&ink, &driver_stop, &start_marker)
-                .and_then(|()| run(&ink, &driver_stop, mode == "export"));
+                .and_then(|()| run(&ink, &driver_stop, mode == "export", overlap));
             match result {
-                Ok(()) => println!("performance-probe event=complete mode={mode} strokes={} samples_per_stroke={} input=synthetic-paced physical_pen=false", workload::STROKES, workload::LAST_SAMPLE + 1),
+                Ok(()) => println!("performance-probe event=complete mode={mode} strokes={} samples_per_stroke={} input=synthetic-paced physical_pen=false{overlap_label}", workload::STROKES, workload::LAST_SAMPLE + 1),
                 Err(error) => eprintln!("performance-probe event=stopped mode={mode} reason={error}"),
             }
         });
@@ -132,7 +142,12 @@ fn save(ink: &LiveInkBridge, stop: &AtomicBool, wait_for_start: bool) -> Result<
     })
 }
 
-fn run(ink: &LiveInkBridge, stop: &AtomicBool, exporting: bool) -> Result<(), String> {
+fn run(
+    ink: &LiveInkBridge,
+    stop: &AtomicBool,
+    exporting: bool,
+    overlap: bool,
+) -> Result<(), String> {
     // Let the first frame's Fit/projection finish before configuring the fixed brush.
     thread::sleep(Duration::from_millis(250));
     healthy(ink, stop)?;
@@ -152,8 +167,13 @@ fn run(ink: &LiveInkBridge, stop: &AtomicBool, exporting: bool) -> Result<(), St
     control(ink, stop, ToolCommand::SetColor(workload::COLOR), |p| {
         p.brush_color == workload::COLOR
     })?;
+    let overlap_label = if overlap {
+        " overlap=true window=4"
+    } else {
+        ""
+    };
     println!(
-        "performance-probe event=started canvas=3840x2160 brush={} rate_hz=240 strokes={} export={exporting} input=synthetic-paced",
+        "performance-probe event=started canvas=3840x2160 brush={} rate_hz=240 strokes={} export={exporting} input=synthetic-paced{overlap_label}",
         workload::BRUSH.size_px,
         workload::STROKES
     );
@@ -176,9 +196,14 @@ fn run(ink: &LiveInkBridge, stop: &AtomicBool, exporting: bool) -> Result<(), St
                 .map_err(|e| format!("input-admission:{e:?}"))?;
         }
         let snapshot = SnapshotId(u128::from(stroke) + 2);
-        wait(ink, stop, || {
-            ink.protocol_snapshot().0.history.entries.len() == stroke as usize + 3
-        })?;
+        // Four outstanding strokes fit the writer and completion lanes (both
+        // capacity four). Wait for adoption before admitting a fifth, and
+        // always settle the final stroke before the final Save barrier.
+        if !overlap || (stroke + 1) % 4 == 0 || stroke + 1 == workload::STROKES {
+            wait(ink, stop, || {
+                ink.protocol_snapshot().0.history.entries.len() == stroke as usize + 3
+            })?;
+        }
         println!(
             "performance-probe event=stroke-complete stroke={stroke} max_schedule_lateness_us={max_lateness} expected_snapshot={}",
             snapshot.0

@@ -1612,7 +1612,10 @@ impl ActiveCanvas {
             .map_or((&[][..], false), crate::edit_gesture::EditGesture::preview);
         self.scene.set_gesture_preview(guide, closed);
         let composite_timing = Span::new(Stage::Composite);
-        let stats = match self.scene.render_viewport(viewport) {
+        crate::performance::frame_mark(crate::performance::FrameMark::ViewportBegin);
+        let rendered = self.scene.render_viewport(viewport);
+        crate::performance::frame_mark(crate::performance::FrameMark::ViewportEnd);
+        let stats = match rendered {
             Ok(stats) => stats,
             Err(error) => {
                 eprintln!("native-canvas event=viewport-render-failed error={error:?}");
@@ -2576,9 +2579,12 @@ impl ActiveCanvas {
     }
 
     fn apply_materialized_tiles(&mut self) {
+        let mut trace = crate::performance::MaterializedTrace::begin();
+        let previously_deferred = self.deferred_completions.len();
         self.stroke
             .materializer
             .drain_completed(&mut self.deferred_completions);
+        trace.add_completed(self.deferred_completions.len() - previously_deferred);
         let active_layer = self.scene.active_live_stroke().map(LiveStrokeToken::layer);
         let mut deferred = Vec::new();
         let mut latest_history = None;
@@ -2588,6 +2594,7 @@ impl ActiveCanvas {
             }
             let mut remaining = Vec::new();
             for (key, pixels) in completion.tiles {
+                trace.add_cpu_clone(pixels.len());
                 self.cpu_tiles.insert(key, pixels.clone());
                 let newer_preview = self
                     .latest_preview_generation
@@ -2597,18 +2604,24 @@ impl ActiveCanvas {
                     continue;
                 }
                 if active_layer == Some(key.layer) {
+                    trace.add_deferred();
                     remaining.push((key, pixels));
                     continue;
                 }
+                trace.add_upload_attempt();
                 match self.scene.upload_closed_tile(key, &pixels) {
                     Ok(()) => {
+                        trace.add_upload_success();
                         if self.latest_preview_generation.get(&key)
                             == Some(&completion.stroke_generation)
                         {
                             self.latest_preview_generation.remove(&key);
                         }
                     }
-                    Err(LayerUploadError::LiveStrokeActive(_)) => remaining.push((key, pixels)),
+                    Err(LayerUploadError::LiveStrokeActive(_)) => {
+                        trace.add_deferred();
+                        remaining.push((key, pixels));
+                    }
                     Err(error) => eprintln!(
                         "live-ink event=closed-tile-display-upload-failed stroke={} error={error:?}",
                         completion.ordinal,

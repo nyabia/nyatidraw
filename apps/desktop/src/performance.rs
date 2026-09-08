@@ -416,6 +416,8 @@ pub(crate) enum FrameMark {
     AcquireEnd,
     PresentBegin,
     PresentEnd,
+    ViewportBegin,
+    ViewportEnd,
 }
 
 #[derive(Clone, Copy)]
@@ -434,7 +436,9 @@ struct FrameSample {
     id: u64,
     wake: Instant,
     end: Instant,
-    marks: [Option<Instant>; 7],
+    marks: [Option<Instant>; 9],
+    viewport_calls: u64,
+    materialized: MaterializedCounters,
     input: Option<TraceInput>,
     dequeues: u64,
     exporting_at_wake: bool,
@@ -442,6 +446,7 @@ struct FrameSample {
 }
 
 struct FrameTrace {
+    materialized_totals: MaterializedCounters,
     sequence: u64,
     current: Option<FrameSample>,
     pending: Option<TraceInput>,
@@ -477,6 +482,7 @@ impl FrameBatch {
             let mut trace = cell.borrow_mut();
             let trace = trace.get_or_insert_with(|| {
                 Box::new(FrameTrace {
+                    materialized_totals: MaterializedCounters::default(),
                     sequence: 0,
                     current: None,
                     pending: None,
@@ -499,7 +505,9 @@ impl FrameBatch {
                 id: trace.sequence,
                 wake: now,
                 end: now,
-                marks: [None; 7],
+                marks: [None; 9],
+                viewport_calls: 0,
+                materialized: MaterializedCounters::default(),
                 input: None,
                 dequeues: 0,
                 exporting_at_wake: EXPORTING.load(Ordering::Relaxed),
@@ -518,9 +526,129 @@ pub(crate) fn frame_mark(mark: FrameMark) {
         if let Some(trace) = cell.borrow_mut().as_mut()
             && let Some(current) = trace.current.as_mut()
         {
+            if matches!(mark, FrameMark::ViewportBegin) {
+                current.viewport_calls = current.viewport_calls.saturating_add(1);
+                current.marks[FrameMark::ViewportEnd as usize] = None;
+            }
             current.marks[mark as usize] = Some(Instant::now());
         }
     });
+}
+
+#[derive(Clone, Copy, Default)]
+struct MaterializedCounters {
+    nanos: u128,
+    calls: u64,
+    completed: u64,
+    cpu_clones: u64,
+    cpu_bytes: u64,
+    upload_attempts: u64,
+    upload_successes: u64,
+    deferred: u64,
+    outside_scene_calls: u64,
+}
+
+impl MaterializedCounters {
+    fn accumulate(&mut self, add: Self) {
+        self.nanos = self.nanos.saturating_add(add.nanos);
+        self.calls = self.calls.saturating_add(add.calls);
+        self.completed = self.completed.saturating_add(add.completed);
+        self.cpu_clones = self.cpu_clones.saturating_add(add.cpu_clones);
+        self.cpu_bytes = self.cpu_bytes.saturating_add(add.cpu_bytes);
+        self.upload_attempts = self.upload_attempts.saturating_add(add.upload_attempts);
+        self.upload_successes = self.upload_successes.saturating_add(add.upload_successes);
+        self.deferred = self.deferred.saturating_add(add.deferred);
+        self.outside_scene_calls = self
+            .outside_scene_calls
+            .saturating_add(add.outside_scene_calls);
+    }
+}
+
+/// Local counters and elapsed time for each materialization adoption call.
+/// Multiple non-overlapping calls accumulate, never use their outer envelope.
+pub(crate) struct MaterializedTrace {
+    started: Option<(Instant, u64)>,
+    counts: MaterializedCounters,
+}
+
+impl MaterializedTrace {
+    pub(crate) fn begin() -> Self {
+        let mut result = Self {
+            started: None,
+            counts: MaterializedCounters::default(),
+        };
+        if FRAME_TRACE_ENABLED.get() != Some(&true) {
+            return result;
+        }
+        FRAME_TRACE.with(|cell| {
+            if let Some(trace) = cell.borrow().as_ref()
+                && let Some(current) = trace.current.as_ref()
+            {
+                result.started = Some((Instant::now(), current.id));
+                result.counts.calls = 1;
+                result.counts.outside_scene_calls = u64::from(
+                    current.marks[FrameMark::SceneBegin as usize].is_none()
+                        || current.marks[FrameMark::SceneEnd as usize].is_some(),
+                );
+            }
+        });
+        result
+    }
+
+    pub(crate) fn add_completed(&mut self, count: usize) {
+        if self.started.is_some() {
+            self.counts.completed = self
+                .counts
+                .completed
+                .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        }
+    }
+
+    pub(crate) fn add_cpu_clone(&mut self, bytes: usize) {
+        if self.started.is_some() {
+            self.counts.cpu_clones = self.counts.cpu_clones.saturating_add(1);
+            self.counts.cpu_bytes = self
+                .counts
+                .cpu_bytes
+                .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        }
+    }
+
+    pub(crate) fn add_upload_attempt(&mut self) {
+        if self.started.is_some() {
+            self.counts.upload_attempts = self.counts.upload_attempts.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn add_upload_success(&mut self) {
+        if self.started.is_some() {
+            self.counts.upload_successes = self.counts.upload_successes.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn add_deferred(&mut self) {
+        if self.started.is_some() {
+            self.counts.deferred = self.counts.deferred.saturating_add(1);
+        }
+    }
+}
+
+impl Drop for MaterializedTrace {
+    fn drop(&mut self) {
+        let Some((started, batch)) = self.started else {
+            return;
+        };
+        self.counts.nanos = started.elapsed().as_nanos();
+        FRAME_TRACE.with(|cell| {
+            if let Some(trace) = cell.borrow_mut().as_mut()
+                && let Some(current) = trace.current.as_mut()
+                && current.id == batch
+            {
+                current.materialized.accumulate(self.counts);
+                trace.materialized_totals.accumulate(self.counts);
+            }
+        });
+    }
 }
 
 fn trace_dequeued(admission: Instant) {
@@ -613,7 +741,10 @@ impl FrameSample {
                 -i128::try_from(self.wake.duration_since(at).as_micros()).unwrap_or(i128::MAX)
             }
         };
-        let marks = self.marks.map(|at| at.map(offset));
+        let marks: [Option<i128>; 7] = std::array::from_fn(|index| self.marks[index].map(offset));
+        let viewport_begin = self.marks[FrameMark::ViewportBegin as usize].map(offset);
+        let viewport_end = self.marks[FrameMark::ViewportEnd as usize].map(offset);
+        let materialized = self.materialized;
         let status = if self.marks[FrameMark::PresentEnd as usize].is_some() {
             "present-request-returned"
         } else if self.marks[FrameMark::Render as usize].is_some() {
@@ -627,7 +758,7 @@ impl FrameSample {
                 .map(|end| end.saturating_duration_since(input.admission).as_micros())
         });
         println!(
-            "performance-frame owner={owner} batch={} status={status} control_boundary={} export_at_wake={} offsets_us_render_scene_begin_scene_end_acquire_begin_acquire_end_present_begin_present_end={marks:?} end_us={} dequeues={} input_first_batch={:?} input_batches={:?} admission_offset_us={:?} first_dequeue_offset_us={:?} last_dequeue_offset_us={:?} export_at_first_dequeue={:?} crossed_control_boundary={:?} admission_to_present_us={admission_to_present:?} claim=cpu-api-correlation-not-artwork-proof",
+            "performance-frame owner={owner} batch={} status={status} control_boundary={} export_at_wake={} offsets_us_render_scene_begin_scene_end_acquire_begin_acquire_end_present_begin_present_end={marks:?} end_us={} dequeues={} input_first_batch={:?} input_batches={:?} admission_offset_us={:?} first_dequeue_offset_us={:?} last_dequeue_offset_us={:?} export_at_first_dequeue={:?} crossed_control_boundary={:?} admission_to_present_us={admission_to_present:?} viewport_calls={} viewport_last_begin_us={viewport_begin:?} viewport_last_end_us={viewport_end:?} materialized_us={} materialized_calls={} materialized_completed={} materialized_cpu_clones={} materialized_cpu_bytes={} materialized_upload_attempts={} materialized_upload_successes={} materialized_deferred={} materialized_outside_scene_calls={} claim=cpu-api-correlation-not-artwork-proof",
             self.id,
             self.control_boundary,
             self.exporting_at_wake,
@@ -640,6 +771,16 @@ impl FrameSample {
             input.map(|i| offset(i.last_dequeue)),
             input.map(|i| i.exporting_at_first_dequeue),
             input.map(|i| i.crossed_control_boundary),
+            self.viewport_calls,
+            materialized.nanos / 1000,
+            materialized.calls,
+            materialized.completed,
+            materialized.cpu_clones,
+            materialized.cpu_bytes,
+            materialized.upload_attempts,
+            materialized.upload_successes,
+            materialized.deferred,
+            materialized.outside_scene_calls,
         );
     }
 }
@@ -659,8 +800,9 @@ fn flush_frame_trace(owner: &str) {
     for sample in trace.samples.iter().flatten() {
         sample.print(owner);
     }
+    let materialized = trace.materialized_totals;
     println!(
-        "performance-frames owner={owner} batches={} recorded={} omitted={} below_threshold={} pending_unpresented_batches={} unframed_dequeues_in_recorded_thread={} presented={} skipped={} control_only={} coalesced_presentations={} capacity={FRAME_TRACE_CAPACITY} threshold_us={FRAME_TRACE_TAIL_US} selection=first-qualifying wake=mailbox-observed scope=actor-thread-lifetime helper_threads=unobserved",
+        "performance-frames owner={owner} batches={} recorded={} omitted={} below_threshold={} pending_unpresented_batches={} unframed_dequeues_in_recorded_thread={} presented={} skipped={} control_only={} coalesced_presentations={} materialized_us={} materialized_calls={} materialized_completed={} materialized_cpu_clones={} materialized_cpu_bytes={} materialized_upload_attempts={} materialized_upload_successes={} materialized_deferred={} materialized_outside_scene_calls={} capacity={FRAME_TRACE_CAPACITY} threshold_us={FRAME_TRACE_TAIL_US} selection=first-qualifying wake=mailbox-observed scope=actor-thread-lifetime helper_threads=unobserved",
         trace.sequence,
         trace.stored,
         trace.omitted,
@@ -671,5 +813,14 @@ fn flush_frame_trace(owner: &str) {
         trace.skipped,
         trace.control_only,
         trace.coalesced_presentations,
+        materialized.nanos / 1000,
+        materialized.calls,
+        materialized.completed,
+        materialized.cpu_clones,
+        materialized.cpu_bytes,
+        materialized.upload_attempts,
+        materialized.upload_successes,
+        materialized.deferred,
+        materialized.outside_scene_calls,
     );
 }

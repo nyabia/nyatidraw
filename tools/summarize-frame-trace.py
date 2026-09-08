@@ -13,6 +13,21 @@ from pathlib import Path
 MARKS = "render scene_begin scene_end acquire_begin acquire_end present_begin present_end".split()
 OFFSET_KEY = "offsets_us_render_scene_begin_scene_end_acquire_begin_acquire_end_present_begin_present_end"
 FIELDS = re.compile(r"(\w+)=((?:\[[^\]]*\])|(?:Some\([^)]*\))|(?:\S+))")
+MATERIALIZED = ["materialized_" + name for name in (
+    "us calls completed cpu_clones cpu_bytes upload_attempts upload_successes deferred outside_scene_calls".split())]
+
+
+def materialized_fields(row, errors):
+    for key in MATERIALIZED:
+        row.setdefault(key, None)  # Old trace version did not observe these values.
+    values = [row[key] for key in MATERIALIZED]
+    if all(value is None for value in values):
+        return
+    if any(type(value) is not int or value < 0 for value in values):
+        errors.append("incomplete/invalid materialization counters")
+        return
+    if row["materialized_upload_successes"] > row["materialized_upload_attempts"] or row["materialized_outside_scene_calls"] > row["materialized_calls"]:
+        errors.append("inconsistent materialization counters")
 
 
 def typed(value):
@@ -58,6 +73,22 @@ def frame(line):
     if admission is not None and (first is None or last is None or not admission <= first <= last <= row["end_us"]):
         errors.append("invalid admission/dequeue ordering")
     row["carried_input"] = row["input_first_batch"] is not None and row["input_first_batch"] < row["batch"]
+    materialized_fields(row, errors)
+    for key in ("viewport_calls", "viewport_last_begin_us", "viewport_last_end_us"):
+        row.setdefault(key, None)
+    begin, end = row["viewport_last_begin_us"], row["viewport_last_end_us"]
+    row["durations_us"]["viewport_last_call"] = end - begin if type(begin) is int and type(end) is int and end >= begin else None
+    if begin is not None and (type(begin) is not int or (end is not None and (type(end) is not int or end < begin))):
+        errors.append("invalid viewport boundary ordering")
+    if end is not None and begin is None:
+        errors.append("viewport end without begin")
+    scene_begin, scene_end = row["offsets_us"]["scene_begin"], row["offsets_us"]["scene_end"]
+    row["viewport_last_inside_scene"] = (scene_begin <= begin <= end <= scene_end
+        if all(type(v) is int for v in (scene_begin, begin, end, scene_end)) else None)
+    if row["materialized_outside_scene_calls"] == 0 and row["materialized_calls"]:
+        scene_us = row["durations_us"]["scene"]
+        if scene_us is not None and row["materialized_us"] > scene_us + 1:
+            errors.append("materialization accumulated time exceeds containing scene")
     if row["input_first_batch"] is not None and row["input_first_batch"] > row["batch"]:
         errors.append("input comes from a future batch")
     if (present is None or admission is None) and row["admission_to_present_us"] is not None:
@@ -100,6 +131,10 @@ def summarize(root):
             errors.append("expected exactly one actor lifetime summary")
         summary = summaries[0] if len(summaries) == 1 else {}
         if summary:
+            materialized_fields(summary, errors)
+            for key in MATERIALIZED:
+                if type(summary[key]) is int and summary[key] < sum(row[key] or 0 for row in rows):
+                    errors.append(f"retained {key} exceeds lifetime total")
             counts = "batches recorded omitted below_threshold presented skipped control_only capacity pending_unpresented_batches unframed_dequeues_in_recorded_thread coalesced_presentations".split()
             if any(type(summary[key]) is not int or summary[key] < 0 for key in counts):
                 errors.append("invalid nonnegative summary counts")
