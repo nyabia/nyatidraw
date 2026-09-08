@@ -4,6 +4,10 @@
 [현재 gate 점검](../status-plan-2026-09-06.md)에 모았다. 아래 표는 제품 완료 조건이며,
 엔진 probe나 제한된 설치판 acceptance만으로 전체 Sprint를 완료 처리하지 않는다.
 
+2026-09-08의 후속 성능·재시작 상태는 [완료 타일 반영 검증](../status-completion-adoption-2026-09-08.md)에
+연결한다. CPU 중복 복사와 픽셀 대조는 검증했지만 반복 startup의 빈 창 정체는
+남아 있어 Sprint 3 전체 완료로 승격하지 않는다.
+
 활성 스프린트는 내부 엔진 부품 수가 아니라 **Godot 작업 중 사용자가 끝까지 수행할
 수 있는 작업**으로 판정한다. 독립 드로잉 소프트웨어 공개는 장기 목표지만, 당장은
 Godot project 안의 PNG를 Windows `Open with`로 열고, paired `.ntdr`을 자동으로 찾아

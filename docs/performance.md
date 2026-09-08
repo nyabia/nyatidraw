@@ -477,3 +477,8 @@ actor 관찰/input dequeue/scene/acquire/present 경계를 연결했으며 고�
 처음 qualifying tail만 남긴다. 무입력 scene 뒤 다음 입력이 대기한 표본과 현재
 acquire가 느린 표본이 모두 있어 원인을 저장 하나로 확정하지 않는다. 두 scratch의
 재실행 tile·PNG 대조는 통과했지만 최초 가시 픽셀·물리 펜 증거는 아니다.
+
+이어 수행한 [완료 타일 반영 전후 비교](status-completion-adoption-2026-09-08.md)에서는
+최대 4획을 겹친 같은 32획의 CPU 복사가 3,638,689,792B에서 88,080,384B로 줄었다.
+GPU 업로드 성공 수와 최종 타일·PNG는 같았다. 일반 paced 입력에는 중복 복사가
+없었고 p99 개선도 일관되지 않았다. 별도의 반복 startup 실패는 미해결로 기록했다.
