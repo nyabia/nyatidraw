@@ -75,6 +75,10 @@
 검증한 DX 실행 파일 SHA256:
 `70eca144a512f7dce3a557119f21c2cbc57521989709211d164626f475fcece8`.
 로그와 scratch 작품은 `target/alpha4-acceptance/`에 있으며 Git에 넣지 않는다.
+후속 읽기 전용 패키지 감사에서 `SHA256SUMS.txt`의 6개 산출물 해시를 모두 대조했다.
+DX 실행 파일과 stage 실행 파일이 같고, nupkg/Portable ZIP 내부의 실행 파일도
+동일한 SHA256이었다. 두 압축 파일 모두 MIT·Apache-2.0 전문과 타사 고지를 포함했다.
+이 검사는 패키지 구성 증거이며 설치 동작 증거를 대신하지 않는다.
 
 Codex 하위 프로세스에서 alpha.3 → alpha.4 적용, 제거, 재설치는 종료 코드 0이었다.
 각 hook의 등록/정리와 기존 PNG 기본 앱·개발판 `.ntdr` 등록·작품 보존도 확인했다.
