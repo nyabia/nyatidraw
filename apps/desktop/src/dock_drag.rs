@@ -32,7 +32,7 @@ pub(super) fn minimum_width(node: &DockNode) -> u16 {
     match node {
         DockNode::Panel(panel) => match panel {
             PanelKind::Tools => 48,
-            PanelKind::Brush | PanelKind::ToolProperties | PanelKind::BrushSizes => 170,
+            PanelKind::Brush | PanelKind::ToolProperties | PanelKind::BrushSizes => 224,
             PanelKind::Canvas => 240,
             PanelKind::Layers => 280,
             _ => 160,

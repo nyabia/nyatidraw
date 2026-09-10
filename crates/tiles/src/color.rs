@@ -43,6 +43,25 @@ pub fn srgb8_to_linear_premultiplied(color: [u8; 4]) -> [u8; 4] {
     ]
 }
 
+/// Unpremultiplies durable linear RGBA8 and converts RGB to straight UI sRGB.
+/// Fully transparent pixels have no recoverable color.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn linear_premultiplied_to_srgb8(color: [u8; 4]) -> Option<[u8; 4]> {
+    if color[3] == 0 {
+        return None;
+    }
+    let channel = |value: u8| {
+        (linear_to_srgb(f64::from(value.min(color[3])) / f64::from(color[3])) * 255.0).round() as u8
+    };
+    Some([
+        channel(color[0]),
+        channel(color[1]),
+        channel(color[2]),
+        color[3],
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,6 +83,16 @@ mod tests {
                 assert_eq!(actual[3], alpha);
                 assert!(actual[..3].iter().all(|value| *value <= alpha));
             }
+        }
+        // Sampling must not darken translucent artwork or invent a color from
+        // alpha-zero bytes. Low-alpha quantization cannot be losslessly undone.
+        for (pixel, expected) in [
+            ([55, 55, 55, 255], Some([128, 128, 128, 255])),
+            ([128, 0, 0, 128], Some([255, 0, 0, 128])),
+            ([1, 1, 1, 1], Some([255, 255, 255, 1])),
+            ([0, 0, 0, 0], None),
+        ] {
+            assert_eq!(linear_premultiplied_to_srgb8(pixel), expected);
         }
     }
 }

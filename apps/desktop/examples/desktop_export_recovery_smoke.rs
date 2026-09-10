@@ -109,6 +109,8 @@ mod windows_probe {
         };
         let group = |id, children| {
             LayerTreeNode::Group(GroupNode {
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                 id: GroupId(id),
                 name: format!("Group{id}"),
                 visible: true,
@@ -119,6 +121,9 @@ mod windows_probe {
         let rasters = (1..=20)
             .map(|id| {
                 LayerTreeNode::Raster(LayerNode {
+                    alpha_locked: false,
+                    clip_to_below: false,
+                    blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                     id: LayerId(id),
                     name: format!("Layer{id}"),
                     visible: true,
@@ -130,6 +135,8 @@ mod windows_probe {
             })
             .collect();
         let baseline = LayerTree::new(GroupNode {
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: GroupId(100),
             name: "Root".into(),
             visible: true,

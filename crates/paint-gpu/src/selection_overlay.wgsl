@@ -11,8 +11,9 @@ fn vertex_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32
 }
 
 fn covered(document: vec2<f32>) -> bool {
-    if any(document < vec2<f32>(0.0)) || any(document >= vec2<f32>(selection.dimensions.yz)) { return false; }
-    let pixel = vec2<u32>(floor(document));
+    let local = document - vec2<f32>(selection.origin.zw);
+    if any(local < vec2<f32>(0.0)) || any(local >= vec2<f32>(selection.dimensions.yz)) { return false; }
+    let pixel = vec2<u32>(floor(local));
     let index = pixel.y * selection.dimensions.y + pixel.x;
     return (bits[index / 32u] & (1u << (index % 32u))) != 0u;
 }

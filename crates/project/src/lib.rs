@@ -297,3 +297,17 @@ pub const CANVAS_HISTORY_SCHEMA_VERSION: u64 = 4;
 /// Storage capability bit, independent of the existing metadata-history level.
 /// Old writers reject the combined marker before touching compressed projects.
 pub const COMPRESSED_TILE_SCHEMA_FLAG: u64 = 0x100;
+/// Versioned brush controls require readers that replay engine 2 correctly.
+pub const CONFIGURABLE_BRUSH_SCHEMA_FLAG: u64 = 0x200;
+/// Signed selection replay must never be opened by origin-zero-only writers.
+pub const SIGNED_SELECTION_SCHEMA_FLAG: u64 = 0x400;
+/// Layer-tree v3 blend/clipping/alpha-lock metadata requires matching readers.
+pub const LAYER_COMPOSITING_SCHEMA_FLAG: u64 = 0x800;
+/// Semantic alpha-locked strokes require source-atop replay, independently of
+/// whatever layer settings are selected when the project is reopened.
+pub const ALPHA_LOCK_STROKE_SCHEMA_FLAG: u64 = 0x1000;
+pub const SCHEMA_CAPABILITY_FLAGS: u64 = COMPRESSED_TILE_SCHEMA_FLAG
+    | CONFIGURABLE_BRUSH_SCHEMA_FLAG
+    | SIGNED_SELECTION_SCHEMA_FLAG
+    | LAYER_COMPOSITING_SCHEMA_FLAG
+    | ALPHA_LOCK_STROKE_SCHEMA_FLAG;

@@ -52,15 +52,9 @@ impl ProjectionState {
         size_tenths: u16,
         opacity_u16: u16,
         color: [u8; 4],
+        background_color: [u8; 4],
     ) {
         self.current.drawing_tool = tool;
-        if self.current.brush_size_tenths != size_tenths {
-            self.current
-                .recent_brush_sizes
-                .retain(|recent| *recent != size_tenths);
-            self.current.recent_brush_sizes.insert(0, size_tenths);
-            self.current.recent_brush_sizes.truncate(4);
-        }
         self.current.brush_size_tenths = size_tenths;
         self.current.brush_opacity_u16 = opacity_u16;
         if self.current.brush_color != color {
@@ -69,6 +63,22 @@ impl ProjectionState {
             self.current.recent_colors.truncate(8);
         }
         self.current.brush_color = color;
+        self.current.background_color = background_color;
+    }
+
+    /// Records an accepted drawing Begin, not a size selection or artwork edit.
+    /// This session MRU never participates in history roots or Undo/Redo.
+    /// Returns whether a semantic publication is needed.
+    pub fn stage_used_brush_size(&mut self, size_tenths: u16) -> bool {
+        if self.current.recent_brush_sizes.first() == Some(&size_tenths) {
+            return false;
+        }
+        self.current
+            .recent_brush_sizes
+            .retain(|size| *size != size_tenths);
+        self.current.recent_brush_sizes.insert(0, size_tenths);
+        self.current.recent_brush_sizes.truncate(4);
+        true
     }
 
     /// Stages session-only layer isolation for the next semantic projection.
@@ -89,6 +99,10 @@ impl ProjectionState {
 
     pub fn stage_edit_settings(&mut self, settings: nyatidraw_api::EditSettings) {
         self.current.edit_settings = settings;
+    }
+
+    pub fn stage_brush_settings(&mut self, settings: nyatidraw_api::BrushSettings) {
+        self.current.brush_settings = settings;
     }
 
     /// Publishes document metadata at one monotonically increasing revision.
@@ -214,6 +228,9 @@ fn project_children(group: &GroupNode, depth: u16, out: &mut Vec<LayerProjection
     for (index, child) in group.children.iter().enumerate().rev() {
         match child {
             LayerTreeNode::Raster(layer) => out.push(LayerProjection {
+                alpha_locked: layer.alpha_locked,
+                clip_to_below: layer.clip_to_below,
+                blend_mode: layer.blend_mode,
                 id: LayerTreeNodeId::Raster(layer.id),
                 parent: group.id,
                 index,
@@ -221,11 +238,15 @@ fn project_children(group: &GroupNode, depth: u16, out: &mut Vec<LayerProjection
                 kind: LayerProjectionKind::Raster,
                 name: layer.name.clone(),
                 visible: layer.visible,
+                locked: layer.locked,
                 reference: layer.reference,
                 opacity_u16: layer.opacity_u16,
             }),
             LayerTreeNode::Group(child_group) => {
                 out.push(LayerProjection {
+                    alpha_locked: false,
+                    clip_to_below: child_group.clip_to_below,
+                    blend_mode: child_group.blend_mode,
                     id: LayerTreeNodeId::Group(child_group.id),
                     parent: group.id,
                     index,
@@ -233,6 +254,7 @@ fn project_children(group: &GroupNode, depth: u16, out: &mut Vec<LayerProjection
                     kind: LayerProjectionKind::Group,
                     name: child_group.name.clone(),
                     visible: child_group.visible,
+                    locked: false,
                     reference: false,
                     opacity_u16: child_group.opacity_u16,
                 });

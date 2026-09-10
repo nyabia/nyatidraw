@@ -4,7 +4,7 @@ use super::{
     ProjectHistoryCursor, ProjectOpenError, ReadableTable, RecordKind, SNAPSHOTS, SnapshotId,
     TableDefinition, decode_envelope, write_canvas_metadata,
 };
-use nyatidraw_project::COMPRESSED_TILE_SCHEMA_FLAG;
+use nyatidraw_project::SCHEMA_CAPABILITY_FLAGS;
 use std::collections::BTreeSet;
 
 pub(super) const SNAPSHOT_CANVAS: TableDefinition<&[u8], &[u8]> =
@@ -21,7 +21,7 @@ impl ProjectDb {
             .get("schema_version")
             .map_err(|error| self.io(error))?
             .is_some_and(|value| {
-                value.value() & !COMPRESSED_TILE_SCHEMA_FLAG == CANVAS_HISTORY_SCHEMA_VERSION
+                value.value() & !SCHEMA_CAPABILITY_FLAGS == CANVAS_HISTORY_SCHEMA_VERSION
             }))
     }
 
@@ -75,7 +75,7 @@ impl ProjectDb {
                 .get("schema_version")
                 .map_err(|error| self.io(error))?
                 .is_some_and(|value| {
-                    value.value() & !COMPRESSED_TILE_SCHEMA_FLAG == CANVAS_HISTORY_SCHEMA_VERSION
+                    value.value() & !SCHEMA_CAPABILITY_FLAGS == CANVAS_HISTORY_SCHEMA_VERSION
                 })
         };
         if !enabled && canvas.is_none() {
@@ -137,8 +137,15 @@ impl ProjectDb {
             .open_table(META)
             .map_err(|error| self.io(error))?;
         write_canvas_metadata(&mut metadata, next).map_err(|error| self.io(error))?;
+        let capabilities = metadata
+            .get("schema_version")
+            .map_err(|error| self.io(error))?
+            .map_or(0, |value| value.value() & SCHEMA_CAPABILITY_FLAGS);
         metadata
-            .insert("schema_version", CANVAS_HISTORY_SCHEMA_VERSION)
+            .insert(
+                "schema_version",
+                CANVAS_HISTORY_SCHEMA_VERSION | capabilities,
+            )
             .map_err(|error| self.io(error))?;
         Ok(())
     }

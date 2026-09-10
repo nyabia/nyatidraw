@@ -1,5 +1,5 @@
 //! Bounded native gesture capture. Only a completed gesture becomes a command.
-use nyatidraw_api::{DrawingTool, EditCommand, EditSettings};
+use nyatidraw_api::{DrawingTool, EditCommand, EditSettings, RasterTransform};
 use nyatidraw_input::{PointerPhase, StylusSample};
 
 const MAX_VERTICES: usize = 4096;
@@ -34,7 +34,8 @@ impl EditGesture {
             start,
             vertices: match tool {
                 DrawingTool::Lasso => vec![start],
-                DrawingTool::Gradient => vec![start, start],
+                DrawingTool::RectangleSelection => rectangle_vertices(start, start),
+                DrawingTool::Gradient | DrawingTool::MoveSelection => vec![start, start],
                 _ => Vec::new(),
             },
             error: point
@@ -62,7 +63,13 @@ impl EditGesture {
                 self.vertices.push(point);
             }
         }
-        if self.tool == DrawingTool::Gradient {
+        if self.tool == DrawingTool::RectangleSelection {
+            self.vertices = rectangle_vertices(self.start, point);
+        }
+        if matches!(
+            self.tool,
+            DrawingTool::Gradient | DrawingTool::MoveSelection
+        ) {
             self.vertices[1] = point;
         }
     }
@@ -73,7 +80,10 @@ impl EditGesture {
         }
         (
             &self.vertices,
-            self.tool == DrawingTool::Lasso && self.vertices.len() > 2,
+            matches!(
+                self.tool,
+                DrawingTool::Lasso | DrawingTool::RectangleSelection
+            ) && self.vertices.len() > 2,
         )
     }
 
@@ -87,22 +97,52 @@ impl EditGesture {
         }
         let end = document_pixel(sample).ok_or("선택 끝점이 유효하지 않습니다.")?;
         Ok(match self.tool {
+            DrawingTool::Eyedropper => EditCommand::PickColor {
+                point: end,
+                source: self.settings.source,
+            },
             DrawingTool::Wand => EditCommand::SelectWand {
                 seed: self.start,
                 tolerance: self.settings.tolerance,
                 source: self.settings.source,
             },
-            DrawingTool::Lasso if self.vertices.len() >= 3 => EditCommand::SelectLasso {
-                vertices: self.vertices,
-            },
-            DrawingTool::Fill if self.has_selection => {
-                EditCommand::FillSelection { color: self.color }
+            DrawingTool::Lasso | DrawingTool::RectangleSelection if self.vertices.len() >= 3 => {
+                if self.settings.selection_mode == nyatidraw_api::SelectionMode::Replace {
+                    EditCommand::SelectLasso {
+                        vertices: self.vertices,
+                    }
+                } else {
+                    EditCommand::CombineLasso {
+                        vertices: self.vertices,
+                        mode: self.settings.selection_mode,
+                    }
+                }
             }
-            DrawingTool::Fill => EditCommand::FloodFill {
+            DrawingTool::MoveSelection => {
+                if !self.has_selection {
+                    return Err("먼저 이동할 영역을 선택하세요.".into());
+                }
+                let offset = [
+                    end[0].checked_sub(self.start[0]),
+                    end[1].checked_sub(self.start[1]),
+                ];
+                let [Some(x), Some(y)] = offset else {
+                    return Err("선택 이동 거리가 허용 범위를 벗어났습니다.".into());
+                };
+                if x == 0 && y == 0 {
+                    return Err("이동하지 않았습니다. 선택 영역을 유지합니다.".into());
+                }
+                EditCommand::Transform(RasterTransform {
+                    offset: [x, y],
+                    ..RasterTransform::default()
+                })
+            }
+            DrawingTool::Fill => EditCommand::FloodFillAdvanced {
                 seed: self.start,
                 tolerance: self.settings.tolerance,
                 source: self.settings.source,
                 color: self.color,
+                settings: self.settings.fill,
             },
             DrawingTool::Gradient if self.has_selection && self.start != end => {
                 EditCommand::GradientSelection {
@@ -120,6 +160,16 @@ impl EditGesture {
     }
 }
 
+// Pixel-inclusive drag endpoints become a half-open polygon of pixel edges.
+// document_pixel excludes i32::MAX, so the upper edge cannot overflow.
+fn rectangle_vertices(start: [i32; 2], end: [i32; 2]) -> Vec<[i32; 2]> {
+    let left = start[0].min(end[0]);
+    let top = start[1].min(end[1]);
+    let right = start[0].max(end[0]) + 1;
+    let bottom = start[1].max(end[1]) + 1;
+    vec![[left, top], [right, top], [right, bottom], [left, bottom]]
+}
+
 #[allow(clippy::cast_possible_truncation)]
 fn document_pixel(sample: StylusSample) -> Option<[i32; 2]> {
     let point = sample.position_document;
@@ -135,6 +185,95 @@ fn document_pixel(sample: StylusSample) -> Option<[i32; 2]> {
 mod tests {
     use super::*;
     use nyatidraw_input::{PenButtons, Point};
+
+    #[test]
+    fn rectangle_edges_and_move_rejection_preserve_exact_selected_pixels() {
+        // Product risk: reversed drags or missing selection must not select an
+        // extra row, overflow coordinates, or move the entire active layer.
+        let sample = |point: [i32; 2], phase| StylusSample {
+            sequence: 1,
+            timestamp_ns: 1,
+            device_id: 1,
+            phase,
+            position_document: Point {
+                x: f64::from(point[0]),
+                y: f64::from(point[1]),
+            },
+            pressure: 1.0,
+            tilt: None,
+            twist_radians: None,
+            tangential_pressure: None,
+            buttons: PenButtons(0),
+            eraser: false,
+            viewport_revision: 1,
+        };
+        let canvas = nyatidraw_api::CanvasSpec {
+            width_px: 8,
+            height_px: 8,
+            pixels_per_inch: 96,
+        };
+        for (start, end, bounds) in [
+            ([1, 2], [3, 4], [1, 2, 3, 3]),
+            ([3, 4], [1, 2], [1, 2, 3, 3]),
+            ([1, 4], [3, 2], [1, 2, 3, 3]),
+            ([3, 2], [1, 4], [1, 2, 3, 3]),
+            ([3, 3], [3, 3], [3, 3, 1, 1]),
+            ([-2, -2], [1, 1], [0, 0, 2, 2]),
+        ] {
+            let mut gesture = EditGesture::begin(
+                DrawingTool::RectangleSelection,
+                EditSettings::default(),
+                [0; 4],
+                false,
+                sample(start, PointerPhase::Begin),
+            );
+            gesture.push(sample(end, PointerPhase::Move));
+            assert!(gesture.preview().1);
+            assert_eq!(gesture.preview().0.len(), 4);
+            let EditCommand::SelectLasso { vertices } =
+                gesture.finish(sample(end, PointerPhase::End)).unwrap()
+            else {
+                panic!("rectangle uses the shared polygon selection engine");
+            };
+            let mask = nyatidraw_paint_cpu::lasso_selection(
+                canvas,
+                &vertices,
+                nyatidraw_paint_cpu::EditLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(mask.bounds(), Some(bounds));
+            assert_eq!(mask.selected_pixels(), u64::from(bounds[2] * bounds[3]));
+        }
+        for (has_selection, phase, revision, end, accepted) in [
+            (true, PointerPhase::End, 1, [5, -2], true),
+            (false, PointerPhase::End, 1, [5, -2], false),
+            (true, PointerPhase::Cancel, 1, [5, -2], false),
+            (true, PointerPhase::End, 2, [5, -2], false),
+            (true, PointerPhase::End, 1, [1, 1], false),
+            (true, PointerPhase::End, 1, [i32::MIN, 1], false),
+        ] {
+            let gesture = EditGesture::begin(
+                DrawingTool::MoveSelection,
+                EditSettings::default(),
+                [0; 4],
+                has_selection,
+                sample([1, 1], PointerPhase::Begin),
+            );
+            let mut end = sample(end, phase);
+            end.viewport_revision = revision;
+            let result = gesture.finish(end);
+            assert_eq!(result.is_ok(), accepted);
+            if accepted {
+                assert_eq!(
+                    result.unwrap(),
+                    EditCommand::Transform(RasterTransform {
+                        offset: [4, -3],
+                        ..RasterTransform::default()
+                    })
+                );
+            }
+        }
+    }
 
     #[test]
     fn invalid_or_cancelled_lasso_never_emits_a_partial_artwork_command() {

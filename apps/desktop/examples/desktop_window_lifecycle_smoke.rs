@@ -129,11 +129,16 @@ mod windows_probe {
 
     fn tree() -> LayerTree {
         LayerTree::new(GroupNode {
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: GroupId(100),
             name: "Lifecycle root".into(),
             visible: true,
             opacity_u16: u16::MAX,
             children: vec![LayerTreeNode::Raster(LayerNode {
+                alpha_locked: false,
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                 id: LayerId(1),
                 name: "Lifecycle scratch".into(),
                 visible: true,

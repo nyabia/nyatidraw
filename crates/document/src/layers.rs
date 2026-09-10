@@ -1,14 +1,22 @@
 use std::collections::BTreeSet;
 
 use nyatidraw_api::{
-    CompositeInvalidation, ContentRootId, GroupId, LayerId, LayerTreeNodeId, TileCoordinate,
+    CompositeInvalidation, ContentRootId, GroupId, LayerBlendMode, LayerId, LayerTreeNodeId,
+    TileCoordinate,
 };
 
 const MAX_LAYER_TREE_DEPTH: usize = 64;
 const MAX_LAYER_NAME_CHARS: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+// Visibility, edit protection, alpha protection and source roles are independent.
+#[allow(clippy::struct_excessive_bools)]
 pub struct LayerNode {
+    /// Preserve stored pixel alpha while recoloring; distinct from edit lock.
+    pub alpha_locked: bool,
+    /// Uses the nearest preceding unclipped sibling as the clipping base.
+    pub clip_to_below: bool,
+    pub blend_mode: LayerBlendMode,
     pub id: LayerId,
     pub name: String,
     pub visible: bool,
@@ -21,6 +29,8 @@ pub struct LayerNode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GroupNode {
+    pub clip_to_below: bool,
+    pub blend_mode: LayerBlendMode,
     pub id: GroupId,
     pub name: String,
     pub visible: bool,
@@ -55,6 +65,7 @@ pub enum LayerTreeError {
     MoveIntoDescendant,
     IndexOutOfBounds { index: usize, len: usize },
     InvalidName,
+    LockedNode(LayerTreeNodeId),
 }
 
 /// Validated raster/group hierarchy in bottom-to-top compositing order.
@@ -73,7 +84,11 @@ impl LayerTree {
     ///
     /// Returns an error for duplicate tagged IDs or mutable root properties.
     pub fn new(root: GroupNode) -> Result<Self, LayerTreeError> {
-        if !root.visible || root.opacity_u16 != u16::MAX {
+        if !root.visible
+            || root.opacity_u16 != u16::MAX
+            || root.clip_to_below
+            || root.blend_mode != LayerBlendMode::Normal
+        {
             return Err(LayerTreeError::InvalidRootProperties);
         }
         let mut ids = BTreeSet::new();
@@ -139,6 +154,35 @@ impl LayerTree {
         Ok(invalidation)
     }
 
+    /// Copies raster metadata immediately above its source in the same group.
+    /// The caller must duplicate its tile keys in the same durable transaction.
+    ///
+    /// # Errors
+    /// Rejects unknown sources or duplicate destination IDs without mutation.
+    pub fn duplicate_raster(
+        &mut self,
+        source: LayerId,
+        destination: LayerId,
+    ) -> Result<CompositeInvalidation, LayerTreeError> {
+        let source_node = LayerTreeNodeId::Raster(source);
+        let (parent, index) = self
+            .parent_and_index(source_node)
+            .ok_or(LayerTreeError::UnknownNode(source_node))?;
+        let Some(LayerTreeNode::Raster(layer)) = find_node_mut(&mut self.root, source_node) else {
+            return Err(LayerTreeError::UnknownNode(source_node));
+        };
+        let mut copy = layer.clone();
+        copy.id = destination;
+        let suffix = " 복사";
+        copy.name = layer
+            .name
+            .chars()
+            .take(MAX_LAYER_NAME_CHARS - suffix.chars().count())
+            .chain(suffix.chars())
+            .collect();
+        self.insert(parent, index + 1, LayerTreeNode::Raster(copy))
+    }
+
     /// Changes a user-visible node name without invalidating pixel composites.
     ///
     /// # Errors
@@ -165,6 +209,91 @@ impl LayerTree {
         Ok(CompositeInvalidation::empty())
     }
 
+    /// Returns immutable raster metadata, including its authoritative lock.
+    #[must_use]
+    pub fn raster(&self, id: LayerId) -> Option<&LayerNode> {
+        match find_node(&self.root, LayerTreeNodeId::Raster(id))? {
+            LayerTreeNode::Raster(layer) => Some(layer),
+            LayerTreeNode::Group(_) => None,
+        }
+    }
+
+    /// Changes a raster lock without altering its pixels or composition.
+    ///
+    /// # Errors
+    /// Rejects unknown raster IDs without mutation.
+    pub fn set_locked(&mut self, id: LayerId, locked: bool) -> Result<(), LayerTreeError> {
+        let node = LayerTreeNodeId::Raster(id);
+        match find_node_mut(&mut self.root, node) {
+            Some(LayerTreeNode::Raster(layer)) => {
+                layer.locked = locked;
+                Ok(())
+            }
+            _ => Err(LayerTreeError::UnknownNode(node)),
+        }
+    }
+
+    /// Changes raster alpha protection without changing existing composition.
+    /// # Errors
+    /// Rejects unknown rasters atomically.
+    pub fn set_alpha_locked(
+        &mut self,
+        id: LayerId,
+        alpha_locked: bool,
+    ) -> Result<(), LayerTreeError> {
+        let node = LayerTreeNodeId::Raster(id);
+        match find_node_mut(&mut self.root, node) {
+            Some(LayerTreeNode::Raster(layer)) => {
+                layer.alpha_locked = alpha_locked;
+                Ok(())
+            }
+            _ => Err(LayerTreeError::UnknownNode(node)),
+        }
+    }
+
+    /// Changes same-parent clipping membership and invalidates ancestor composites.
+    /// No stored base ID is rebound; sibling order determines the current stack.
+    /// # Errors
+    /// Rejects the implicit root and unknown nodes without mutation.
+    pub fn set_clip_to_below(
+        &mut self,
+        node: LayerTreeNodeId,
+        value: bool,
+    ) -> Result<CompositeInvalidation, LayerTreeError> {
+        let ancestors = self.editable_ancestors(node)?;
+        let slot = match find_node_mut(&mut self.root, node) {
+            Some(LayerTreeNode::Raster(layer)) => &mut layer.clip_to_below,
+            Some(LayerTreeNode::Group(group)) => &mut group.clip_to_below,
+            None => return Err(LayerTreeError::UnknownNode(node)),
+        };
+        if *slot == value {
+            return Ok(CompositeInvalidation::empty());
+        }
+        *slot = value;
+        Ok(invalidate_all(ancestors))
+    }
+
+    /// Changes a raster/isolated group's backdrop blend mode.
+    /// # Errors
+    /// Rejects the implicit root and unknown nodes without mutation.
+    pub fn set_blend_mode(
+        &mut self,
+        node: LayerTreeNodeId,
+        value: LayerBlendMode,
+    ) -> Result<CompositeInvalidation, LayerTreeError> {
+        let ancestors = self.editable_ancestors(node)?;
+        let slot = match find_node_mut(&mut self.root, node) {
+            Some(LayerTreeNode::Raster(layer)) => &mut layer.blend_mode,
+            Some(LayerTreeNode::Group(group)) => &mut group.blend_mode,
+            None => return Err(LayerTreeError::UnknownNode(node)),
+        };
+        if *slot == value {
+            return Ok(CompositeInvalidation::empty());
+        }
+        *slot = value;
+        Ok(invalidate_all(ancestors))
+    }
+
     /// Changes a raster's selection/fill source membership without invalidating
     /// ordinary composition. The caller persists this metadata through history.
     ///
@@ -185,10 +314,14 @@ impl LayerTree {
     /// and tiles in history before publishing this candidate.
     ///
     /// # Errors
-    /// Rejects the implicit root or unknown IDs without changing the tree.
+    /// Rejects the implicit root, unknown IDs, or subtrees containing locked
+    /// rasters without changing the tree.
     pub fn remove(&mut self, node: LayerTreeNodeId) -> Result<LayerTreeNode, LayerTreeError> {
         if node == LayerTreeNodeId::Group(self.root.id) {
             return Err(LayerTreeError::CannotEditRoot);
+        }
+        if find_node(&self.root, node).is_some_and(contains_locked_raster) {
+            return Err(LayerTreeError::LockedNode(node));
         }
         remove_node(&mut self.root, node).ok_or(LayerTreeError::UnknownNode(node))
     }
@@ -200,6 +333,28 @@ impl LayerTree {
             return Some(Vec::new());
         }
         ancestors_in_group(&self.root, node)
+    }
+
+    /// Presentation-only visibility shared by the GPU and temporary picker.
+    /// Solo reveals its ancestor path without changing saved visibility; a Solo
+    /// group's descendants retain their own visibility, at every nesting depth.
+    #[must_use]
+    pub fn display_child_visible(
+        &self,
+        _parent: GroupId,
+        child: &LayerTreeNode,
+        solo: Option<LayerTreeNodeId>,
+    ) -> bool {
+        match solo {
+            None => match child {
+                LayerTreeNode::Raster(layer) => layer.visible,
+                LayerTreeNode::Group(group) => group.visible,
+            },
+            Some(target) => {
+                crate::composition_scope_nodes(self.root(), crate::CompositionScope::Solo(target))
+                    .contains(&child.id())
+            }
+        }
     }
 
     /// Scopes one raster tile edit to the exact coordinate in its ancestor
@@ -392,6 +547,25 @@ fn ancestors_in_group(group: &GroupNode, target: LayerTreeNodeId) -> Option<Vec<
     None
 }
 
+fn contains_locked_raster(node: &LayerTreeNode) -> bool {
+    match node {
+        LayerTreeNode::Raster(layer) => layer.locked,
+        LayerTreeNode::Group(group) => group.children.iter().any(contains_locked_raster),
+    }
+}
+
+fn find_node(group: &GroupNode, target: LayerTreeNodeId) -> Option<&LayerTreeNode> {
+    group.children.iter().find_map(|node| {
+        if node.id() == target {
+            Some(node)
+        } else if let LayerTreeNode::Group(group) = node {
+            find_node(group, target)
+        } else {
+            None
+        }
+    })
+}
+
 fn find_node_mut(group: &mut GroupNode, target: LayerTreeNodeId) -> Option<&mut LayerTreeNode> {
     for child in &mut group.children {
         if child.id() == target {
@@ -472,6 +646,9 @@ mod tests {
 
     fn raster(id: u128) -> LayerTreeNode {
         LayerTreeNode::Raster(LayerNode {
+            alpha_locked: false,
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: LayerId(id),
             name: format!("Layer {id}"),
             visible: true,
@@ -487,6 +664,8 @@ mod tests {
         // Product risk: moving a valid subtree must not create a tree that the
         // project decoder rejects on restart, or detach artwork on rejection.
         let group = |id, children| GroupNode {
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: GroupId(id),
             name: format!("Group {id}"),
             visible: true,
@@ -529,6 +708,8 @@ mod tests {
     #[test]
     fn insert_preserves_project_tree_identity_and_failure_atomicity() {
         let mut tree = LayerTree::new(GroupNode {
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: GroupId(100),
             name: "Root".into(),
             visible: true,
@@ -576,5 +757,86 @@ mod tests {
         tree.insert(GroupId(100), 1, removed)
             .expect("restore exact node");
         assert_eq!(tree, renamed);
+    }
+
+    #[test]
+    fn shading_metadata_invalidates_ancestors_without_breaking_root_or_clone_identity() {
+        // Product risk: stale parent caches change displayed/exported artwork,
+        // and invalid root metadata must not be accepted through any entry point.
+        let child = GroupNode {
+            id: GroupId(2),
+            name: "Group".into(),
+            visible: true,
+            opacity_u16: u16::MAX,
+            clip_to_below: false,
+            blend_mode: LayerBlendMode::Normal,
+            children: vec![raster(3)],
+        };
+        let mut tree = LayerTree::new(GroupNode {
+            id: GroupId(1),
+            name: "Root".into(),
+            visible: true,
+            opacity_u16: u16::MAX,
+            clip_to_below: false,
+            blend_mode: LayerBlendMode::Normal,
+            children: vec![LayerTreeNode::Group(child)],
+        })
+        .unwrap();
+        for (node, expected) in [
+            (
+                LayerTreeNodeId::Raster(LayerId(3)),
+                vec![GroupId(1), GroupId(2)],
+            ),
+            (LayerTreeNodeId::Group(GroupId(2)), vec![GroupId(1)]),
+        ] {
+            assert_eq!(
+                tree.set_clip_to_below(node, true)
+                    .unwrap()
+                    .all_tiles()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(tree.set_clip_to_below(node, true).unwrap().is_empty());
+            assert_eq!(
+                tree.set_blend_mode(node, LayerBlendMode::Multiply)
+                    .unwrap()
+                    .all_tiles()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(
+                tree.set_blend_mode(node, LayerBlendMode::Multiply)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        tree.set_alpha_locked(LayerId(3), true).unwrap();
+        tree.duplicate_raster(LayerId(3), LayerId(4)).unwrap();
+        let copy = tree.raster(LayerId(4)).unwrap();
+        assert!(copy.alpha_locked && copy.clip_to_below);
+        assert_eq!(copy.blend_mode, LayerBlendMode::Multiply);
+        let original = tree.clone();
+        for node in [
+            LayerTreeNodeId::Group(GroupId(1)),
+            LayerTreeNodeId::Raster(LayerId(99)),
+        ] {
+            assert!(tree.set_clip_to_below(node, true).is_err());
+            assert!(tree.set_blend_mode(node, LayerBlendMode::Multiply).is_err());
+            assert_eq!(tree, original);
+        }
+        assert!(tree.set_alpha_locked(LayerId(99), true).is_err());
+        assert_eq!(tree, original);
+        for mutate_clip in [false, true] {
+            let mut root = tree.root().clone();
+            if mutate_clip {
+                root.clip_to_below = true;
+            } else {
+                root.blend_mode = LayerBlendMode::Multiply;
+            }
+            assert_eq!(
+                LayerTree::new(root),
+                Err(LayerTreeError::InvalidRootProperties)
+            );
+        }
     }
 }

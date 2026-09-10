@@ -9,7 +9,8 @@
 
 use nyatidraw_input::{Point, StylusSample};
 
-pub const ROUND_BRUSH_ENGINE_VERSION: u32 = 1;
+pub const ROUND_BRUSH_ENGINE_VERSION: u32 = 2;
+pub const ROUND_BRUSH_PRESET_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BrushPresetId(pub u128);
@@ -27,6 +28,14 @@ pub struct BrushPreset {
     pub flow: f32,
     /// Dab spacing divided by the preset's full diameter.
     pub spacing_ratio: f32,
+    pub size_pressure: bool,
+    pub opacity_pressure: bool,
+    /// Minimum fraction of the full diameter when size pressure is enabled.
+    pub size_min_ratio: f32,
+    /// Minimum fraction of opacity when opacity pressure is enabled.
+    pub opacity_min_ratio: f32,
+    /// Opaque inner radius fraction. One preserves the legacy hard circle.
+    pub hardness: f32,
 }
 
 /// Immutable brush configuration captured when a stroke is sealed.
@@ -41,6 +50,7 @@ pub struct BrushDab {
     pub radius_px: f32,
     pub opacity: f32,
     pub flow: f32,
+    pub hardness: f32,
 }
 
 /// Metadata required to replay the same deterministic brush engine version.
@@ -67,6 +77,7 @@ pub enum RoundBrushReplayError {
     SampleCountMismatch,
     SampleSequenceMismatch,
     NonFiniteSample,
+    InvalidPreset,
 }
 
 pub trait BrushEvaluator {
@@ -82,7 +93,7 @@ pub trait BrushEvaluator {
     fn end(&mut self, token: Self::StrokeToken, out: &mut Vec<BrushDab>) -> RecordedStroke;
 }
 
-/// A round tip with square-root pressure-to-size and linear pressure-to-opacity.
+/// A round tip with independently switchable size/opacity pressure mappings.
 ///
 /// Every stroke begins with a dab, so a tap remains visible. Subsequent dabs are
 /// emitted on a fixed arc-length spacing calculated from the immutable preset.
@@ -185,12 +196,15 @@ pub fn replay_round_stroke(
     out: &mut Vec<BrushDab>,
 ) -> Result<(), RoundBrushReplayError> {
     let preset = snapshot.preset;
-    if preset.engine_version != ROUND_BRUSH_ENGINE_VERSION
-        || recorded.brush_engine_version != ROUND_BRUSH_ENGINE_VERSION
+    if !matches!(preset.engine_version, 1 | ROUND_BRUSH_ENGINE_VERSION)
+        || recorded.brush_engine_version != preset.engine_version
     {
         return Err(RoundBrushReplayError::UnsupportedEngineVersion(
             recorded.brush_engine_version,
         ));
+    }
+    if !valid_preset(&preset) {
+        return Err(RoundBrushReplayError::InvalidPreset);
     }
     if recorded.preset_id != preset.id || recorded.preset_schema_version != preset.schema_version {
         return Err(RoundBrushReplayError::PresetIdentityMismatch);
@@ -271,18 +285,74 @@ fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut 
 
 #[must_use]
 fn spacing_px(preset: &BrushPreset) -> f32 {
+    if !preset.size_px.is_finite() || !preset.spacing_ratio.is_finite() {
+        return 0.25;
+    }
     (preset.size_px.max(0.0) * preset.spacing_ratio.clamp(0.01, 4.0)).max(0.25)
 }
 
 #[must_use]
 fn dab_for(preset: &BrushPreset, sample: StylusSample) -> BrushDab {
-    let pressure = sample.pressure.clamp(0.0, 1.0);
+    let pressure = unit(sample.pressure);
+    let legacy = preset.engine_version == 1;
+    let size = if legacy {
+        pressure.sqrt()
+    } else {
+        pressure_factor(preset.size_pressure, preset.size_min_ratio, pressure.sqrt())
+    };
+    let opacity = if legacy {
+        pressure
+    } else {
+        pressure_factor(preset.opacity_pressure, preset.opacity_min_ratio, pressure)
+    };
     BrushDab {
         center: sample.position_document,
-        radius_px: preset.size_px.max(0.0) * pressure.sqrt() * 0.5,
-        opacity: preset.opacity.clamp(0.0, 1.0) * pressure,
-        flow: preset.flow.clamp(0.0, 1.0),
+        radius_px: if preset.size_px.is_finite() {
+            preset.size_px.max(0.0) * size * 0.5
+        } else {
+            0.0
+        },
+        opacity: unit(preset.opacity) * opacity,
+        flow: unit(preset.flow),
+        hardness: if legacy { 1.0 } else { unit(preset.hardness) },
     }
+}
+
+fn unit(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn pressure_factor(enabled: bool, minimum: f32, pressure: f32) -> f32 {
+    if enabled {
+        let minimum = unit(minimum);
+        minimum + (1.0 - minimum) * pressure
+    } else {
+        1.0
+    }
+}
+
+fn valid_preset(preset: &BrushPreset) -> bool {
+    [
+        preset.size_px,
+        preset.opacity,
+        preset.flow,
+        preset.spacing_ratio,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+        && (preset.engine_version == 1
+            || (preset.schema_version == ROUND_BRUSH_PRESET_SCHEMA_VERSION
+                && [
+                    preset.size_min_ratio,
+                    preset.opacity_min_ratio,
+                    preset.hardness,
+                ]
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))))
 }
 
 #[must_use]
@@ -356,12 +426,17 @@ mod tests {
     fn preset() -> BrushPreset {
         BrushPreset {
             id: BrushPresetId(7),
-            schema_version: 1,
+            schema_version: ROUND_BRUSH_PRESET_SCHEMA_VERSION,
             engine_version: ROUND_BRUSH_ENGINE_VERSION,
             size_px: 10.0,
             opacity: 0.8,
             flow: 0.5,
             spacing_ratio: 0.5,
+            size_pressure: true,
+            opacity_pressure: true,
+            size_min_ratio: 0.0,
+            opacity_min_ratio: 0.0,
+            hardness: 1.0,
         }
     }
 
@@ -398,5 +473,77 @@ mod tests {
         assert!(left_dabs[0].radius_px < left_dabs[4].radius_px);
         assert!(left_dabs[0].opacity < left_dabs[4].opacity);
         assert!((left_dabs[0].flow - left_dabs[4].flow).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn pressure_axes_and_legacy_replay_preserve_the_recorded_artwork() {
+        // Risk: disabling opacity pressure must not change size pressure, and
+        // opening a v1 stroke must never reinterpret its tip or pressure curve.
+        for (size_pressure, opacity_pressure, expected_radius, expected_opacity) in [
+            (false, false, 5.0, 0.8),
+            (true, false, 3.0, 0.8),
+            (false, true, 5.0, 0.5),
+            (true, true, 3.0, 0.5),
+        ] {
+            let configured = BrushPreset {
+                size_pressure,
+                opacity_pressure,
+                size_min_ratio: 0.2,
+                opacity_min_ratio: 0.5,
+                hardness: 0.3,
+                ..preset()
+            };
+            let dab = dab_for(&configured, sample(1, 0.0, 0.25));
+            assert!((dab.radius_px - expected_radius).abs() < 0.000_001);
+            assert!((dab.opacity - expected_opacity).abs() < 0.000_001);
+            let mut evaluator = RoundBrushEvaluator::default();
+            let mut dabs = Vec::new();
+            let samples = [sample(1, 0.0, 0.25), sample(2, 10.0, 1.0)];
+            let mut token = begin_round_stroke(&mut evaluator, &configured, samples[0], &mut dabs);
+            evaluator.push(&mut token, &samples[1..], &mut dabs);
+            let record = evaluator.end(token, &mut dabs);
+            let mut replay = Vec::new();
+            replay_round_stroke(
+                &BrushSnapshot { preset: configured },
+                &record,
+                &samples,
+                &mut replay,
+            )
+            .unwrap();
+            assert_eq!(dabs, replay);
+        }
+        let legacy = BrushPreset {
+            engine_version: 1,
+            schema_version: 1,
+            size_pressure: false,
+            opacity_pressure: false,
+            hardness: 0.0,
+            size_min_ratio: 0.9,
+            opacity_min_ratio: 0.9,
+            ..preset()
+        };
+        let dab = dab_for(&legacy, sample(1, 0.0, 0.25));
+        assert_eq!(
+            dab,
+            BrushDab {
+                center: Point { x: 0.0, y: 0.0 },
+                radius_px: 2.5,
+                opacity: 0.2,
+                flow: 0.5,
+                hardness: 1.0
+            }
+        );
+        for value in [f32::NAN, f32::INFINITY, -1.0, 2.0] {
+            let configured = BrushPreset {
+                size_min_ratio: value,
+                opacity_min_ratio: value,
+                hardness: value,
+                ..preset()
+            };
+            let dab = dab_for(&configured, sample(1, 0.0, value));
+            assert!(
+                dab.radius_px.is_finite() && dab.opacity.is_finite() && dab.hardness.is_finite()
+            );
+        }
     }
 }

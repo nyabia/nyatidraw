@@ -30,6 +30,7 @@ pub(crate) struct CanvasViewportSnapshot {
     pub(crate) pan: Point,
     pub(crate) zoom: f64,
     pub(crate) rotation_radians: f64,
+    pub(crate) mirrored_horizontal: bool,
     pub(crate) revision: u64,
     pub(crate) geometry_epoch: u64,
 }
@@ -65,6 +66,7 @@ impl CanvasViewportSnapshot {
             pan: Point { x: 0.0, y: 0.0 },
             zoom: 1.0,
             rotation_radians: 0.0,
+            mirrored_horizontal: false,
             revision: 0,
             geometry_epoch: 0,
         }
@@ -133,6 +135,7 @@ impl CanvasViewportSnapshot {
             pan: self.pan,
             zoom: self.zoom,
             rotation_radians: self.rotation_radians,
+            mirrored_horizontal: self.mirrored_horizontal,
         };
         transform.validate().ok()
     }
@@ -228,6 +231,9 @@ struct ExportMailbox {
     status: ExportStatus,
 }
 
+// Admission, edit pausing, clean-Begin recovery and temporary intent are
+// independent gates; combining them into one enum would hide valid overlaps.
+#[allow(clippy::struct_excessive_bools)]
 struct RawInputState {
     performance_batch_start: Option<std::time::Instant>,
     queue: InputQueue,
@@ -235,9 +241,11 @@ struct RawInputState {
     /// contains only transitions. The producer never waits for the consumer.
     pending_transitions: VecDeque<StylusSample>,
     transition_capacity: usize,
-    begin_layers: VecDeque<(u64, LayerId)>,
+    begin_layers: VecDeque<(u64, LayerId, bool)>,
     admission_layer: LayerId,
     admitted_active: bool,
+    admitted_temporary_picker: bool,
+    temporary_read_pending: Option<(u64, u64)>,
     edit_paused: bool,
     skipped_edit_gesture: bool,
     discontinuity: Option<InputDiscontinuity>,
@@ -265,6 +273,8 @@ pub(crate) struct AdmittedSample {
     /// The authoritative active layer observed when this Begin was admitted.
     /// Non-Begin samples intentionally carry no UI/editor state.
     pub(crate) begin_layer: Option<LayerId>,
+    /// Begin-only intent, ordered with the raw sample rather than UI commands.
+    pub(crate) temporary_picker: bool,
 }
 
 impl LiveInkBridge {
@@ -323,6 +333,8 @@ impl LiveInkBridge {
                     begin_layers: VecDeque::with_capacity(capacity.saturating_mul(2)),
                     admission_layer: initial_layer,
                     admitted_active: false,
+                    admitted_temporary_picker: false,
+                    temporary_read_pending: None,
                     edit_paused: false,
                     skipped_edit_gesture: false,
                     discontinuity: None,
@@ -359,6 +371,16 @@ impl LiveInkBridge {
 
     /// Enqueues one sample and reports whether the event loop needs one wake-up.
     pub(crate) fn push(&self, sample: StylusSample) -> Result<bool, PushError> {
+        self.push_with_temporary_picker(sample, false)
+    }
+
+    /// Native adapters sample their modifier state at Begin. Later modifier
+    /// release cannot reinterpret this gesture or leave a selected tool stuck.
+    pub(crate) fn push_with_temporary_picker(
+        &self,
+        sample: StylusSample,
+        temporary_picker: bool,
+    ) -> Result<bool, PushError> {
         let performance_start = crate::performance::start();
         let mut raw = self.raw_input();
         if self.is_closing() || self.inner.saving_as.load(Ordering::Acquire) {
@@ -377,7 +399,7 @@ impl LiveInkBridge {
             return Err(PushError::TransitionQueueFull);
         }
 
-        if raw.edit_paused {
+        if raw.edit_paused || raw.temporary_read_pending.is_some() {
             if sample.phase == PointerPhase::Begin {
                 raw.skipped_edit_gesture = true;
                 eprintln!(
@@ -423,10 +445,15 @@ impl LiveInkBridge {
         }
         if sample.phase == PointerPhase::Begin {
             raw.admitted_active = true;
+            raw.admitted_temporary_picker = temporary_picker;
             raw.begin_layers
-                .push_back((sample.sequence, admission_layer));
+                .push_back((sample.sequence, admission_layer, temporary_picker));
         } else if matches!(sample.phase, PointerPhase::End | PointerPhase::Cancel) {
             raw.admitted_active = false;
+            raw.temporary_read_pending = (sample.phase == PointerPhase::End
+                && raw.admitted_temporary_picker)
+                .then_some((sample.device_id, sample.sequence));
+            raw.admitted_temporary_picker = false;
         }
         drop(raw);
         Ok(self.request_redraw())
@@ -453,6 +480,19 @@ impl LiveInkBridge {
         self.raw_input().edit_paused = false;
     }
 
+    /// Separate from ordinary edit pauses: unrelated UI commands cannot release
+    /// a read-before-paint barrier established by the admitted temporary End.
+    pub(crate) fn complete_temporary_pick(&self, sequence: (u64, u64)) {
+        let mut raw = self.raw_input();
+        if raw.temporary_read_pending == Some(sequence) {
+            raw.temporary_read_pending = None;
+        }
+    }
+
+    pub(crate) fn temporary_pick_pending(&self) -> bool {
+        self.raw_input().temporary_read_pending.is_some()
+    }
+
     /// Enqueues one versioned semantic command. This bounded lane cannot carry
     /// raw input samples and is never touched per stylus sample by Dioxus.
     pub(crate) fn push_editor_command(
@@ -460,7 +500,7 @@ impl LiveInkBridge {
         based_on: Revision,
         command: EditorCommand,
     ) -> Result<CommandId, CanvasCommandQueueFull> {
-        if matches!(&command, EditorCommand::Edit(nyatidraw_api::EditCommand::SelectLasso { vertices }) if !(3..=4096).contains(&vertices.len()))
+        if matches!(&command, EditorCommand::Edit(nyatidraw_api::EditCommand::SelectLasso { vertices } | nyatidraw_api::EditCommand::CombineLasso { vertices, .. }) if !(3..=4096).contains(&vertices.len()))
         {
             return Err(CanvasCommandQueueFull);
         }
@@ -638,6 +678,8 @@ impl LiveInkBridge {
             raw.performance_batch_start = None;
             raw.discontinuity = None;
             raw.admitted_active = false;
+            raw.admitted_temporary_picker = false;
+            raw.temporary_read_pending = None;
             raw.edit_paused = false;
             raw.skipped_edit_gesture = false;
         }
@@ -952,6 +994,9 @@ impl LiveInkBridge {
     }
 
     pub(crate) fn queue_save_as(&self, path: std::path::PathBuf) -> Result<(), String> {
+        if self.protocol_snapshot().0.edit.transform.is_some() {
+            return Err("변형을 확정하거나 취소한 뒤 저장하세요.".into());
+        }
         let raw = self.raw_input();
         let commands = self
             .inner
@@ -1135,6 +1180,7 @@ impl LiveInkBridge {
             output.push(AdmittedSample {
                 queued,
                 begin_layer: None,
+                temporary_picker: false,
             });
         }
         while let Some(sample) = raw.pending_transitions.pop_front() {
@@ -1145,22 +1191,25 @@ impl LiveInkBridge {
                     sample,
                 },
                 begin_layer: None,
+                temporary_picker: false,
             });
         }
         for admitted in &mut output[first..] {
             if admitted.queued.sample.phase != PointerPhase::Begin {
                 continue;
             }
-            let Some((sequence, layer)) = raw.begin_layers.pop_front() else {
+            let Some((sequence, layer, temporary_picker)) = raw.begin_layers.pop_front() else {
                 debug_assert!(false, "every admitted Begin retains its admission layer");
                 continue;
             };
             debug_assert_eq!(sequence, admitted.queued.sample.sequence);
             admitted.begin_layer = Some(layer);
+            admitted.temporary_picker = temporary_picker;
         }
         let discontinuity = raw.discontinuity.take();
         if discontinuity.is_some() {
             raw.admitted_active = false;
+            raw.admitted_temporary_picker = false;
             raw.stats.discontinuities_acknowledged =
                 raw.stats.discontinuities_acknowledged.saturating_add(1);
         }
@@ -1213,6 +1262,7 @@ impl LiveInkBridge {
         pan: Point,
         zoom: f64,
         rotation_radians: f64,
+        mirrored_horizontal: bool,
         geometry_epoch: u64,
     ) -> Result<CanvasViewportSnapshot, CanvasViewportPublishError> {
         let mut viewport = self.canvas_viewport();
@@ -1227,6 +1277,7 @@ impl LiveInkBridge {
             pan,
             zoom,
             rotation_radians,
+            mirrored_horizontal,
         };
         if candidate.validate().is_err() {
             return Err(CanvasViewportPublishError::InvalidGeometry);
@@ -1234,12 +1285,14 @@ impl LiveInkBridge {
         let changed = viewport.origin_client_px.is_none()
             || viewport.pan != pan
             || viewport.zoom.to_bits() != zoom.to_bits()
-            || viewport.rotation_radians.to_bits() != rotation_radians.to_bits();
+            || viewport.rotation_radians.to_bits() != rotation_radians.to_bits()
+            || viewport.mirrored_horizontal != mirrored_horizontal;
         if changed {
             viewport.origin_client_px = Some(Point { x: 0.0, y: 0.0 });
             viewport.pan = pan;
             viewport.zoom = zoom;
             viewport.rotation_radians = rotation_radians;
+            viewport.mirrored_horizontal = mirrored_horizontal;
             viewport.revision = viewport.revision.wrapping_add(1);
         }
         Ok(*viewport)
@@ -1280,6 +1333,50 @@ impl LiveInkBridge {
 mod tests {
     use super::*;
     use nyatidraw_input::PenButtons;
+
+    #[test]
+    fn temporary_read_barrier_cannot_be_released_by_old_or_other_device_completion() {
+        // Product risk: an old cancelled picker or recorder-local sequence
+        // collision may let the next stroke paint before its sampled color.
+        let bridge = LiveInkBridge::with_capacity(8, LayerId(7));
+        let sample = |device, sequence, phase| StylusSample {
+            sequence,
+            device_id: device,
+            phase,
+            timestamp_ns: sequence,
+            position_document: Point { x: 1.0, y: 1.0 },
+            pressure: 1.0,
+            tilt: None,
+            twist_radians: None,
+            tangential_pressure: None,
+            buttons: PenButtons::default(),
+            eraser: false,
+            viewport_revision: 0,
+        };
+        bridge
+            .push_with_temporary_picker(sample(1, 1, PointerPhase::Begin), true)
+            .unwrap();
+        bridge.push(sample(1, 2, PointerPhase::Cancel)).unwrap();
+        bridge
+            .push_with_temporary_picker(sample(2, 1, PointerPhase::Begin), true)
+            .unwrap();
+        bridge.push(sample(2, 2, PointerPhase::End)).unwrap();
+        bridge.complete_temporary_pick((1, 2));
+        bridge.resume_after_edit();
+        assert!(bridge.push(sample(1, 3, PointerPhase::Begin)).is_err());
+        let mut admitted = Vec::new();
+        bridge.drain_into(&mut admitted);
+        assert_eq!(
+            admitted.len(),
+            4,
+            "all admitted transitions survive the barrier"
+        );
+        assert!(admitted[0].temporary_picker && admitted[2].temporary_picker);
+        assert!(!admitted[1].temporary_picker && !admitted[3].temporary_picker);
+        bridge.complete_temporary_pick((2, 2));
+        assert!(bridge.push(sample(1, 4, PointerPhase::Move)).is_err());
+        assert!(bridge.push(sample(1, 5, PointerPhase::Begin)).is_ok());
+    }
 
     #[test]
     fn native_navigation_preserves_delta_and_order_without_rebasing_ui_edits() {
@@ -1369,8 +1466,8 @@ mod tests {
         let pan = Point { x: 0.0, y: 0.0 };
         bridge.publish_canvas_surface(800, 600, 1.0);
         let old_epoch = bridge.canvas_viewport_snapshot().geometry_epoch;
-        bridge
-            .publish_renderer_view(pan, 1.0, 0.0, old_epoch)
+        let displayed = bridge
+            .publish_renderer_view(pan, 1.0, 0.0, false, old_epoch)
             .unwrap();
         assert!(
             bridge
@@ -1378,21 +1475,33 @@ mod tests {
                 .recorder_mapping()
                 .is_some()
         );
+        let mirrored = bridge
+            .publish_renderer_view(pan, 1.0, 0.0, true, old_epoch)
+            .unwrap();
+        assert_ne!(
+            mirrored.revision, displayed.revision,
+            "mirror changes input revision even when pan and zoom match"
+        );
+        let sample = mirrored
+            .recorder_mapping()
+            .unwrap()
+            .document_point(Point { x: 30.0, y: 20.0 });
+        assert_eq!(sample, Point { x: -30.0, y: 20.0 });
         bridge.publish_canvas_surface(1600, 900, 1.5);
         let resized = bridge.canvas_viewport_snapshot();
         assert!(resized.recorder_mapping().is_none());
         assert_eq!(
-            bridge.publish_renderer_view(pan, 2.0, 0.0, old_epoch),
+            bridge.publish_renderer_view(pan, 2.0, 0.0, false, old_epoch),
             Err(CanvasViewportPublishError::StaleGeometry)
         );
         assert_eq!(bridge.canvas_viewport_snapshot(), resized);
         bridge
-            .publish_renderer_view(pan, 1.0, 0.0, resized.geometry_epoch)
+            .publish_renderer_view(pan, 1.0, 0.0, false, resized.geometry_epoch)
             .unwrap();
         bridge.invalidate_canvas_viewport();
         let hidden = bridge.canvas_viewport_snapshot();
         assert_eq!(
-            bridge.publish_renderer_view(pan, 1.0, 0.0, resized.geometry_epoch),
+            bridge.publish_renderer_view(pan, 1.0, 0.0, false, resized.geometry_epoch),
             Err(CanvasViewportPublishError::StaleGeometry)
         );
         assert_eq!(bridge.canvas_viewport_snapshot(), hidden);

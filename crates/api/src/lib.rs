@@ -10,11 +10,12 @@ pub use dock::{
     DockNode, DockPosition, DockTree, PanelKind,
 };
 pub use protocol::{
-    CommandEnvelope, CommandRejectReason, DockCommand, DrawingTool, EditCommand, EditProjection,
-    EditSettings, EditSource, EditorCommand, EditorEvent, EventEnvelope,
-    HISTORY_PROJECTION_MAX_ENTRIES, HistoryBranchProjection, HistoryCommand,
-    HistoryEntryProjection, HistoryOperationLabel, HistoryProjection, LayerCommand,
-    LayerProjection, LayerProjectionKind, ProjectCommand, RasterTransform, ToolCommand,
+    AffineTransform, BrushSettings, CommandEnvelope, CommandRejectReason, DockCommand, DrawingTool,
+    EditCommand, EditProjection, EditSettings, EditSource, EditorCommand, EditorEvent,
+    EventEnvelope, FillSettings, HISTORY_PROJECTION_MAX_ENTRIES, HistoryBranchProjection,
+    HistoryCommand, HistoryEntryProjection, HistoryOperationLabel, HistoryProjection,
+    LayerBlendMode, LayerCommand, LayerProjection, LayerProjectionKind, ProjectCommand,
+    RasterTransform, SelectionMode, ToolCommand, TransformCommand, TransformProjection,
     UiProjection, ViewportCommand, ViewportProjection, WorkspaceProjection,
 };
 

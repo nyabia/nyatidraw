@@ -3,9 +3,14 @@ use std::{
     num::NonZeroU64,
 };
 
-use nyatidraw_api::{CompositeTileKey, GroupId, LayerId, LayerTreeNodeId, TileCoordinate};
+use nyatidraw_api::{
+    CompositeTileKey, GroupId, LayerBlendMode, LayerId, LayerTreeNodeId, TileCoordinate,
+};
 use nyatidraw_brush::BrushDab;
-use nyatidraw_document::{GroupNode, LayerTree, LayerTreeError, LayerTreeNode};
+use nyatidraw_document::{
+    CompositionScope, GroupNode, LayerTree, LayerTreeError, LayerTreeNode, composition_scope_nodes,
+    layer_stacks,
+};
 use nyatidraw_input::{Point, ViewportTransform, ViewportValidationError};
 use nyatidraw_tiles::{CompositeCache, TILE_BYTE_LEN, TILE_EDGE, TileKey};
 
@@ -18,6 +23,7 @@ const INITIAL_COMPOSITE_CHILD_CAPACITY: usize = 32;
 const UNIFORM_VALUE_BYTES: usize = 16;
 const WORKSPACE_TILE_UNIFORM_BYTES: usize = 64;
 const MAX_SPARSE_ATLAS_SLOTS: u32 = 2_048;
+const COMPOSITE_SCRATCH_BYTES: u64 = TILE_BYTE_LEN as u64 * 4;
 /// Explicit cap for the temporary full-document Sprint 3 texture strategy.
 pub const MAX_PERSISTENT_SCENE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -263,6 +269,35 @@ impl CompositeSurface {
     }
 }
 
+#[derive(Clone, Copy)]
+enum StackInput {
+    Page(LayerTreeNodeId),
+    Sparse(SparseSurfaceKey),
+    Scratch(usize),
+    Transparent,
+}
+struct StackPass {
+    input: StackInput,
+    backdrop: usize,
+    target: usize,
+    params: [u32; 4],
+}
+fn node_opacity(node: &LayerTreeNode) -> u16 {
+    match node {
+        LayerTreeNode::Raster(layer) => layer.opacity_u16,
+        LayerTreeNode::Group(group) => group.opacity_u16,
+    }
+}
+fn blend_operation(node: &LayerTreeNode) -> u32 {
+    let mode = match node {
+        LayerTreeNode::Raster(layer) => layer.blend_mode,
+        LayerTreeNode::Group(group) => group.blend_mode,
+    };
+    match mode {
+        LayerBlendMode::Normal => 0,
+        LayerBlendMode::Multiply => 1,
+    }
+}
 struct DynamicOpacityBuffer {
     buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -314,11 +349,14 @@ impl DynamicOpacityBuffer {
         );
     }
 
-    fn write(&self, queue: &wgpu::Queue, opacities: &[f32]) {
-        let mut bytes = vec![0_u8; self.stride.saturating_mul(opacities.len())];
-        for (index, opacity) in opacities.iter().enumerate() {
+    fn write(&self, queue: &wgpu::Queue, parameters: &[[u32; 4]]) {
+        let mut bytes = vec![0_u8; self.stride.saturating_mul(parameters.len())];
+        for (index, values) in parameters.iter().enumerate() {
             let start = index * self.stride;
-            bytes[start..start + size_of::<f32>()].copy_from_slice(&opacity.to_ne_bytes());
+            for (component, value) in values.iter().enumerate() {
+                bytes[start + component * 4..start + component * 4 + 4]
+                    .copy_from_slice(&value.to_ne_bytes());
+            }
         }
         if !bytes.is_empty() {
             queue.write_buffer(&self.buffer, 0, &bytes);
@@ -429,12 +467,18 @@ pub struct GpuCompositeScene {
     document_size: [u32; 2],
     tree: LayerTree,
     solo_node: Option<LayerTreeNodeId>,
+    solo_scope: Option<BTreeSet<LayerTreeNodeId>>,
     rasters: BTreeMap<LayerId, CompositeSurface>,
     groups: BTreeMap<GroupId, CompositeSurface>,
-    cache: CompositeCache<()>,
+    // A boundary coordinate has two different products: its page-clipped
+    // texture and its complete signed-atlas tile. Rebuilding one must never
+    // make the other look current. Sparse validity is bounded by atlas slots.
+    page_cache: CompositeCache<()>,
+    sparse_cache: CompositeCache<()>,
     source_layout: wgpu::BindGroupLayout,
     opacity_layout: wgpu::BindGroupLayout,
     composite_pipeline: wgpu::RenderPipeline,
+    composite_scratch: [CompositeSurface; 4],
     opacity: DynamicOpacityBuffer,
     viewport_pipeline: wgpu::RenderPipeline,
     selection_overlay: crate::selection::SelectionBinding,
@@ -492,7 +536,9 @@ impl GpuCompositeScene {
             .and_then(|size| size.checked_mul(u64::from(RGBA8_BYTES_PER_PIXEL)))
             .and_then(|size| size.checked_mul(u64::try_from(surfaces).ok()?))
             .unwrap_or(u64::MAX);
-        let required_bytes = page_bytes.saturating_add(TILE_BYTE_LEN as u64);
+        let required_bytes = page_bytes
+            .saturating_add(COMPOSITE_SCRATCH_BYTES)
+            .saturating_add(TILE_BYTE_LEN as u64);
         if required_bytes > MAX_PERSISTENT_SCENE_BYTES {
             return Err(CompositeRenderError::AllocationBudgetExceeded {
                 required_bytes,
@@ -501,8 +547,11 @@ impl GpuCompositeScene {
             });
         }
         Ok(self.sparse_atlas.slots.len().min(
-            usize::try_from((MAX_PERSISTENT_SCENE_BYTES - page_bytes) / TILE_BYTE_LEN as u64)
-                .unwrap_or(usize::MAX),
+            usize::try_from(
+                (MAX_PERSISTENT_SCENE_BYTES - page_bytes - COMPOSITE_SCRATCH_BYTES)
+                    / TILE_BYTE_LEN as u64,
+            )
+            .unwrap_or(usize::MAX),
         ))
     }
 
@@ -600,7 +649,8 @@ impl GpuCompositeScene {
         {
             self.solo_node = None;
         }
-        self.cache.clear();
+        self.page_cache.clear();
+        self.sparse_cache.clear();
         self.sparse_atlas.key_to_slot.clear();
         self.sparse_atlas
             .slots
@@ -645,7 +695,8 @@ impl GpuCompositeScene {
             .checked_mul(u64::from(document_size[1]))
             .and_then(|pixels| pixels.checked_mul(u64::from(RGBA8_BYTES_PER_PIXEL)))
             .and_then(|surface_bytes| surface_bytes.checked_mul(u64::try_from(surface_count).ok()?))
-            .unwrap_or(u64::MAX);
+            .unwrap_or(u64::MAX)
+            .saturating_add(COMPOSITE_SCRATCH_BYTES);
         if required_bytes > MAX_PERSISTENT_SCENE_BYTES {
             return Err(CompositeRenderError::AllocationBudgetExceeded {
                 required_bytes,
@@ -670,6 +721,18 @@ impl GpuCompositeScene {
         let source_layout = create_source_layout(device);
         let opacity_layout = create_opacity_layout(device);
         let composite_pipeline = create_composite_pipeline(device, &source_layout, &opacity_layout);
+        let composite_scratch = std::array::from_fn(|_| {
+            CompositeSurface::new(
+                create_document_texture(
+                    device,
+                    queue,
+                    [TILE_EDGE; 2],
+                    "nyatidraw-stack-composite-scratch",
+                ),
+                device,
+                &source_layout,
+            )
+        });
         let viewport_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("nayati-viewport-affine"),
             size: 48,
@@ -719,12 +782,15 @@ impl GpuCompositeScene {
             document_size,
             tree,
             solo_node: None,
+            solo_scope: None,
             rasters,
             groups,
-            cache: CompositeCache::default(),
+            page_cache: CompositeCache::default(),
+            sparse_cache: CompositeCache::default(),
             source_layout,
             opacity_layout,
             composite_pipeline,
+            composite_scratch,
             opacity,
             viewport_pipeline,
             selection_overlay,
@@ -771,7 +837,8 @@ impl GpuCompositeScene {
         }
         if self.solo_node != node {
             self.solo_node = node;
-            self.cache.clear();
+            self.page_cache.clear();
+            self.sparse_cache.clear();
         }
         Ok(())
     }
@@ -945,12 +1012,13 @@ impl GpuCompositeScene {
         self.validate_live_token(token)?;
         let mut batch_keys = signed_dab_keys(token.layer, dabs);
         if let Some([width, height]) = painter.selection.dimensions() {
+            let [left, top] = painter.selection.mask_origin().map(i64::from);
             batch_keys.retain(|key| {
                 let (x, y) = key.pixel_origin();
-                x < i64::from(width)
-                    && y < i64::from(height)
-                    && x + i64::from(TILE_EDGE) > 0
-                    && y + i64::from(TILE_EDGE) > 0
+                x < left + i64::from(width)
+                    && y < top + i64::from(height)
+                    && x + i64::from(TILE_EDGE) > left
+                    && y + i64::from(TILE_EDGE) > top
             });
         }
         if batch_keys.is_empty() {
@@ -1228,6 +1296,51 @@ impl GpuCompositeScene {
         tile.readback_rgba8(&self.device, &self.queue).map(Some)
     }
 
+    /// Diagnostic readback of an already rendered group tile, without page
+    /// checkerboard or workspace chrome. Boundary/signed coordinates use the
+    /// complete sparse product; fully in-page coordinates use the page product.
+    /// Never called by the input/render loop or used as durable artwork.
+    /// # Errors
+    /// Returns device-copy/mapping failures, or None for a nonresident product.
+    pub fn readback_resident_group_tile(
+        &self,
+        group: GroupId,
+        coordinate: TileCoordinate,
+    ) -> Result<Option<crate::Rgba8Readback>, crate::GpuReadbackError> {
+        if coordinate.mip != 0 {
+            return Ok(None);
+        }
+        if tile_requires_sparse(coordinate, self.document_size) {
+            return self
+                .sparse_atlas
+                .surface(SparseSurfaceKey::Group(CompositeTileKey {
+                    group,
+                    tile: coordinate,
+                }))
+                .map(|surface| surface.tile.readback_rgba8(&self.device, &self.queue))
+                .transpose();
+        }
+        let Some(surface) = self.groups.get(&group) else {
+            return Ok(None);
+        };
+        let Some((origin, extent)) = tile_region(coordinate, self.document_size) else {
+            return Ok(None);
+        };
+        GpuWorkingTile {
+            texture: surface.tile.texture.clone(),
+            view: surface.tile.view.clone(),
+            copy_origin: wgpu::Origin3d {
+                x: origin[0],
+                y: origin[1],
+                z: 0,
+            },
+            width: extent[0],
+            height: extent[1],
+        }
+        .readback_rgba8(&self.device, &self.queue)
+        .map(Some)
+    }
+
     fn validate_live_token(&self, token: LiveStrokeToken) -> Result<(), LiveStrokeError> {
         let Some(active) = &self.live_stroke else {
             return Err(LiveStrokeError::NoActiveStroke);
@@ -1464,7 +1577,8 @@ impl GpuCompositeScene {
         visible: bool,
     ) -> Result<(), LayerTreeError> {
         let invalidation = self.tree.set_visibility(node, visible)?;
-        self.cache.apply_invalidation(&invalidation);
+        self.page_cache.apply_invalidation(&invalidation);
+        self.sparse_cache.apply_invalidation(&invalidation);
         Ok(())
     }
 
@@ -1477,7 +1591,8 @@ impl GpuCompositeScene {
         opacity_u16: u16,
     ) -> Result<(), LayerTreeError> {
         let invalidation = self.tree.set_opacity(node, opacity_u16)?;
-        self.cache.apply_invalidation(&invalidation);
+        self.page_cache.apply_invalidation(&invalidation);
+        self.sparse_cache.apply_invalidation(&invalidation);
         Ok(())
     }
 
@@ -1499,7 +1614,8 @@ impl GpuCompositeScene {
         index: usize,
     ) -> Result<(), LayerTreeError> {
         let invalidation = self.tree.reorder(node, new_parent, index)?;
-        self.cache.apply_invalidation(&invalidation);
+        self.page_cache.apply_invalidation(&invalidation);
+        self.sparse_cache.apply_invalidation(&invalidation);
         Ok(())
     }
 
@@ -1541,7 +1657,8 @@ impl GpuCompositeScene {
                 self.groups.insert(id, surface);
             }
         }
-        self.cache.apply_invalidation(&invalidation);
+        self.page_cache.apply_invalidation(&invalidation);
+        self.sparse_cache.apply_invalidation(&invalidation);
         Ok(())
     }
 
@@ -1567,7 +1684,8 @@ impl GpuCompositeScene {
             .checked_mul(u64::from(self.document_size[1]))
             .and_then(|pixels| pixels.checked_mul(u64::from(RGBA8_BYTES_PER_PIXEL)))
             .and_then(|surface_bytes| surface_bytes.checked_mul(u64::try_from(surface_count).ok()?))
-            .unwrap_or(u64::MAX);
+            .unwrap_or(u64::MAX)
+            .saturating_add(COMPOSITE_SCRATCH_BYTES);
         if required_bytes > MAX_PERSISTENT_SCENE_BYTES {
             return Err(CompositeRenderError::AllocationBudgetExceeded {
                 required_bytes,
@@ -1611,14 +1729,16 @@ impl GpuCompositeScene {
     fn handle_sparse_eviction(&mut self, evicted: Option<SparseSurfaceKey>) -> Result<(), ()> {
         match evicted {
             Some(SparseSurfaceKey::Group(key)) => {
-                self.cache.remove(key);
+                self.sparse_cache.remove(key);
             }
             Some(SparseSurfaceKey::Raster(key)) => {
                 let invalidation = self
                     .tree
                     .invalidate_raster_tile(key.layer, key.coordinate())
                     .map_err(|_| ())?;
-                self.cache.apply_invalidation(&invalidation);
+                // Atlas residency loss does not invalidate an independently
+                // completed page texture at the same document coordinate.
+                self.sparse_cache.apply_invalidation(&invalidation);
             }
             Some(SparseSurfaceKey::LiveBackup(_)) | None => {}
         }
@@ -1763,31 +1883,41 @@ impl GpuCompositeScene {
         Ok(())
     }
 
-    fn sparse_group_has_content(&self, group: &GroupNode, coordinate: TileCoordinate) -> bool {
-        group
-            .children
-            .iter()
-            .filter(|child| render_child_visible(group.id, child, self.solo_node))
-            .any(|child| match child {
-                LayerTreeNode::Raster(layer) => {
-                    let key = TileKey {
-                        layer: layer.id,
-                        mip: 0,
-                        x: coordinate.x,
-                        y: coordinate.y,
-                    };
-                    self.sparse_closed_tiles.contains_key(&key)
-                        || self.sparse_preview_tiles.contains(&key)
-                        || self
-                            .live_stroke
-                            .as_ref()
-                            .is_some_and(|stroke| stroke.dirty_tiles.contains(&key))
-                }
-                LayerTreeNode::Group(child) => self.sparse_group_has_content(child, coordinate),
-            })
+    fn child_visible(&self, child: &LayerTreeNode) -> bool {
+        self.solo_scope.as_ref().map_or_else(
+            || match child {
+                LayerTreeNode::Raster(layer) => layer.visible,
+                LayerTreeNode::Group(group) => group.visible,
+            },
+            |scope| scope.contains(&child.id()),
+        )
     }
-
-    #[allow(clippy::too_many_lines)]
+    fn sparse_group_has_content(&self, group: &GroupNode, coordinate: TileCoordinate) -> bool {
+        layer_stacks(group).any(|stack| {
+            self.child_visible(stack.base)
+                && node_opacity(stack.base) != 0
+                && self.sparse_node_has_content(stack.base, coordinate)
+        })
+    }
+    fn sparse_node_has_content(&self, node: &LayerTreeNode, coordinate: TileCoordinate) -> bool {
+        match node {
+            LayerTreeNode::Raster(layer) => {
+                let key = TileKey {
+                    layer: layer.id,
+                    mip: 0,
+                    x: coordinate.x,
+                    y: coordinate.y,
+                };
+                self.sparse_closed_tiles.contains_key(&key)
+                    || self.sparse_preview_tiles.contains(&key)
+                    || self
+                        .live_stroke
+                        .as_ref()
+                        .is_some_and(|stroke| stroke.dirty_tiles.contains(&key))
+            }
+            LayerTreeNode::Group(group) => self.sparse_group_has_content(group, coordinate),
+        }
+    }
     fn ensure_sparse_group_tile(
         &mut self,
         group_id: GroupId,
@@ -1798,7 +1928,7 @@ impl GpuCompositeScene {
             group: group_id,
             tile: coordinate,
         };
-        if self.cache.get(key).is_some()
+        if self.sparse_cache.get(key).is_some()
             && self
                 .sparse_atlas
                 .surface_mut(SparseSurfaceKey::Group(key))
@@ -1810,54 +1940,38 @@ impl GpuCompositeScene {
             .cloned()
             .ok_or(CompositeRenderError::UnknownGroup(group_id))?;
         let mut rebuilt = 1_u64;
-        let mut visible = Vec::new();
-        for child in &group.children {
-            if !render_child_visible(group.id, child, self.solo_node) {
+        // Finish children before reusing the scratch targets for this parent.
+        for stack in layer_stacks(&group) {
+            if !self.child_visible(stack.base)
+                || node_opacity(stack.base) == 0
+                || !self.sparse_node_has_content(stack.base, coordinate)
+            {
                 continue;
             }
-            match child {
-                LayerTreeNode::Raster(layer) => {
-                    let tile_key = TileKey {
-                        layer: layer.id,
-                        mip: 0,
-                        x: coordinate.x,
-                        y: coordinate.y,
-                    };
-                    if self.sparse_closed_tiles.contains_key(&tile_key)
-                        || self.sparse_preview_tiles.contains(&tile_key)
-                        || self
-                            .live_stroke
-                            .as_ref()
-                            .is_some_and(|stroke| stroke.dirty_tiles.contains(&tile_key))
-                    {
-                        self.ensure_sparse_raster(tile_key, protected)
-                            .map_err(|()| CompositeRenderError::SparseAtlasExhausted)?;
-                        visible.push((
-                            SparseSurfaceKey::Raster(tile_key),
-                            opacity(layer.opacity_u16),
-                        ));
+            for child in std::iter::once(stack.base).chain(stack.clips.iter()) {
+                if !self.child_visible(child) || !self.sparse_node_has_content(child, coordinate) {
+                    continue;
+                }
+                match child {
+                    LayerTreeNode::Raster(layer) => self
+                        .ensure_sparse_raster(
+                            TileKey {
+                                layer: layer.id,
+                                mip: 0,
+                                x: coordinate.x,
+                                y: coordinate.y,
+                            },
+                            protected,
+                        )
+                        .map_err(|()| CompositeRenderError::SparseAtlasExhausted)?,
+                    LayerTreeNode::Group(group) => {
+                        rebuilt = rebuilt.saturating_add(
+                            self.ensure_sparse_group_tile(group.id, coordinate, protected)?,
+                        );
                     }
                 }
-                LayerTreeNode::Group(child_group)
-                    if self.sparse_group_has_content(child_group, coordinate) =>
-                {
-                    rebuilt = rebuilt.saturating_add(self.ensure_sparse_group_tile(
-                        child_group.id,
-                        coordinate,
-                        protected,
-                    )?);
-                    visible.push((
-                        SparseSurfaceKey::Group(CompositeTileKey {
-                            group: child_group.id,
-                            tile: coordinate,
-                        }),
-                        opacity(child_group.opacity_u16),
-                    ));
-                }
-                LayerTreeNode::Group(_) => {}
             }
         }
-
         let (_, evicted) = self
             .sparse_atlas
             .allocate(
@@ -1869,82 +1983,8 @@ impl GpuCompositeScene {
             .map_err(|()| CompositeRenderError::SparseAtlasExhausted)?;
         self.handle_sparse_eviction(evicted)
             .map_err(|()| CompositeRenderError::SparseAtlasExhausted)?;
-        let target = self
-            .sparse_atlas
-            .surface(SparseSurfaceKey::Group(key))
-            .ok_or(CompositeRenderError::SparseAtlasExhausted)?;
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target.tile.texture,
-                mip_level: 0,
-                origin: target.tile.copy_origin,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &self.zero_tile,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(TILE_EDGE * RGBA8_BYTES_PER_PIXEL),
-                rows_per_image: Some(TILE_EDGE),
-            },
-            wgpu::Extent3d {
-                width: TILE_EDGE,
-                height: TILE_EDGE,
-                depth_or_array_layers: 1,
-            },
-        );
-        if !visible.is_empty() {
-            self.opacity
-                .ensure_capacity(&self.device, &self.opacity_layout, visible.len());
-            self.opacity.write(
-                &self.queue,
-                &visible.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
-            );
-            let target_view = &self
-                .sparse_atlas
-                .surface(SparseSurfaceKey::Group(key))
-                .ok_or(CompositeRenderError::SparseAtlasExhausted)?
-                .tile
-                .view;
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("nayati-sparse-group-tile-composite"),
-                });
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("nayati-sparse-group-tile-composite-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: target_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                pass.set_pipeline(&self.composite_pipeline);
-                for (index, (source_key, _)) in visible.iter().enumerate() {
-                    let source = &self
-                        .sparse_atlas
-                        .surface(*source_key)
-                        .ok_or(CompositeRenderError::SparseAtlasExhausted)?
-                        .source_bind_group;
-                    pass.set_bind_group(0, source, &[]);
-                    pass.set_bind_group(
-                        1,
-                        &self.opacity.bind_group,
-                        &[self.opacity.dynamic_offset(index)?],
-                    );
-                    pass.draw(0..3, 0..1);
-                }
-            }
-            self.queue.submit([encoder.finish()]);
-        }
-        self.cache.insert(key, ());
+        self.composite_stack_tile(&group, coordinate, true)?;
+        self.sparse_cache.insert(key, ());
         Ok(rebuilt)
     }
 
@@ -1969,6 +2009,9 @@ impl GpuCompositeScene {
             .map_err(CompositeRenderError::InvalidViewport)?;
         self.ensure_display(viewport.physical_size);
 
+        self.solo_scope = self
+            .solo_node
+            .map(|node| composition_scope_nodes(self.tree.root(), CompositionScope::Solo(node)));
         let mut stats = CompositeRenderStats::default();
         for coordinate in visible_tile_coordinates(viewport, self.document_size) {
             stats.group_tiles_rebuilt = stats
@@ -2119,7 +2162,10 @@ impl GpuCompositeScene {
         }
         self.queue.submit([encoder.finish()]);
         stats.display_passes = stats.display_passes.saturating_add(1);
-        stats.cache_entries = self.cache.len();
+        stats.cache_entries = self
+            .page_cache
+            .len()
+            .saturating_add(self.sparse_cache.len());
         Ok(stats)
     }
 
@@ -2132,7 +2178,8 @@ impl GpuCompositeScene {
             .tree
             .invalidate_raster_tile(layer, coordinate)
             .map_err(LayerUploadError::LayerTree)?;
-        self.cache.apply_invalidation(&invalidation);
+        self.page_cache.apply_invalidation(&invalidation);
+        self.sparse_cache.apply_invalidation(&invalidation);
         Ok(())
     }
 
@@ -2151,7 +2198,6 @@ impl GpuCompositeScene {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn ensure_group_tile(
         &mut self,
         group_id: GroupId,
@@ -2161,134 +2207,247 @@ impl GpuCompositeScene {
             group: group_id,
             tile: coordinate,
         };
-        if self.cache.get(key).is_some() {
+        if self.page_cache.get(key).is_some() {
             return Ok(0);
         }
         let group = find_group(self.tree.root(), group_id)
             .cloned()
             .ok_or(CompositeRenderError::UnknownGroup(group_id))?;
         let mut rebuilt = 1_u64;
-        for child in &group.children {
-            if let LayerTreeNode::Group(child_group) = child
-                && render_child_visible(group.id, child, self.solo_node)
-            {
-                rebuilt =
-                    rebuilt.saturating_add(self.ensure_group_tile(child_group.id, coordinate)?);
+        for stack in layer_stacks(&group) {
+            if !self.child_visible(stack.base) || node_opacity(stack.base) == 0 {
+                continue;
             }
-        }
-
-        let visible: Vec<_> = group
-            .children
-            .iter()
-            .filter(|child| render_child_visible(group.id, child, self.solo_node))
-            .map(|child| match child {
-                LayerTreeNode::Raster(layer) => (
-                    LayerTreeNodeId::Raster(layer.id),
-                    opacity(layer.opacity_u16),
-                ),
-                LayerTreeNode::Group(child_group) => (
-                    LayerTreeNodeId::Group(child_group.id),
-                    opacity(child_group.opacity_u16),
-                ),
-            })
-            .collect();
-        self.opacity
-            .ensure_capacity(&self.device, &self.opacity_layout, visible.len());
-        self.opacity.write(
-            &self.queue,
-            &visible.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
-        );
-        self.clear_group_tile(group_id, coordinate)?;
-
-        if !visible.is_empty() {
-            let target = self
-                .groups
-                .get(&group_id)
-                .ok_or(CompositeRenderError::UnknownGroup(group_id))?;
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("nayati-group-tile-composite"),
-                });
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("nayati-group-tile-composite-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &target.tile.view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                let (origin, extent) = tile_region(coordinate, self.document_size)
-                    .ok_or(CompositeRenderError::InvalidDocumentSize)?;
-                pass.set_scissor_rect(origin[0], origin[1], extent[0], extent[1]);
-                pass.set_pipeline(&self.composite_pipeline);
-                for (index, (node, _)) in visible.iter().enumerate() {
-                    let source = match node {
-                        LayerTreeNodeId::Raster(layer) => {
-                            &self
-                                .rasters
-                                .get(layer)
-                                .ok_or(CompositeRenderError::MissingRaster(*layer))?
-                                .source_bind_group
-                        }
-                        LayerTreeNodeId::Group(group) => {
-                            &self
-                                .groups
-                                .get(group)
-                                .ok_or(CompositeRenderError::UnknownGroup(*group))?
-                                .source_bind_group
-                        }
-                    };
-                    pass.set_bind_group(0, source, &[]);
-                    pass.set_bind_group(
-                        1,
-                        &self.opacity.bind_group,
-                        &[self.opacity.dynamic_offset(index)?],
-                    );
-                    pass.draw(0..3, 0..1);
+            for child in std::iter::once(stack.base).chain(stack.clips.iter()) {
+                if self.child_visible(child)
+                    && let LayerTreeNode::Group(group) = child
+                {
+                    rebuilt = rebuilt.saturating_add(self.ensure_group_tile(group.id, coordinate)?);
                 }
             }
-            self.queue.submit([encoder.finish()]);
         }
-        self.cache.insert(key, ());
+        self.composite_stack_tile(&group, coordinate, false)?;
+        self.page_cache.insert(key, ());
         Ok(rebuilt)
     }
-
-    fn clear_group_tile(
+    fn stack_input(
         &self,
-        group: GroupId,
+        node: &LayerTreeNode,
         coordinate: TileCoordinate,
+        sparse: bool,
+    ) -> StackInput {
+        if !sparse {
+            return StackInput::Page(node.id());
+        }
+        let key = match node {
+            LayerTreeNode::Raster(layer) => SparseSurfaceKey::Raster(TileKey {
+                layer: layer.id,
+                mip: 0,
+                x: coordinate.x,
+                y: coordinate.y,
+            }),
+            LayerTreeNode::Group(group) => SparseSurfaceKey::Group(CompositeTileKey {
+                group: group.id,
+                tile: coordinate,
+            }),
+        };
+        if self.sparse_atlas.surface(key).is_some()
+            && self.sparse_node_has_content(node, coordinate)
+        {
+            StackInput::Sparse(key)
+        } else {
+            StackInput::Transparent
+        }
+    }
+    fn stack_source(&self, input: StackInput) -> Result<&wgpu::BindGroup, CompositeRenderError> {
+        match input {
+            StackInput::Page(LayerTreeNodeId::Raster(id)) => self
+                .rasters
+                .get(&id)
+                .map(|surface| &surface.source_bind_group)
+                .ok_or(CompositeRenderError::MissingRaster(id)),
+            StackInput::Page(LayerTreeNodeId::Group(id)) => self
+                .groups
+                .get(&id)
+                .map(|surface| &surface.source_bind_group)
+                .ok_or(CompositeRenderError::UnknownGroup(id)),
+            StackInput::Sparse(key) => self
+                .sparse_atlas
+                .surface(key)
+                .map(|surface| &surface.source_bind_group)
+                .ok_or(CompositeRenderError::SparseAtlasExhausted),
+            StackInput::Scratch(index) => Ok(&self.composite_scratch[index].source_bind_group),
+            StackInput::Transparent => Ok(&self.composite_scratch[0].source_bind_group),
+        }
+    }
+    #[allow(clippy::too_many_lines)]
+    fn composite_stack_tile(
+        &mut self,
+        group: &GroupNode,
+        coordinate: TileCoordinate,
+        sparse: bool,
     ) -> Result<(), CompositeRenderError> {
-        let target = self
-            .groups
-            .get(&group)
-            .ok_or(CompositeRenderError::UnknownGroup(group))?;
-        let (origin, extent) = tile_region(coordinate, self.document_size)
-            .ok_or(CompositeRenderError::InvalidDocumentSize)?;
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target.tile.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
+        let origin = if sparse {
+            [0, 0]
+        } else {
+            tile_region(coordinate, self.document_size)
+                .ok_or(CompositeRenderError::InvalidDocumentSize)?
+                .0
+        };
+        let mut passes = Vec::new();
+        let mut accumulated = 0;
+        // Membership is resolved on original siblings before visibility.
+        for stack in layer_stacks(group) {
+            if !self.child_visible(stack.base) || node_opacity(stack.base) == 0 {
+                continue;
+            }
+            let input = self.stack_input(stack.base, coordinate, sparse);
+            if matches!(input, StackInput::Transparent) {
+                continue;
+            }
+            passes.push(StackPass {
+                input,
+                backdrop: 3,
+                target: 2,
+                params: [65535, 4, origin[0], origin[1]],
+            });
+            let mut current_stack = 2;
+            for clip in stack.clips {
+                if !self.child_visible(clip) || node_opacity(clip) == 0 {
+                    continue;
+                }
+                let input = self.stack_input(clip, coordinate, sparse);
+                if matches!(input, StackInput::Transparent) {
+                    continue;
+                }
+                let next = 5 - current_stack;
+                passes.push(StackPass {
+                    input,
+                    backdrop: current_stack,
+                    target: next,
+                    params: [
+                        u32::from(node_opacity(clip)),
+                        blend_operation(clip) + 2,
+                        origin[0],
+                        origin[1],
+                    ],
+                });
+                current_stack = next;
+            }
+            let next = 1 - accumulated;
+            passes.push(StackPass {
+                input: StackInput::Scratch(current_stack),
+                backdrop: accumulated,
+                target: next,
+                params: [
+                    u32::from(node_opacity(stack.base)),
+                    blend_operation(stack.base),
+                    0,
+                    0,
+                ],
+            });
+            accumulated = next;
+        }
+        self.opacity
+            .ensure_capacity(&self.device, &self.opacity_layout, passes.len());
+        self.opacity.write(
+            &self.queue,
+            &passes.iter().map(|pass| pass.params).collect::<Vec<_>>(),
+        );
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("nyatidraw-isolated-clipping-stack-tile"),
+            });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("nyatidraw-stack-clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.composite_scratch[0].tile.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+        for (index, operation) in passes.iter().enumerate() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("nyatidraw-stack-integer-composite"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.composite_scratch[operation.target].tile.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.composite_pipeline);
+            pass.set_bind_group(0, self.stack_source(operation.input)?, &[]);
+            pass.set_bind_group(
+                1,
+                &self.composite_scratch[operation.backdrop].source_bind_group,
+                &[],
+            );
+            pass.set_bind_group(
+                2,
+                &self.opacity.bind_group,
+                &[self.opacity.dynamic_offset(index)?],
+            );
+            pass.draw(0..3, 0..1);
+        }
+        let (target, destination, extent) = if sparse {
+            let target = self
+                .sparse_atlas
+                .surface(SparseSurfaceKey::Group(CompositeTileKey {
+                    group: group.id,
+                    tile: coordinate,
+                }))
+                .ok_or(CompositeRenderError::SparseAtlasExhausted)?;
+            (
+                &target.tile.texture,
+                target.tile.copy_origin,
+                [TILE_EDGE; 2],
+            )
+        } else {
+            let surface = self
+                .groups
+                .get(&group.id)
+                .ok_or(CompositeRenderError::UnknownGroup(group.id))?;
+            let (origin, extent) = tile_region(coordinate, self.document_size)
+                .ok_or(CompositeRenderError::InvalidDocumentSize)?;
+            (
+                &surface.tile.texture,
+                wgpu::Origin3d {
                     x: origin[0],
                     y: origin[1],
                     z: 0,
                 },
+                extent,
+            )
+        };
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.composite_scratch[accumulated].tile.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &self.zero_tile,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(TILE_EDGE * RGBA8_BYTES_PER_PIXEL),
-                rows_per_image: Some(TILE_EDGE),
+            wgpu::TexelCopyTextureInfo {
+                texture: target,
+                mip_level: 0,
+                origin: destination,
+                aspect: wgpu::TextureAspect::All,
             },
             wgpu::Extent3d {
                 width: extent[0],
@@ -2296,10 +2455,10 @@ impl GpuCompositeScene {
                 depth_or_array_layers: 1,
             },
         );
+        self.queue.submit([encoder.finish()]);
         Ok(())
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn write_viewport_uniform(
         &self,
         viewport: ViewportTransform,
@@ -2358,11 +2517,11 @@ fn create_composite_pipeline(
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("nayati-composite-shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("composite.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(include_str!("stack_composite.wgsl").into()),
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("nayati-composite-pipeline-layout"),
-        bind_group_layouts: &[source_layout, opacity_layout],
+        bind_group_layouts: &[source_layout, source_layout, opacity_layout],
         push_constant_ranges: &[],
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2383,18 +2542,7 @@ fn create_composite_pipeline(
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: WORKING_TEXTURE_FORMAT,
-                blend: Some(wgpu::BlendState {
-                    color: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                    alpha: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                }),
+                blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -2676,39 +2824,6 @@ fn find_group(group: &GroupNode, id: GroupId) -> Option<&GroupNode> {
         LayerTreeNode::Raster(_) => None,
         LayerTreeNode::Group(child_group) => find_group(child_group, id),
     })
-}
-
-fn render_child_visible(
-    group: GroupId,
-    child: &LayerTreeNode,
-    solo: Option<LayerTreeNodeId>,
-) -> bool {
-    let durably_visible = match child {
-        LayerTreeNode::Raster(layer) => layer.visible,
-        LayerTreeNode::Group(group) => group.visible,
-    };
-    match solo {
-        None => durably_visible,
-        Some(LayerTreeNodeId::Group(solo_group)) if solo_group == group => durably_visible,
-        Some(target) => node_contains(child, target),
-    }
-}
-
-fn node_contains(node: &LayerTreeNode, target: LayerTreeNodeId) -> bool {
-    if node.id() == target {
-        return true;
-    }
-    match node {
-        LayerTreeNode::Raster(_) => false,
-        LayerTreeNode::Group(group) => group
-            .children
-            .iter()
-            .any(|child| node_contains(child, target)),
-    }
-}
-
-fn opacity(value: u16) -> f32 {
-    f32::from(value) / f32::from(u16::MAX)
 }
 
 fn tile_region(

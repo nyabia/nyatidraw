@@ -28,11 +28,12 @@ use windows::{
             DestroyWindow, GWLP_USERDATA, GetClientRect, GetMessagePos, GetMessageTime, GetParent,
             GetWindowLongPtrW, HWND_BOTTOM, IDC_ARROW, LoadCursorW, MSG, PostMessageW,
             RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer, SetWindowLongPtrW,
-            SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE,
-            WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-            WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-            WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SIZE,
-            WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+            SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED,
+            WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+            WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+            WM_NCDESTROY, WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP,
+            WM_POINTERUPDATE, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
+            WS_CLIPSIBLINGS, WS_VISIBLE,
         },
     },
     core::w,
@@ -51,6 +52,7 @@ const WM_NAYATI_REDRAW: u32 = WM_APP + 0x4e1;
 const WM_NAYATI_CLOSE: u32 = WM_APP + 0x4e3;
 const WM_NAYATI_REOPEN: u32 = WM_APP + 0x4e4;
 const WM_NAYATI_SAVE_AS: u32 = WM_APP + 0x4e5;
+const WM_NAYATI_CANCEL_INPUT: u32 = WM_APP + 0x4e6;
 const CLOSE_SUBCLASS: usize = 0x4e59;
 const CLOSE_TIMER: usize = 0x4e59;
 
@@ -311,6 +313,18 @@ unsafe extern "system" fn close_wnd_proc(
     }
     // SAFETY: only this parent subclass owns data, until WM_NCDESTROY above.
     let state = unsafe { &*(data as *const CloseWindowState) };
+    if message == WM_ACTIVATEAPP && wparam.0 == 0 {
+        // Parent deactivation is not reliably delivered as child focus loss.
+        // Post instead of reentering the child while parent state is borrowed.
+        let _ = unsafe {
+            PostMessageW(
+                Some(state.child),
+                WM_NAYATI_CANCEL_INPUT,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+    }
     if message == WM_CLOSE && state.live_ink.close_status() != CloseStatus::Ready {
         if state.live_ink.begin_close() {
             let _ =
@@ -584,7 +598,10 @@ unsafe extern "system" fn canvas_wnd_proc(
 
     // SAFETY: the pointer was installed at WM_NCCREATE and remains owned by
     // this HWND until WM_NCDESTROY.
-    if message == WM_NAYATI_CLOSE {
+    if matches!(
+        message,
+        WM_NAYATI_CLOSE | WM_NAYATI_CANCEL_INPUT | WM_KILLFOCUS
+    ) {
         // The web visual is above the canvas now, so keep its last frame
         // visible behind the close dialog. Release only our capture, before
         // borrowing state because the API can synchronously reenter here.
@@ -595,6 +612,14 @@ unsafe extern "system" fn canvas_wnd_proc(
     let state = unsafe { canvas_state(hwnd) };
     if let Some(state) = state {
         match message {
+            WM_NAYATI_CANCEL_INPUT | WM_KILLFOCUS => {
+                let timestamp = current_message(hwnd, message, wparam, lparam).time;
+                state.viewport.drag = None;
+                state.mouse.capture_lost(timestamp);
+                state.pen.cancel_active(timestamp);
+                state.live_ink.request_redraw();
+                return LRESULT(0);
+            }
             WM_NAYATI_CLOSE => {
                 state.begin_close(hwnd);
                 return LRESULT(0);
@@ -737,6 +762,60 @@ impl WindowsViewportInput {
         match message.message {
             WM_KEYDOWN => {
                 let command = match message.wParam.0 {
+                    0x0d if self.live_ink.protocol_snapshot().0.edit.transform.is_some() => self
+                        .live_ink
+                        .protocol_snapshot()
+                        .0
+                        .edit
+                        .transform
+                        .map(|transform| {
+                            nyatidraw_api::EditorCommand::Edit(
+                                nyatidraw_api::EditCommand::FreeTransform(
+                                    nyatidraw_api::TransformCommand::Commit {
+                                        generation: transform.generation,
+                                    },
+                                ),
+                            )
+                        }),
+                    0x41 if control_is_down() => Some(nyatidraw_api::EditorCommand::Edit(
+                        nyatidraw_api::EditCommand::SelectAll,
+                    )),
+                    0x44 if control_is_down() => Some(nyatidraw_api::EditorCommand::Edit(
+                        nyatidraw_api::EditCommand::ClearSelection,
+                    )),
+                    0x49 if control_is_down() && shift_is_down() => {
+                        Some(nyatidraw_api::EditorCommand::Edit(
+                            nyatidraw_api::EditCommand::InvertSelection,
+                        ))
+                    }
+                    0x2E if !control_is_down() => Some(nyatidraw_api::EditorCommand::Edit(
+                        nyatidraw_api::EditCommand::DeleteSelectedPixels,
+                    )),
+                    0x43 if control_is_down() => Some(nyatidraw_api::EditorCommand::Edit(
+                        nyatidraw_api::EditCommand::CopySelection,
+                    )),
+                    0x58 if control_is_down() => Some(nyatidraw_api::EditorCommand::Edit(
+                        nyatidraw_api::EditCommand::CutSelection,
+                    )),
+                    0x56 if control_is_down() => Some(nyatidraw_api::EditorCommand::Edit(
+                        nyatidraw_api::EditCommand::PasteSelection,
+                    )),
+                    0xDB if !control_is_down() && !shift_is_down() => {
+                        Some(nyatidraw_api::EditorCommand::Tool(
+                            nyatidraw_api::ToolCommand::AdjustSizeSteps {
+                                tool: self.live_ink.protocol_snapshot().0.drawing_tool,
+                                steps: -1,
+                            },
+                        ))
+                    }
+                    0xDD if !control_is_down() && !shift_is_down() => {
+                        Some(nyatidraw_api::EditorCommand::Tool(
+                            nyatidraw_api::ToolCommand::AdjustSizeSteps {
+                                tool: self.live_ink.protocol_snapshot().0.drawing_tool,
+                                steps: 1,
+                            },
+                        ))
+                    }
                     0x1b => Some(nyatidraw_api::EditorCommand::Tool(
                         nyatidraw_api::ToolCommand::CancelGesture,
                     )),
@@ -751,6 +830,12 @@ impl WindowsViewportInput {
                     )),
                     0x46 => Some(nyatidraw_api::EditorCommand::Tool(
                         nyatidraw_api::ToolCommand::CycleFillFamily,
+                    )),
+                    0x49 => Some(nyatidraw_api::EditorCommand::Tool(
+                        nyatidraw_api::ToolCommand::Select(nyatidraw_api::DrawingTool::Eyedropper),
+                    )),
+                    0x58 => Some(nyatidraw_api::EditorCommand::Tool(
+                        nyatidraw_api::ToolCommand::SwapColors,
                     )),
                     0x53 => Some(nyatidraw_api::EditorCommand::Project(
                         nyatidraw_api::ProjectCommand::Save,
@@ -776,13 +861,17 @@ impl WindowsViewportInput {
                 });
                 true
             }
-            WM_LBUTTONDOWN if self.live_ink.navigation_tool() || space_is_down() => {
+            WM_LBUTTONDOWN
+                if space_is_down() || (self.live_ink.navigation_tool() && !alt_is_down()) =>
+            {
                 self.drag = Some(ViewportDrag {
                     last_client_px: client_point(message.lParam),
                 });
                 true
             }
-            WM_POINTERDOWN if self.live_ink.navigation_tool() || space_is_down() => {
+            WM_POINTERDOWN
+                if space_is_down() || (self.live_ink.navigation_tool() && !alt_is_down()) =>
+            {
                 self.drag = Some(ViewportDrag {
                     last_client_px: screen_message_point(hwnd, message.lParam),
                 });
@@ -920,6 +1009,17 @@ fn space_is_down() -> bool {
 fn shift_is_down() -> bool {
     // SAFETY: GetKeyState reads thread input state and has no pointer contract.
     unsafe { GetKeyState(0x10) < 0 }
+}
+
+fn control_is_down() -> bool {
+    // SAFETY: querying process-independent virtual-key state has no pointers.
+    unsafe { GetKeyState(0x11) < 0 }
+}
+
+fn alt_is_down() -> bool {
+    // Read current native thread state, not a latched DOM modifier: Alt release
+    // outside the canvas/window cannot leave the temporary picker enabled.
+    unsafe { GetKeyState(0x12) < 0 }
 }
 
 fn screen_message_point(hwnd: HWND, lparam: LPARAM) -> [i32; 2] {
@@ -1200,6 +1300,7 @@ impl CanvasSurfaceRenderer {
                 viewport.pan,
                 viewport.zoom,
                 viewport.rotation_radians,
+                viewport.mirrored_horizontal,
                 display.geometry_epoch,
             );
         }
@@ -1576,7 +1677,12 @@ impl WindowsMouseInput {
             viewport_revision,
         };
         self.next_sequence = self.next_sequence.wrapping_add(1);
-        self.live_ink.push(sample).is_ok()
+        self.live_ink
+            .push_with_temporary_picker(
+                sample,
+                phase == nyatidraw_input::PointerPhase::Begin && alt_is_down(),
+            )
+            .is_ok()
     }
 }
 
@@ -1585,6 +1691,7 @@ struct WindowsPenInput {
     batch: nyatidraw_input_platform::WindowsPenMessageBuffer,
     policy: nyatidraw_input::InStrokeViewportPolicy,
     live_ink: LiveInkBridge,
+    active_pointer: Option<u32>,
 }
 
 impl WindowsPenInput {
@@ -1596,10 +1703,16 @@ impl WindowsPenInput {
             batch: nyatidraw_input_platform::WindowsPenMessageBuffer::default(),
             policy: nyatidraw_input::InStrokeViewportPolicy::default(),
             live_ink,
+            active_pointer: None,
         }
     }
 
     fn observe(&mut self, message: &MSG) -> bool {
+        if message.message == WM_POINTERDOWN {
+            self.active_pointer = u32::try_from(message.wParam.0 & 0xffff).ok();
+        } else if matches!(message.message, WM_POINTERUP | WM_POINTERCAPTURECHANGED) {
+            self.active_pointer = None;
+        }
         let viewport = self.live_ink.canvas_viewport_snapshot();
         let mapping = viewport.recorder_mapping();
         if let Some(mapping) = mapping
@@ -1624,6 +1737,15 @@ impl WindowsPenInput {
         })
     }
 
+    fn cancel_active(&mut self, timestamp_ms: u32) {
+        if let Some(pointer) = self.active_pointer.take()
+            && let Some(record) = self.recorder.cancel_active(pointer, timestamp_ms)
+        {
+            let viewport = self.live_ink.canvas_viewport_snapshot();
+            self.admit(record, viewport, false);
+        }
+    }
+
     fn admit(
         &mut self,
         recorded: nyatidraw_input_platform::RecordedStylusEvent,
@@ -1646,6 +1768,11 @@ impl WindowsPenInput {
         {
             return false;
         }
-        self.live_ink.push(recorded.sample).is_ok()
+        self.live_ink
+            .push_with_temporary_picker(
+                recorded.sample,
+                recorded.sample.phase == nyatidraw_input::PointerPhase::Begin && alt_is_down(),
+            )
+            .is_ok()
     }
 }

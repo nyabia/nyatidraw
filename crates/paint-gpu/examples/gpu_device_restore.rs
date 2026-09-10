@@ -114,5 +114,6 @@ fn dab(x: f64, y: f64, radius_px: f32, opacity: f32, flow: f32) -> BrushDab {
         radius_px,
         opacity,
         flow,
+        hardness: 1.0,
     }
 }

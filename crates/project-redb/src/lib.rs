@@ -25,14 +25,16 @@ use nyatidraw_api::{CanvasSpec, ContentRootId, HistoryNodeId, SnapshotId};
 use nyatidraw_document::LayerTree;
 use nyatidraw_history::{History, HistoryNode};
 use nyatidraw_project::{
-    CANVAS_HISTORY_SCHEMA_VERSION, COMPRESSED_TILE_SCHEMA_FLAG, Envelope,
+    ALPHA_LOCK_STROKE_SCHEMA_FLAG, CANVAS_HISTORY_SCHEMA_VERSION, COMPRESSED_TILE_SCHEMA_FLAG,
+    CONFIGURABLE_BRUSH_SCHEMA_FLAG, Envelope, LAYER_COMPOSITING_SCHEMA_FLAG,
     LAYER_HISTORY_SCHEMA_VERSION, MAX_LAYER_TREE_RECORD_BYTES, OpenMode, ProjectCommitBatch,
     ProjectHistoryCursor, ProjectOpenError, ProjectRepository, ProjectStructuralBatch, RecordKind,
-    ReopenedProject, RootManifest, SCHEMA_VERSION, SELECTION_STROKE_SCHEMA_VERSION,
-    decode_history_cursor, decode_history_node, decode_initial_history_cursor, decode_layer_tree,
-    decode_project_head, decode_root_manifest, decode_stroke_commit, encode_history_cursor,
-    encode_history_node, encode_initial_history_cursor, encode_layer_tree, encode_project_head,
-    encode_root_manifest, encode_stroke_commit, open_mode,
+    ReopenedProject, RootManifest, SCHEMA_CAPABILITY_FLAGS, SCHEMA_VERSION,
+    SELECTION_STROKE_SCHEMA_VERSION, SIGNED_SELECTION_SCHEMA_FLAG, decode_history_cursor,
+    decode_history_node, decode_initial_history_cursor, decode_layer_tree, decode_project_head,
+    decode_root_manifest, decode_stroke_commit, encode_history_cursor, encode_history_node,
+    encode_initial_history_cursor, encode_layer_tree, encode_project_head, encode_root_manifest,
+    encode_stroke_commit, open_mode,
 };
 use nyatidraw_stroke::{MaterializationStrategy, materialize_with_strategy};
 use nyatidraw_tiles::{ContentRoot, ObjectHash, TileObject, TileSnapshot};
@@ -496,7 +498,10 @@ impl ProjectDb {
             batch.stroke.parent_snapshot,
             None,
         )?;
-        if batch.stroke.selection().is_some() {
+        if batch.stroke.selection().is_some()
+            || batch.stroke.brush.preset.engine_version >= 2
+            || batch.stroke.alpha_locked()
+        {
             let mut metadata = transaction
                 .open_table(META)
                 .map_err(|error| self.io(error))?;
@@ -507,8 +512,32 @@ impl ProjectDb {
             metadata
                 .insert(
                     "schema_version",
-                    (current & !COMPRESSED_TILE_SCHEMA_FLAG).max(SELECTION_STROKE_SCHEMA_VERSION)
-                        | (current & COMPRESSED_TILE_SCHEMA_FLAG),
+                    (current & !SCHEMA_CAPABILITY_FLAGS).max(
+                        if batch.stroke.selection().is_some() {
+                            SELECTION_STROKE_SCHEMA_VERSION
+                        } else {
+                            SCHEMA_VERSION
+                        },
+                    ) | (current & SCHEMA_CAPABILITY_FLAGS)
+                        | if batch.stroke.brush.preset.engine_version >= 2 {
+                            CONFIGURABLE_BRUSH_SCHEMA_FLAG
+                        } else {
+                            0
+                        }
+                        | if batch
+                            .stroke
+                            .selection()
+                            .is_some_and(|selection| selection.origin() != [0, 0])
+                        {
+                            SIGNED_SELECTION_SCHEMA_FLAG
+                        } else {
+                            0
+                        }
+                        | if batch.stroke.alpha_locked() {
+                            ALPHA_LOCK_STROKE_SCHEMA_FLAG
+                        } else {
+                            0
+                        },
                 )
                 .map_err(|error| self.io(error))?;
         }
@@ -757,6 +786,7 @@ impl ProjectDb {
     ///
     /// Returns `Corrupt` when any envelope, hash, root, stroke replay, or
     /// cross-record invariant fails.
+    #[allow(clippy::too_many_lines)] // Keep capability, replay, and root validation in one read transaction.
     pub fn load_current(&self) -> Result<Option<ProjectCommitBatch>, ProjectOpenError> {
         let transaction = self.db.begin_read().map_err(|error| self.io(error))?;
         let state = match transaction.open_table(STATE) {
@@ -822,6 +852,31 @@ impl ProjectDb {
             .map_err(|message| self.corrupt(format!("stroke commit corrupt: {message}")))?;
         let stroke = decode_stroke_commit(&stroke_envelope.payload, &before)
             .map_err(|error| self.corrupt(error))?;
+        if stroke.alpha_locked()
+            || stroke
+                .selection()
+                .is_some_and(|selection| selection.origin() != [0, 0])
+        {
+            let metadata = transaction
+                .open_table(META)
+                .map_err(|error| self.corrupt(error))?;
+            let schema = metadata
+                .get("schema_version")
+                .map_err(|error| self.corrupt(error))?
+                .map_or(0, |value| value.value());
+            if schema & SIGNED_SELECTION_SCHEMA_FLAG == 0
+                && stroke
+                    .selection()
+                    .is_some_and(|selection| selection.origin() != [0, 0])
+            {
+                return Err(
+                    self.corrupt("signed stroke selection lacks required reader capability")
+                );
+            }
+            if stroke.alpha_locked() && schema & ALPHA_LOCK_STROKE_SCHEMA_FLAG == 0 {
+                return Err(self.corrupt("alpha-locked stroke lacks required reader capability"));
+            }
+        }
         drop(strokes);
 
         let history = transaction
@@ -1131,6 +1186,7 @@ impl ProjectDb {
         transaction
             .set_durability(Durability::Immediate)
             .map_err(|error| self.io(error))?;
+        self.mark_layer_compositing(&transaction)?;
         {
             let mut state = transaction
                 .open_table(STATE)
@@ -1166,6 +1222,7 @@ impl ProjectDb {
         }
         let envelope = decode_envelope(RecordKind::LayerTree, bytes.value())
             .map_err(|message| self.corrupt(format!("layer tree corrupt: {message}")))?;
+        self.validate_layer_payload_capability(&envelope.payload)?;
         decode_layer_tree(&envelope.payload)
             .map(Some)
             .map_err(|error| self.corrupt(format!("layer tree corrupt: {error}")))
@@ -1388,7 +1445,7 @@ impl ProjectDb {
             .map_err(|error| self.io(error))?
             .is_some_and(|value| {
                 matches!(
-                    value.value() & !COMPRESSED_TILE_SCHEMA_FLAG,
+                    value.value() & !SCHEMA_CAPABILITY_FLAGS,
                     SCHEMA_VERSION
                         | LAYER_HISTORY_SCHEMA_VERSION
                         | SELECTION_STROKE_SCHEMA_VERSION
@@ -1700,11 +1757,16 @@ mod tests {
         let preset = BrushPreset {
             id: BrushPresetId(17),
             schema_version: 1,
-            engine_version: ROUND_BRUSH_ENGINE_VERSION,
+            engine_version: 1,
             size_px: 18.0,
             opacity: 0.9,
             flow: 0.6,
             spacing_ratio: 0.2,
+            size_pressure: true,
+            opacity_pressure: true,
+            size_min_ratio: 0.0,
+            opacity_min_ratio: 0.0,
+            hardness: 1.0,
         };
         let samples = vec![
             sample(sequence, PointerPhase::Begin, -8.0, 5.0),
@@ -1739,6 +1801,350 @@ mod tests {
             42,
             10,
         )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn alpha_locked_stroke_wire_reopen_and_gate_preserve_recoloring() {
+        // Product risk: older writers drop alpha-lock replay, an extension
+        // changes old hashes, or reopen silently changes soft-edge alpha.
+        use nyatidraw_stroke::{CpuReplayMaterializer, StrokeMaterializer, StrokeSelection};
+        const REOPEN: &str = "NYATIDRAW_ALPHA_LOCK_REOPEN";
+        let before = TileSnapshot::from_tiles([-1, 0, 1].map(|x| {
+            let pixels = (0..TILE_BYTE_LEN / 4)
+                .flat_map(|index| {
+                    let alpha = if index % 5 == 0 { 0 } else { 128 };
+                    [0, alpha / 2, 0, alpha]
+                })
+                .collect::<Vec<_>>();
+            (
+                TileKey {
+                    layer: LayerId(4),
+                    mip: 0,
+                    x,
+                    y: 0,
+                },
+                pixels,
+            )
+        }))
+        .unwrap();
+        let template = prepared_batch_from(
+            SnapshotId(1),
+            before,
+            SnapshotId(2),
+            HistoryNodeId(3),
+            42,
+            10,
+        );
+        let bare = encode_stroke_commit(&template.stroke);
+        assert!(!template.stroke.alpha_locked());
+        assert_eq!(
+            decode_stroke_commit(&bare, &template.before).unwrap(),
+            template.stroke
+        );
+        let mut durable = None;
+        for origin in [None, Some([0, 0]), Some([-16, -4])] {
+            let selection = origin.map(|origin| {
+                std::sync::Arc::new(
+                    StrokeSelection::from_packed_bits_at(
+                        origin,
+                        [176, 64],
+                        &vec![255; 176 * 64 / 8],
+                    )
+                    .unwrap(),
+                )
+            });
+            let session = HeadlessStrokeSession::new(
+                template.stroke.parent_snapshot,
+                template.before.clone(),
+            );
+            let prepare = |alpha_locked| {
+                session
+                    .prepare_round_stroke_with_options(
+                        template.snapshot_id,
+                        template.history_node.id,
+                        template.history_node.timestamp_ns,
+                        template.stroke.layer,
+                        template.stroke.brush,
+                        template.stroke.recorded.clone(),
+                        template.stroke.color,
+                        template.stroke.samples().to_vec(),
+                        selection.clone(),
+                        alpha_locked,
+                    )
+                    .unwrap()
+            };
+            let unlocked = prepare(false);
+            let legacy = session
+                .prepare_round_stroke_with_selection(
+                    template.snapshot_id,
+                    template.history_node.id,
+                    template.history_node.timestamp_ns,
+                    template.stroke.layer,
+                    template.stroke.brush,
+                    template.stroke.recorded.clone(),
+                    template.stroke.color,
+                    template.stroke.samples().to_vec(),
+                    selection.clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                encode_stroke_commit(&unlocked.stroke),
+                encode_stroke_commit(&legacy.stroke),
+                "unlocked wire must remain byte-identical to legacy sealing"
+            );
+            assert_eq!(unlocked.stroke.id, legacy.stroke.id);
+            let batch = prepare(true);
+            let wire = encode_stroke_commit(&batch.stroke);
+            assert_eq!(
+                &wire[32..bare.len()],
+                &bare[32..],
+                "only semantic identity and optional suffix may change"
+            );
+            assert_eq!(&wire[bare.len()..bare.len() + 8], b"NYALP001");
+            assert_eq!(
+                decode_stroke_commit(&wire, &template.before).unwrap(),
+                batch.stroke
+            );
+            for mode in 0..4 {
+                let mut bad = wire.clone();
+                match mode {
+                    0 => {
+                        bad.drain(bare.len()..bare.len() + 8);
+                    }
+                    1 => {
+                        bad.splice(bare.len()..bare.len(), *b"NYALP001");
+                    }
+                    2 => {
+                        bad[bare.len() + 4] ^= 1;
+                    }
+                    _ => {
+                        bad.pop();
+                    }
+                }
+                assert!(
+                    decode_stroke_commit(&bad, &template.before).is_err(),
+                    "noncanonical alpha extension must fail closed"
+                );
+            }
+            for (key, original) in template.before.iter() {
+                let after = batch.materialized.after.get(key).unwrap();
+                assert!(
+                    original
+                        .pixels()
+                        .chunks_exact(4)
+                        .zip(after.pixels().chunks_exact(4))
+                        .all(|(a, b)| a[3] == b[3]),
+                    "durable recoloring must retain every alpha byte"
+                );
+            }
+            assert!(!batch.materialized.changed_tiles.is_empty());
+            durable = Some(batch);
+        }
+        let batch = durable.unwrap();
+        if let Some(path) = std::env::var_os(REOPEN) {
+            let db = ProjectDb::open(&PathBuf::from(path)).unwrap();
+            let loaded = db.load_current().unwrap().unwrap();
+            assert_eq!(loaded.stroke, batch.stroke);
+            assert_eq!(loaded.materialized.after, batch.materialized.after);
+            assert_eq!(
+                CpuReplayMaterializer
+                    .materialize(&loaded.stroke, &loaded.before)
+                    .unwrap()
+                    .after,
+                batch.materialized.after
+            );
+            return;
+        }
+        let path = temp("alpha-locked-stroke");
+        let db = ProjectDb::open(&path).unwrap();
+        assert!(
+            db.commit_with_failure(&batch, CommitFailurePoint::BeforeCommitAbort)
+                .is_err()
+        );
+        assert!(db.load_current().unwrap().is_none());
+        let marker = |db: &ProjectDb| {
+            db.db
+                .begin_read()
+                .unwrap()
+                .open_table(META)
+                .unwrap()
+                .get("schema_version")
+                .unwrap()
+                .unwrap()
+                .value()
+        };
+        assert_eq!(
+            marker(&db) & ALPHA_LOCK_STROKE_SCHEMA_FLAG,
+            0,
+            "failed commit cannot upgrade reader capability"
+        );
+        db.commit(&batch).unwrap();
+        assert_ne!(marker(&db) & ALPHA_LOCK_STROKE_SCHEMA_FLAG, 0);
+        let old_flags = SCHEMA_CAPABILITY_FLAGS & !ALPHA_LOCK_STROKE_SCHEMA_FLAG;
+        assert!(
+            !(1..=4).contains(&(marker(&db) & !old_flags)),
+            "older reader must reject before modifying artwork"
+        );
+        drop(db);
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::alpha_locked_stroke_wire_reopen_and_gate_preserve_recoloring"
+                ])
+                .env(REOPEN, &path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let db = ProjectDb::open(&path).unwrap();
+        let session = HeadlessStrokeSession::from_reopened(db.load_reopened().unwrap().unwrap());
+        let structural = session
+            .prepare_structural_change(
+                SnapshotId(3),
+                HistoryNodeId(4),
+                13_000,
+                session.tiles().clone(),
+            )
+            .unwrap();
+        db.commit_structural_with_layer_tree(&structural, &layer_tree_fixture())
+            .unwrap();
+        let after_layer = marker(&db);
+        assert_ne!(
+            after_layer & ALPHA_LOCK_STROKE_SCHEMA_FLAG,
+            0,
+            "metadata upgrade cannot drop capability for an older stroke"
+        );
+        db.persist_history_cursor(ProjectHistoryCursor {
+            snapshot_id: batch.snapshot_id,
+            history_head: Some(batch.history_node.id),
+            root: batch.materialized.after.root(),
+        })
+        .unwrap();
+        let tx = db.db.begin_write().unwrap();
+        tx.open_table(META)
+            .unwrap()
+            .insert(
+                "schema_version",
+                after_layer & !ALPHA_LOCK_STROKE_SCHEMA_FLAG,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        assert!(
+            db.load_current().is_err(),
+            "missing semantic-stroke reader gate is corruption"
+        );
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn configurable_brush_survives_reopen_and_metadata_upgrades_without_losing_reader_gate() {
+        // Risk: old writers must not discard configurable brush meaning, even
+        // after a layer/page upgrade or Undo preserves the v2 redo branch.
+        let legacy = prepared_batch();
+        let preset = BrushPreset {
+            schema_version: 2,
+            engine_version: ROUND_BRUSH_ENGINE_VERSION,
+            opacity_pressure: false,
+            size_min_ratio: 0.2,
+            opacity_min_ratio: 0.1,
+            hardness: 0.3,
+            ..legacy.stroke.brush.preset
+        };
+        let samples = legacy.stroke.samples().to_vec();
+        let mut evaluator = RoundBrushEvaluator::new(42);
+        let mut dabs = Vec::new();
+        let mut token = begin_round_stroke(&mut evaluator, &preset, samples[0], &mut dabs);
+        evaluator.push(&mut token, &samples[1..], &mut dabs);
+        let recorded = evaluator.end(token, &mut dabs);
+        let batch = HeadlessStrokeSession::new(SnapshotId(1), TileSnapshot::empty())
+            .prepare_round_stroke(
+                SnapshotId(2),
+                HistoryNodeId(3),
+                12_000,
+                LayerId(4),
+                BrushSnapshot { preset },
+                recorded,
+                legacy.stroke.color,
+                samples,
+            )
+            .unwrap();
+        let path = temp("configurable-brush");
+        let database = ProjectDb::open(&path).unwrap();
+        database.commit(&batch).unwrap();
+        drop(database);
+        let database = ProjectDb::open(&path).unwrap();
+        assert_eq!(
+            database
+                .load_current()
+                .unwrap()
+                .unwrap()
+                .stroke
+                .brush
+                .preset,
+            preset
+        );
+        assert_eq!(
+            database.load_reopened().unwrap().unwrap().current_tiles(),
+            &batch.materialized.after
+        );
+        for id in 3..=4 {
+            let session =
+                HeadlessStrokeSession::from_reopened(database.load_reopened().unwrap().unwrap());
+            let change = session
+                .prepare_structural_change(
+                    SnapshotId(id),
+                    HistoryNodeId(id + 1),
+                    13_000,
+                    session.tiles().clone(),
+                )
+                .unwrap();
+            if id == 3 {
+                database
+                    .commit_structural_with_layer_tree(&change, &layer_tree_fixture())
+                    .unwrap();
+            } else {
+                database
+                    .commit_structural_with_canvas(&change, CanvasSpec::DEFAULT)
+                    .unwrap();
+            }
+        }
+        assert!(database.layer_history_enabled().unwrap());
+        assert!(database.canvas_history_enabled().unwrap());
+        let session =
+            HeadlessStrokeSession::from_reopened(database.load_reopened().unwrap().unwrap());
+        database
+            .persist_history_cursor(session.prepare_undo_cursor().unwrap().target())
+            .unwrap();
+        let tx = database.db.begin_read().unwrap();
+        let marker = tx
+            .open_table(META)
+            .unwrap()
+            .get("schema_version")
+            .unwrap()
+            .unwrap()
+            .value();
+        assert_eq!(
+            marker,
+            CANVAS_HISTORY_SCHEMA_VERSION
+                | COMPRESSED_TILE_SCHEMA_FLAG
+                | CONFIGURABLE_BRUSH_SCHEMA_FLAG
+                | LAYER_COMPOSITING_SCHEMA_FLAG
+        );
+        // The original reader masked compression only; this must not resemble
+        // one of its known levels 1..=4.
+        assert!(!(1..=4).contains(&(marker & !COMPRESSED_TILE_SCHEMA_FLAG)));
+        drop(tx);
+        drop(database);
+        let reopened = ProjectDb::open(&path).unwrap();
+        assert_eq!(
+            reopened.load_reopened().unwrap().unwrap().current_tiles(),
+            &batch.materialized.after
+        );
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2205,6 +2611,9 @@ mod tests {
     fn layer_tree_fixture() -> LayerTree {
         let raster = |id, name: &str| {
             LayerTreeNode::Raster(LayerNode {
+                alpha_locked: false,
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                 id: LayerId(id),
                 name: name.into(),
                 visible: true,
@@ -2215,6 +2624,8 @@ mod tests {
             })
         };
         LayerTree::new(GroupNode {
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: GroupId(1),
             name: "Root".into(),
             visible: true,
@@ -2222,6 +2633,8 @@ mod tests {
             children: vec![
                 raster(10, "Background"),
                 LayerTreeNode::Group(GroupNode {
+                    clip_to_below: false,
+                    blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                     id: GroupId(2),
                     name: "Ink".into(),
                     visible: true,
@@ -2367,6 +2780,189 @@ mod tests {
             );
         }
         std::fs::remove_file(path).expect("remove scratch project");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn signed_selection_reopen_preserves_offpage_pixels_and_reader_gate() {
+        // Risk: an origin rewrite can paint a different part of the artwork;
+        // later metadata upgrades must not let old writers strip that origin.
+        use nyatidraw_stroke::{CpuReplayMaterializer, StrokeMaterializer, StrokeSelection};
+        let template = prepared_batch();
+        let dimensions = [16, 16];
+        let packed = vec![255; 32];
+        let prepare = |origin| {
+            HeadlessStrokeSession::new(template.stroke.parent_snapshot, template.before.clone())
+                .prepare_round_stroke_with_selection(
+                    template.snapshot_id,
+                    template.history_node.id,
+                    template.history_node.timestamp_ns,
+                    template.stroke.layer,
+                    template.stroke.brush,
+                    template.stroke.recorded.clone(),
+                    template.stroke.color,
+                    template.stroke.samples().to_vec(),
+                    Some(std::sync::Arc::new(
+                        StrokeSelection::from_packed_bits_at(origin, dimensions, &packed).unwrap(),
+                    )),
+                )
+                .unwrap()
+        };
+        let legacy = prepare([0, 0]);
+        let batch = prepare([-16, -4]);
+        let bare = encode_stroke_commit(&template.stroke);
+        let legacy_wire = encode_stroke_commit(&legacy.stroke);
+        let mut expected_legacy = bare.clone();
+        expected_legacy[..32].copy_from_slice(&(legacy.stroke.id.0).0);
+        expected_legacy.extend_from_slice(b"NYSEL001");
+        expected_legacy.extend_from_slice(&16_u32.to_le_bytes());
+        expected_legacy.extend_from_slice(&16_u32.to_le_bytes());
+        expected_legacy.extend_from_slice(&packed);
+        assert_eq!(
+            legacy_wire, expected_legacy,
+            "origin zero retains exact v1 layout"
+        );
+        assert_ne!(legacy.stroke.id, batch.stroke.id);
+        assert_eq!(
+            (legacy.stroke.id.0).0,
+            [
+                205, 97, 5, 39, 97, 29, 183, 168, 5, 193, 42, 145, 132, 113, 118, 120, 111, 228,
+                83, 244, 241, 50, 238, 204, 231, 127, 204, 57, 90, 13, 222, 104
+            ],
+            "legacy selected hash fixture"
+        );
+        let wire = encode_stroke_commit(&batch.stroke);
+        assert_eq!(&wire[bare.len()..bare.len() + 8], b"NYSEL002");
+        assert_eq!(
+            decode_stroke_commit(&wire, &template.before).unwrap(),
+            batch.stroke
+        );
+        for mutation in 0..3 {
+            let mut bad = wire.clone();
+            match mutation {
+                0 => bad[bare.len() + 8] ^= 1, // Valid mask translated without resealing.
+                1 => bad[bare.len() + 8..bare.len() + 16].fill(0), // Noncanonical signed zero.
+                _ => {
+                    bad.pop();
+                } // Truncated mask.
+            }
+            assert!(decode_stroke_commit(&bad, &template.before).is_err());
+        }
+        assert!(!batch.materialized.changed_tiles.is_empty());
+        for (key, tile) in batch.materialized.after.iter() {
+            let (ox, oy) = key.pixel_origin();
+            for (index, pixel) in tile.pixels().chunks_exact(4).enumerate() {
+                let x = ox + i64::try_from(index % 128).unwrap();
+                let y = oy + i64::try_from(index / 128).unwrap();
+                if !(-16..0).contains(&x) || !(-4..12).contains(&y) {
+                    assert_eq!(
+                        pixel, [0; 4],
+                        "selected replay must not leak outside signed mask"
+                    );
+                }
+            }
+        }
+        if let Some(path) = std::env::var_os("NYATIDRAW_SIGNED_SELECTION_REOPEN") {
+            let db = ProjectDb::open(&PathBuf::from(path)).unwrap();
+            let loaded = db.load_current().unwrap().unwrap();
+            assert_eq!(loaded.stroke, batch.stroke);
+            assert_eq!(loaded.materialized.after, batch.materialized.after);
+            assert_eq!(
+                CpuReplayMaterializer
+                    .materialize(&loaded.stroke, &loaded.before)
+                    .unwrap()
+                    .after,
+                batch.materialized.after
+            );
+            return;
+        }
+        let path = temp("signed-selection");
+        let db = ProjectDb::open(&path).unwrap();
+        assert!(
+            db.commit_with_failure(&batch, CommitFailurePoint::BeforeCommitAbort)
+                .is_err()
+        );
+        assert!(db.load_current().unwrap().is_none());
+        db.commit(&batch).unwrap();
+        drop(db);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::signed_selection_reopen_preserves_offpage_pixels_and_reader_gate",
+            ])
+            .env("NYATIDRAW_SIGNED_SELECTION_REOPEN", &path)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "fresh process must recover signed pixels and semantic replay"
+        );
+        let db = ProjectDb::open(&path).unwrap();
+        for id in 3..=4 {
+            let session =
+                HeadlessStrokeSession::from_reopened(db.load_reopened().unwrap().unwrap());
+            let change = session
+                .prepare_structural_change(
+                    SnapshotId(id),
+                    HistoryNodeId(id + 1),
+                    13_000,
+                    session.tiles().clone(),
+                )
+                .unwrap();
+            if id == 3 {
+                db.commit_structural_with_layer_tree(&change, &layer_tree_fixture())
+                    .unwrap();
+            } else {
+                db.commit_structural_with_canvas(&change, CanvasSpec::DEFAULT)
+                    .unwrap();
+            }
+        }
+        let tx = db.db.begin_read().unwrap();
+        let marker = tx
+            .open_table(META)
+            .unwrap()
+            .get("schema_version")
+            .unwrap()
+            .unwrap()
+            .value();
+        assert_eq!(
+            marker,
+            CANVAS_HISTORY_SCHEMA_VERSION
+                | COMPRESSED_TILE_SCHEMA_FLAG
+                | SIGNED_SELECTION_SCHEMA_FLAG
+                | LAYER_COMPOSITING_SCHEMA_FLAG
+        );
+        assert!(
+            !(1..=4).contains(
+                &(marker & !(COMPRESSED_TILE_SCHEMA_FLAG | CONFIGURABLE_BRUSH_SCHEMA_FLAG))
+            ),
+            "previous reader must reject signed redo branches"
+        );
+        drop(tx);
+        let session = HeadlessStrokeSession::from_reopened(db.load_reopened().unwrap().unwrap());
+        // Restore the stroke cursor before forging its marker; no file rewrite
+        // can silently accept the signed record as a legacy selection.
+        let target = ProjectHistoryCursor {
+            snapshot_id: batch.snapshot_id,
+            history_head: Some(batch.history_node.id),
+            root: batch.materialized.after.root(),
+        };
+        drop(session);
+        db.persist_history_cursor(target).unwrap();
+        let tx = db.db.begin_write().unwrap();
+        {
+            tx.open_table(META)
+                .unwrap()
+                .insert("schema_version", marker & !SIGNED_SELECTION_SCHEMA_FLAG)
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(
+            db.load_current().is_err(),
+            "missing signed reader gate is corruption"
+        );
+        drop(db);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -3007,6 +3603,128 @@ mod tests {
             assert_eq!(after, before, "{name}: rejected open rewrote the project");
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn composition_metadata_reader_gate_is_atomic_and_survives_fresh_reopen() {
+        // Product risk: an older writer must not discard shading semantics,
+        // and failed metadata publication must not advance either head or gate.
+        let changed_tree = || {
+            let mut tree = layer_tree_fixture();
+            tree.set_alpha_locked(LayerId(20), true).unwrap();
+            tree.set_clip_to_below(LayerTreeNodeId::Raster(LayerId(20)), true)
+                .unwrap();
+            tree.set_blend_mode(
+                LayerTreeNodeId::Raster(LayerId(20)),
+                nyatidraw_api::LayerBlendMode::Multiply,
+            )
+            .unwrap();
+            tree.set_clip_to_below(LayerTreeNodeId::Group(GroupId(2)), true)
+                .unwrap();
+            tree.set_blend_mode(
+                LayerTreeNodeId::Group(GroupId(2)),
+                nyatidraw_api::LayerBlendMode::Multiply,
+            )
+            .unwrap();
+            tree
+        };
+        if let Some(path) = std::env::var_os("NYATIDRAW_COMPOSITION_METADATA_REOPEN") {
+            let db = ProjectDb::open(Path::new(&path)).unwrap();
+            assert_eq!(db.load_layer_tree().unwrap(), Some(changed_tree()));
+            let reopened = db.load_reopened().unwrap().unwrap();
+            assert_eq!(reopened.current_snapshot(), SnapshotId(3));
+            assert_eq!(
+                reopened.current_tiles(),
+                &prepared_batch().materialized.after
+            );
+            return;
+        }
+        let path = temp("composition-metadata");
+        let db = ProjectDb::open(&path).unwrap();
+        let first = prepared_batch();
+        db.commit(&first).unwrap();
+        let session = HeadlessStrokeSession::from_reopened(db.load_reopened().unwrap().unwrap());
+        let batch = session
+            .prepare_structural_change(SnapshotId(3), HistoryNodeId(4), 50, session.tiles().clone())
+            .unwrap();
+        let tree = changed_tree();
+        let marker = |db: &ProjectDb| {
+            let transaction = db.db.begin_read().unwrap();
+            transaction
+                .open_table(META)
+                .unwrap()
+                .get("schema_version")
+                .unwrap()
+                .unwrap()
+                .value()
+        };
+        let before_marker = marker(&db);
+        assert_eq!(before_marker & LAYER_COMPOSITING_SCHEMA_FLAG, 0);
+        assert!(
+            db.commit_structural_inner(
+                &batch,
+                Some(&tree),
+                None,
+                &CommitControl::Failure(CommitFailurePoint::BeforeCommitAbort)
+            )
+            .is_err()
+        );
+        assert_eq!(marker(&db), before_marker);
+        assert!(db.load_layer_tree().unwrap().is_none());
+        assert_eq!(
+            db.load_reopened().unwrap().unwrap().current_snapshot(),
+            first.snapshot_id
+        );
+        db.commit_structural_with_layer_tree(&batch, &tree).unwrap();
+        let upgraded = marker(&db);
+        assert_ne!(upgraded & LAYER_COMPOSITING_SCHEMA_FLAG, 0);
+        let old_known = COMPRESSED_TILE_SCHEMA_FLAG
+            | CONFIGURABLE_BRUSH_SCHEMA_FLAG
+            | SIGNED_SELECTION_SCHEMA_FLAG;
+        assert!(
+            !(1..=4).contains(&(upgraded & !old_known)),
+            "older reader rejects before editing"
+        );
+        drop(db);
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::composition_metadata_reader_gate_is_atomic_and_survives_fresh_reopen"
+                ])
+                .env("NYATIDRAW_COMPOSITION_METADATA_REOPEN", &path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let db = ProjectDb::open(&path).unwrap();
+        let session = HeadlessStrokeSession::from_reopened(db.load_reopened().unwrap().unwrap());
+        let undo = session.prepare_undo_cursor().unwrap();
+        db.persist_history_cursor(undo.target()).unwrap();
+        assert!(db.load_layer_tree().unwrap().is_none());
+        assert_eq!(
+            marker(&db),
+            upgraded,
+            "Undo cannot downgrade retained redo records"
+        );
+        // Forge a missing flag while current state is legacy. Historical v3
+        // metadata must still reject read-only, not only the current tree.
+        let transaction = db.db.begin_write().unwrap();
+        transaction
+            .open_table(META)
+            .unwrap()
+            .insert("schema_version", upgraded & !LAYER_COMPOSITING_SCHEMA_FLAG)
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(db);
+        let original = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            ProjectDb::open(&path),
+            Err(ProjectOpenError::Corrupt { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

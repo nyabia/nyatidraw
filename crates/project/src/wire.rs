@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use nyatidraw_api::{ContentRootId, GroupId, HistoryNodeId, LayerId, SnapshotId};
+use nyatidraw_api::{ContentRootId, GroupId, HistoryNodeId, LayerBlendMode, LayerId, SnapshotId};
 use nyatidraw_brush::{BrushPreset, BrushPresetId, BrushSnapshot, RecordedStroke};
 use nyatidraw_document::{GroupNode, LayerNode, LayerTree, LayerTreeNode};
 use nyatidraw_history::{HistoryNode, OperationRecord};
@@ -19,7 +19,9 @@ const RECORD_SCHEMA_VERSION: u16 = 1;
 const ROOT_ENTRY_ENCODED_LEN: usize = 57;
 const SAMPLE_MIN_ENCODED_LEN: usize = 61;
 const SELECTION_EXTENSION: [u8; 8] = *b"NYSEL001";
-const LAYER_TREE_WIRE_VERSION: u16 = 2;
+const SIGNED_SELECTION_EXTENSION: [u8; 8] = *b"NYSEL002";
+const ALPHA_LOCK_EXTENSION: [u8; 8] = *b"NYALP001";
+const LAYER_TREE_WIRE_VERSION: u16 = 3;
 const MAX_LAYER_TREE_NODES: usize = 4_096;
 const MAX_LAYER_TREE_DEPTH: usize = 64;
 const MAX_LAYER_NAME_BYTES: usize = 1_024;
@@ -479,6 +481,8 @@ fn encode_group_node(
     encode_layer_name(output, &group.name)?;
     output.push(u8::from(group.visible));
     output.extend_from_slice(&group.opacity_u16.to_le_bytes());
+    output.push(u8::from(group.clip_to_below));
+    output.push(encode_blend_mode(group.blend_mode));
     let child_count = u64::try_from(group.children.len())
         .map_err(|_| WireError::InvalidData("layer child count exceeds format"))?;
     output.extend_from_slice(&child_count.to_le_bytes());
@@ -507,6 +511,9 @@ fn encode_raster_node(
     output.push(u8::from(layer.reference));
     output.extend_from_slice(&layer.opacity_u16.to_le_bytes());
     output.extend_from_slice(&layer.content_root.0.to_le_bytes());
+    output.push(u8::from(layer.alpha_locked));
+    output.push(u8::from(layer.clip_to_below));
+    output.push(encode_blend_mode(layer.blend_mode));
     Ok(())
 }
 
@@ -518,6 +525,21 @@ fn count_layer_node(node_count: &mut usize) -> Result<(), WireError> {
         return Err(WireError::InvalidData("layer tree exceeds node limit"));
     }
     Ok(())
+}
+
+const fn encode_blend_mode(mode: LayerBlendMode) -> u8 {
+    match mode {
+        LayerBlendMode::Normal => 0,
+        LayerBlendMode::Multiply => 1,
+    }
+}
+
+fn decode_blend_mode(decoder: &mut Decoder<'_>) -> Result<LayerBlendMode, WireError> {
+    match decoder.u8()? {
+        0 => Ok(LayerBlendMode::Normal),
+        1 => Ok(LayerBlendMode::Multiply),
+        _ => Err(WireError::InvalidEnum),
+    }
 }
 
 fn encode_layer_name(output: &mut Vec<u8>, name: &str) -> Result<(), WireError> {
@@ -548,6 +570,12 @@ fn decode_group_node(
     let name = decoder.bounded_string(MAX_LAYER_NAME_BYTES, "layer name exceeds byte limit")?;
     let visible = decoder.boolean()?;
     let opacity_u16 = decoder.u16()?;
+    let clip_to_below = version >= 3 && decoder.boolean()?;
+    let blend_mode = if version >= 3 {
+        decode_blend_mode(decoder)?
+    } else {
+        LayerBlendMode::Normal
+    };
     let remaining_nodes = MAX_LAYER_TREE_NODES - *node_count;
     let child_count = decoder.bounded_len(remaining_nodes, "layer child count exceeds limit")?;
     let mut children = Vec::with_capacity(child_count);
@@ -566,6 +594,8 @@ fn decode_group_node(
         }
     }
     Ok(GroupNode {
+        clip_to_below,
+        blend_mode,
         id,
         name,
         visible,
@@ -591,6 +621,13 @@ fn decode_raster_node(
         reference: version >= 2 && decoder.boolean()?,
         opacity_u16: decoder.u16()?,
         content_root: ContentRootId(decoder.u128()?),
+        alpha_locked: version >= 3 && decoder.boolean()?,
+        clip_to_below: version >= 3 && decoder.boolean()?,
+        blend_mode: if version >= 3 {
+            decode_blend_mode(decoder)?
+        } else {
+            LayerBlendMode::Normal
+        },
     })
 }
 
@@ -695,8 +732,20 @@ pub fn encode_stroke_commit(commit: &StrokeCommit) -> Vec<u8> {
     for sample in commit.samples() {
         encode_sample(&mut output, sample);
     }
+    // This marker must precede selection: historical selection formats consume
+    // all remaining bytes as packed coverage. Unlocked bytes remain unchanged.
+    if commit.alpha_locked() {
+        output.extend_from_slice(&ALPHA_LOCK_EXTENSION);
+    }
     if let Some(selection) = commit.selection() {
-        output.extend_from_slice(&SELECTION_EXTENSION);
+        let origin = selection.origin();
+        if origin == [0, 0] {
+            output.extend_from_slice(&SELECTION_EXTENSION);
+        } else {
+            output.extend_from_slice(&SIGNED_SELECTION_EXTENSION);
+            output.extend_from_slice(&origin[0].to_le_bytes());
+            output.extend_from_slice(&origin[1].to_le_bytes());
+        }
         let [width, height] = selection.dimensions();
         output.extend_from_slice(&width.to_le_bytes());
         output.extend_from_slice(&height.to_le_bytes());
@@ -734,20 +783,36 @@ pub fn decode_stroke_commit(
     for _ in 0..sample_count {
         samples.push(decode_sample(&mut decoder)?);
     }
+    let alpha_locked = decoder.bytes[decoder.position..].starts_with(&ALPHA_LOCK_EXTENSION);
+    if alpha_locked {
+        let _ = decoder.array::<8>()?;
+    }
     let selection = if decoder.remaining_len() == 0 {
         None
     } else {
-        if decoder.array::<8>()? != SELECTION_EXTENSION {
-            return Err(WireError::InvalidData(
-                "unsupported stroke selection extension",
-            ));
-        }
+        let origin = match decoder.array::<8>()? {
+            SELECTION_EXTENSION => [0, 0],
+            SIGNED_SELECTION_EXTENSION => {
+                let origin = [decoder.i32()?, decoder.i32()?];
+                if origin == [0, 0] {
+                    return Err(WireError::InvalidData(
+                        "noncanonical signed selection origin",
+                    ));
+                }
+                origin
+            }
+            _ => {
+                return Err(WireError::InvalidData(
+                    "unsupported stroke selection extension",
+                ));
+            }
+        };
         let width = decoder.u32()?;
         let height = decoder.u32()?;
         let packed = &decoder.bytes[decoder.position..];
         decoder.position = decoder.bytes.len();
         Some(Arc::new(
-            StrokeSelection::from_packed_bits(width, height, packed)
+            StrokeSelection::from_packed_bits_at(origin, [width, height], packed)
                 .map_err(|_| WireError::InvalidData("invalid stroke selection coverage"))?,
         ))
     };
@@ -755,7 +820,7 @@ pub fn decode_stroke_commit(
     if before.root() != before_root {
         return Err(WireError::RootMismatch);
     }
-    let commit = StrokeCommit::seal_with_selection(
+    let commit = StrokeCommit::seal_with_options(
         parent_snapshot,
         layer,
         before,
@@ -764,6 +829,7 @@ pub fn decode_stroke_commit(
         color,
         samples,
         selection,
+        alpha_locked,
     )
     .map_err(WireError::StrokeCommit)?;
     if commit.id != expected_id || commit.affected_tiles != affected_tiles {
@@ -917,10 +983,23 @@ fn encode_brush_preset(output: &mut Vec<u8>, preset: BrushPreset) {
     output.extend_from_slice(&preset.opacity.to_bits().to_le_bytes());
     output.extend_from_slice(&preset.flow.to_bits().to_le_bytes());
     output.extend_from_slice(&preset.spacing_ratio.to_bits().to_le_bytes());
+    if preset.engine_version >= 2 {
+        output.extend_from_slice(&[
+            u8::from(preset.size_pressure),
+            u8::from(preset.opacity_pressure),
+        ]);
+        for value in [
+            preset.size_min_ratio,
+            preset.opacity_min_ratio,
+            preset.hardness,
+        ] {
+            output.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+    }
 }
 
 fn decode_brush_preset(decoder: &mut Decoder<'_>) -> Result<BrushPreset, WireError> {
-    Ok(BrushPreset {
+    let mut preset = BrushPreset {
         id: BrushPresetId(decoder.u128()?),
         schema_version: decoder.u32()?,
         engine_version: decoder.u32()?,
@@ -928,7 +1007,28 @@ fn decode_brush_preset(decoder: &mut Decoder<'_>) -> Result<BrushPreset, WireErr
         opacity: f32::from_bits(decoder.u32()?),
         flow: f32::from_bits(decoder.u32()?),
         spacing_ratio: f32::from_bits(decoder.u32()?),
-    })
+        size_pressure: true,
+        opacity_pressure: true,
+        size_min_ratio: 0.0,
+        opacity_min_ratio: 0.0,
+        hardness: 1.0,
+    };
+    if preset.engine_version >= 2 {
+        preset.size_pressure = match decoder.array::<1>()?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(WireError::InvalidData("invalid pressure switch")),
+        };
+        preset.opacity_pressure = match decoder.array::<1>()?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(WireError::InvalidData("invalid pressure switch")),
+        };
+        preset.size_min_ratio = f32::from_bits(decoder.u32()?);
+        preset.opacity_min_ratio = f32::from_bits(decoder.u32()?);
+        preset.hardness = f32::from_bits(decoder.u32()?);
+    }
+    Ok(preset)
 }
 
 fn encode_recorded_stroke(output: &mut Vec<u8>, recorded: &RecordedStroke) {
@@ -1202,6 +1302,112 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod project_head_compatibility_tests {
     use super::*;
+    use nyatidraw_brush::{BrushEvaluator, RoundBrushEvaluator, begin_round_stroke};
+    use nyatidraw_stroke::{CpuReplayMaterializer, StrokeMaterializer};
+
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::float_cmp)] // Exact legacy replay constants.
+    fn legacy_and_configurable_brush_records_preserve_replay_and_content_roots() {
+        // Risk: adding pressure switches/tip softness must not reinterpret old
+        // bytes or drop new settings when artwork is decoded and materialized.
+        let mut old_bytes = 7_u128.to_le_bytes().to_vec();
+        old_bytes.extend_from_slice(&1_u32.to_le_bytes());
+        old_bytes.extend_from_slice(&1_u32.to_le_bytes());
+        for value in [10.0_f32, 0.8, 0.5, 0.5] {
+            old_bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        let mut decoder = Decoder::new(&old_bytes);
+        let legacy = decode_brush_preset(&mut decoder).unwrap();
+        decoder.finish().unwrap();
+        let mut old_encoded = Vec::new();
+        encode_brush_preset(&mut old_encoded, legacy);
+        assert_eq!(
+            old_encoded, old_bytes,
+            "v1 bytes must not acquire v2 fields"
+        );
+        let current = BrushPreset {
+            schema_version: 2,
+            engine_version: 2,
+            opacity_pressure: false,
+            size_min_ratio: 0.2,
+            opacity_min_ratio: 0.1,
+            hardness: 0.3,
+            ..legacy
+        };
+        let samples = vec![
+            StylusSample {
+                sequence: 1,
+                timestamp_ns: 1,
+                device_id: 1,
+                phase: PointerPhase::Begin,
+                position_document: Point { x: -2.0, y: 2.0 },
+                pressure: 0.25,
+                tilt: None,
+                twist_radians: None,
+                tangential_pressure: None,
+                buttons: PenButtons::default(),
+                eraser: false,
+                viewport_revision: 0,
+            },
+            StylusSample {
+                sequence: 2,
+                timestamp_ns: 2,
+                device_id: 1,
+                phase: PointerPhase::End,
+                position_document: Point { x: 10.0, y: 2.0 },
+                pressure: 1.0,
+                tilt: None,
+                twist_radians: None,
+                tangential_pressure: None,
+                buttons: PenButtons::default(),
+                eraser: false,
+                viewport_revision: 0,
+            },
+        ];
+        let before = TileSnapshot::empty();
+        let mut roots = Vec::new();
+        for preset in [legacy, current] {
+            let mut evaluator = RoundBrushEvaluator::new(12);
+            let mut dabs = Vec::new();
+            let mut token = begin_round_stroke(&mut evaluator, &preset, samples[0], &mut dabs);
+            evaluator.push(&mut token, &samples[1..], &mut dabs);
+            let recorded = evaluator.end(token, &mut dabs);
+            if preset.engine_version == 1 {
+                assert_eq!(dabs[0].radius_px, 2.5);
+                assert_eq!(dabs[0].opacity, 0.2);
+                assert_eq!(dabs[0].hardness, 1.0);
+            }
+            let commit = StrokeCommit::seal(
+                SnapshotId(1),
+                LayerId(2),
+                &before,
+                BrushSnapshot { preset },
+                recorded,
+                StrokeColor::new([255; 4]).unwrap(),
+                samples.clone(),
+            )
+            .unwrap();
+            let encoded = encode_stroke_commit(&commit);
+            let reopened = decode_stroke_commit(&encoded, &before).unwrap();
+            assert_eq!(reopened.brush.preset, preset);
+            assert_eq!(reopened.id, commit.id);
+            let expected = CpuReplayMaterializer.materialize(&commit, &before).unwrap();
+            let actual = CpuReplayMaterializer
+                .materialize(&reopened, &before)
+                .unwrap();
+            assert_eq!(actual.after.root(), expected.after.root());
+            roots.push(actual.after.root());
+        }
+        assert_ne!(roots[0], roots[1], "new controls must change actual pixels");
+        let mut current_bytes = Vec::new();
+        encode_brush_preset(&mut current_bytes, current);
+        let mut invalid_bool = current_bytes.clone();
+        invalid_bool[40] = 2;
+        assert!(decode_brush_preset(&mut Decoder::new(&invalid_bool)).is_err());
+        for end in 40..54 {
+            assert!(decode_brush_preset(&mut Decoder::new(&current_bytes[..end])).is_err());
+        }
+    }
 
     #[test]
     fn reference_metadata_preserves_legacy_layers_and_rejects_malformed_membership() {
@@ -1225,22 +1431,56 @@ mod project_head_compatibility_tests {
             panic!("raster fixture")
         };
         assert!(!layer.reference);
+        assert!(!layer.alpha_locked && !layer.clip_to_below);
+        assert_eq!(layer.blend_mode, LayerBlendMode::Normal);
         assert_eq!(layer.id, LayerId(7));
+        let mut v2 = legacy.clone();
+        v2[..2].copy_from_slice(&2_u16.to_le_bytes());
+        v2.insert(v2.len() - 18, 1);
+        let v2_tree = decode_layer_tree(&v2).expect("independent v2 reference fixture");
+        let v2_layer = v2_tree.raster(LayerId(7)).unwrap();
+        assert!(v2_layer.reference);
+        assert!(!v2_layer.alpha_locked && !v2_layer.clip_to_below);
+        assert_eq!(v2_layer.blend_mode, LayerBlendMode::Normal);
         let prior = tree.clone();
         assert!(tree.set_reference(LayerId(99), true).is_err());
         assert_eq!(tree, prior, "unknown source must preserve artwork metadata");
         tree.set_reference(LayerId(7), true).expect("select source");
-        let current = encode_layer_tree(&tree).expect("v2 source encoding");
-        assert_eq!(&current[..2], &[2, 0]);
+        tree.set_alpha_locked(LayerId(7), true).unwrap();
+        tree.set_clip_to_below(nyatidraw_api::LayerTreeNodeId::Raster(LayerId(7)), true)
+            .unwrap();
+        tree.set_blend_mode(
+            nyatidraw_api::LayerTreeNodeId::Raster(LayerId(7)),
+            LayerBlendMode::Multiply,
+        )
+        .unwrap();
+        let current = encode_layer_tree(&tree).expect("v3 composition encoding");
+        assert_eq!(&current[..2], &[3, 0]);
         assert_eq!(decode_layer_tree(&current), Ok(tree));
-        let reference_offset = current.len() - 19;
+        let reference_offset = current.len() - 22;
         for invalid in [2, 255] {
             let mut corrupt = current.clone();
             corrupt[reference_offset] = invalid;
             assert_eq!(decode_layer_tree(&corrupt), Err(WireError::InvalidEnum));
         }
+        for offset in [current.len() - 3, current.len() - 2, current.len() - 1] {
+            for invalid in [2, 255] {
+                let mut corrupt = current.clone();
+                corrupt[offset] = invalid;
+                assert_eq!(decode_layer_tree(&corrupt), Err(WireError::InvalidEnum));
+            }
+        }
+        for offset in [31, 32] {
+            // Root after visible and opacity, before child count.
+            let mut corrupt = current.clone();
+            corrupt[offset] = 1;
+            assert!(
+                decode_layer_tree(&corrupt).is_err(),
+                "root cannot clip/multiply"
+            );
+        }
         let mut unsupported = current;
-        unsupported[..2].copy_from_slice(&3_u16.to_le_bytes());
+        unsupported[..2].copy_from_slice(&4_u16.to_le_bytes());
         assert!(decode_layer_tree(&unsupported).is_err());
     }
 

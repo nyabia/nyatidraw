@@ -1,6 +1,7 @@
 /target/
 /.nyatidraw/
 /.playwright-cli/
+/.codex-remote-attachments/
 /output/
 /vendor/
 

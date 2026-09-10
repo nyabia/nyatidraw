@@ -16,6 +16,9 @@ fn main() {
         let mut children = Vec::new();
         for layer in 1..=layers {
             children.push(LayerTreeNode::Raster(LayerNode {
+                alpha_locked: false,
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                 id: LayerId(u128::from(layer)),
                 name: format!("Layer{layer}"),
                 visible: true,
@@ -41,11 +44,15 @@ fn main() {
             }
         }
         let tree = LayerTree::new(GroupNode {
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: GroupId(100),
             name: "Root".into(),
             visible: true,
             opacity_u16: u16::MAX,
             children: vec![LayerTreeNode::Group(GroupNode {
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                 id: GroupId(101),
                 name: "Isolated".into(),
                 visible: true,

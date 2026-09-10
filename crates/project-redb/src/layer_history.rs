@@ -1,12 +1,12 @@
 //! Immutable layer metadata shares the pixel/history transaction boundary.
 use super::{
-    CURRENT_LAYER_TREE, Envelope, LAYER_HISTORY_SCHEMA_VERSION, LayerTree,
-    MAX_LAYER_TREE_RECORD_BYTES, MAX_REOPEN_HISTORY_NODES, META, ProjectDb, ProjectHistoryCursor,
-    ProjectOpenError, ReadableTable, RecordKind, SNAPSHOTS, STATE, SnapshotId, TableDefinition,
-    decode_envelope, decode_layer_tree, encode_layer_tree,
+    CURRENT_LAYER_TREE, Envelope, LAYER_COMPOSITING_SCHEMA_FLAG, LAYER_HISTORY_SCHEMA_VERSION,
+    LayerTree, MAX_LAYER_TREE_RECORD_BYTES, MAX_REOPEN_HISTORY_NODES, META, ProjectDb,
+    ProjectHistoryCursor, ProjectOpenError, ReadableTable, RecordKind, SNAPSHOTS, STATE,
+    SnapshotId, TableDefinition, decode_envelope, decode_layer_tree, encode_layer_tree,
 };
 use nyatidraw_project::{
-    CANVAS_HISTORY_SCHEMA_VERSION, COMPRESSED_TILE_SCHEMA_FLAG, SELECTION_STROKE_SCHEMA_VERSION,
+    CANVAS_HISTORY_SCHEMA_VERSION, SCHEMA_CAPABILITY_FLAGS, SELECTION_STROKE_SCHEMA_VERSION,
 };
 use std::collections::BTreeSet;
 
@@ -26,7 +26,7 @@ impl ProjectDb {
             .map_err(|error| self.io(error))?
             .is_some_and(|value| {
                 matches!(
-                    value.value() & !COMPRESSED_TILE_SCHEMA_FLAG,
+                    value.value() & !SCHEMA_CAPABILITY_FLAGS,
                     LAYER_HISTORY_SCHEMA_VERSION
                         | SELECTION_STROKE_SCHEMA_VERSION
                         | CANVAS_HISTORY_SCHEMA_VERSION
@@ -77,6 +77,7 @@ impl ProjectDb {
             self.copy_layer_record(value.value())?
         };
         self.decode_optional_layers(&bytes)?;
+        self.validate_layer_record_capability(&bytes)?;
         Ok(Some(bytes))
     }
 
@@ -100,7 +101,7 @@ impl ProjectDb {
                 .map_err(|error| self.io(error))?
                 .is_some_and(|value| {
                     matches!(
-                        value.value() & !COMPRESSED_TILE_SCHEMA_FLAG,
+                        value.value() & !SCHEMA_CAPABILITY_FLAGS,
                         LAYER_HISTORY_SCHEMA_VERSION
                             | SELECTION_STROKE_SCHEMA_VERSION
                             | CANVAS_HISTORY_SCHEMA_VERSION
@@ -171,8 +172,15 @@ impl ProjectDb {
             let mut metadata = transaction
                 .open_table(META)
                 .map_err(|error| self.io(error))?;
+            let capabilities = metadata
+                .get("schema_version")
+                .map_err(|error| self.io(error))?
+                .map_or(0, |value| value.value() & SCHEMA_CAPABILITY_FLAGS);
             metadata
-                .insert("schema_version", LAYER_HISTORY_SCHEMA_VERSION)
+                .insert(
+                    "schema_version",
+                    LAYER_HISTORY_SCHEMA_VERSION | capabilities,
+                )
                 .map_err(|error| self.io(error))?;
         }
         {
@@ -191,6 +199,7 @@ impl ProjectDb {
                 .map_err(|error| self.io(error))?;
         }
         if tree.is_some() {
+            self.mark_layer_compositing(transaction)?;
             let mut state = transaction
                 .open_table(STATE)
                 .map_err(|error| self.io(error))?;
@@ -218,6 +227,7 @@ impl ProjectDb {
             .map_err(|error| self.corrupt(error))?;
         let legacy = self.read_legacy_layers(&state)?;
         self.decode_optional_layers(&legacy)?;
+        self.validate_layer_record_capability(&legacy)?;
         let initial = self
             .load_initial_cursor()?
             .ok_or_else(|| self.corrupt("layer history has no initial cursor"))?;
@@ -240,6 +250,7 @@ impl ProjectDb {
             }
             if value.value() != LEGACY_REFERENCE {
                 self.decode_optional_layers(value.value())?;
+                self.validate_layer_record_capability(value.value())?;
             }
         }
         if !expected.is_empty() {
@@ -288,6 +299,54 @@ impl ProjectDb {
         decode_layer_tree(&envelope.payload)
             .map(Some)
             .map_err(|error| self.corrupt(error))
+    }
+
+    // Called in the same write transaction as any v3 current/history record.
+    pub(super) fn mark_layer_compositing(
+        &self,
+        transaction: &redb::WriteTransaction,
+    ) -> Result<(), ProjectOpenError> {
+        let mut metadata = transaction
+            .open_table(META)
+            .map_err(|error| self.io(error))?;
+        let schema = metadata
+            .get("schema_version")
+            .map_err(|error| self.io(error))?
+            .map_or(0, |value| value.value());
+        metadata
+            .insert("schema_version", schema | LAYER_COMPOSITING_SCHEMA_FLAG)
+            .map_err(|error| self.io(error))?;
+        Ok(())
+    }
+
+    fn validate_layer_record_capability(&self, bytes: &[u8]) -> Result<(), ProjectOpenError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let envelope =
+            decode_envelope(RecordKind::LayerTree, bytes).map_err(|error| self.corrupt(error))?;
+        self.validate_layer_payload_capability(&envelope.payload)
+    }
+
+    pub(super) fn validate_layer_payload_capability(
+        &self,
+        payload: &[u8],
+    ) -> Result<(), ProjectOpenError> {
+        if payload.get(..2) != Some(&[3, 0]) {
+            return Ok(());
+        }
+        let transaction = self.db.begin_read().map_err(|error| self.io(error))?;
+        let metadata = transaction
+            .open_table(META)
+            .map_err(|error| self.corrupt(error))?;
+        let schema = metadata
+            .get("schema_version")
+            .map_err(|error| self.corrupt(error))?
+            .map_or(0, |value| value.value());
+        if schema & LAYER_COMPOSITING_SCHEMA_FLAG == 0 {
+            return Err(self.corrupt("layer composition metadata lacks required reader capability"));
+        }
+        Ok(())
     }
 }
 

@@ -1,9 +1,13 @@
-//! Bounded, deterministic finite-page selection and pixel editing.
+//! Bounded, deterministic signed-region selection and pixel editing.
 use crate::{CpuCompositeError, PremultipliedRgba8, composite_surface, flatten_layer_tree_rgba8};
 use nyatidraw_api::{CanvasSpec, LayerId, LayerTreeNodeId};
 use nyatidraw_document::{GroupNode, LayerTree, LayerTreeNode};
 use nyatidraw_tiles::{TILE_BYTE_LEN, TILE_EDGE, TileKey, TileSnapshot, TileSnapshotError};
 use std::collections::VecDeque;
+
+#[path = "selection_morph.rs"]
+mod morphology;
+pub use morphology::{grow_selection, select_layer_alpha, shrink_selection};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EditLimits {
@@ -11,6 +15,8 @@ pub struct EditLimits {
     pub max_workspace_bytes: u64,
     pub max_frontier: usize,
     pub max_polygon_work: u64,
+    /// Bounded linear image-filter work, separate from polygon edge work.
+    pub max_filter_work: u64,
 }
 
 impl Default for EditLimits {
@@ -20,6 +26,7 @@ impl Default for EditLimits {
             max_workspace_bytes: 256 * 1024 * 1024,
             max_frontier: 1024 * 1024,
             max_polygon_work: 64 * 1024 * 1024,
+            max_filter_work: 1024 * 1024 * 1024,
         }
     }
 }
@@ -33,6 +40,7 @@ impl EditLimits {
             max_workspace_bytes: self.max_workspace_bytes.min(maximum.max_workspace_bytes),
             max_frontier: self.max_frontier.min(maximum.max_frontier),
             max_polygon_work: self.max_polygon_work.min(maximum.max_polygon_work),
+            max_filter_work: self.max_filter_work.min(maximum.max_filter_work),
         }
     }
 }
@@ -58,6 +66,7 @@ pub enum EditError {
     InvalidCanvas,
     UnknownLayer,
     LockedLayer,
+    AlphaLockedLayer,
     MissingReference,
     InvalidSeed,
     InvalidPolygon,
@@ -70,9 +79,11 @@ pub enum EditError {
     Tiles(TileSnapshotError),
 }
 
-/// Binary pixel-center coverage in the finite page; outside artwork is excluded.
+/// Binary pixel-center coverage in a bounded signed document rectangle.
+/// Bytes are currently 0/1, not fractional antialias coverage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectionMask {
+    origin: [i32; 2],
     width: u32,
     height: u32,
     selected: Vec<u8>,
@@ -97,14 +108,19 @@ impl SelectionMask {
     /// Rejects oversized dimensions, wrong lengths and nonzero unused bits
     /// before allocating the decoded page.
     pub fn from_packed_bits(width: u32, height: u32, packed: &[u8]) -> Result<Self, EditError> {
-        let count = page_len(
-            CanvasSpec {
-                width_px: width,
-                height_px: height,
-                pixels_per_inch: 96,
-            },
-            EditLimits::default(),
-        )?;
+        Self::from_packed_bits_at([0, 0], [width, height], packed)
+    }
+
+    /// Restores a bounded signed mask; origin-zero payloads retain their encoding.
+    /// # Errors
+    /// Rejects malformed bits, oversized extents and coordinate overflow.
+    pub fn from_packed_bits_at(
+        origin: [i32; 2],
+        dimensions: [u32; 2],
+        packed: &[u8],
+    ) -> Result<Self, EditError> {
+        let [width, height] = dimensions;
+        let count = region_len(origin, dimensions, EditLimits::default())?;
         if packed.len() != count.div_ceil(8)
             || (count % 8 != 0 && packed.last().is_some_and(|last| last >> (count % 8) != 0))
         {
@@ -115,6 +131,7 @@ impl SelectionMask {
             .collect();
         let count = selected.iter().map(|&value| u64::from(value)).sum();
         Ok(Self {
+            origin,
             width,
             height,
             selected,
@@ -128,19 +145,49 @@ impl SelectionMask {
     }
 
     #[must_use]
+    pub const fn origin(&self) -> [i32; 2] {
+        self.origin
+    }
+
+    #[must_use]
     pub const fn selected_pixels(&self) -> u64 {
         self.count
     }
 
     #[must_use]
     pub fn contains(&self, x: u32, y: u32) -> bool {
-        x < self.width && y < self.height && self.selected[pixel_index(self.width, x, y)] == 1
+        let [Ok(x), Ok(y)] = [x, y].map(i32::try_from) else {
+            return false;
+        };
+        self.contains_signed(x, y)
+    }
+
+    #[must_use]
+    pub fn contains_signed(&self, x: i32, y: i32) -> bool {
+        let [Ok(x), Ok(y)] = [
+            i64::from(x) - i64::from(self.origin[0]),
+            i64::from(y) - i64::from(self.origin[1]),
+        ]
+        .map(u32::try_from) else {
+            return false;
+        };
+        x < self.width && y < self.height && self.selected[pixel_index(self.width, x, y)] != 0
     }
 
     /// Computes the selected pixel rectangle on the CPU editing worker.
     /// The result is [left, top, width, height]; empty coverage has no bounds.
     #[must_use]
     pub fn bounds(&self) -> Option<[u32; 4]> {
+        let (origin, [width, height]) = self.bounds_signed()?;
+        let [Ok(x), Ok(y)] = origin.map(u32::try_from) else {
+            return None;
+        };
+        Some([x, y, width, height])
+    }
+
+    /// Selected document origin and extent, excluding unselected padding.
+    #[must_use]
+    pub fn bounds_signed(&self) -> Option<([i32; 2], [u32; 2])> {
         if self.count == 0 {
             return None;
         }
@@ -150,7 +197,7 @@ impl SelectionMask {
         let mut bottom = 0;
         for y in 0..self.height {
             for x in 0..self.width {
-                if self.contains(x, y) {
+                if self.selected[pixel_index(self.width, x, y)] != 0 {
                     left = left.min(x);
                     top = top.min(y);
                     right = right.max(x);
@@ -158,8 +205,139 @@ impl SelectionMask {
                 }
             }
         }
-        Some([left, top, right - left + 1, bottom - top + 1])
+        Some((
+            [
+                i32::try_from(i64::from(self.origin[0]) + i64::from(left)).ok()?,
+                i32::try_from(i64::from(self.origin[1]) + i64::from(top)).ok()?,
+            ],
+            [right - left + 1, bottom - top + 1],
+        ))
     }
+}
+
+fn region_len(origin: [i32; 2], size: [u32; 2], limits: EditLimits) -> Result<usize, EditError> {
+    if size.contains(&0) {
+        return Err(EditError::InvalidMask);
+    }
+    for axis in 0..2 {
+        if i32::try_from(i64::from(origin[axis]) + i64::from(size[axis]) - 1).is_err() {
+            return Err(EditError::CoordinateOutOfRange);
+        }
+    }
+    let count = u64::from(size[0]) * u64::from(size[1]);
+    if count > limits.max_pixels {
+        return Err(EditError::LimitExceeded);
+    }
+    require_workspace(count, limits)?;
+    usize::try_from(count).map_err(|_| EditError::LimitExceeded)
+}
+
+/// Selection boolean operations on document pixels, not mask-local indices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectionCombine {
+    Replace,
+    Add,
+    Subtract,
+}
+
+/// Selects a caller-defined finite domain. No infinite allocation is implied.
+/// # Errors
+/// Rejects coordinate overflow and configured work/memory limits.
+pub fn selection_all(
+    origin: [i32; 2],
+    size: [u32; 2],
+    limits: EditLimits,
+) -> Result<SelectionMask, EditError> {
+    let count = region_len(origin, size, limits.bounded())?;
+    Ok(SelectionMask {
+        origin,
+        width: size[0],
+        height: size[1],
+        selected: vec![1; count],
+        count: count as u64,
+    })
+}
+
+/// Half-open signed rectangle; dragging backwards gives the same pixels.
+/// # Errors
+/// Rejects empty rectangles, coordinate overflow or oversized regions.
+pub fn rectangle_selection_signed(
+    start: [i32; 2],
+    end: [i32; 2],
+    limits: EditLimits,
+) -> Result<SelectionMask, EditError> {
+    let origin = std::array::from_fn(|axis| start[axis].min(end[axis]));
+    let size = std::array::from_fn(|axis| start[axis].abs_diff(end[axis]));
+    selection_all(origin, size, limits)
+}
+
+/// Combines bounded document coverage without modifying either input.
+/// # Errors
+/// Rejects an oversized union before allocating its result.
+pub fn combine_selection(
+    current: &SelectionMask,
+    incoming: &SelectionMask,
+    operation: SelectionCombine,
+    limits: EditLimits,
+) -> Result<SelectionMask, EditError> {
+    let limits = limits.bounded();
+    let (origin, size) = match operation {
+        SelectionCombine::Replace => (incoming.origin(), incoming.dimensions()),
+        SelectionCombine::Subtract => (current.origin(), current.dimensions()),
+        SelectionCombine::Add => {
+            let origin =
+                std::array::from_fn(|axis| current.origin[axis].min(incoming.origin[axis]));
+            let end: [i64; 2] = std::array::from_fn(|axis| {
+                (i64::from(current.origin[axis]) + i64::from(current.dimensions()[axis]))
+                    .max(i64::from(incoming.origin[axis]) + i64::from(incoming.dimensions()[axis]))
+            });
+            let [Ok(w), Ok(h)] =
+                std::array::from_fn::<_, 2, _>(|axis| end[axis] - i64::from(origin[axis]))
+                    .map(u32::try_from)
+            else {
+                return Err(EditError::LimitExceeded);
+            };
+            (origin, [w, h])
+        }
+    };
+    let count = region_len(origin, size, limits)?;
+    require_workspace(
+        count as u64 + current.selected.len() as u64 + incoming.selected.len() as u64,
+        limits,
+    )?;
+    let mut mask = selection_all(origin, size, limits)?;
+    mask.count = 0;
+    for y in 0..size[1] {
+        for x in 0..size[0] {
+            let px = i32::try_from(i64::from(origin[0]) + i64::from(x))
+                .map_err(|_| EditError::CoordinateOutOfRange)?;
+            let py = i32::try_from(i64::from(origin[1]) + i64::from(y))
+                .map_err(|_| EditError::CoordinateOutOfRange)?;
+            let a = current.contains_signed(px, py);
+            let b = incoming.contains_signed(px, py);
+            let selected = match operation {
+                SelectionCombine::Replace => b,
+                SelectionCombine::Add => a || b,
+                SelectionCombine::Subtract => a && !b,
+            };
+            mask.selected[pixel_index(size[0], x, y)] = u8::from(selected);
+            mask.count += u64::from(selected);
+        }
+    }
+    Ok(mask)
+}
+
+/// Complements coverage only inside the explicit finite domain.
+/// # Errors
+/// Rejects coordinate overflow or oversized working memory atomically.
+pub fn invert_selection(
+    mask: &SelectionMask,
+    origin: [i32; 2],
+    size: [u32; 2],
+    limits: EditLimits,
+) -> Result<SelectionMask, EditError> {
+    let domain = selection_all(origin, size, limits)?;
+    combine_selection(&domain, mask, SelectionCombine::Subtract, limits)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,22 +386,36 @@ fn pixel_index(width: u32, x: u32, y: u32) -> usize {
 }
 
 // Match the export group's visibility/opacity semantics, retaining ancestors.
-fn restrict_references(group: &mut GroupNode, ancestors_visible: bool) -> usize {
-    let visible = ancestors_visible && group.visible && group.opacity_u16 != 0;
-    group
-        .children
-        .iter_mut()
-        .map(|child| match child {
-            LayerTreeNode::Raster(layer) => {
-                layer.visible &= layer.reference;
-                usize::from(visible && layer.visible && layer.opacity_u16 != 0)
+pub(crate) fn restrict_references(group: &mut GroupNode, ancestors_visible: bool) -> usize {
+    use nyatidraw_document::{CompositionScope, composition_scope_nodes};
+    fn apply(group: &mut GroupNode, nodes: &std::collections::BTreeSet<LayerTreeNodeId>) -> usize {
+        let mut references = 0;
+        for child in &mut group.children {
+            match child {
+                LayerTreeNode::Raster(layer) => {
+                    layer.visible = nodes.contains(&LayerTreeNodeId::Raster(layer.id));
+                    references +=
+                        usize::from(layer.visible && layer.reference && layer.opacity_u16 != 0);
+                }
+                LayerTreeNode::Group(nested) => {
+                    nested.visible = nodes.contains(&LayerTreeNodeId::Group(nested.id));
+                    references += apply(nested, nodes);
+                }
             }
-            LayerTreeNode::Group(child) => restrict_references(child, visible),
-        })
-        .sum()
+        }
+        references
+    }
+    let nodes = if ancestors_visible {
+        composition_scope_nodes(group, CompositionScope::Reference)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // Resolve dependencies before mutating visibility; preserve sibling order,
+    // orphan clips, and all metadata so hidden bases never rebind a stack.
+    apply(group, &nodes)
 }
 
-fn group_depth(group: &GroupNode) -> u64 {
+pub(crate) fn group_depth(group: &GroupNode) -> u64 {
     1 + group
         .children
         .iter()
@@ -233,6 +425,87 @@ fn group_depth(group: &GroupNode) -> u64 {
         })
         .max()
         .unwrap_or(0)
+}
+
+/// Samples durable artwork at a signed document pixel, including off-page ink.
+/// Active-layer mode reads raw pixels; composite modes honor visibility and
+/// group isolation/opacity, never viewport decorations or session Solo.
+///
+/// # Errors
+/// Rejects a missing active layer or an empty visible reference set.
+pub fn sample_artwork_pixel(
+    snapshot: &TileSnapshot,
+    tree: &LayerTree,
+    active: LayerId,
+    point: [i32; 2],
+    source: SelectionSource,
+) -> Result<[u8; 4], EditError> {
+    if source == SelectionSource::ActiveLayer {
+        tree.raster(active).ok_or(EditError::UnknownLayer)?;
+        return Ok(raster_pixel(snapshot, active, point));
+    }
+    if source == SelectionSource::ReferenceLayers {
+        let nodes = nyatidraw_document::composition_scope_nodes(
+            tree.root(),
+            nyatidraw_document::CompositionScope::Reference,
+        );
+        if nodes.is_empty() {
+            return Err(EditError::MissingReference);
+        }
+        return Ok(crate::compositing::group_pixel(
+            snapshot,
+            tree.root(),
+            point,
+            Some(&nodes),
+        ));
+    }
+    Ok(group_pixel(snapshot, tree.root(), point))
+}
+
+pub(crate) fn raster_pixel(snapshot: &TileSnapshot, layer: LayerId, point: [i32; 2]) -> [u8; 4] {
+    let key = TileKey::from_pixel(layer, 128, point[0], point[1]);
+    let offset = usize::try_from((point[1].rem_euclid(128) * 128 + point[0].rem_euclid(128)) * 4)
+        .expect("tile offset");
+    snapshot.get(key).map_or([0; 4], |tile| {
+        tile.pixels()[offset..offset + 4]
+            .try_into()
+            .expect("RGBA pixel")
+    })
+}
+
+/// Samples only displayed artwork using the native compositor's Solo rules.
+/// No UI decoration or presentation-only state is written to the document.
+///
+/// # Errors
+/// Rejects a stale Solo target rather than returning a misleading color.
+pub fn sample_display_pixel(
+    snapshot: &TileSnapshot,
+    tree: &LayerTree,
+    point: [i32; 2],
+    solo: Option<LayerTreeNodeId>,
+) -> Result<[u8; 4], EditError> {
+    if let Some(target) = solo
+        && target != LayerTreeNodeId::Group(tree.root_id())
+        && tree.parent_and_index(target).is_none()
+    {
+        return Err(EditError::UnknownLayer);
+    }
+    let scope = solo.map(|target| {
+        nyatidraw_document::composition_scope_nodes(
+            tree.root(),
+            nyatidraw_document::CompositionScope::Solo(target),
+        )
+    });
+    Ok(crate::compositing::group_pixel(
+        snapshot,
+        tree.root(),
+        point,
+        scope.as_ref(),
+    ))
+}
+
+pub(crate) fn group_pixel(snapshot: &TileSnapshot, group: &GroupNode, point: [i32; 2]) -> [u8; 4] {
+    crate::compositing::group_pixel(snapshot, group, point, None)
 }
 
 /// Selects the 4-connected region whose RGBA channel differences from the seed
@@ -294,6 +567,7 @@ pub fn wand_selection(
             .map_err(EditError::Composite)?
     };
     let mut mask = SelectionMask {
+        origin: [0, 0],
         width,
         height,
         selected: vec![0; count],
@@ -381,6 +655,7 @@ pub fn lasso_selection(
         return Err(EditError::LimitExceeded);
     }
     let mut mask = SelectionMask {
+        origin: [0, 0],
         width: canvas.width_px,
         height: canvas.height_px,
         selected: vec![0; count],
@@ -430,6 +705,48 @@ pub fn lasso_selection(
     Ok(mask)
 }
 
+/// Selects a polygon without page clipping, in its bounded signed rectangle.
+/// Coverage is binary pixel-center even-odd, not edge antialiasing.
+/// # Errors
+/// Rejects invalid polygons, excessive work and coordinate/region limits.
+pub fn lasso_selection_signed(
+    vertices: &[[i32; 2]],
+    limits: EditLimits,
+) -> Result<SelectionMask, EditError> {
+    if !(3..=4096).contains(&vertices.len()) {
+        return Err(EditError::InvalidPolygon);
+    }
+    let origin: [i32; 2] =
+        std::array::from_fn(|axis| vertices.iter().map(|p| p[axis]).min().unwrap_or(0));
+    let end: [i32; 2] =
+        std::array::from_fn(|axis| vertices.iter().map(|p| p[axis]).max().unwrap_or(0));
+    let size = std::array::from_fn(|axis| end[axis].abs_diff(origin[axis]));
+    region_len(origin, size, limits.bounded())?;
+    let local: Vec<[i32; 2]> = vertices
+        .iter()
+        .map(|p| {
+            let [Ok(x), Ok(y)] =
+                std::array::from_fn::<_, 2, _>(|axis| i64::from(p[axis]) - i64::from(origin[axis]))
+                    .map(i32::try_from)
+            else {
+                return Err(EditError::CoordinateOutOfRange);
+            };
+            Ok([x, y])
+        })
+        .collect::<Result<_, EditError>>()?;
+    let mut mask = lasso_selection(
+        CanvasSpec {
+            width_px: size[0],
+            height_px: size[1],
+            pixels_per_inch: 96,
+        },
+        &local,
+        limits,
+    )?;
+    mask.origin = origin;
+    Ok(mask)
+}
+
 fn valid_color(color: PremultipliedRgba8) -> bool {
     color.0[..3].iter().all(|channel| *channel <= color.0[3])
 }
@@ -451,7 +768,7 @@ fn validate_paint(paint: SelectionPaint) -> Result<(), EditError> {
     }
 }
 
-fn paint_pixel(paint: SelectionPaint, x: u32, y: u32) -> [u8; 4] {
+fn paint_pixel(paint: SelectionPaint, x: i32, y: i32) -> [u8; 4] {
     match paint {
         SelectionPaint::Solid(color) => color.0,
         SelectionPaint::LinearGradient {
@@ -492,6 +809,9 @@ pub fn clear_raster(
     if layer.locked {
         return Err(EditError::LockedLayer);
     }
+    if layer.alpha_locked {
+        return Err(EditError::AlphaLockedLayer);
+    }
     let changed_tiles: Vec<_> = snapshot
         .iter()
         .filter(|(key, _)| key.layer == target)
@@ -526,14 +846,7 @@ pub fn paint_selection(
 ) -> Result<SelectionPaintResult, EditError> {
     let limits = limits.bounded();
     validate_paint(paint)?;
-    let count = page_len(
-        CanvasSpec {
-            width_px: mask.width,
-            height_px: mask.height,
-            pixels_per_inch: 1,
-        },
-        limits,
-    )?;
+    let count = region_len(mask.origin, mask.dimensions(), limits)?;
     let layer = find_raster(tree.root(), target).ok_or(EditError::UnknownLayer)?;
     if layer.locked {
         return Err(EditError::LockedLayer);
@@ -551,19 +864,28 @@ pub fn paint_selection(
         let mut pixels = snapshot
             .get(key)
             .map_or_else(|| vec![0; TILE_BYTE_LEN], |tile| tile.pixels().to_vec());
-        let left = u32::try_from(key.x).map_err(|_| EditError::InvalidCanvas)? * TILE_EDGE;
-        let top = u32::try_from(key.y).map_err(|_| EditError::InvalidCanvas)? * TILE_EDGE;
-        for y in top..(top + TILE_EDGE).min(mask.height) {
-            for x in left..(left + TILE_EDGE).min(mask.width) {
-                if !mask.contains(x, y) {
+        let (left, top) = key.pixel_origin();
+        for row in 0..TILE_EDGE {
+            for column in 0..TILE_EDGE {
+                let [Ok(x), Ok(y)] =
+                    [left + i64::from(column), top + i64::from(row)].map(i32::try_from)
+                else {
+                    continue;
+                };
+                if !mask.contains_signed(x, y) {
                     continue;
                 }
-                let offset = ((y % TILE_EDGE) * TILE_EDGE + x % TILE_EDGE) as usize * 4;
-                composite_surface(
-                    &mut pixels[offset..offset + 4],
-                    &paint_pixel(paint, x, y),
-                    u16::MAX,
-                );
+                let offset = (row * TILE_EDGE + column) as usize * 4;
+                let source = paint_pixel(paint, x, y);
+                if layer.alpha_locked {
+                    crate::composite_source_atop(
+                        &mut pixels[offset..offset + 4],
+                        PremultipliedRgba8(source),
+                        1.0,
+                    );
+                } else {
+                    composite_surface(&mut pixels[offset..offset + 4], &source, u16::MAX);
+                }
             }
         }
         replacements.push((key, pixels));
@@ -589,31 +911,57 @@ fn selected_tiles(
     target: LayerId,
     limits: EditLimits,
 ) -> Result<Vec<TileKey>, EditError> {
-    let mut keys = Vec::new();
-    for tile_x in 0..mask.width.div_ceil(TILE_EDGE) {
-        for tile_y in 0..mask.height.div_ceil(TILE_EDGE) {
-            let left = tile_x * TILE_EDGE;
-            let top = tile_y * TILE_EDGE;
-            let right = (left + TILE_EDGE).min(mask.width);
-            if !(top..(top + TILE_EDGE).min(mask.height)).any(|y| {
-                mask.selected
-                    [pixel_index(mask.width, left, y)..=pixel_index(mask.width, right - 1, y)]
-                    .contains(&1)
-            }) {
+    let mut keys = std::collections::BTreeSet::new();
+    for y in 0..mask.height {
+        for x in 0..mask.width {
+            if mask.selected[pixel_index(mask.width, x, y)] == 0 {
                 continue;
             }
-            let bytes =
-                mask.selected.len() as u64 + (keys.len() as u64 + 1) * (TILE_BYTE_LEN as u64 + 128);
+            let point = [
+                i64::from(mask.origin[0]) + i64::from(x),
+                i64::from(mask.origin[1]) + i64::from(y),
+            ]
+            .map(|v| i32::try_from(v).expect("validated region"));
+            let key = TileKey::from_pixel(target, 128, point[0], point[1]);
+            if keys.contains(&key) {
+                continue;
+            }
+            let bytes = mask.selected.len() as u64
+                + (keys.len() as u64 + 1) * (TILE_BYTE_LEN as u64 * 2 + 256);
             require_workspace(bytes, limits)?;
-            keys.push(TileKey {
-                layer: target,
-                mip: 0,
-                x: i32::try_from(tile_x).map_err(|_| EditError::InvalidCanvas)?,
-                y: i32::try_from(tile_y).map_err(|_| EditError::InvalidCanvas)?,
-            });
+            keys.insert(key);
         }
     }
-    Ok(keys)
+    Ok(keys.into_iter().collect())
+}
+
+/// Deletes selected signed artwork, retaining the selection and other pixels.
+/// # Errors
+/// Rejects locked/missing layers or exceeded bounds without publishing edits.
+pub fn clear_selection(
+    snapshot: &TileSnapshot,
+    tree: &LayerTree,
+    target: LayerId,
+    mask: &SelectionMask,
+    limits: EditLimits,
+) -> Result<SelectionPaintResult, EditError> {
+    if tree
+        .raster(target)
+        .ok_or(EditError::UnknownLayer)?
+        .alpha_locked
+    {
+        return Err(EditError::AlphaLockedLayer);
+    }
+    if mask.selected_pixels() == 0 {
+        if tree.raster(target).ok_or(EditError::UnknownLayer)?.locked {
+            return Err(EditError::LockedLayer);
+        }
+        return Ok(SelectionPaintResult {
+            after: snapshot.clone(),
+            changed_tiles: Vec::new(),
+        });
+    }
+    crate::cut_selection(snapshot, tree, target, mask, limits)
 }
 
 pub(crate) fn find_raster(
@@ -635,6 +983,9 @@ mod tests {
 
     fn raster(id: u128, reference: bool, locked: bool) -> LayerTreeNode {
         LayerTreeNode::Raster(LayerNode {
+            alpha_locked: false,
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: LayerId(id),
             name: format!("Layer{id}"),
             visible: true,
@@ -646,6 +997,8 @@ mod tests {
     }
     fn tree(locked: bool) -> LayerTree {
         LayerTree::new(GroupNode {
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: GroupId(100),
             name: "Root".into(),
             visible: true,
@@ -653,6 +1006,8 @@ mod tests {
             children: vec![
                 raster(1, false, locked),
                 LayerTreeNode::Group(GroupNode {
+                    clip_to_below: false,
+                    blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                     id: GroupId(10),
                     name: "References".into(),
                     visible: true,
@@ -678,6 +1033,252 @@ mod tests {
             x,
             y: 0,
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn signed_selection_algebra_and_edits_preserve_offpage_pixels_or_fail_atomically() {
+        // Product risk: local/document coordinate confusion corrupts negative
+        // artwork, while huge sparse unions must fail before allocating.
+        let limits = EditLimits::default();
+        let a = rectangle_selection_signed([-130, -2], [1, 1], limits).unwrap();
+        let b = lasso_selection_signed(&[[-129, -1], [2, -1], [2, 2], [-129, 2]], limits).unwrap();
+        assert_eq!(a.origin(), [-130, -2]);
+        assert_eq!(a.bounds_signed(), Some(([-130, -2], [131, 3])));
+        assert_eq!(
+            SelectionMask::from_packed_bits_at(a.origin(), a.dimensions(), &a.packed_bits())
+                .unwrap(),
+            a
+        );
+        for operation in [
+            SelectionCombine::Replace,
+            SelectionCombine::Add,
+            SelectionCombine::Subtract,
+        ] {
+            let result = combine_selection(&a, &b, operation, limits).unwrap();
+            for y in -3..3 {
+                for x in -131..3 {
+                    let expected = match operation {
+                        SelectionCombine::Replace => b.contains_signed(x, y),
+                        SelectionCombine::Add => a.contains_signed(x, y) || b.contains_signed(x, y),
+                        SelectionCombine::Subtract => {
+                            a.contains_signed(x, y) && !b.contains_signed(x, y)
+                        }
+                    };
+                    assert_eq!(result.contains_signed(x, y), expected);
+                }
+            }
+        }
+        let inverse = invert_selection(&a, [-131, -3], [134, 6], limits).unwrap();
+        assert!(!inverse.contains_signed(-130, -2));
+        assert!(inverse.contains_signed(-131, -3));
+        let original = TileSnapshot::default();
+        let painted = paint_selection(
+            &original,
+            &tree(false),
+            LayerId(1),
+            &a,
+            SelectionPaint::Solid(PremultipliedRgba8([64, 0, 0, 128])),
+            limits,
+        )
+        .unwrap()
+        .after;
+        assert_eq!(
+            sample_artwork_pixel(
+                &painted,
+                &tree(false),
+                LayerId(1),
+                [-130, -2],
+                SelectionSource::ActiveLayer
+            )
+            .unwrap(),
+            [64, 0, 0, 128]
+        );
+        assert_eq!(
+            sample_artwork_pixel(
+                &painted,
+                &tree(false),
+                LayerId(1),
+                [-131, -2],
+                SelectionSource::ActiveLayer
+            )
+            .unwrap(),
+            [0; 4]
+        );
+        let fragment =
+            crate::copy_selection(&painted, &tree(false), LayerId(1), &a, limits).unwrap();
+        assert_eq!(fragment.origin(), [-130, -2]);
+        let cleared = clear_selection(&painted, &tree(false), LayerId(1), &a, limits)
+            .unwrap()
+            .after;
+        assert_eq!(cleared, original);
+        assert_eq!(
+            crate::paste_fragment(&cleared, &tree(false), LayerId(1), &fragment, limits)
+                .unwrap()
+                .after,
+            painted
+        );
+        let shifted = crate::transform_raster(
+            &painted,
+            &tree(false),
+            LayerId(1),
+            Some(&a),
+            nyatidraw_api::RasterTransform {
+                offset: [-128, 128],
+                ..Default::default()
+            },
+            limits,
+        )
+        .unwrap()
+        .after;
+        assert_eq!(
+            sample_artwork_pixel(
+                &shifted,
+                &tree(false),
+                LayerId(1),
+                [-258, 126],
+                SelectionSource::ActiveLayer
+            )
+            .unwrap(),
+            [64, 0, 0, 128]
+        );
+        assert_eq!(
+            sample_artwork_pixel(
+                &shifted,
+                &tree(false),
+                LayerId(1),
+                [-130, -2],
+                SelectionSource::ActiveLayer
+            )
+            .unwrap(),
+            [0; 4]
+        );
+        let far = selection_all([i32::MAX, 0], [1, 1], limits).unwrap();
+        assert_eq!(
+            combine_selection(&a, &far, SelectionCombine::Add, limits),
+            Err(EditError::LimitExceeded)
+        );
+        assert_eq!(
+            selection_all([i32::MAX, 0], [2, 1], limits),
+            Err(EditError::CoordinateOutOfRange)
+        );
+        assert!(
+            paint_selection(
+                &painted,
+                &tree(false),
+                LayerId(1),
+                &a,
+                SelectionPaint::Solid(PremultipliedRgba8([255; 4])),
+                EditLimits {
+                    max_workspace_bytes: 1,
+                    ..limits
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(
+            crate::copy_selection(&painted, &tree(false), LayerId(1), &a, limits).unwrap(),
+            fragment
+        );
+    }
+
+    #[test]
+    fn sampling_preserves_signed_pixels_and_matches_isolated_layer_composition() {
+        // Product risk: picking a decoration, wrong layer or double-applied
+        // group opacity silently changes the color used in subsequent artwork.
+        let mut tree = tree(true);
+        let snapshot = TileSnapshot::from_tiles([
+            (key(1, -1), [128, 0, 0, 128].repeat(TILE_BYTE_LEN / 4)),
+            (key(1, 0), [255, 0, 0, 255].repeat(TILE_BYTE_LEN / 4)),
+            (key(2, 0), [0, 0, 255, 255].repeat(TILE_BYTE_LEN / 4)),
+        ])
+        .unwrap();
+        let original_root = snapshot.root();
+        for (point, source, expected) in [
+            ([-1, 0], SelectionSource::ActiveLayer, [128, 0, 0, 128]),
+            ([0, 0], SelectionSource::ActiveLayer, [255, 0, 0, 255]),
+            ([0, 0], SelectionSource::ReferenceLayers, [0, 0, 128, 128]),
+            ([0, 0], SelectionSource::AllVisible, [127, 0, 128, 255]),
+            ([128, 0], SelectionSource::AllVisible, [0; 4]),
+            ([0, -1], SelectionSource::ActiveLayer, [0; 4]),
+        ] {
+            assert_eq!(
+                sample_artwork_pixel(&snapshot, &tree, LayerId(1), point, source).unwrap(),
+                expected
+            );
+        }
+        let flat = flatten_layer_tree_rgba8(&snapshot, &tree, canvas(2, 1)).unwrap();
+        assert_eq!(
+            &flat.pixels[..4],
+            &sample_artwork_pixel(
+                &snapshot,
+                &tree,
+                LayerId(1),
+                [0, 0],
+                SelectionSource::AllVisible,
+            )
+            .unwrap()
+        );
+        tree.set_visibility(LayerTreeNodeId::Raster(LayerId(1)), false)
+            .unwrap();
+        assert_eq!(
+            sample_artwork_pixel(
+                &snapshot,
+                &tree,
+                LayerId(1),
+                [0, 0],
+                SelectionSource::ActiveLayer
+            )
+            .unwrap(),
+            [255, 0, 0, 255]
+        );
+        assert_eq!(
+            sample_artwork_pixel(
+                &snapshot,
+                &tree,
+                LayerId(1),
+                [0, 0],
+                SelectionSource::AllVisible
+            )
+            .unwrap(),
+            [0, 0, 128, 128]
+        );
+        tree.set_visibility(LayerTreeNodeId::Group(GroupId(10)), false)
+            .unwrap();
+        // Display sampling follows session Solo, unlike durable AllVisible:
+        // a hidden target path is revealed, preserving group opacity exactly.
+        for (solo, expected) in [
+            (None, [0; 4]),
+            (Some(LayerTreeNodeId::Raster(LayerId(1))), [255, 0, 0, 255]),
+            (Some(LayerTreeNodeId::Raster(LayerId(2))), [0, 0, 128, 128]),
+            (Some(LayerTreeNodeId::Group(GroupId(10))), [0, 0, 128, 128]),
+        ] {
+            assert_eq!(
+                sample_display_pixel(&snapshot, &tree, [0, 0], solo).unwrap(),
+                expected
+            );
+        }
+        assert!(matches!(
+            sample_artwork_pixel(
+                &snapshot,
+                &tree,
+                LayerId(1),
+                [0, 0],
+                SelectionSource::ReferenceLayers
+            ),
+            Err(EditError::MissingReference)
+        ));
+        assert!(matches!(
+            sample_artwork_pixel(
+                &snapshot,
+                &tree,
+                LayerId(99),
+                [0, 0],
+                SelectionSource::ActiveLayer
+            ),
+            Err(EditError::UnknownLayer)
+        ));
+        assert_eq!(snapshot.root(), original_root);
     }
 
     #[test]
@@ -991,7 +1592,7 @@ mod tests {
             &small,
             fill,
             EditLimits {
-                max_workspace_bytes: 70_000,
+                max_workspace_bytes: 140_000,
                 ..EditLimits::default()
             },
         )

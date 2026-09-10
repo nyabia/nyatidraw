@@ -44,10 +44,10 @@ fn require_pixels(pixels: u64, limits: EditLimits) -> Result<(), EditError> {
 
 fn selected(mask: Option<&SelectionMask>, point: [i64; 2]) -> bool {
     mask.is_none_or(|mask| {
-        let [Ok(x), Ok(y)] = point.map(u32::try_from) else {
+        let [Ok(x), Ok(y)] = point.map(i32::try_from) else {
             return false;
         };
-        mask.contains(x, y)
+        mask.contains_signed(x, y)
     })
 }
 
@@ -78,12 +78,12 @@ fn source_bounds(
     if let Some(mask) = mask {
         let [width, height] = mask.dimensions();
         require_pixels(u64::from(width) * u64::from(height), limits)?;
-        for y in 0..height {
-            for x in 0..width {
-                if mask.contains(x, y) {
-                    Bounds::include(&mut bounds, [i64::from(x), i64::from(y)]);
-                }
-            }
+        if let Some((origin, size)) = mask.bounds_signed() {
+            Bounds::include(&mut bounds, origin.map(i64::from));
+            Bounds::include(
+                &mut bounds,
+                std::array::from_fn(|axis| i64::from(origin[axis]) + i64::from(size[axis]) - 1),
+            );
         }
     } else {
         for (key, tile) in snapshot.iter().filter(|(key, _)| key.layer == target) {
@@ -105,15 +105,15 @@ fn source_bounds(
     Ok(bounds)
 }
 
-struct Replacements<'a> {
-    before: &'a TileSnapshot,
-    tiles: BTreeMap<TileKey, Vec<u8>>,
-    baseline_bytes: u64,
-    limits: EditLimits,
+pub(crate) struct Replacements<'a> {
+    pub(crate) before: &'a TileSnapshot,
+    pub(crate) tiles: BTreeMap<TileKey, Vec<u8>>,
+    pub(crate) baseline_bytes: u64,
+    pub(crate) limits: EditLimits,
 }
 
 impl Replacements<'_> {
-    fn tile(&mut self, key: TileKey) -> Result<&mut Vec<u8>, EditError> {
+    pub(crate) fn tile(&mut self, key: TileKey) -> Result<&mut Vec<u8>, EditError> {
         if !self.tiles.contains_key(&key) {
             // Include construction of immutable replacement objects and root
             // metadata while scratch buffers and the original root coexist.
@@ -131,7 +131,7 @@ impl Replacements<'_> {
         Ok(self.tiles.get_mut(&key).expect("replacement inserted"))
     }
 
-    fn finish(mut self) -> Result<SelectionPaintResult, EditError> {
+    pub(crate) fn finish(mut self) -> Result<SelectionPaintResult, EditError> {
         self.tiles.retain(|key, pixels| {
             self.before.get(*key).map_or_else(
                 || pixels.iter().any(|byte| *byte != 0),
@@ -150,7 +150,7 @@ impl Replacements<'_> {
     }
 }
 
-fn pixel_address(target: LayerId, point: [i64; 2]) -> (TileKey, usize) {
+pub(crate) fn pixel_address(target: LayerId, point: [i64; 2]) -> (TileKey, usize) {
     // Both rectangles have been checked against signed i32 pixel coordinates.
     let [x, y] = point.map(|v| i32::try_from(v).expect("preflighted transform coordinate"));
     let offset = (y.rem_euclid(128) as usize * 128 + x.rem_euclid(128) as usize) * 4;
@@ -282,6 +282,9 @@ pub fn transform_raster(
     if layer.locked {
         return Err(EditError::LockedLayer);
     }
+    if layer.alpha_locked {
+        return Err(EditError::AlphaLockedLayer);
+    }
     if transform.quarter_turns > 3 || transform.size.is_some_and(|size| size.contains(&0)) {
         return Err(EditError::InvalidTransform);
     }
@@ -368,6 +371,8 @@ mod tests {
 
     fn tree(locked: bool) -> LayerTree {
         LayerTree::new(GroupNode {
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: GroupId(100),
             name: "Root".into(),
             visible: true,
@@ -375,6 +380,9 @@ mod tests {
             children: [1, 2]
                 .map(|id| {
                     LayerTreeNode::Raster(LayerNode {
+                        alpha_locked: false,
+                        clip_to_below: false,
+                        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                         id: LayerId(id),
                         name: "Raster".into(),
                         visible: true,

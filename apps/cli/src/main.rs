@@ -7,6 +7,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -116,7 +117,7 @@ fn export_project(
 }
 
 /// Creates a private scratch project with one real closed stroke, then runs the
-/// same validate/export paths as the public CLI commands and compares the PPM
+/// public validate/export commands in fresh processes and compares the PPM
 /// bytes with the pre-save flattened snapshot contract.
 fn run_nonempty_project_smoke() -> Result<(), String> {
     let scratch = scratch_directory("nonempty-cli-smoke")?;
@@ -145,16 +146,39 @@ fn run_nonempty_project_smoke() -> Result<(), String> {
             .map_err(|error| format!("commit fixture: {error:?}"))?;
         drop(database);
 
+        // A child process cannot reuse this process's in-memory snapshot/cache.
+        // Both paths are newly created scratch artifacts, never user artwork.
+        let executable = env::current_exe().map_err(|error| format!("locate CLI: {error}"))?;
+        let validation = Command::new(&executable)
+            .arg("validate")
+            .arg(&project)
+            .output()
+            .map_err(|error| format!("start fresh validator: {error}"))?;
+        if !validation.status.success() {
+            return Err(format!(
+                "fresh validator failed: {}",
+                String::from_utf8_lossy(&validation.stderr)
+            ));
+        }
+        let export = Command::new(&executable)
+            .arg("export")
+            .arg(&project)
+            .arg(&output)
+            .arg(layer.0.to_string())
+            .output()
+            .map_err(|error| format!("start fresh exporter: {error}"))?;
+        if !export.status.success() {
+            return Err(format!(
+                "fresh exporter failed: {}",
+                String::from_utf8_lossy(&export.stderr)
+            ));
+        }
         let loaded = validate_project(&project)?
             .ok_or_else(|| "validate unexpectedly reported an empty fixture".to_owned())?;
         if loaded.snapshot_id != batch.snapshot_id
             || loaded.materialized.after.root() != batch.materialized.after.root()
         {
             return Err("validate reopened a different durable snapshot/root".to_owned());
-        }
-        let exported = export_project(&project, &output, layer)?;
-        if exported.hash() != before_save.hash() {
-            return Err("export flatten hash differs from the pre-save snapshot".to_owned());
         }
         let actual_ppm = fs::read(&output)
             .map_err(|error| format!("read exported PPM {}: {error}", output.display()))?;
@@ -163,7 +187,7 @@ fn run_nonempty_project_smoke() -> Result<(), String> {
         }
         println!(
             concat!(
-                "{{\"event\":\"diagnostic-smoke\",\"status\":\"ok\",",
+                "{{\"event\":\"diagnostic-smoke\",\"status\":\"ok\",\"fresh_process_reopen\":true,",
                 "\"snapshot_id\":{},\"root\":\"{}\",",
                 "\"flattened_pixel_hash\":\"{}\",\"ppm_bytes_hash\":\"{}\"}}"
             ),
@@ -208,12 +232,17 @@ fn prepared_batch(
 ) -> Result<ProjectCommitBatch, String> {
     let preset = BrushPreset {
         id: BrushPresetId(17),
-        schema_version: 1,
+        schema_version: nyatidraw_brush::ROUND_BRUSH_PRESET_SCHEMA_VERSION,
         engine_version: ROUND_BRUSH_ENGINE_VERSION,
         size_px: 18.0,
         opacity: 0.9,
         flow: 0.6,
         spacing_ratio: 0.2,
+        size_pressure: true,
+        opacity_pressure: false,
+        size_min_ratio: 0.2,
+        opacity_min_ratio: 0.1,
+        hardness: 0.3,
     };
     let samples = vec![
         sample(sequence, PointerPhase::Begin, -8.0, 5.0),

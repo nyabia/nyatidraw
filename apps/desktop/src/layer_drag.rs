@@ -215,6 +215,9 @@ mod tests {
         let row = |key, parent, index| {
             let id = node_key(key).unwrap();
             LayerProjection {
+                alpha_locked: false,
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                 id,
                 parent: GroupId(parent),
                 index,
@@ -227,6 +230,7 @@ mod tests {
                 name: key.into(),
                 visible: true,
                 reference: false,
+                locked: false,
                 opacity_u16: u16::MAX,
             }
         };

@@ -1,5 +1,7 @@
 # 아키텍처 결정 기록
 
+문서 정리 기준 시각: 2026-09-09T18:52:14+09:00
+
 | 상태 | 결정 | 근거 |
 |---|---|---|
 | 확정 | UI shell과 drawing/document core를 분리 | Dioxus Native 위험을 제품 전체 위험으로 전파하지 않기 위해 |
@@ -54,3 +56,11 @@
 | 히스토리/도구 창 | [128단계 우회, 세 패널 분리와 목업 단축키 복원](ADR-0047-bounded-history-and-brush-panels.md) |
 | 저장 크기 | [타일 무손실 압축, 참조 회수와 최신 redb/SQLite 비교](ADR-0048-compressed-tile-storage.md) |
 | 현재 저장소 | [redb 4.2와 제거 가능한 알파 자동 변환](ADR-0049-redb4-alpha-upgrade.md) |
+| 그림 클립보드 | [원본 픽셀 보존 형식, Windows PNG 교환과 실패 원자성](ADR-0050-artwork-clipboard.md) |
+| 기본 브러시 표현 | [독립 필압·경도·도구 기억과 engine1/2 저장 호환](ADR-0051-basic-brush-controls.md) |
+| 보기/임시 색 채취 | [반전 좌표·원래 도구 유지·표시 합성의 Solo 의미](ADR-0052-view-and-temporary-picker.md) |
+| 페이지 밖 선택 | [Signed ROI·선택 조합·유한 반전·저장 호환](ADR-0053-signed-selection.md) |
+| 최소 선 보정 | [위치 보정·끄기·live/저장 평가 입력 일치](ADR-0054-minimal-stroke-smoothing.md) |
+| 자유 변형 코어 | [원본 고정 보간·세대별 미리보기·확정/취소 계약](ADR-0055-free-transform-transaction.md) |
+| 선화 밑색 | [참조 연결 채우기·틈 닫기·AA 받침·선택 경계 연산](ADR-0056-flat-fill-and-selection-morphology.md) |
+| 명암 합성 | [Alpha lock·하위 clipping stack·Normal/Multiply 계약](ADR-0057-shading-compositing-contract.md) |

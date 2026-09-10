@@ -1,5 +1,11 @@
 # Sprint 4 — 브러시다운 브러시
 
+문서 정리 기준 시각: 2026-09-09T18:52:14+09:00
+
+기본 필압 축 분리·hard/soft preset·크기 기억·최소 보정은
+[일러스트 워크플로우 W1](../illustration-workflow.md)로 앞당긴다.
+아래 목록 전체를 기다려야 기본 펜을 쓸 수 있는 계획으로 해석하지 않는다.
+
 ## 목표
 
 Clip Studio를 동작 참고점으로 삼되 범용 node graph 없이 표현력 있는 raster brush preset을 만든다.

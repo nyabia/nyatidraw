@@ -1,8 +1,8 @@
 //! Real GPU/CPU selected stroke comparison, including sparse padding and Cancel.
 use nyatidraw_api::{ContentRootId, GroupId, LayerId, SnapshotId};
 use nyatidraw_brush::{
-    BrushEvaluator, BrushPreset, BrushPresetId, BrushSnapshot, ROUND_BRUSH_ENGINE_VERSION,
-    RoundBrushEvaluator, begin_round_stroke,
+    BrushEvaluator, BrushPreset, BrushPresetId, BrushSnapshot, RoundBrushEvaluator,
+    begin_round_stroke,
 };
 use nyatidraw_document::{GroupNode, LayerNode, LayerTree, LayerTreeNode};
 use nyatidraw_input::{PenButtons, Point, PointerPhase, StylusSample};
@@ -21,11 +21,16 @@ fn debug_error(error: impl std::fmt::Debug) -> std::io::Error {
 
 fn tree() -> LayerTree {
     LayerTree::new(GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: GroupId(100),
         name: "Root".into(),
         visible: true,
         opacity_u16: u16::MAX,
         children: vec![LayerTreeNode::Raster(LayerNode {
+            alpha_locked: false,
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: LayerId(1),
             name: "Ink".into(),
             visible: true,
@@ -38,7 +43,7 @@ fn tree() -> LayerTree {
     .unwrap()
 }
 
-fn selection(empty: bool) -> Arc<StrokeSelection> {
+fn selection(origin: [i32; 2], empty: bool) -> Arc<StrokeSelection> {
     let mut bits = vec![0; (129_usize * 129).div_ceil(8)];
     if !empty {
         for y in 17..129 {
@@ -51,7 +56,7 @@ fn selection(empty: bool) -> Arc<StrokeSelection> {
             }
         }
     }
-    Arc::new(StrokeSelection::from_packed_bits(SIZE, SIZE, &bits).unwrap())
+    Arc::new(StrokeSelection::from_packed_bits_at(origin, [SIZE, SIZE], &bits).unwrap())
 }
 
 fn compare(
@@ -79,8 +84,8 @@ fn compare(
             let x = origin_x + i64::try_from(index % 128)?;
             let y = origin_y + i64::try_from(index / 128)?;
             let selected =
-                selection.is_none_or(|mask| match (u32::try_from(x), u32::try_from(y)) {
-                    (Ok(x), Ok(y)) => mask.contains(x, y),
+                selection.is_none_or(|mask| match (i32::try_from(x), i32::try_from(y)) {
+                    (Ok(x), Ok(y)) => mask.contains_signed(x, y),
                     _ => false,
                 });
             for (actual, expected) in actual.iter().zip(expected) {
@@ -108,6 +113,7 @@ fn verify_guide(scene: &mut GpuCompositeScene, before: &TileSnapshot) -> Result<
         pan: Point { x: 80.0, y: 80.0 },
         zoom: 0.8,
         rotation_radians: 0.3,
+        mirrored_horizontal: false,
     };
     scene.render_viewport(viewport).map_err(debug_error)?;
     let baseline = scene
@@ -164,6 +170,59 @@ fn verify_guide(scene: &mut GpuCompositeScene, before: &TileSnapshot) -> Result<
     Ok(())
 }
 
+fn verify_selection_overlay(
+    scene: &mut GpuCompositeScene,
+    gpu_mask: &nyatidraw_paint_gpu::GpuSelectionMask,
+    origin: [i32; 2],
+    empty: bool,
+) -> Result<()> {
+    let viewport = nyatidraw_input::ViewportTransform {
+        revision: 4,
+        window_origin_physical: Point::default(),
+        physical_size: [384, 384],
+        dpi_scale: 1.0,
+        pan: Point { x: 128.0, y: 128.0 },
+        zoom: 1.0,
+        rotation_radians: 0.0,
+        mirrored_horizontal: false,
+    };
+    scene.set_selection_overlay(None);
+    scene.render_viewport(viewport).map_err(debug_error)?;
+    let baseline = scene
+        .readback_display()
+        .map_err(debug_error)?
+        .ok_or("missing baseline")?;
+    scene.set_selection_overlay(Some(gpu_mask));
+    scene.render_viewport(viewport).map_err(debug_error)?;
+    let shown = scene
+        .readback_display()
+        .map_err(debug_error)?
+        .ok_or("missing overlay")?;
+    if empty {
+        if shown.pixels != baseline.pixels {
+            return Err("empty selection overlay changed the display".into());
+        }
+    } else {
+        // This known selected pixel has an unselected immediate left neighbor.
+        // Verify its signed boundary, independently of the renderer mapping.
+        let offset = (usize::try_from(origin[1] + 18 + 128)? * 384
+            + usize::try_from(origin[0] + 62 + 128)?)
+            * 4;
+        if shown.pixels[offset..offset + 4] == baseline.pixels[offset..offset + 4] {
+            return Err("selection boundary missing at signed origin".into());
+        }
+        if origin != [0, 0] {
+            let stale_offset = ((18 + 128) * 384 + 62 + 128) * 4;
+            if shown.pixels[stale_offset..stale_offset + 4]
+                != baseline.pixels[stale_offset..stale_offset + 4]
+            {
+                return Err("selection boundary incorrectly remained at origin zero".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let backend = match std::env::args().nth(1).as_deref() {
@@ -197,15 +256,25 @@ fn main() -> Result<()> {
     let preset = BrushPreset {
         id: BrushPresetId(1),
         schema_version: 1,
-        engine_version: ROUND_BRUSH_ENGINE_VERSION,
+        engine_version: 1,
         size_px: 40.0,
         opacity: 0.8,
         flow: 0.5,
         spacing_ratio: 0.25,
+        size_pressure: true,
+        opacity_pressure: true,
+        size_min_ratio: 0.0,
+        opacity_min_ratio: 0.0,
+        hardness: 1.0,
     };
     for eraser in [false, true] {
-        for empty in [false, true] {
-            let mask = selection(empty);
+        for (origin, empty) in [
+            ([0, 0], false),
+            ([0, 0], true),
+            ([-96, -64], false),
+            ([-96, -64], true),
+        ] {
+            let mask = selection(origin, empty);
             let mut scene = GpuCompositeScene::new(&device, &queue, [SIZE, SIZE], tree())
                 .map_err(debug_error)?;
             for (key, tile) in before.iter() {
@@ -223,6 +292,7 @@ fn main() -> Result<()> {
                     pan: Point { x: 128.0, y: 128.0 },
                     zoom: 1.0,
                     rotation_radians: 0.0,
+                    mirrored_horizontal: false,
                 })
                 .map_err(debug_error)?;
             let mut painter = if eraser {
@@ -231,10 +301,11 @@ fn main() -> Result<()> {
                 GpuRoundDabPainter::new(&device, &queue, [0.75, 0.375, 0.1875, 32.0 / 255.0])
             };
             let gpu_mask = painter
-                .create_selection_mask(mask.dimensions(), &mask.packed_bits())
+                .create_selection_mask_at(mask.origin(), mask.dimensions(), &mask.packed_bits())
                 .map_err(debug_error)?;
             painter.set_selection_mask(Some(&gpu_mask));
             scene.set_selection_overlay(Some(&gpu_mask));
+            verify_selection_overlay(&mut scene, &gpu_mask, origin, empty)?;
             // Display chrome must compile on this backend and leave all artwork
             // surfaces byte-identical, including after viewport rotation.
             scene
@@ -246,6 +317,7 @@ fn main() -> Result<()> {
                     pan: Point { x: 80.0, y: 80.0 },
                     zoom: 0.8,
                     rotation_radians: 0.3,
+                    mirrored_horizontal: false,
                 })
                 .map_err(debug_error)?;
             compare(&scene, &before, None, 0)?;
@@ -264,7 +336,10 @@ fn main() -> Result<()> {
                     timestamp_ns: sequence * 1_000,
                     device_id: 1,
                     phase,
-                    position_document: Point { x, y },
+                    position_document: Point {
+                        x: x + f64::from(origin[0]),
+                        y: y + f64::from(origin[1]),
+                    },
                     pressure,
                     tilt: None,
                     twist_radians: None,
@@ -300,6 +375,20 @@ fn main() -> Result<()> {
             )
             .map_err(debug_error)?
             .after;
+            if !empty && expected == before {
+                return Err("nonempty selected stroke fixture did not change artwork".into());
+            }
+            if !empty
+                && origin != [0, 0]
+                && !expected.iter().any(|(key, tile)| {
+                    (key.x < 0 || key.y < 0)
+                        && before
+                            .get(key)
+                            .is_none_or(|previous| previous.pixels() != tile.pixels())
+                })
+            {
+                return Err("signed fixture did not exercise changed off-page pixels".into());
+            }
             let mut maximum = 0;
             for disposition in [LiveStrokeDisposition::Cancel, LiveStrokeDisposition::Commit] {
                 let token = scene.begin_live_stroke(LayerId(1)).map_err(debug_error)?;
@@ -361,7 +450,7 @@ fn main() -> Result<()> {
                 .finish_live_stroke(token, LiveStrokeDisposition::Cancel)
                 .map_err(debug_error)?;
             println!(
-                "gpu-selected-stroke adapter={:?} backend={:?} eraser={eraser} empty={empty} max_delta={maximum} outside=exact cancel=exact clear=passed",
+                "gpu-selected-stroke adapter={:?} backend={:?} origin={origin:?} eraser={eraser} empty={empty} max_delta={maximum} outside=exact cancel=exact clear=passed",
                 info.name, info.backend
             );
         }

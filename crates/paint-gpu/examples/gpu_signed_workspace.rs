@@ -23,11 +23,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
     let tree = LayerTree::new(GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: ROOT,
         name: "Root".into(),
         visible: true,
         opacity_u16: u16::MAX,
         children: vec![LayerTreeNode::Raster(LayerNode {
+            alpha_locked: false,
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: LAYER,
             name: "Ink".into(),
             visible: true,
@@ -58,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pan: Point { x: 128.0, y: 0.0 },
         zoom: 1.0,
         rotation_radians: 0.0,
+        mirrored_horizontal: false,
     };
     scene.render_viewport(viewport).map_err(debug_error)?;
     require_pixel(
@@ -78,6 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 radius_px: 18.0,
                 opacity: 1.0,
                 flow: 1.0,
+                hardness: 1.0,
             }],
         )
         .map_err(debug_error)?;
@@ -115,6 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 radius_px: 18.0,
                 opacity: 1.0,
                 flow: 1.0,
+                hardness: 1.0,
             }],
         )
         .map_err(debug_error)?;
@@ -132,6 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 radius_px: 18.0,
                 opacity: 1.0,
                 flow: 1.0,
+                hardness: 1.0,
             }],
         )
         .map_err(debug_error)?;
@@ -146,8 +155,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         [255, 0, 0, 255],
     )?;
 
+    let mirrored = viewport
+        .with_view_at(Point { x: 128.0, y: 128.0 }, 1.0, 0.37, true)
+        .ok_or("mirrored signed viewport")?;
+    scene.render_viewport(mirrored).map_err(debug_error)?;
+    let physical = mirrored
+        .document_to_window(Point { x: -64.0, y: 64.0 })
+        .ok_or("signed point")?;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    require_pixel(
+        &readback(&scene, &device, &queue)?,
+        physical.x.floor() as u32,
+        physical.y.floor() as u32,
+        [255, 0, 0, 255],
+    )?;
+
     println!(
-        "{{\"event\":\"gpu_signed_workspace\",\"adapter\":{:?},\"backend\":{:?},\"negative_reopen_upload\":true,\"live_cancel_restored\":true,\"pending_preview_cancel_restored\":true,\"pass\":true}}",
+        "{{\"event\":\"gpu_signed_workspace\",\"adapter\":{:?},\"backend\":{:?},\"negative_reopen_upload\":true,\"live_cancel_restored\":true,\"pending_preview_cancel_restored\":true,\"mirrored_rotated_signed_view\":true,\"pass\":true}}",
         info.name, info.backend,
     );
     Ok(())

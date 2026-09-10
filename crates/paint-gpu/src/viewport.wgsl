@@ -55,10 +55,11 @@ fn fragment_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
     }
 
     // Checkerboard is a page-only alpha backdrop. It cannot leak into the
-    // workspace and it never alters the composite source texture.
+    // workspace and it never alters the composite source texture. Anchor to
+    // document pixel edges, so panning/zooming/rotation move it with artwork.
     let checker_cell = 16.0;
-    let checker = (i32(floor(position.x / checker_cell))
-        + i32(floor(position.y / checker_cell))) & 1;
+    let checker = (i32(floor(document.x / checker_cell))
+        + i32(floor(document.y / checker_cell))) & 1;
     let checker_value = select(0.58, 0.72, checker == 0);
     let checkerboard = vec3<f32>(checker_value);
     let uv = document / params.document_size.xy;

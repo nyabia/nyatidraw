@@ -15,6 +15,8 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn tree() -> LayerTree {
     LayerTree::new(GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: GroupId(100),
         name: "Root".into(),
         visible: true,
@@ -22,6 +24,9 @@ fn tree() -> LayerTree {
         children: [2, 1]
             .map(|id| {
                 LayerTreeNode::Raster(LayerNode {
+                    alpha_locked: false,
+                    clip_to_below: false,
+                    blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                     id: LayerId(id),
                     name: if id == 1 {
                         "Paced ink"

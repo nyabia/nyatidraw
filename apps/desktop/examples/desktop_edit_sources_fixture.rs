@@ -16,6 +16,8 @@ const INK: [u8; 4] = [26, 199, 232, 255];
 
 fn tree() -> LayerTree {
     LayerTree::new(GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: GroupId(100),
         name: "Root".into(),
         visible: true,
@@ -27,6 +29,9 @@ fn tree() -> LayerTree {
         ]
         .map(|(id, name, reference)| {
             LayerTreeNode::Raster(LayerNode {
+                alpha_locked: false,
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                 id: LayerId(id),
                 name: name.into(),
                 visible: true,

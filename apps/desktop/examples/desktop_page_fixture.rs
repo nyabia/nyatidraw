@@ -26,6 +26,8 @@ fn canvas(stage: u8) -> Result<CanvasSpec> {
 
 fn tree() -> LayerTree {
     LayerTree::new(GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: GroupId(100),
         name: "Root".into(),
         visible: true,
@@ -33,6 +35,9 @@ fn tree() -> LayerTree {
         children: [1, 2, 3]
             .map(|id| {
                 LayerTreeNode::Raster(LayerNode {
+                    alpha_locked: false,
+                    clip_to_below: false,
+                    blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                     id: LayerId(id),
                     name: match id {
                         1 => "Crop ink",

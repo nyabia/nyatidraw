@@ -1,8 +1,8 @@
 //! Separate-process selected brush/eraser, history and legacy-reader acceptance.
 use nyatidraw_api::{CanvasSpec, ContentRootId, GroupId, HistoryNodeId, LayerId, SnapshotId};
 use nyatidraw_brush::{
-    BrushEvaluator, BrushPreset, BrushPresetId, BrushSnapshot, ROUND_BRUSH_ENGINE_VERSION,
-    RoundBrushEvaluator, begin_round_stroke,
+    BrushEvaluator, BrushPreset, BrushPresetId, BrushSnapshot, RoundBrushEvaluator,
+    begin_round_stroke,
 };
 use nyatidraw_document::{GroupNode, LayerNode, LayerTree, LayerTreeNode};
 use nyatidraw_editor::HeadlessStrokeSession;
@@ -21,11 +21,16 @@ const MARKER: &str = ".nyatidraw-selected-stroke-probe";
 
 fn tree() -> LayerTree {
     LayerTree::new(GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: GroupId(100),
         name: "Root".into(),
         visible: true,
         opacity_u16: u16::MAX,
         children: vec![LayerTreeNode::Raster(LayerNode {
+            alpha_locked: false,
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: LayerId(1),
             name: "Ink".into(),
             visible: true,
@@ -114,11 +119,16 @@ fn edit(project: &Path, operation: &str) -> Result<()> {
     let preset = BrushPreset {
         id: BrushPresetId(1),
         schema_version: 1,
-        engine_version: ROUND_BRUSH_ENGINE_VERSION,
+        engine_version: 1,
         size_px: 64.0,
         opacity: 1.0,
         flow: 1.0,
         spacing_ratio: 0.25,
+        size_pressure: true,
+        opacity_pressure: true,
+        size_min_ratio: 0.0,
+        opacity_min_ratio: 0.0,
+        hardness: 1.0,
     };
     let samples = [PointerPhase::Begin, PointerPhase::End]
         .into_iter()

@@ -7,16 +7,28 @@
 //! `coverage * dab.opacity * dab.flow`; source RGB is scaled by that same
 //! amount and composited with source-over.
 
+mod affine;
+mod affine_draft;
+mod compositing;
+mod flat_fill;
+mod fragment;
 mod selection;
 mod transform;
+pub use affine::{AffineResult, transform_selection_affine};
+pub use affine_draft::{AffineDraft, AffineDraftError};
+pub use flat_fill::{FloodFillRequest, flood_fill};
+pub use fragment::{RasterFragment, copy_selection, cut_selection, paste_fragment};
 pub use selection::{
-    EditError, EditLimits, SelectionMask, SelectionPaint, SelectionPaintResult, SelectionSource,
-    WandRequest, clear_raster, lasso_selection, paint_selection, wand_selection,
+    EditError, EditLimits, SelectionCombine, SelectionMask, SelectionPaint, SelectionPaintResult,
+    SelectionSource, WandRequest, clear_raster, clear_selection, combine_selection, grow_selection,
+    invert_selection, lasso_selection, lasso_selection_signed, paint_selection,
+    rectangle_selection_signed, sample_artwork_pixel, sample_display_pixel, select_layer_alpha,
+    selection_all, shrink_selection, wand_selection,
 };
 pub use transform::{transform_raster, translate_artwork};
 
 use nyatidraw_brush::BrushDab;
-use nyatidraw_document::{GroupNode, LayerTree, LayerTreeNode};
+use nyatidraw_document::{GroupNode, LayerTree};
 use nyatidraw_input::Point;
 use nyatidraw_tiles::{FlattenError, FlattenedRgba8, MAX_FLATTENED_PIXELS, TileSnapshot};
 
@@ -242,20 +254,11 @@ fn composite_preview_group(
     y: u32,
     destination: &mut [u8],
 ) {
-    for child in &group.children {
-        match child {
-            LayerTreeNode::Raster(layer) if layer.visible => {
-                let source = preview_raster_pixel(snapshot, layer.id, x, y);
-                composite_surface(destination, &source, layer.opacity_u16);
-            }
-            LayerTreeNode::Group(child_group) if child_group.visible => {
-                let mut source = [0; 4];
-                composite_preview_group(snapshot, child_group, x, y, &mut source);
-                composite_surface(destination, &source, child_group.opacity_u16);
-            }
-            LayerTreeNode::Raster(_) | LayerTreeNode::Group(_) => {}
-        }
-    }
+    let pixel = match [i32::try_from(x), i32::try_from(y)] {
+        [Ok(x), Ok(y)] => compositing::group_pixel(snapshot, group, [x, y], None),
+        _ => [0; 4],
+    };
+    destination.copy_from_slice(&pixel);
 }
 
 fn preview_raster_pixel(
@@ -294,89 +297,19 @@ fn composite_group(
     canvas: nyatidraw_api::CanvasSpec,
     destination: &mut [u8],
 ) -> Result<(), CpuCompositeError> {
-    for child in &group.children {
-        match child {
-            LayerTreeNode::Raster(layer) if layer.visible => {
-                composite_raster_tiles(snapshot, layer.id, canvas, destination, layer.opacity_u16)?;
-            }
-            LayerTreeNode::Group(child_group) if child_group.visible => {
-                let mut source = vec![0; destination.len()];
-                composite_group(snapshot, child_group, canvas, &mut source)?;
-                composite_surface(destination, &source, child_group.opacity_u16);
-            }
-            LayerTreeNode::Raster(_) | LayerTreeNode::Group(_) => {}
-        }
-    }
-    Ok(())
-}
-
-/// Blend only a raster's tile/page intersections. Missing tiles are transparent
-/// identity, so materializing and scanning a full-page raster adds no pixels.
-/// Group surfaces remain isolated: their opacity still applies exactly once.
-fn composite_raster_tiles(
-    snapshot: &TileSnapshot,
-    layer: nyatidraw_api::LayerId,
-    canvas: nyatidraw_api::CanvasSpec,
-    destination: &mut [u8],
-    opacity: u16,
-) -> Result<(), CpuCompositeError> {
-    use nyatidraw_tiles::TILE_EDGE;
-
-    // Match crop_base_layer_rgba8_to_canvas even for tiles outside the page
-    // and zero-opacity layers: unsupported mip data must not become hidden.
-    if let Some((key, _)) = snapshot
-        .iter()
-        .find(|(key, _)| key.layer == layer && key.mip != 0)
-    {
-        return Err(CpuCompositeError::Flatten(FlattenError::UnsupportedMip {
-            mip: key.mip,
-        }));
-    }
-    let edge = usize::try_from(TILE_EDGE).expect("tile edge fits usize");
-    let width = usize::try_from(canvas.width_px).expect("validated page width fits usize");
-    for (key, tile) in snapshot.iter().filter(|(key, _)| key.layer == layer) {
-        let tile_left = i64::from(key.x) * i64::from(TILE_EDGE);
-        let tile_top = i64::from(key.y) * i64::from(TILE_EDGE);
-        let left = tile_left.max(0);
-        let top = tile_top.max(0);
-        let right = (tile_left + i64::from(TILE_EDGE)).min(i64::from(canvas.width_px));
-        let bottom = (tile_top + i64::from(TILE_EDGE)).min(i64::from(canvas.height_px));
-        if left >= right || top >= bottom {
-            continue;
-        }
-        let source_x = usize::try_from(left - tile_left).expect("intersection is within tile");
-        let source_y = usize::try_from(top - tile_top).expect("intersection is within tile");
-        let x = usize::try_from(left).expect("intersection is within page");
-        let y = usize::try_from(top).expect("intersection is within page");
-        let row_bytes = usize::try_from(right - left).expect("intersection is within tile") * 4;
-        let rows = usize::try_from(bottom - top).expect("intersection is within tile");
-        for row in 0..rows {
-            let source_start = ((source_y + row) * edge + source_x) * 4;
-            let destination_start = ((y + row) * width + x) * 4;
-            composite_surface(
-                &mut destination[destination_start..destination_start + row_bytes],
-                &tile.pixels()[source_start..source_start + row_bytes],
-                opacity,
-            );
-        }
-    }
-    Ok(())
+    compositing::flatten_group(snapshot, group, canvas, destination)
 }
 
 fn composite_surface(destination: &mut [u8], source: &[u8], opacity_u16: u16) {
     debug_assert_eq!(destination.len(), source.len());
-    let opacity = u32::from(opacity_u16);
     for (destination, source) in destination.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
-        let source_alpha = (u32::from(source[3]) * opacity + 32_767) / 65_535;
-        let inverse_alpha = 255 - source_alpha;
-        for channel in 0..3 {
-            let source_channel = (u32::from(source[channel]) * opacity + 32_767) / 65_535;
-            let value =
-                source_channel + (u32::from(destination[channel]) * inverse_alpha + 127) / 255;
-            destination[channel] = u8::try_from(value.min(255)).expect("channel is clamped");
-        }
-        let alpha = source_alpha + (u32::from(destination[3]) * inverse_alpha + 127) / 255;
-        destination[3] = u8::try_from(alpha.min(255)).expect("alpha is clamped");
+        compositing::blend_pixel(
+            destination,
+            source,
+            opacity_u16,
+            nyatidraw_api::LayerBlendMode::Normal,
+            false,
+        );
     }
 }
 
@@ -521,6 +454,12 @@ impl CpuCanvas {
         }
     }
 
+    pub fn apply_dabs_alpha_locked(&mut self, dabs: &[BrushDab], colour: PremultipliedRgba8) {
+        for &dab in dabs {
+            self.apply_dab_alpha_locked(dab, colour);
+        }
+    }
+
     pub fn erase_dabs(&mut self, dabs: &[BrushDab]) {
         for &dab in dabs {
             self.erase_dab(dab);
@@ -531,6 +470,13 @@ impl CpuCanvas {
     pub fn apply_dab(&mut self, dab: BrushDab, colour: PremultipliedRgba8) {
         self.rasterize_dab(dab, |destination, coverage_alpha| {
             composite_source_over(destination, colour, coverage_alpha);
+        });
+    }
+
+    /// Source-atop recoloring preserves each destination alpha byte exactly.
+    pub fn apply_dab_alpha_locked(&mut self, dab: BrushDab, colour: PremultipliedRgba8) {
+        self.rasterize_dab(dab, |destination, coverage_alpha| {
+            composite_source_atop(destination, colour, coverage_alpha);
         });
     }
 
@@ -554,7 +500,7 @@ impl CpuCanvas {
 
         for y in bounds.top..bounds.bottom {
             for x in bounds.left..bounds.right {
-                let coverage = circle_coverage(dab.center, radius, x, y);
+                let coverage = circle_coverage(dab.center, radius, dab.hardness, x, y);
                 if coverage == 0.0 {
                     continue;
                 }
@@ -680,20 +626,34 @@ fn pixel_offset(width: u32, x: u32, y: u32) -> usize {
 }
 
 #[must_use]
-fn circle_coverage(center: Point, radius: f64, x: u32, y: u32) -> f32 {
+fn circle_coverage(center: Point, radius: f64, hardness: f32, x: u32, y: u32) -> f32 {
     const OFFSETS: [f64; 4] = [0.125, 0.375, 0.625, 0.875];
     let radius_squared = radius * radius;
-    let mut covered = 0_u8;
+    let hardness = if hardness.is_finite() {
+        f64::from(hardness.clamp(0.0, 1.0))
+    } else {
+        0.0
+    };
+    let mut covered = 0.0;
     for offset_y in OFFSETS {
         for offset_x in OFFSETS {
             let dx = f64::from(x) + offset_x - center.x;
             let dy = f64::from(y) + offset_y - center.y;
-            if dx.mul_add(dx, dy * dy) <= radius_squared {
-                covered = covered.saturating_add(1);
+            let distance_squared = dx.mul_add(dx, dy * dy);
+            if distance_squared <= radius_squared {
+                if hardness >= 1.0 {
+                    covered += 1.0;
+                } else {
+                    let t = ((1.0 - distance_squared.sqrt() / radius) / (1.0 - hardness))
+                        .clamp(0.0, 1.0);
+                    covered += t * t * (3.0 - 2.0 * t);
+                }
             }
         }
     }
-    f32::from(covered) / 16.0
+    #[allow(clippy::cast_possible_truncation)]
+    let coverage = (covered / 16.0) as f32;
+    coverage
 }
 
 fn composite_source_over(destination: &mut [u8], colour: PremultipliedRgba8, coverage_alpha: f32) {
@@ -707,6 +667,23 @@ fn composite_source_over(destination: &mut [u8], colour: PremultipliedRgba8, cov
     }
     let destination_alpha = f32::from(destination[3]) / 255.0;
     destination[3] = normalized_byte(source_alpha + destination_alpha * inverse_source_alpha);
+}
+
+pub(crate) fn composite_source_atop(
+    destination: &mut [u8],
+    colour: PremultipliedRgba8,
+    coverage_alpha: f32,
+) {
+    let alpha_byte = destination[3];
+    let destination_alpha = f32::from(alpha_byte) / 255.0;
+    let source_alpha = f32::from(colour.0[3]) / 255.0 * coverage_alpha;
+    for (channel, destination_channel_byte) in destination.iter_mut().take(3).enumerate() {
+        let source = f32::from(colour.0[channel]) / 255.0 * coverage_alpha;
+        let previous = f32::from(*destination_channel_byte) / 255.0;
+        *destination_channel_byte =
+            normalized_byte(source * destination_alpha + previous * (1.0 - source_alpha))
+                .min(alpha_byte);
+    }
 }
 
 fn composite_destination_out(destination: &mut [u8], coverage_alpha: f32) {
@@ -779,6 +756,9 @@ mod tests {
             };
             let raster = |id, visible| {
                 LayerTreeNode::Raster(LayerNode {
+                    alpha_locked: false,
+                    clip_to_below: false,
+                    blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                     id: LayerId(id),
                     name: format!("{id}"),
                     visible,
@@ -789,6 +769,8 @@ mod tests {
                 })
             };
             let tree = LayerTree::new(GroupNode {
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                 id: GroupId(100),
                 name: "Root".into(),
                 visible: true,
@@ -796,6 +778,8 @@ mod tests {
                 children: vec![
                     raster(1, true),
                     LayerTreeNode::Group(GroupNode {
+                        clip_to_below: false,
+                        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                         id: GroupId(101),
                         name: "Isolated".into(),
                         visible: true,
@@ -855,6 +839,7 @@ mod tests {
                 radius_px: 1.0,
                 opacity: 0.5,
                 flow: 0.5,
+                hardness: 1.0,
             },
             PremultipliedRgba8::new(128, 64, 32, 128),
         );
@@ -907,6 +892,34 @@ mod tests {
     }
 
     #[test]
+    fn alpha_locked_dabs_recolor_without_changing_transparent_or_soft_edges() {
+        // Product risk: source-atop is accidentally source-over or source-in,
+        // destroying exact soft-edge alpha during repeated recoloring.
+        for (before, color, opacity, expected) in [
+            ([0; 4], [128, 0, 0, 128], 1.0, [0; 4]),
+            ([0, 64, 32, 128], [128, 0, 0, 128], 1.0, [64, 32, 16, 128]),
+            ([0, 64, 32, 128], [128, 0, 0, 128], 0.5, [32, 48, 24, 128]),
+            ([0, 128, 64, 255], [128, 0, 0, 128], 1.0, [128, 64, 32, 255]),
+            ([1, 0, 0, 1], [0, 128, 0, 128], 1.0, [0, 1, 0, 1]),
+        ] {
+            let mut canvas = CpuCanvas::from_rgba8_premultiplied(1, 1, before.to_vec()).unwrap();
+            let dab = BrushDab {
+                center: Point { x: 0.5, y: 0.5 },
+                radius_px: 1.0,
+                opacity,
+                flow: 1.0,
+                hardness: 1.0,
+            };
+            canvas.apply_dab_alpha_locked(dab, PremultipliedRgba8(color));
+            assert_eq!(canvas.pixel(0, 0).unwrap().0, expected);
+            canvas.apply_dabs_alpha_locked(&[dab; 64], PremultipliedRgba8(color));
+            let actual = canvas.pixel(0, 0).unwrap().0;
+            assert_eq!(actual[3], before[3]);
+            assert!(actual[..3].iter().all(|channel| *channel <= actual[3]));
+        }
+    }
+
+    #[test]
     fn eraser_scales_every_premultiplied_channel_by_remaining_coverage() {
         // Product risk: erasing RGB differently from alpha leaves coloured
         // fringes and corrupts the premultiplied pixel invariant on reopen.
@@ -917,6 +930,7 @@ mod tests {
             radius_px: 1.0,
             opacity: 0.5,
             flow: 1.0,
+            hardness: 1.0,
         });
 
         assert_eq!(
@@ -942,16 +956,23 @@ mod tests {
         )])
         .expect("valid fixture tile");
         let tree = LayerTree::new(GroupNode {
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: GroupId(1),
             name: "Root".into(),
             visible: true,
             opacity_u16: u16::MAX,
             children: vec![LayerTreeNode::Group(GroupNode {
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                 id: GroupId(2),
                 name: "Half".into(),
                 visible: true,
                 opacity_u16: 32_768,
                 children: vec![LayerTreeNode::Raster(LayerNode {
+                    alpha_locked: false,
+                    clip_to_below: false,
+                    blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                     id: layer,
                     name: "Ink".into(),
                     visible: true,
@@ -1019,11 +1040,16 @@ mod tests {
         ])
         .expect("valid signed sparse tiles");
         let tree = LayerTree::new(GroupNode {
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: GroupId(1),
             name: "Root".into(),
             visible: true,
             opacity_u16: u16::MAX,
             children: vec![LayerTreeNode::Raster(LayerNode {
+                alpha_locked: false,
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                 id: layer,
                 name: "Ink".into(),
                 visible: true,

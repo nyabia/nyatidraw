@@ -58,6 +58,9 @@ fn key(layer: u128, x: i32) -> TileKey {
 fn fixture_tree() -> LayerTree {
     let raster = |id, reference| {
         LayerTreeNode::Raster(LayerNode {
+            alpha_locked: false,
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: LayerId(id),
             name: format!("Layer{id}"),
             visible: true,
@@ -68,12 +71,16 @@ fn fixture_tree() -> LayerTree {
         })
     };
     LayerTree::new(GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: GroupId(100),
         name: "Root".into(),
         visible: true,
         opacity_u16: u16::MAX,
         children: vec![
             LayerTreeNode::Group(GroupNode {
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                 id: GroupId(10),
                 name: "Reference group".into(),
                 visible: true,

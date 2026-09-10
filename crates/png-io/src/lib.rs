@@ -73,7 +73,37 @@ impl From<std::io::Error> for PngIoError {
 /// large input without modifying a project file.
 pub fn decode_png(path: &Path, layer: LayerId) -> Result<ImportedPng, PngIoError> {
     let file = File::open(path)?;
-    let mut decoder = png::Decoder::new(BufReader::new(file));
+    decode_png_reader(
+        BufReader::new(file),
+        layer,
+        nyatidraw_tiles::MAX_FLATTENED_PIXELS,
+    )
+}
+
+/// Decodes a bounded clipboard PNG without temporary files.
+/// # Errors
+/// Rejects malformed, unsupported or oversized PNG data.
+pub fn decode_png_bytes(
+    bytes: &[u8],
+    layer: LayerId,
+    max_pixels: u64,
+) -> Result<ImportedPng, PngIoError> {
+    if bytes.len() > 128 * 1024 * 1024 {
+        return Err(PngIoError::DimensionsTooLarge);
+    }
+    decode_png_reader(
+        std::io::Cursor::new(bytes),
+        layer,
+        max_pixels.min(nyatidraw_tiles::MAX_FLATTENED_PIXELS),
+    )
+}
+
+fn decode_png_reader(
+    reader: impl std::io::Read,
+    layer: LayerId,
+    max_pixels: u64,
+) -> Result<ImportedPng, PngIoError> {
+    let mut decoder = png::Decoder::new(reader);
     decoder.set_transformations(png::Transformations::EXPAND);
     let mut reader = decoder.read_info().map_err(PngIoError::Decode)?;
     let info = reader.info();
@@ -89,7 +119,7 @@ pub fn decode_png(path: &Path, layer: LayerId) -> Result<ImportedPng, PngIoError
     let pixels = u64::from(info.width)
         .checked_mul(u64::from(info.height))
         .ok_or(PngIoError::DimensionsTooLarge)?;
-    if pixels > nyatidraw_tiles::MAX_FLATTENED_PIXELS {
+    if pixels > max_pixels {
         return Err(PngIoError::DimensionsTooLarge);
     }
     let mut frame_buffer = vec![0; reader.output_buffer_size()];

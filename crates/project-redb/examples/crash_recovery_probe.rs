@@ -262,11 +262,16 @@ fn run_kill_case(
 
 fn layer_fixture(changed: bool) -> Result<LayerTree, String> {
     LayerTree::new(GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: GroupId(1),
         name: "Root".into(),
         visible: true,
         opacity_u16: u16::MAX,
         children: vec![LayerTreeNode::Raster(LayerNode {
+            alpha_locked: false,
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: LayerId(4),
             name: if changed {
                 "Renamed after edit"
@@ -330,12 +335,17 @@ fn prepared_batch(
 ) -> Result<ProjectCommitBatch, String> {
     let preset = BrushPreset {
         id: BrushPresetId(17),
-        schema_version: 1,
+        schema_version: nyatidraw_brush::ROUND_BRUSH_PRESET_SCHEMA_VERSION,
         engine_version: ROUND_BRUSH_ENGINE_VERSION,
         size_px: 18.0,
         opacity: 0.9,
         flow: 0.6,
         spacing_ratio: 0.2,
+        size_pressure: true,
+        opacity_pressure: true,
+        size_min_ratio: 0.0,
+        opacity_min_ratio: 0.0,
+        hardness: 1.0,
     };
     let samples = vec![
         sample(sequence, PointerPhase::Begin, -8.0, 5.0),

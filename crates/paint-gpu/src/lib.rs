@@ -23,9 +23,9 @@ use wgpu::util::DeviceExt;
 
 pub const WORKING_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-const FLOATS_PER_INSTANCE: usize = 8;
+const FLOATS_PER_INSTANCE: usize = 9;
 const BYTES_PER_INSTANCE: usize = FLOATS_PER_INSTANCE * size_of::<f32>();
-const INSTANCE_STRIDE: wgpu::BufferAddress = 32;
+const INSTANCE_STRIDE: wgpu::BufferAddress = 36;
 const INITIAL_INSTANCE_CAPACITY: usize = 64;
 const RGBA8_BYTES_PER_PIXEL: u32 = 4;
 
@@ -312,7 +312,36 @@ impl GpuRoundDabPainter {
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, brush_rgba: [f32; 4]) -> Self {
-        Self::new_with_blend(device, queue, brush_rgba, wgpu::BlendState::ALPHA_BLENDING)
+        Self::new_with_blend(
+            device,
+            queue,
+            brush_rgba,
+            wgpu::BlendState::ALPHA_BLENDING,
+            false,
+        )
+    }
+
+    /// Builds a source-atop recoloring painter. RGB is premultiplied in the
+    /// fragment shader, and alpha writes are disabled to retain exact bytes.
+    #[must_use]
+    pub fn new_alpha_locked(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        brush_rgba: [f32; 4],
+    ) -> Self {
+        let source_atop = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::DstAlpha,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        Self::new_with_blend(device, queue, brush_rgba, source_atop, true)
     }
 
     /// Builds a destination-out painter for alpha erasing.
@@ -330,7 +359,7 @@ impl GpuRoundDabPainter {
                 operation: wgpu::BlendOperation::Add,
             },
         };
-        Self::new_with_blend(device, queue, [0.0, 0.0, 0.0, 1.0], destination_out)
+        Self::new_with_blend(device, queue, [0.0, 0.0, 0.0, 1.0], destination_out, false)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -339,6 +368,7 @@ impl GpuRoundDabPainter {
         queue: &wgpu::Queue,
         brush_rgba: [f32; 4],
         blend: wgpu::BlendState,
+        alpha_locked: bool,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("nayati-round-dab-shader"),
@@ -412,6 +442,11 @@ impl GpuRoundDabPainter {
                             offset: 28,
                             shader_location: 4,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 32,
+                            shader_location: 5,
+                        },
                     ],
                 }],
             },
@@ -420,12 +455,20 @@ impl GpuRoundDabPainter {
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fragment_main"),
+                entry_point: Some(if alpha_locked {
+                    "fragment_alpha_locked"
+                } else {
+                    "fragment_main"
+                }),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: WORKING_TEXTURE_FORMAT,
                     blend: Some(blend),
-                    write_mask: wgpu::ColorWrites::ALL,
+                    write_mask: if alpha_locked {
+                        wgpu::ColorWrites::RED | wgpu::ColorWrites::GREEN | wgpu::ColorWrites::BLUE
+                    } else {
+                        wgpu::ColorWrites::ALL
+                    },
                 })],
             }),
             multiview: None,
@@ -462,7 +505,20 @@ impl GpuRoundDabPainter {
         dimensions: [u32; 2],
         packed: &[u8],
     ) -> Result<GpuSelectionMask, GpuSelectionError> {
-        GpuSelectionMask::new(&self.device, dimensions, packed)
+        self.create_selection_mask_at([0, 0], dimensions, packed)
+    }
+
+    /// Uploads bounded coverage whose document origin may lie outside the page.
+    ///
+    /// # Errors
+    /// Rejects invalid extents or noncanonical packed coverage.
+    pub fn create_selection_mask_at(
+        &self,
+        origin: [i32; 2],
+        dimensions: [u32; 2],
+        packed: &[u8],
+    ) -> Result<GpuSelectionMask, GpuSelectionError> {
+        GpuSelectionMask::new(&self.device, origin, dimensions, packed)
     }
 
     /// Changes semantic coverage between strokes; no mask upload occurs per dab.
@@ -695,6 +751,7 @@ impl PreparedDabs {
                 || !radius.is_finite()
                 || radius <= 0.0
                 || opacity <= 0.0
+                || !opacity.is_finite()
             {
                 continue;
             }
@@ -724,6 +781,11 @@ impl PreparedDabs {
                 x as f32,
                 y as f32,
                 radius as f32,
+                if dab.hardness.is_finite() {
+                    dab.hardness.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
             ];
             bytes.extend_from_slice(&encode_f32s(&instance));
         }

@@ -1,6 +1,6 @@
 //! Fixed software workload shared by the paced driver and offline replay.
 use nyatidraw_api::CanvasSpec;
-use nyatidraw_brush::{BrushPreset, BrushPresetId, ROUND_BRUSH_ENGINE_VERSION};
+use nyatidraw_brush::{BrushPreset, BrushPresetId};
 use nyatidraw_input::{PenButtons, Point, PointerPhase, StylusSample};
 
 pub const CANVAS: CanvasSpec = CanvasSpec {
@@ -15,11 +15,17 @@ pub const COLOR: [u8; 4] = [26, 199, 232, 255];
 pub const BRUSH: BrushPreset = BrushPreset {
     id: BrushPresetId(1),
     schema_version: 1,
-    engine_version: ROUND_BRUSH_ENGINE_VERSION,
+    // Keep this historical diagnostic workload pixel/hash compatible.
+    engine_version: 1,
     size_px: 64.0,
     opacity: 1.0,
     flow: 0.38,
     spacing_ratio: 0.12,
+    size_pressure: true,
+    opacity_pressure: true,
+    size_min_ratio: 0.0,
+    opacity_min_ratio: 0.0,
+    hardness: 1.0,
 };
 
 pub fn sample(stroke: u32, index: u32) -> StylusSample {

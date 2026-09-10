@@ -29,9 +29,33 @@ pub enum EditSource {
     AllVisible,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SelectionMode {
+    #[default]
+    Replace,
+    Add,
+    Subtract,
+}
+
 /// Completed document-space gestures; raw pointer samples never enter this lane.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EditCommand {
+    CopySelection,
+    CutSelection,
+    /// Paste as a new raster above the active one, preserving source position.
+    PasteSelection,
+    /// Read one signed document pixel; never changes artwork or history.
+    PickColor {
+        point: [i32; 2],
+        source: EditSource,
+    },
+    /// Temporary canvas picker: session Solo affects the sampled artwork,
+    /// while checkerboard, page border and editor overlays never do.
+    PickDisplayColor {
+        point: [i32; 2],
+        solo: Option<crate::LayerTreeNodeId>,
+        input_sequence: (u64, u64),
+    },
     /// Clears every pixel of the active raster, including off-page artwork.
     /// Keeps the layer and its properties; independent of selection.
     ClearActiveLayer,
@@ -45,6 +69,8 @@ pub enum EditCommand {
     /// Cut the selection (or whole active raster when absent), then transform
     /// and composite it back. Successful completion clears the selection.
     Transform(RasterTransform),
+    /// Provisional free transform; only explicit Commit creates history.
+    FreeTransform(TransformCommand),
     SelectWand {
         seed: [i32; 2],
         tolerance: u8,
@@ -54,6 +80,21 @@ pub enum EditCommand {
     SelectLasso {
         vertices: Vec<[i32; 2]>,
     },
+    CombineLasso {
+        vertices: Vec<[i32; 2]>,
+        mode: SelectionMode,
+    },
+    /// Finite page plus active artwork and current selection bounds.
+    SelectAll,
+    InvertSelection,
+    DeleteSelectedPixels,
+    GrowSelection {
+        radius: u8,
+    },
+    ShrinkSelection {
+        radius: u8,
+    },
+    SelectLayerAlpha,
     ClearSelection,
     /// Colors are premultiplied linear RGBA8, matching durable tile pixels.
     FillSelection {
@@ -64,6 +105,14 @@ pub enum EditCommand {
         tolerance: u8,
         source: EditSource,
         color: [u8; 4],
+    },
+    /// Connected fill with boundary controls, clipped by any current selection.
+    FloodFillAdvanced {
+        seed: [i32; 2],
+        tolerance: u8,
+        source: EditSource,
+        color: [u8; 4],
+        settings: FillSettings,
     },
     GradientSelection {
         start: [i32; 2],
@@ -86,23 +135,72 @@ pub struct RasterTransform {
     pub size: Option<[u32; 2]>,
 }
 
+/// Document-space free transform about the selected bounds' center.
+/// Flips precede scale and clockwise rotation, followed by translation.
+/// Integer UI units keep command equality exact; sampling uses premultiplied
+/// linear pixels. This is artwork editing, not a viewport transformation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AffineTransform {
+    pub offset_milli: [i64; 2],
+    pub scale_ppm: [u32; 2],
+    pub rotation_millidegrees: i32,
+    pub flip_x: bool,
+    pub flip_y: bool,
+}
+
+impl Default for AffineTransform {
+    fn default() -> Self {
+        Self {
+            offset_milli: [0, 0],
+            scale_ppm: [1_000_000, 1_000_000],
+            rotation_millidegrees: 0,
+            flip_x: false,
+            flip_y: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransformCommand {
+    Begin,
+    Paste,
+    Preview(AffineTransform),
+    Commit { generation: u64 },
+    Cancel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransformProjection {
+    pub generation: u64,
+    pub transform: AffineTransform,
+    pub origin: [i32; 2],
+    pub size: [u32; 2],
+    pub corners_milli: [[i64; 2]; 4],
+    pub can_commit: bool,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EditProjection {
     pub busy: bool,
     pub has_selection: bool,
     pub selected_pixels: u64,
     pub error: Option<String>,
+    pub transform: Option<TransformProjection>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DrawingTool {
+    /// Viewport navigation only; never moves artwork.
     Move,
+    MoveSelection,
     Pencil,
     Pen,
     Brush,
     Eraser,
     Wand,
     Lasso,
+    RectangleSelection,
+    Eyedropper,
     Fill,
     Gradient,
 }
@@ -110,7 +208,33 @@ pub enum DrawingTool {
 impl DrawingTool {
     #[must_use]
     pub const fn is_edit(self) -> bool {
-        matches!(self, Self::Wand | Self::Lasso | Self::Fill | Self::Gradient)
+        matches!(
+            self,
+            Self::Wand
+                | Self::Lasso
+                | Self::RectangleSelection
+                | Self::MoveSelection
+                | Self::Eyedropper
+                | Self::Fill
+                | Self::Gradient
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FillSettings {
+    pub gap_close_px: u8,
+    pub expand_px: u8,
+    pub antialias: bool,
+}
+
+impl Default for FillSettings {
+    fn default() -> Self {
+        Self {
+            gap_close_px: 0,
+            expand_px: 1,
+            antialias: true,
+        }
     }
 }
 
@@ -118,6 +242,8 @@ impl DrawingTool {
 pub struct EditSettings {
     pub source: EditSource,
     pub tolerance: u8,
+    pub selection_mode: SelectionMode,
+    pub fill: FillSettings,
 }
 
 impl Default for EditSettings {
@@ -125,7 +251,46 @@ impl Default for EditSettings {
         Self {
             source: EditSource::ActiveLayer,
             tolerance: 0,
+            selection_mode: SelectionMode::Replace,
+            fill: FillSettings::default(),
         }
+    }
+}
+
+/// Fixed-point, session-only controls for the current round brush.
+/// Ratios use the full `u16` range; no raw input or renderer state crosses UI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BrushSettings {
+    pub size_pressure: bool,
+    pub opacity_pressure: bool,
+    pub size_minimum_u16: u16,
+    pub opacity_minimum_u16: u16,
+    pub hardness_u16: u16,
+    /// Session input smoothing strength. Zero is exact bypass.
+    pub smoothing: u8,
+}
+
+impl BrushSettings {
+    #[must_use]
+    pub const fn for_tool(tool: DrawingTool) -> Self {
+        Self {
+            size_pressure: true,
+            opacity_pressure: matches!(tool, DrawingTool::Pencil),
+            size_minimum_u16: 0,
+            opacity_minimum_u16: 0,
+            hardness_u16: match tool {
+                DrawingTool::Pencil => 32_768,
+                DrawingTool::Brush => 0,
+                _ => u16::MAX,
+            },
+            smoothing: 0,
+        }
+    }
+}
+
+impl Default for BrushSettings {
+    fn default() -> Self {
+        Self::for_tool(DrawingTool::Brush)
     }
 }
 
@@ -138,29 +303,48 @@ pub enum ToolCommand {
     CycleSelectionFamily,
     CycleFillFamily,
     SetSizeTenths(u16),
+    /// Applies relative steps to the writer-owned size, avoiding stale UI values.
+    AdjustSizeSteps {
+        tool: DrawingTool,
+        steps: i8,
+    },
     SetOpacityU16(u16),
+    SetSizePressure(bool),
+    SetOpacityPressure(bool),
+    SetSizeMinimumU16(u16),
+    SetOpacityMinimumU16(u16),
+    SetHardnessU16(u16),
+    SetSmoothing(u8),
     SetColor([u8; 4]),
+    SwapColors,
     SetEditSource(EditSource),
     SetEditTolerance(u8),
+    SetFillSettings(FillSettings),
+    SetFillGapClose(u8),
+    SetFillExpansion(u8),
+    SetFillAntialias(bool),
+    SetSelectionMode(SelectionMode),
 }
 
 /// Discrete viewport operations keep the cross-thread protocol deterministic
 /// and `Eq` while the renderer remains the authority for the resulting affine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ViewportCommand {
+    /// Fit the page, resetting rotation and view mirroring.
     FitDocument,
+    /// One document pixel per physical pixel; reset rotation and view mirroring.
     ActualPixels,
     PanBy {
         logical_x: i32,
         logical_y: i32,
     },
-    /// Centers one finite-page coordinate while preserving zoom and rotation.
+    /// Centers one finite-page coordinate while preserving zoom and orientation.
     /// Coordinates are ten-thousandths of the output page extent.
     CenterPageAt {
         page_x_10k: i32,
         page_y_10k: i32,
     },
-    /// Number of 1.25x zoom increments; negative values zoom out.
+    /// Viewport-center-anchored 1.25x zoom increments; negative values zoom out.
     ZoomSteps(i8),
     /// Pointer-centered zoom in logical child-window coordinates.
     ZoomAt {
@@ -168,8 +352,12 @@ pub enum ViewportCommand {
         logical_x: i32,
         logical_y: i32,
     },
-    /// Number of 45 degree clockwise increments; negative values rotate left.
+    /// Center-anchored 45 degree clockwise increments; negative values rotate left.
     RotateQuarterSteps(i8),
+    /// Reflect document X in the view around the current viewport center.
+    ToggleMirrorHorizontal,
+    /// Reset only rotation, preserving the center document anchor, zoom and mirror.
+    ResetRotation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -188,8 +376,28 @@ pub enum ProjectCommand {
     Save,
 }
 
+/// Raster/group composition over a premultiplied linear-light backdrop.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LayerBlendMode {
+    #[default]
+    Normal,
+    Multiply,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LayerCommand {
+    SetAlphaLocked {
+        layer: LayerId,
+        alpha_locked: bool,
+    },
+    SetClipToBelow {
+        node: LayerTreeNodeId,
+        clip_to_below: bool,
+    },
+    SetBlendMode {
+        node: LayerTreeNodeId,
+        blend_mode: LayerBlendMode,
+    },
     SetActive(LayerId),
     SetReference {
         layer: LayerId,
@@ -197,6 +405,11 @@ pub enum LayerCommand {
     },
     /// Inserts one empty raster immediately above the active raster.
     AddRaster,
+    DuplicateRaster(LayerId),
+    SetLocked {
+        layer: LayerId,
+        locked: bool,
+    },
     /// Inserts one empty group immediately above the active raster.
     AddGroup,
     Delete(LayerTreeNodeId),
@@ -272,6 +485,7 @@ pub enum CommandRejectReason {
         current: Revision,
     },
     UnknownLayer,
+    LayerLocked,
     InvalidLayerMove,
     InvalidLayout,
     InvalidViewport,
@@ -297,7 +511,12 @@ pub enum LayerProjectionKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+// Orthogonal user layer toggles, not states of one state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct LayerProjection {
+    pub alpha_locked: bool,
+    pub clip_to_below: bool,
+    pub blend_mode: LayerBlendMode,
     pub id: LayerTreeNodeId,
     pub parent: GroupId,
     /// Bottom-to-top sibling index before a proposed move.
@@ -306,6 +525,7 @@ pub struct LayerProjection {
     pub kind: LayerProjectionKind,
     pub name: String,
     pub visible: bool,
+    pub locked: bool,
     pub reference: bool,
     pub opacity_u16: u16,
 }
@@ -393,11 +613,14 @@ pub struct UiProjection {
     pub viewport: ViewportProjection,
     pub drawing_tool: DrawingTool,
     pub brush_size_tenths: u16,
-    /// Session brush sizes, newest first, at most four unique tenths of a pixel.
+    /// Sizes used at accepted drawing Begin, newest first, at most four unique
+    /// tenths of a pixel. Session-only; selection and Undo/Redo do not update it.
     pub recent_brush_sizes: Vec<u16>,
     pub brush_opacity_u16: u16,
+    pub brush_settings: BrushSettings,
     /// Straight sRGB8 UI color; alpha is linear. Convert before artwork commands.
     pub brush_color: [u8; 4],
+    pub background_color: [u8; 4],
     /// Session palette, newest first, at most eight unique straight sRGB8 colors.
     pub recent_colors: Vec<[u8; 4]>,
     pub edit_settings: EditSettings,
@@ -411,6 +634,7 @@ pub struct ViewportProjection {
     pub pan_y_milli: i64,
     pub zoom_ppm: u32,
     pub rotation_millidegrees: i32,
+    pub mirrored_horizontal: bool,
 }
 
 impl UiProjection {
@@ -434,9 +658,11 @@ impl UiProjection {
             },
             drawing_tool: DrawingTool::Brush,
             brush_size_tenths: 50,
-            recent_brush_sizes: vec![50],
+            recent_brush_sizes: Vec::new(),
             brush_opacity_u16: u16::MAX,
+            brush_settings: BrushSettings::default(),
             brush_color: [26, 199, 232, 255],
+            background_color: [255; 4],
             recent_colors: vec![[26, 199, 232, 255]],
             edit_settings: EditSettings::default(),
         }

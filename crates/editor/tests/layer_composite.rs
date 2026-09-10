@@ -4,6 +4,9 @@ use nyatidraw_tiles::{CompositeCache, TILE_EDGE, TileKey};
 
 fn raster(id: u128) -> LayerTreeNode {
     LayerTreeNode::Raster(LayerNode {
+        alpha_locked: false,
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: LayerId(id),
         name: format!("Layer {id}"),
         visible: true,
@@ -16,6 +19,8 @@ fn raster(id: u128) -> LayerTreeNode {
 
 fn fixture() -> LayerTree {
     let lower = GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: GroupId(10),
         name: "Lower ten".into(),
         visible: true,
@@ -23,6 +28,8 @@ fn fixture() -> LayerTree {
         children: (1..=10).map(raster).collect(),
     };
     let upper = GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: GroupId(20),
         name: "Upper ten".into(),
         visible: true,
@@ -30,6 +37,8 @@ fn fixture() -> LayerTree {
         children: (11..=20).map(raster).collect(),
     };
     LayerTree::new(GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: GroupId(1),
         name: "Document root".into(),
         visible: true,

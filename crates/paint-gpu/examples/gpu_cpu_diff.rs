@@ -102,7 +102,14 @@ fn run_eraser_fixture(
         .checked_mul(usize::try_from(HEIGHT).expect("probe height fits usize"))
         .expect("probe dimensions do not overflow");
     let initial = initial_pixel.repeat(pixel_count);
-    let dabs = overlapping_dabs(7, 18.25, 14.0, 5.25, 0.38, 0.52);
+    let dabs: Vec<_> = overlapping_dabs(7, 18.25, 14.0, 5.25, 0.38, 0.52)
+        .into_iter()
+        .enumerate()
+        .map(|(index, dab)| BrushDab {
+            hardness: if index % 2 == 0 { 0.2 } else { 1.0 },
+            ..dab
+        })
+        .collect();
     let mut eraser = GpuRoundDabPainter::new_eraser(device, queue);
     let tile = eraser
         .restore_closed_rgba8(WIDTH, HEIGHT, &initial)
@@ -189,6 +196,39 @@ fn diff_json(stats: ImageDiffStats) -> String {
 fn probe_fixtures() -> Vec<ProbeFixture> {
     vec![
         ProbeFixture {
+            name: "soft_tips_and_clipped_falloff",
+            brush_rgba8: [64, 128, 192, 255],
+            dabs: vec![
+                BrushDab {
+                    hardness: 0.0,
+                    ..dab(8.25, 7.75, 7.5, 0.9, 0.9)
+                },
+                BrushDab {
+                    hardness: 0.35,
+                    ..dab(18.25, 16.125, 6.25, 0.9, 0.8)
+                },
+                BrushDab {
+                    hardness: 0.8,
+                    ..dab(36.5, 28.5, 6.0, 0.41, 0.76)
+                },
+                BrushDab {
+                    hardness: 0.0,
+                    ..dab(-1.0, 22.0, 7.0, 0.7, 0.65)
+                },
+            ],
+        },
+        ProbeFixture {
+            name: "soft_dense_overlap",
+            brush_rgba8: [232, 24, 192, 255],
+            dabs: overlapping_dabs(12, 23.0, 13.0, 7.75, 0.38, 0.52)
+                .into_iter()
+                .map(|dab| BrushDab {
+                    hardness: 0.2,
+                    ..dab
+                })
+                .collect(),
+        },
+        ProbeFixture {
             name: "overlap_blue",
             brush_rgba8: [64, 128, 192, 255],
             dabs: vec![
@@ -248,6 +288,7 @@ fn dab(x: f64, y: f64, radius_px: f32, opacity: f32, flow: f32) -> BrushDab {
         radius_px,
         opacity,
         flow,
+        hardness: 1.0,
     }
 }
 

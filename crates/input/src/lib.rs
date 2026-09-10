@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod smoothing;
+
+pub use smoothing::{SmoothingError, StrokeSmoother};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Point {
     pub x: f64,
@@ -18,6 +22,8 @@ pub struct ViewportTransform {
     pub pan: Point,
     pub zoom: f64,
     pub rotation_radians: f64,
+    /// Reflect document X before rotating. This is a view transform only.
+    pub mirrored_horizontal: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,7 +101,7 @@ impl ViewportTransform {
         let y = logical.y - self.pan.y;
         let (sin, cos) = self.rotation_radians.sin_cos();
         Some(Point {
-            x: (cos * x + sin * y) / self.zoom,
+            x: (cos * x + sin * y) / self.zoom * if self.mirrored_horizontal { -1.0 } else { 1.0 },
             y: (-sin * x + cos * y) / self.zoom,
         })
     }
@@ -106,10 +112,48 @@ impl ViewportTransform {
             return None;
         }
         let (sin, cos) = self.rotation_radians.sin_cos();
+        let x = document.x * if self.mirrored_horizontal { -1.0 } else { 1.0 };
         Some(Point {
-            x: cos * document.x.mul_add(self.zoom, 0.0) - sin * document.y * self.zoom + self.pan.x,
-            y: sin * document.x * self.zoom + cos * document.y * self.zoom + self.pan.y,
+            x: cos * x * self.zoom - sin * document.y * self.zoom + self.pan.x,
+            y: sin * x * self.zoom + cos * document.y * self.zoom + self.pan.y,
         })
+    }
+
+    /// Change view orientation/scale without moving the artwork under `focus`.
+    /// Pan is adjusted to preserve the document anchor; document pixels are untouched.
+    #[must_use]
+    pub fn with_view_at(
+        self,
+        focus: Point,
+        zoom: f64,
+        rotation_radians: f64,
+        mirrored_horizontal: bool,
+    ) -> Option<Self> {
+        let document = self.logical_to_document(focus)?;
+        Self {
+            zoom,
+            rotation_radians,
+            mirrored_horizontal,
+            ..self
+        }
+        .with_document_at(document, focus)
+    }
+
+    /// Centering/navigation uses the same forward transform as input and GPU display.
+    #[must_use]
+    pub fn with_document_at(self, document: Point, logical: Point) -> Option<Self> {
+        if !logical.x.is_finite() || !logical.y.is_finite() {
+            return None;
+        }
+        let projected = self.document_to_logical(document)?;
+        let candidate = Self {
+            pan: Point {
+                x: self.pan.x + logical.x - projected.x,
+                y: self.pan.y + logical.y - projected.y,
+            },
+            ..self
+        };
+        candidate.validate().ok()
     }
 
     #[must_use]
@@ -217,6 +261,103 @@ mod tests {
     }
 
     #[test]
+    fn mirrored_view_anchors_and_round_trips_prevent_drawing_on_the_wrong_pixels() {
+        let center = Point { x: 210.0, y: 145.0 };
+        let document = Point { x: -32.5, y: 91.75 };
+        for (rotation, zoom, scale) in [(0.0, 1.0, 1.0), (0.73, 2.5, 1.5), (-1.7, 0.3, 2.0)] {
+            let original = ViewportTransform {
+                revision: 7,
+                window_origin_physical: Point { x: 17.0, y: 23.0 },
+                physical_size: [840, 580],
+                dpi_scale: scale,
+                pan: Point { x: 57.0, y: -36.0 },
+                zoom,
+                rotation_radians: rotation,
+                mirrored_horizontal: false,
+            };
+            let anchor = original.logical_to_document(center).expect("anchor");
+            let mirrored = original
+                .with_view_at(center, zoom, rotation, true)
+                .expect("mirror");
+            assert_point_near(
+                mirrored.logical_to_document(center).expect("same anchor"),
+                anchor,
+            );
+            let twice = mirrored
+                .with_view_at(center, zoom, rotation, false)
+                .expect("unmirror");
+            assert_point_near(twice.pan, original.pan);
+
+            // Reflection reverses document X before rotation, around the held center.
+            let original_right = original
+                .document_to_logical(Point {
+                    x: anchor.x + 12.0,
+                    y: anchor.y,
+                })
+                .expect("right");
+            let mirror_right = mirrored
+                .document_to_logical(Point {
+                    x: anchor.x + 12.0,
+                    y: anchor.y,
+                })
+                .expect("mirrored right");
+            assert_point_near(
+                Point {
+                    x: original_right.x + mirror_right.x,
+                    y: original_right.y + mirror_right.y,
+                },
+                Point {
+                    x: center.x * 2.0,
+                    y: center.y * 2.0,
+                },
+            );
+            for view in [original, mirrored] {
+                let physical = view.document_to_window(document).expect("forward");
+                assert_point_near(
+                    view.window_to_document(physical).expect("inverse"),
+                    document,
+                );
+                let reset = view
+                    .with_view_at(center, zoom, 0.0, view.mirrored_horizontal)
+                    .expect("reset angle");
+                assert_point_near(
+                    reset.logical_to_document(center).expect("reset anchor"),
+                    anchor,
+                );
+                let focus = Point { x: 29.0, y: 79.0 };
+                let focus_document = view.logical_to_document(focus).expect("zoom anchor");
+                let zoomed = view
+                    .with_view_at(focus, zoom * 1.25, rotation, view.mirrored_horizontal)
+                    .expect("zoom");
+                assert_point_near(
+                    zoomed.logical_to_document(focus).expect("held zoom anchor"),
+                    focus_document,
+                );
+                let navigated = view
+                    .with_document_at(document, center)
+                    .expect("navigator center");
+                assert_point_near(
+                    navigated
+                        .logical_to_document(center)
+                        .expect("navigation inverse"),
+                    document,
+                );
+            }
+        }
+    }
+
+    fn assert_point_near(actual: Point, expected: Point) {
+        assert!(
+            (actual.x - expected.x).abs() < 1e-9,
+            "x: {actual:?} != {expected:?}"
+        );
+        assert!(
+            (actual.y - expected.y).abs() < 1e-9,
+            "y: {actual:?} != {expected:?}"
+        );
+    }
+
+    #[test]
     fn viewport_round_trip_and_stroke_revision_policy_prevent_mixed_coordinates() {
         let viewport = ViewportTransform {
             revision: 7,
@@ -226,6 +367,7 @@ mod tests {
             pan: Point { x: 3.0, y: -4.0 },
             zoom: 1.5,
             rotation_radians: 0.37,
+            mirrored_horizontal: false,
         };
         let document = Point { x: 21.0, y: -8.0 };
         let window = viewport

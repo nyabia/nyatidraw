@@ -23,6 +23,8 @@ const COLORS: [[u8; 4]; 6] = [
 
 fn tree() -> LayerTree {
     LayerTree::new(GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: GroupId(100),
         name: "Root".into(),
         visible: true,
@@ -30,6 +32,9 @@ fn tree() -> LayerTree {
         children: [1, 2]
             .map(|id| {
                 LayerTreeNode::Raster(LayerNode {
+                    alpha_locked: false,
+                    clip_to_below: false,
+                    blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                     id: LayerId(id),
                     name: if id == 1 {
                         "Transform ink"

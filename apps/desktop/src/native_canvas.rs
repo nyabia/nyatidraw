@@ -10,20 +10,52 @@ use std::{
     time::Instant,
 };
 
+#[cfg(test)]
+#[path = "signed_selection_acceptance.rs"]
+mod signed_selection_acceptance;
+
+#[cfg(test)]
+#[path = "affine_acceptance.rs"]
+mod affine_acceptance;
+
+#[cfg(test)]
+#[path = "flat_fill_acceptance.rs"]
+mod flat_fill_acceptance;
+
+#[cfg(test)]
+#[path = "alpha_lock_acceptance.rs"]
+mod alpha_lock_acceptance;
+#[cfg(test)]
+#[path = "shading_gpu_acceptance.rs"]
+mod shading_gpu_acceptance;
+
+#[cfg(test)]
+#[path = "flat_fill_gpu_acceptance.rs"]
+mod flat_fill_gpu_acceptance;
+
+#[cfg(test)]
+#[path = "transform_gpu_acceptance.rs"]
+mod transform_gpu_acceptance;
+
+#[path = "transform_runtime.rs"]
+mod transform_runtime;
+
 use nyatidraw_api::{
-    CanvasSpec, CommandEnvelope, CommandRejectReason, ContentRootId, DockCommand, DockTree,
-    DrawingTool, EditCommand, EditorCommand, EditorEvent, GroupId, HistoryNodeId,
+    BrushSettings, CanvasSpec, CommandEnvelope, CommandRejectReason, ContentRootId, DockCommand,
+    DockTree, DrawingTool, EditCommand, EditorCommand, EditorEvent, GroupId, HistoryNodeId,
     HistoryProjection, LayerCommand, LayerId, ProjectCommand, Revision, SnapshotId, ToolCommand,
     ViewportCommand, ViewportProjection,
 };
 use nyatidraw_brush::{
     BrushDab, BrushEvaluator, BrushPreset, BrushPresetId, BrushSnapshot,
-    ROUND_BRUSH_ENGINE_VERSION, RecordedStroke, RoundBrushEvaluator, RoundBrushStroke,
-    begin_round_stroke,
+    ROUND_BRUSH_ENGINE_VERSION, ROUND_BRUSH_PRESET_SCHEMA_VERSION, RecordedStroke,
+    RoundBrushEvaluator, RoundBrushStroke, begin_round_stroke,
 };
 use nyatidraw_document::{GroupNode, LayerNode, LayerTree, LayerTreeNode};
 use nyatidraw_editor::{HeadlessStrokeSession, ProjectionError, ProjectionState};
-use nyatidraw_input::{PenButtons, Point, PointerPhase, StylusSample, ViewportTransform};
+use nyatidraw_input::{
+    PenButtons, Point, PointerPhase, StrokeSmoother, StylusSample, ViewportTransform,
+};
 use nyatidraw_paint_cpu::{
     flatten_layer_tree_rgba8, render_page_preview_rgba8, render_raster_page_preview_rgba8,
 };
@@ -50,13 +82,19 @@ use crate::{
 
 const LIVE_BRUSH: BrushPreset = BrushPreset {
     id: BrushPresetId(1),
-    schema_version: 1,
+    schema_version: ROUND_BRUSH_PRESET_SCHEMA_VERSION,
     engine_version: ROUND_BRUSH_ENGINE_VERSION,
     size_px: 5.0,
     opacity: 1.0,
     flow: 0.38,
     spacing_ratio: 0.12,
+    size_pressure: true,
+    opacity_pressure: false,
+    size_min_ratio: 0.0,
+    opacity_min_ratio: 0.0,
+    hardness: 0.0,
 };
+#[cfg(test)]
 const LIVE_BRUSH_COLOR: StrokeColor = StrokeColor([26, 199, 232, 255]);
 const LIVE_LAYER: LayerId = LayerId(1);
 const BACKGROUND_LAYER: LayerId = LayerId(2);
@@ -141,24 +179,87 @@ struct DrawingConfig {
     tool: DrawingTool,
     size_tenths: u16,
     opacity_u16: u16,
+    brush_settings: BrushSettings,
+    remembered: [RememberedBrush; 4],
+    last_painting_slot: usize,
     color: [u8; 4],
+    background_color: [u8; 4],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RememberedBrush {
+    size_tenths: u16,
+    opacity_u16: u16,
+    settings: BrushSettings,
+}
+
+impl RememberedBrush {
+    const fn for_tool(tool: DrawingTool) -> Self {
+        Self {
+            size_tenths: 50,
+            opacity_u16: u16::MAX,
+            settings: BrushSettings::for_tool(tool),
+        }
+    }
 }
 
 impl DrawingConfig {
     fn from_projection(projection: &nyatidraw_api::UiProjection) -> Self {
-        Self {
+        let mut drawing = Self {
             edit_settings: projection.edit_settings,
             tool: projection.drawing_tool,
             size_tenths: projection.brush_size_tenths,
             opacity_u16: projection.brush_opacity_u16,
+            brush_settings: projection.brush_settings,
+            remembered: [
+                RememberedBrush::for_tool(DrawingTool::Pencil),
+                RememberedBrush::for_tool(DrawingTool::Pen),
+                RememberedBrush::for_tool(DrawingTool::Brush),
+                RememberedBrush::for_tool(DrawingTool::Eraser),
+            ],
+            last_painting_slot: Self::painting_slot(projection.drawing_tool).unwrap_or(2),
             color: projection.brush_color,
+            background_color: projection.background_color,
+        };
+        drawing.remember_current();
+        drawing
+    }
+
+    const fn painting_slot(tool: DrawingTool) -> Option<usize> {
+        match tool {
+            DrawingTool::Pencil => Some(0),
+            DrawingTool::Pen => Some(1),
+            DrawingTool::Brush => Some(2),
+            DrawingTool::Eraser => Some(3),
+            _ => None,
+        }
+    }
+
+    fn remember_current(&mut self) {
+        self.remembered[self.last_painting_slot] = RememberedBrush {
+            size_tenths: self.size_tenths,
+            opacity_u16: self.opacity_u16,
+            settings: self.brush_settings,
+        };
+    }
+
+    fn select_tool(&mut self, tool: DrawingTool) {
+        self.remember_current();
+        self.tool = tool;
+        if let Some(slot) = Self::painting_slot(tool) {
+            let brush = self.remembered[slot];
+            self.last_painting_slot = slot;
+            self.size_tenths = brush.size_tenths;
+            self.opacity_u16 = brush.opacity_u16;
+            self.brush_settings = brush.settings;
         }
     }
 
     fn preset(self) -> BrushPreset {
         let (id, flow, spacing_ratio) = match self.tool {
             DrawingTool::Pencil => (BrushPresetId(2), 0.82, 0.08),
-            DrawingTool::Pen => (BrushPresetId(3), 0.62, 0.10),
+            DrawingTool::Pen => (BrushPresetId(3), 1.0, 0.08),
+            DrawingTool::Eraser => (BrushPresetId(4), 1.0, 0.08),
             _ => (BrushPresetId(1), 0.38, 0.12),
         };
         BrushPreset {
@@ -167,8 +268,30 @@ impl DrawingConfig {
             opacity: f32::from(self.opacity_u16) / f32::from(u16::MAX),
             flow,
             spacing_ratio,
+            size_pressure: self.brush_settings.size_pressure,
+            opacity_pressure: self.brush_settings.opacity_pressure,
+            size_min_ratio: f32::from(self.brush_settings.size_minimum_u16) / f32::from(u16::MAX),
+            opacity_min_ratio: f32::from(self.brush_settings.opacity_minimum_u16)
+                / f32::from(u16::MAX),
+            hardness: f32::from(self.brush_settings.hardness_u16) / f32::from(u16::MAX),
             ..LIVE_BRUSH
         }
+    }
+
+    /// A flipped pen uses the remembered eraser, without changing the UI tool
+    /// or overwriting the selected brush's settings for the next painted stroke.
+    fn preset_for_stroke(mut self, hardware_eraser: bool) -> BrushPreset {
+        if hardware_eraser && self.tool != DrawingTool::Eraser {
+            self.select_tool(DrawingTool::Eraser);
+        }
+        self.preset()
+    }
+
+    fn smoothing_for_stroke(mut self, hardware_eraser: bool) -> u8 {
+        if hardware_eraser && self.tool != DrawingTool::Eraser {
+            self.select_tool(DrawingTool::Eraser);
+        }
+        self.brush_settings.smoothing
     }
 
     fn stroke_color(self) -> StrokeColor {
@@ -577,6 +700,11 @@ impl SharedGpuCanvas {
         };
         // Drain admitted native samples before same-frame semantic requests.
         canvas.render(size[0], size[1], scale, self.geometry_epoch);
+        if canvas.stroke.transform_projection.is_some()
+            || canvas.artwork_job.as_ref().is_some_and(|job| job.transform)
+        {
+            return Err("변형을 확정하거나 취소한 뒤 저장하세요.".into());
+        }
         let state = std::mem::replace(&mut self.state, CanvasState::Suspended);
         self.performance_probe.take();
         let source = match &self.project_location {
@@ -850,6 +978,7 @@ enum CanvasState {
 
 struct ActiveCanvas {
     painter: GpuRoundDabPainter,
+    alpha_painter: GpuRoundDabPainter,
     eraser: GpuRoundDabPainter,
     background_painter: GpuRoundDabPainter,
     scene: GpuCompositeScene,
@@ -868,9 +997,10 @@ struct ActiveCanvas {
     drawing: DrawingConfig,
     projection: ProjectionState,
     cpu_tiles: BTreeMap<TileKey, Vec<u8>>,
+    transform_display: Option<TileSnapshot>,
     latest_preview_generation: BTreeMap<TileKey, u64>,
     deferred_uploads: Vec<DeferredTileUpload>,
-    gpu_live_generation: Option<(u64, LiveStrokeToken, bool)>,
+    gpu_live_generation: Option<(u64, LiveStrokeToken, bool, bool)>,
     async_publication_base_revision: Option<Revision>,
     close_raw_probe_staged: bool,
     save_probe_step: u8,
@@ -992,6 +1122,11 @@ impl ActiveCanvas {
         live_ink.set_navigation_tool(drawing.tool == DrawingTool::Move);
         let mut canvas = Self {
             painter: GpuRoundDabPainter::new(device, queue, [0.10, 0.78, 0.91, 1.0]),
+            alpha_painter: GpuRoundDabPainter::new_alpha_locked(
+                device,
+                queue,
+                [0.10, 0.78, 0.91, 1.0],
+            ),
             eraser: GpuRoundDabPainter::new_eraser(device, queue),
             background_painter: GpuRoundDabPainter::new(device, queue, [0.50, 0.20, 0.84, 1.0]),
             scene,
@@ -1011,6 +1146,7 @@ impl ActiveCanvas {
             drawing,
             projection,
             cpu_tiles,
+            transform_display: None,
             latest_preview_generation: BTreeMap::new(),
             deferred_uploads: Vec::new(),
             gpu_live_generation: None,
@@ -1034,7 +1170,7 @@ impl ActiveCanvas {
             gpu_batch_logs_remaining: 16,
         };
         if restoring_projection {
-            canvas.publish_committed_history();
+            canvas.publish_current_projection();
         } else {
             canvas.enqueue_initial_commands(live_ink);
         }
@@ -1523,6 +1659,16 @@ impl ActiveCanvas {
         // coordinates from their admission moment. Consume their End and put
         // its closed stroke in the writer FIFO before accepting same-frame UI
         // commands, especially Save. This never feeds samples through Dioxus.
+        self.stroke.selected_layer_locked = self
+            .scene
+            .tree()
+            .raster(self.active_layer)
+            .is_none_or(|layer| layer.locked);
+        self.stroke.selected_layer_alpha_locked = self
+            .scene
+            .tree()
+            .raster(self.active_layer)
+            .is_some_and(|layer| layer.alpha_locked);
         let drained = self.stroke.drain(self.active_layer, self.drawing);
         self.execute_gpu_ops(drained.samples);
         if self.synchronize_workspace_failure() {
@@ -1532,11 +1678,20 @@ impl ActiveCanvas {
         // Retry once after End so a newly available writer slot cannot let Save
         // overtake a retained closed stroke.
         self.stroke.flush_pending_materializations();
+        let mut recent_sizes_changed = false;
+        for size in drained.started_brush_sizes.into_iter().flatten().rev() {
+            recent_sizes_changed |= self.projection.stage_used_brush_size(size);
+        }
         if drained.artwork_closed {
             self.publish_closed_stroke_dirty();
+        } else if recent_sizes_changed {
+            self.async_publication_base_revision
+                .get_or_insert(self.projection.current().revision);
+            self.publish_current_projection();
         }
         self.apply_materialized_tiles();
         self.adopt_native_edit();
+        self.flush_transform_preview();
         self.apply_commands(width, height, scale);
         if self.synchronize_workspace_failure() {
             return None;
@@ -1604,13 +1759,25 @@ impl ActiveCanvas {
             pan: self.view.pan,
             zoom: self.view.zoom,
             rotation_radians: self.view.rotation_radians,
+            mirrored_horizontal: self.view.mirrored_horizontal,
         };
         let (guide, closed) = self
             .stroke
             .edit_gesture
             .as_ref()
             .map_or((&[][..], false), crate::edit_gesture::EditGesture::preview);
-        self.scene.set_gesture_preview(guide, closed);
+        if let Some(transform) = &self.stroke.transform_projection {
+            let points = crate::transform_gesture::guide(transform, 7.0 / self.view.zoom);
+            #[allow(clippy::cast_possible_truncation)]
+            // Overlay only; worker validates artwork bounds.
+            let points: Vec<[i32; 2]> = points
+                .iter()
+                .map(|p| [p[0].round() as i32, p[1].round() as i32])
+                .collect();
+            self.scene.set_gesture_preview(&points, false);
+        } else {
+            self.scene.set_gesture_preview(guide, closed);
+        }
         let composite_timing = Span::new(Stage::Composite);
         crate::performance::frame_mark(crate::performance::FrameMark::ViewportBegin);
         let rendered = self.scene.render_viewport(viewport);
@@ -1683,11 +1850,21 @@ impl ActiveCanvas {
             EditorCommand::Project(ProjectCommand::Save)
         ) && self.async_publication_base_revision
             == Some(envelope.based_on);
-        let revision_validation = if save_queued_before_publication {
-            Ok(())
-        } else {
-            self.projection.validate_command_revision(envelope.based_on)
-        };
+        // Relative size intent can safely follow earlier size publications, but
+        // must never be retargeted to a different brush after tool selection.
+        let relative_size_for_current_tool = matches!(
+            &envelope.command,
+            EditorCommand::Tool(ToolCommand::AdjustSizeSteps { tool, .. })
+                if *tool == self.drawing.tool
+                    && DrawingConfig::painting_slot(*tool).is_some()
+                    && envelope.based_on <= self.projection.current().revision
+        );
+        let revision_validation =
+            if save_queued_before_publication || relative_size_for_current_tool {
+                Ok(())
+            } else {
+                self.projection.validate_command_revision(envelope.based_on)
+            };
         let result = revision_validation
             .and_then(|()| {
                 self.projection
@@ -1745,6 +1922,22 @@ impl ActiveCanvas {
         height: u32,
         scale: f64,
     ) -> Result<bool, CommandRejectReason> {
+        if self.stroke.transform_projection.is_some() {
+            if matches!(command, EditorCommand::Tool(ToolCommand::CancelGesture)) {
+                return self.enqueue_free_transform(nyatidraw_api::TransformCommand::Cancel);
+            }
+            if !matches!(
+                command,
+                EditorCommand::Edit(EditCommand::FreeTransform(_))
+                    | EditorCommand::Viewport(_)
+                    | EditorCommand::Dock(_)
+            ) {
+                self.stroke
+                    .live_ink
+                    .publish_activation_notice("변형을 확정하거나 취소한 뒤 작업하세요.".into());
+                return Err(CommandRejectReason::CommandQueueBusy);
+            }
+        }
         if self.artwork_job.is_some()
             && matches!(command, EditorCommand::Layer(_) | EditorCommand::History(_))
         {
@@ -1805,13 +1998,13 @@ impl ActiveCanvas {
                             x: f64::from(width) / scale * 0.5,
                             y: f64::from(height) / scale * 0.5,
                         };
-                        let (sin, cos) = self.view.rotation_radians.sin_cos();
-                        self.view.pan = Point {
-                            x: logical_center.x
-                                - (cos * document.x - sin * document.y) * self.view.zoom,
-                            y: logical_center.y
-                                - (sin * document.x + cos * document.y) * self.view.zoom,
-                        };
+                        if let Some(view) = self
+                            .view
+                            .mapping()
+                            .with_document_at(document, logical_center)
+                        {
+                            self.view.pan = view.pan;
+                        }
                     }
                     ViewportCommand::ZoomSteps(steps) => {
                         self.view.ensure_initialized(
@@ -1820,8 +2013,13 @@ impl ActiveCanvas {
                             scale,
                             [self.canvas_spec.width_px, self.canvas_spec.height_px],
                         );
-                        self.view.zoom = (self.view.zoom * 1.25_f64.powi(i32::from(steps)))
-                            .clamp(ViewportTransform::MIN_ZOOM, ViewportTransform::MAX_ZOOM);
+                        self.view.zoom_at(
+                            Point {
+                                x: f64::from(width) / scale * 0.5,
+                                y: f64::from(height) / scale * 0.5,
+                            },
+                            steps,
+                        );
                     }
                     ViewportCommand::ZoomAt {
                         steps,
@@ -1842,15 +2040,35 @@ impl ActiveCanvas {
                             steps,
                         );
                     }
-                    ViewportCommand::RotateQuarterSteps(steps) => {
+                    ViewportCommand::RotateQuarterSteps(_)
+                    | ViewportCommand::ResetRotation
+                    | ViewportCommand::ToggleMirrorHorizontal => {
                         self.view.ensure_initialized(
                             width,
                             height,
                             scale,
                             [self.canvas_spec.width_px, self.canvas_spec.height_px],
                         );
-                        self.view.rotation_radians +=
-                            f64::from(steps) * std::f64::consts::FRAC_PI_4;
+                        let rotation = match command {
+                            ViewportCommand::RotateQuarterSteps(steps) => {
+                                (self.view.rotation_radians
+                                    + f64::from(steps) * std::f64::consts::FRAC_PI_4)
+                                    .rem_euclid(std::f64::consts::TAU)
+                            }
+                            ViewportCommand::ResetRotation => 0.0,
+                            _ => self.view.rotation_radians,
+                        };
+                        let mirrored = self.view.mirrored_horizontal
+                            ^ matches!(command, ViewportCommand::ToggleMirrorHorizontal);
+                        self.view.change_at(
+                            Point {
+                                x: f64::from(width) / scale * 0.5,
+                                y: f64::from(height) / scale * 0.5,
+                            },
+                            self.view.zoom,
+                            rotation,
+                            mirrored,
+                        );
                     }
                 }
                 let candidate = ViewportTransform {
@@ -1861,6 +2079,7 @@ impl ActiveCanvas {
                     pan: self.view.pan,
                     zoom: self.view.zoom,
                     rotation_radians: self.view.rotation_radians,
+                    mirrored_horizontal: self.view.mirrored_horizontal,
                 };
                 if candidate.validate().is_err() {
                     self.view = previous;
@@ -1946,9 +2165,23 @@ impl ActiveCanvas {
             EditorCommand::Tool(ToolCommand::CancelGesture) => {
                 self.stroke.edit_gesture = None;
                 self.stroke.completed_edit = None;
+                if let Some(sequence) = self.stroke.completed_temporary_picker.take() {
+                    self.stroke.live_ink.complete_temporary_pick(sequence);
+                }
                 Ok(false)
             }
             EditorCommand::Tool(command) => {
+                let start_transform =
+                    matches!(command, ToolCommand::Select(DrawingTool::MoveSelection))
+                        || (command == ToolCommand::CycleSelectionFamily
+                            && self.drawing.tool == DrawingTool::Move);
+                // A pending eyedropper result must not overwrite a newer color
+                // command. Serialize color mutations with the artwork worker.
+                if (self.artwork_job.is_some() || self.stroke.live_ink.temporary_pick_pending())
+                    && matches!(command, ToolCommand::SetColor(_) | ToolCommand::SwapColors)
+                {
+                    return Err(CommandRejectReason::CommandQueueBusy);
+                }
                 if self.scene.active_live_stroke().is_some()
                     || self.stroke.edit_gesture.is_some()
                     || !self.stroke.live_ink.try_pause_for_edit()
@@ -1958,67 +2191,146 @@ impl ActiveCanvas {
                 let result = (|| {
                     match command {
                         ToolCommand::Select(tool) => {
-                            self.drawing.tool = tool;
+                            self.drawing.select_tool(tool);
                             self.stroke
                                 .live_ink
                                 .set_navigation_tool(tool == DrawingTool::Move);
                         }
                         ToolCommand::CycleBrushFamily => {
-                            self.drawing.tool = match self.drawing.tool {
+                            let tool = match self.drawing.tool {
                                 DrawingTool::Pencil => DrawingTool::Pen,
                                 DrawingTool::Pen => DrawingTool::Brush,
                                 _ => DrawingTool::Pencil,
                             };
+                            self.drawing.select_tool(tool);
                             self.stroke.live_ink.set_navigation_tool(false);
                         }
                         ToolCommand::CycleSelectionFamily => {
-                            self.drawing.tool = match self.drawing.tool {
-                                DrawingTool::Move => DrawingTool::Wand,
+                            let tool = match self.drawing.tool {
+                                DrawingTool::Move => DrawingTool::MoveSelection,
+                                DrawingTool::MoveSelection => DrawingTool::Wand,
                                 DrawingTool::Wand => DrawingTool::Lasso,
+                                DrawingTool::Lasso => DrawingTool::RectangleSelection,
                                 _ => DrawingTool::Move,
                             };
+                            self.drawing.select_tool(tool);
                             self.stroke
                                 .live_ink
                                 .set_navigation_tool(self.drawing.tool == DrawingTool::Move);
                         }
                         ToolCommand::CycleFillFamily => {
-                            self.drawing.tool = if self.drawing.tool == DrawingTool::Fill {
+                            let tool = if self.drawing.tool == DrawingTool::Fill {
                                 DrawingTool::Gradient
                             } else {
                                 DrawingTool::Fill
                             };
+                            self.drawing.select_tool(tool);
                             self.stroke.live_ink.set_navigation_tool(false);
                         }
                         ToolCommand::SetSizeTenths(size) if (1..=2_000).contains(&size) => {
                             self.drawing.size_tenths = size;
                         }
+                        ToolCommand::AdjustSizeSteps { tool, steps }
+                            if tool == self.drawing.tool
+                                && DrawingConfig::painting_slot(tool).is_some() =>
+                        {
+                            for _ in 0..steps.unsigned_abs() {
+                                let size = self.drawing.size_tenths;
+                                self.drawing.size_tenths = if steps > 0 {
+                                    size.saturating_add((size / 10).max(1)).min(2_000)
+                                } else {
+                                    size.saturating_sub((size / 11).max(1)).max(1)
+                                };
+                            }
+                        }
                         ToolCommand::SetOpacityU16(opacity) if opacity > 0 => {
                             self.drawing.opacity_u16 = opacity;
                         }
+                        ToolCommand::SetSizePressure(enabled) => {
+                            self.drawing.brush_settings.size_pressure = enabled;
+                        }
+                        ToolCommand::SetOpacityPressure(enabled) => {
+                            self.drawing.brush_settings.opacity_pressure = enabled;
+                        }
+                        ToolCommand::SetSizeMinimumU16(minimum) => {
+                            self.drawing.brush_settings.size_minimum_u16 = minimum;
+                        }
+                        ToolCommand::SetOpacityMinimumU16(minimum) => {
+                            self.drawing.brush_settings.opacity_minimum_u16 = minimum;
+                        }
+                        ToolCommand::SetHardnessU16(hardness) => {
+                            self.drawing.brush_settings.hardness_u16 = hardness;
+                        }
+                        ToolCommand::SetSmoothing(strength) => {
+                            self.drawing.brush_settings.smoothing = strength.min(100);
+                        }
                         ToolCommand::SetColor(color) if color[3] > 0 => self.drawing.color = color,
+                        ToolCommand::SwapColors => {
+                            std::mem::swap(
+                                &mut self.drawing.color,
+                                &mut self.drawing.background_color,
+                            );
+                        }
                         ToolCommand::SetEditSource(source) => {
                             self.drawing.edit_settings.source = source;
                         }
                         ToolCommand::SetEditTolerance(tolerance) => {
                             self.drawing.edit_settings.tolerance = tolerance;
                         }
+                        ToolCommand::SetFillSettings(settings) => {
+                            if settings.gap_close_px > 8 || settings.expand_px > 64 {
+                                return Err(CommandRejectReason::UnsupportedCommand);
+                            }
+                            self.drawing.edit_settings.fill = settings;
+                        }
+                        ToolCommand::SetFillGapClose(radius) => {
+                            if radius > 8 {
+                                return Err(CommandRejectReason::UnsupportedCommand);
+                            }
+                            self.drawing.edit_settings.fill.gap_close_px = radius;
+                        }
+                        ToolCommand::SetFillExpansion(radius) => {
+                            if radius > 64 {
+                                return Err(CommandRejectReason::UnsupportedCommand);
+                            }
+                            self.drawing.edit_settings.fill.expand_px = radius;
+                        }
+                        ToolCommand::SetFillAntialias(enabled) => {
+                            self.drawing.edit_settings.fill.antialias = enabled;
+                        }
+                        ToolCommand::SetSelectionMode(mode) => {
+                            self.drawing.edit_settings.selection_mode = mode;
+                        }
                         ToolCommand::CancelGesture
                         | ToolCommand::SetSizeTenths(_)
+                        | ToolCommand::AdjustSizeSteps { .. }
                         | ToolCommand::SetOpacityU16(_)
                         | ToolCommand::SetColor(_) => {
                             return Err(CommandRejectReason::UnsupportedCommand);
                         }
                     }
+                    self.drawing.remember_current();
+                    self.projection
+                        .stage_brush_settings(self.drawing.brush_settings);
                     self.projection.stage_drawing_controls(
                         self.drawing.tool,
                         self.drawing.size_tenths,
                         self.drawing.opacity_u16,
                         self.drawing.color,
+                        self.drawing.background_color,
                     );
                     self.projection
                         .stage_edit_settings(self.drawing.edit_settings);
                     Ok(false)
                 })();
+                if result.is_ok() && start_transform && self.selection.is_some() {
+                    let started =
+                        self.enqueue_free_transform(nyatidraw_api::TransformCommand::Begin);
+                    if self.artwork_job.is_none() {
+                        self.stroke.live_ink.resume_after_edit();
+                    }
+                    return started;
+                }
                 if self.artwork_job.is_none() {
                     self.stroke.live_ink.resume_after_edit();
                 }
@@ -2044,7 +2356,7 @@ impl ActiveCanvas {
         let mut tree = self.scene.tree().clone();
         let mut active = self.active_layer;
         let next_id = self.next_layer_node_id;
-        let mut white_layer = None;
+        let mut pixel_change = None;
         match command {
             LayerCommand::AddRaster | LayerCommand::AddGroup => {
                 let is_group = matches!(command, LayerCommand::AddGroup);
@@ -2057,6 +2369,8 @@ impl ActiveCanvas {
                 let name = next_default_node_name(&tree, is_group);
                 let node = if is_group {
                     LayerTreeNode::Group(GroupNode {
+                        clip_to_below: false,
+                        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                         id: GroupId(next_id),
                         name,
                         visible: true,
@@ -2073,13 +2387,51 @@ impl ActiveCanvas {
                 tree.insert(parent, index, node)
                     .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
             }
+            LayerCommand::DuplicateRaster(source) => {
+                let _ = next_id
+                    .checked_add(1)
+                    .ok_or(CommandRejectReason::RevisionExhausted)?;
+                active = LayerId(next_id);
+                tree.duplicate_raster(source, active)
+                    .map_err(|_| CommandRejectReason::UnknownLayer)?;
+                pixel_change = Some(LayerPixelChange::Duplicate {
+                    source,
+                    destination: active,
+                });
+            }
             LayerCommand::SetReference { layer, reference } => {
                 tree.set_reference(layer, reference)
                     .map_err(|_| CommandRejectReason::UnknownLayer)?;
             }
-            LayerCommand::Delete(node) => {
-                tree.remove(node)
+            LayerCommand::SetLocked { layer, locked } => {
+                tree.set_locked(layer, locked)
                     .map_err(|_| CommandRejectReason::UnknownLayer)?;
+            }
+            LayerCommand::SetAlphaLocked {
+                layer,
+                alpha_locked,
+            } => {
+                tree.set_alpha_locked(layer, alpha_locked)
+                    .map_err(|_| CommandRejectReason::UnknownLayer)?;
+            }
+            LayerCommand::SetClipToBelow {
+                node,
+                clip_to_below,
+            } => {
+                tree.set_clip_to_below(node, clip_to_below)
+                    .map_err(|_| CommandRejectReason::UnknownLayer)?;
+            }
+            LayerCommand::SetBlendMode { node, blend_mode } => {
+                tree.set_blend_mode(node, blend_mode)
+                    .map_err(|_| CommandRejectReason::UnknownLayer)?;
+            }
+            LayerCommand::Delete(node) => {
+                tree.remove(node).map_err(|error| match error {
+                    nyatidraw_document::LayerTreeError::LockedNode(_) => {
+                        CommandRejectReason::LayerLocked
+                    }
+                    _ => CommandRejectReason::UnknownLayer,
+                })?;
                 if raster_layer_ids(&tree).is_empty() {
                     active = LayerId(next_id);
                     let _ = next_id
@@ -2125,13 +2477,13 @@ impl ActiveCanvas {
                     LayerTreeNode::Raster(empty_raster(layer, "White".into())),
                 )
                 .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
-                white_layer = Some(layer);
+                pixel_change = Some(LayerPixelChange::White(layer));
             }
             LayerCommand::SetActive(_) | LayerCommand::ToggleSolo(_) => {
                 unreachable!("session commands handled separately")
             }
         }
-        if &tree == self.scene.tree() && white_layer.is_none() {
+        if &tree == self.scene.tree() && pixel_change.is_none() {
             return Ok(false);
         }
         self.scene
@@ -2141,7 +2493,7 @@ impl ActiveCanvas {
         self.enqueue_artwork(
             WorkerRequest::CommitLayerTree {
                 tree,
-                white_layer,
+                pixel_change,
                 reply,
             },
             received,
@@ -2226,6 +2578,7 @@ impl ActiveCanvas {
             self.selection = None;
             self.stroke.selection = None;
             self.painter.set_selection_mask(None);
+            self.alpha_painter.set_selection_mask(None);
             self.eraser.set_selection_mask(None);
             self.scene.set_selection_overlay(None);
             self.projection
@@ -2291,10 +2644,40 @@ impl ActiveCanvas {
         &mut self,
         command: nyatidraw_api::EditCommand,
     ) -> Result<bool, CommandRejectReason> {
+        if let EditCommand::FreeTransform(command) = command {
+            return self.enqueue_free_transform(command);
+        }
+        if command == EditCommand::PasteSelection {
+            return self.enqueue_free_transform(nyatidraw_api::TransformCommand::Paste);
+        }
+        if self.stroke.transform_projection.is_some() {
+            return Err(CommandRejectReason::CommandQueueBusy);
+        }
         self.ensure_artwork_command_idle()?;
         if let EditCommand::ResizePage { size } = &command {
             self.scene
                 .validate_document_replacement(*size, self.scene.tree())
+                .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
+        }
+        if command == EditCommand::PasteSelection {
+            // Preflight one added surface before the worker commits a layer.
+            // The worker chooses the durable ID; GPU capacity depends on shape,
+            // not the numerical ID used for this temporary validation tree.
+            let mut candidate = self.scene.tree().clone();
+            let (parent, index) = candidate
+                .parent_and_index(nyatidraw_api::LayerTreeNodeId::Raster(self.active_layer))
+                .ok_or(CommandRejectReason::UnknownLayer)?;
+            let id = next_layer_node_id(&candidate)
+                .map_err(|_| CommandRejectReason::RevisionExhausted)?;
+            candidate
+                .insert(
+                    parent,
+                    index + 1,
+                    LayerTreeNode::Raster(empty_raster(LayerId(id), "붙여넣기".into())),
+                )
+                .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
+            self.scene
+                .validate_tree_replacement(&candidate)
                 .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
         }
         if !self.stroke.live_ink.try_pause_for_edit() {
@@ -2321,6 +2704,20 @@ impl ActiveCanvas {
             WorkerRequest::CommitLayerTree { .. } => "layer",
             _ => unreachable!("only artwork requests use the artwork job"),
         };
+        let temporary_picker = match &request {
+            WorkerRequest::Edit {
+                command: EditCommand::PickDisplayColor { input_sequence, .. },
+                ..
+            } => Some(*input_sequence),
+            _ => None,
+        };
+        let transform = matches!(
+            &request,
+            WorkerRequest::Edit {
+                command: EditCommand::FreeTransform(_),
+                ..
+            }
+        );
         let queued = self
             .stroke
             .materializer
@@ -2332,6 +2729,8 @@ impl ActiveCanvas {
             return Err(CommandRejectReason::CommandQueueBusy);
         }
         self.artwork_job = Some(ArtworkJob {
+            transform,
+            temporary_picker,
             received,
             active_layer,
             history_timing: (kind == "history").then(HistoryTiming::queued).flatten(),
@@ -2350,21 +2749,64 @@ impl ActiveCanvas {
         let Some(result) = self.stroke.completed_edit.take() else {
             return;
         };
+        let temporary_picker = std::mem::take(&mut self.stroke.completed_temporary_picker);
         let result = result.and_then(|command| {
-            self.enqueue_edit(command)
+            let command = match command {
+                EditCommand::PickColor { point, .. } if temporary_picker.is_some() => {
+                    EditCommand::PickDisplayColor {
+                        point,
+                        solo: self.projection.current().solo_node,
+                        input_sequence: temporary_picker.expect("matched temporary read"),
+                    }
+                }
+                other => other,
+            };
+            if let EditCommand::Transform(legacy) = &command
+                && self.drawing.tool == DrawingTool::MoveSelection
+            {
+                // An idle move gesture may predate successful draft admission.
+                // It must still become a preview, never an immediate old-style
+                // destructive transform that clears the retained selection.
+                self.enqueue_free_transform(nyatidraw_api::TransformCommand::Begin)
+                    .map_err(|error| format!("변형을 시작하지 못했습니다: {error:?}"))?;
+                self.stroke.pending_transform = Some(nyatidraw_api::AffineTransform {
+                    offset_milli: legacy.offset.map(|value| i64::from(value) * 1000),
+                    ..Default::default()
+                });
+                return Ok(());
+            }
+            let queued = self.enqueue_edit(command.clone());
+            if temporary_picker.is_some()
+                && matches!(
+                    queued,
+                    Err(CommandRejectReason::CommandQueueBusy
+                        | CommandRejectReason::StaleProjection { .. })
+                )
+            {
+                self.stroke.completed_edit = Some(Ok(command));
+                self.stroke.completed_temporary_picker = temporary_picker;
+                return Ok(());
+            }
+            queued
                 .map(|_| ())
                 .map_err(|error| format!("편집을 적용하지 못했습니다. 다시 시도하세요: {error:?}"))
         });
         if let Err(error) = result {
+            if let Some(sequence) = temporary_picker {
+                self.stroke.live_ink.complete_temporary_pick(sequence);
+                self.stroke.live_ink.resume_after_edit();
+            }
             let mut edit = self.projection.current().edit.clone();
             edit.error = Some(error);
             self.projection.stage_edit(edit);
         }
         self.async_publication_base_revision
             .get_or_insert(self.projection.current().revision);
-        self.publish_committed_history();
+        self.publish_current_projection();
     }
 
+    // Keep outcome adoption and release of its owned input barrier together.
+    #[allow(clippy::too_many_lines)]
     fn poll_artwork(&mut self) -> Option<HistoryTiming> {
         let Some(job) = &self.artwork_job else {
             return None;
@@ -2377,18 +2819,38 @@ impl ActiveCanvas {
             }
         };
         let active_layer = job.active_layer;
+        let temporary_picker = job.temporary_picker;
         let mut history_timing = job.history_timing;
         let mut history_changed = false;
         let mut error = None;
         match result {
+            Ok(ArtworkOutcome::Transform(outcome)) => {
+                if let Err(reason) = self.install_transform_outcome(outcome) {
+                    self.stroke.live_ink.publish_workspace_error(reason);
+                    return None;
+                }
+            }
             Ok(ArtworkOutcome::Edit(outcome)) => {
+                if let Some(layer) = outcome.active_layer {
+                    self.active_layer = layer;
+                }
+                if let Some(color) = outcome.sampled_color {
+                    self.drawing.color = color;
+                    self.projection.stage_drawing_controls(
+                        self.drawing.tool,
+                        self.drawing.size_tenths,
+                        self.drawing.opacity_u16,
+                        self.drawing.color,
+                        self.drawing.background_color,
+                    );
+                }
                 let changed = outcome.tiles.is_some();
                 if changed
                     && self
                         .install_history_move(HistoryMove {
                             tiles: outcome.tiles,
                             canvas: outcome.canvas,
-                            tree: None,
+                            tree: outcome.tree,
                             history: outcome.history,
                             worker_timing: None,
                         })
@@ -2425,6 +2887,9 @@ impl ActiveCanvas {
                 }
             }
             Err(EditFailure::Rejected(reason)) => {
+                if let Some(transform) = &mut self.stroke.transform_projection {
+                    transform.can_commit = false;
+                }
                 error = Some(reason);
             }
             Err(EditFailure::Fatal(reason)) => {
@@ -2433,6 +2898,9 @@ impl ActiveCanvas {
             }
         }
         self.artwork_job = None;
+        if let Some(sequence) = temporary_picker {
+            self.stroke.live_ink.complete_temporary_pick(sequence);
+        }
         let selected_pixels = self
             .selection
             .as_ref()
@@ -2442,11 +2910,12 @@ impl ActiveCanvas {
             has_selection: self.selection.is_some(),
             selected_pixels,
             error,
+            transform: self.stroke.transform_projection.clone(),
         });
         self.stroke.live_ink.resume_after_edit();
         self.async_publication_base_revision
             .get_or_insert(self.projection.current().revision);
-        self.publish_committed_history();
+        self.publish_current_projection();
         println!("native-canvas event=artwork-adopted selected_pixels={selected_pixels} pending=0");
         let mut timing = history_timing.filter(|_| history_changed);
         if let Some(timing) = &mut timing {
@@ -2468,12 +2937,16 @@ impl ActiveCanvas {
             let mask = selection
                 .as_ref()
                 .map(|mask| {
-                    self.painter
-                        .create_selection_mask(mask.dimensions(), &mask.packed_bits())
+                    self.painter.create_selection_mask_at(
+                        mask.origin(),
+                        mask.dimensions(),
+                        &mask.packed_bits(),
+                    )
                 })
                 .transpose()
                 .map_err(|error| format!("Selection could not be adopted by the GPU: {error:?}"))?;
             self.painter.set_selection_mask(mask.as_ref());
+            self.alpha_painter.set_selection_mask(mask.as_ref());
             self.eraser.set_selection_mask(mask.as_ref());
             self.scene.set_selection_overlay(mask.as_ref());
         }
@@ -2531,7 +3004,7 @@ impl ActiveCanvas {
                 let mut saved = self.projection.current().clone();
                 saved.dirty = false;
                 self.projection.install_authoritative(saved);
-                self.publish_committed_history();
+                self.publish_current_projection();
                 println!(
                     "native-canvas event=project-save-accepted export_generation={generation} project_durability=independent export=queued"
                 );
@@ -2660,14 +3133,14 @@ impl ActiveCanvas {
         self.deferred_uploads = deferred;
         if let Some(history) = latest_history {
             self.projection.stage_history(history);
-            self.publish_committed_history();
+            self.publish_current_projection();
         }
     }
 
-    /// Publishes the writer-confirmed history after a closed stroke reaches
-    /// durable storage. This is deliberately separate from the raw-input
-    /// close boundary, so the panel cannot claim a stroke before commit.
-    fn publish_committed_history(&mut self) {
+    /// Publishes staged editor/session metadata without creating artwork history.
+    /// History is staged separately after writer confirmation; a usage-only
+    /// publication must not claim an active stroke is durably committed.
+    fn publish_current_projection(&mut self) {
         let _timing = Span::new(Stage::Projection);
         let publish = self.projection.publish_editor_state(
             self.project_title.clone(),
@@ -2683,16 +3156,18 @@ impl ActiveCanvas {
                 .live_ink
                 .publish_editor_event(event, Some(self.projection.current().clone())),
             Err(error) => {
-                eprintln!(
-                    "native-canvas event=committed-history-publication-failed error={error:?}"
-                );
+                eprintln!("native-canvas event=projection-publication-failed error={error:?}");
                 self.stroke.live_ink.publish_workspace_error(format!(
-                    "A saved stroke's history could not be published: {error:?}"
+                    "The editor state could not be published: {error:?}"
                 ));
             }
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep generation checks and fail-closed Begin/Dabs/Finish handling together"
+    )]
     fn execute_gpu_ops(&mut self, drained_samples: usize) {
         let _timing = (!self.stroke.gpu_ops.is_empty()).then(|| Span::new(Stage::GpuOps));
         for op in std::mem::take(&mut self.stroke.gpu_ops) {
@@ -2702,14 +3177,17 @@ impl ActiveCanvas {
                     layer,
                     color,
                     eraser,
+                    alpha_locked,
                 } => {
                     if !eraser {
                         self.painter.set_brush_rgba(color);
+                        self.alpha_painter.set_brush_rgba(color);
                     }
                     match self.scene.replace_live_stroke(layer) {
                         Ok(replacement) => {
                             if replacement.cancelled.is_some()
-                                && let Some((previous_generation, _, _)) = self.gpu_live_generation
+                                && let Some((previous_generation, _, _, _)) =
+                                    self.gpu_live_generation
                             {
                                 self.latest_preview_generation
                                     .retain(|_, latest| *latest != previous_generation);
@@ -2718,7 +3196,7 @@ impl ActiveCanvas {
                             // before GPU submission. Semantic generations and
                             // device-local tokens therefore need not coincide.
                             self.gpu_live_generation =
-                                Some((generation, replacement.active, eraser));
+                                Some((generation, replacement.active, eraser, alpha_locked));
                         }
                         Err(error) => {
                             self.fail_gpu_transaction("begin", generation, None, &error);
@@ -2727,7 +3205,9 @@ impl ActiveCanvas {
                     }
                 }
                 GpuStrokeOp::Dabs { generation, dabs } => {
-                    let Some((active_generation, token, eraser)) = self.gpu_live_generation else {
+                    let Some((active_generation, token, eraser, alpha_locked)) =
+                        self.gpu_live_generation
+                    else {
                         continue;
                     };
                     if active_generation != generation {
@@ -2735,6 +3215,8 @@ impl ActiveCanvas {
                     }
                     let painter = if eraser {
                         &mut self.eraser
+                    } else if alpha_locked {
+                        &mut self.alpha_painter
                     } else {
                         &mut self.painter
                     };
@@ -2772,12 +3254,14 @@ impl ActiveCanvas {
                     generation,
                     disposition,
                 } => {
-                    let Some((active_generation, token, eraser)) = self.gpu_live_generation.take()
+                    let Some((active_generation, token, eraser, alpha_locked)) =
+                        self.gpu_live_generation.take()
                     else {
                         continue;
                     };
                     if active_generation != generation {
-                        self.gpu_live_generation = Some((active_generation, token, eraser));
+                        self.gpu_live_generation =
+                            Some((active_generation, token, eraser, alpha_locked));
                         continue;
                     }
                     match self.scene.finish_live_stroke(token, disposition) {
@@ -2809,11 +3293,11 @@ impl ActiveCanvas {
         error: &impl std::fmt::Debug,
     ) {
         let token = failed_token
-            .or_else(|| self.gpu_live_generation.map(|(_, token, _)| token))
+            .or_else(|| self.gpu_live_generation.map(|(_, token, _, _)| token))
             .or_else(|| self.scene.active_live_stroke());
         let failed_generation = self
             .gpu_live_generation
-            .map_or(generation, |(active, _, _)| active);
+            .map_or(generation, |(active, _, _, _)| active);
         self.gpu_live_generation = None;
         if let Some(token) = token {
             self.latest_preview_generation
@@ -2843,6 +3327,7 @@ struct RendererView {
     pan: Point,
     zoom: f64,
     rotation_radians: f64,
+    mirrored_horizontal: bool,
     initialized: bool,
 }
 
@@ -2852,6 +3337,7 @@ impl Default for RendererView {
             pan: Point { x: 0.0, y: 0.0 },
             zoom: 1.0,
             rotation_radians: 0.0,
+            mirrored_horizontal: false,
             initialized: false,
         }
     }
@@ -2869,6 +3355,7 @@ impl RendererView {
             },
             zoom: f64::from(projection.zoom_ppm) / 1_000_000.0,
             rotation_radians: (f64::from(projection.rotation_millidegrees) / 1_000.0).to_radians(),
+            mirrored_horizontal: projection.mirrored_horizontal,
             initialized: true,
         }
     }
@@ -2893,6 +3380,7 @@ impl RendererView {
             y: (logical_height - f64::from(document_size[1]) * self.zoom) * 0.5,
         };
         self.rotation_radians = 0.0;
+        self.mirrored_horizontal = false;
         self.initialized = true;
     }
 
@@ -2905,23 +3393,42 @@ impl RendererView {
             y: (logical_height - f64::from(document_size[1]) * self.zoom) * 0.5,
         };
         self.rotation_radians = 0.0;
+        self.mirrored_horizontal = false;
         self.initialized = true;
     }
 
     fn zoom_at(&mut self, focus: Point, steps: i8) {
-        let previous_zoom = self.zoom;
-        let next_zoom = (previous_zoom * 1.25_f64.powi(i32::from(steps)))
+        let next_zoom = (self.zoom * 1.25_f64.powi(i32::from(steps)))
             .clamp(ViewportTransform::MIN_ZOOM, ViewportTransform::MAX_ZOOM);
-        let x = focus.x - self.pan.x;
-        let y = focus.y - self.pan.y;
-        let (sin, cos) = self.rotation_radians.sin_cos();
-        let document_x = (cos * x + sin * y) / previous_zoom;
-        let document_y = (-sin * x + cos * y) / previous_zoom;
-        self.pan = Point {
-            x: focus.x - (cos * document_x - sin * document_y) * next_zoom,
-            y: focus.y - (sin * document_x + cos * document_y) * next_zoom,
-        };
-        self.zoom = next_zoom;
+        self.change_at(
+            focus,
+            next_zoom,
+            self.rotation_radians,
+            self.mirrored_horizontal,
+        );
+    }
+
+    /// Logical-only helper; the actual window mapping is validated on publication.
+    fn mapping(self) -> ViewportTransform {
+        ViewportTransform {
+            revision: 0,
+            window_origin_physical: Point::default(),
+            physical_size: [1, 1],
+            dpi_scale: 1.0,
+            pan: self.pan,
+            zoom: self.zoom,
+            rotation_radians: self.rotation_radians,
+            mirrored_horizontal: self.mirrored_horizontal,
+        }
+    }
+
+    fn change_at(&mut self, focus: Point, zoom: f64, rotation: f64, mirrored: bool) {
+        if let Some(view) = self.mapping().with_view_at(focus, zoom, rotation, mirrored) {
+            self.pan = view.pan;
+            self.zoom = view.zoom;
+            self.rotation_radians = view.rotation_radians;
+            self.mirrored_horizontal = view.mirrored_horizontal;
+        }
     }
 
     // RendererView has already passed ViewportTransform validation and zoom is
@@ -2933,6 +3440,7 @@ impl RendererView {
             pan_y_milli: (self.pan.y * 1_000.0).round() as i64,
             zoom_ppm: (self.zoom * 1_000_000.0).round() as u32,
             rotation_millidegrees: (self.rotation_radians.to_degrees() * 1_000.0).round() as i32,
+            mirrored_horizontal: self.mirrored_horizontal,
         }
     }
 }
@@ -2955,6 +3463,7 @@ fn navigator_viewport(
         pan: view.pan,
         zoom: view.zoom,
         rotation_radians: view.rotation_radians,
+        mirrored_horizontal: view.mirrored_horizontal,
     };
     if transform.validate().is_err() {
         return None;
@@ -3010,6 +3519,9 @@ fn projection_rejection(error: ProjectionError) -> CommandRejectReason {
 
 fn empty_raster(id: LayerId, name: String) -> LayerNode {
     LayerNode {
+        alpha_locked: false,
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id,
         name,
         visible: true,
@@ -3091,6 +3603,8 @@ fn valid_active_layer(tree: &LayerTree, preferred: LayerId) -> LayerId {
 
 pub(crate) fn default_layer_tree() -> LayerTree {
     LayerTree::new(GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: ROOT_GROUP,
         name: "Root".into(),
         visible: true,
@@ -3108,6 +3622,9 @@ pub(crate) fn default_layer_tree() -> LayerTree {
 pub(crate) fn legacy_layer_tree() -> LayerTree {
     let raster = |id, name: &str| {
         LayerTreeNode::Raster(LayerNode {
+            alpha_locked: false,
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id,
             name: name.into(),
             visible: true,
@@ -3118,6 +3635,8 @@ pub(crate) fn legacy_layer_tree() -> LayerTree {
         })
     };
     LayerTree::new(GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: ROOT_GROUP,
         name: "Root".into(),
         visible: true,
@@ -3125,6 +3644,8 @@ pub(crate) fn legacy_layer_tree() -> LayerTree {
         children: vec![
             raster(BACKGROUND_LAYER, "Background"),
             LayerTreeNode::Group(GroupNode {
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                 id: INK_GROUP,
                 name: "Ink".into(),
                 visible: true,
@@ -3136,7 +3657,7 @@ pub(crate) fn legacy_layer_tree() -> LayerTree {
     .expect("built-in layer tree is valid")
 }
 
-fn next_layer_node_id(tree: &LayerTree) -> Result<u128, String> {
+pub(crate) fn next_layer_node_id(tree: &LayerTree) -> Result<u128, String> {
     fn visit(group: &GroupNode, maximum: &mut u128) {
         *maximum = (*maximum).max(group.id.0);
         for child in &group.children {
@@ -3265,8 +3786,21 @@ fn input_probe_sample(sequence: u64, phase: PointerPhase) -> StylusSample {
     }
 }
 
+// The cached layer lock is document metadata, independent of the existing
+// discontinuity/fatal/shutdown lifecycle flags; it is not another lifecycle state.
+#[allow(clippy::struct_excessive_bools)]
 struct StrokePipeline {
+    transform_projection: Option<nyatidraw_api::TransformProjection>,
+    transform_gesture: Option<(
+        crate::transform_gesture::TransformGesture,
+        u64,
+        nyatidraw_api::AffineTransform,
+    )>,
+    pending_transform: Option<nyatidraw_api::AffineTransform>,
+    pending_transform_cancel: bool,
     edit_gesture: Option<crate::edit_gesture::EditGesture>,
+    temporary_picker_active: bool,
+    completed_temporary_picker: Option<(u64, u64)>,
     completed_edit: Option<Result<EditCommand, String>>,
     selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     live_ink: LiveInkBridge,
@@ -3279,6 +3813,8 @@ struct StrokePipeline {
     scratch_dabs: Vec<BrushDab>,
     next_generation: u64,
     selected_layer: LayerId,
+    selected_layer_locked: bool,
+    selected_layer_alpha_locked: bool,
     drawing: DrawingConfig,
     closed_strokes: u64,
     awaiting_clean_begin: bool,
@@ -3295,6 +3831,20 @@ struct StrokePipeline {
 struct StrokeDrain {
     samples: usize,
     artwork_closed: bool,
+    /// Bounded newest-first Begin usage; never carries samples through the UI.
+    started_brush_sizes: [Option<u16>; 4],
+}
+
+impl StrokeDrain {
+    fn record_brush_begin(&mut self, size: u16) {
+        let index = self
+            .started_brush_sizes
+            .iter()
+            .position(|entry| *entry == Some(size))
+            .unwrap_or(self.started_brush_sizes.len() - 1);
+        self.started_brush_sizes[..=index].rotate_right(1);
+        self.started_brush_sizes[0] = Some(size);
+    }
 }
 
 impl StrokePipeline {
@@ -3302,8 +3852,14 @@ impl StrokePipeline {
         let materialization_backlog_capacity = live_ink.maximum_drain_len();
         Self {
             live_ink,
+            transform_projection: None,
+            transform_gesture: None,
+            pending_transform: None,
+            pending_transform_cancel: false,
             selection: None,
             edit_gesture: None,
+            temporary_picker_active: false,
+            completed_temporary_picker: None,
             completed_edit: None,
             evaluator: RoundBrushEvaluator::new(0x4e41_5941_5449),
             active: None,
@@ -3314,13 +3870,9 @@ impl StrokePipeline {
             scratch_dabs: Vec::with_capacity(256),
             next_generation: 1,
             selected_layer: LIVE_LAYER,
-            drawing: DrawingConfig {
-                edit_settings: nyatidraw_api::EditSettings::default(),
-                tool: DrawingTool::Brush,
-                size_tenths: 50,
-                opacity_u16: u16::MAX,
-                color: LIVE_BRUSH_COLOR.0,
-            },
+            selected_layer_locked: false,
+            selected_layer_alpha_locked: false,
+            drawing: DrawingConfig::from_projection(&nyatidraw_api::UiProjection::empty()),
             closed_strokes: 0,
             awaiting_clean_begin: false,
             input_discontinuities: 0,
@@ -3360,14 +3912,46 @@ impl StrokePipeline {
             return StrokeDrain {
                 samples: drained,
                 artwork_closed: false,
+                ..StrokeDrain::default()
             };
         }
 
         let mut artwork_closed = false;
+        let mut report = StrokeDrain::default();
         for admitted in queued_samples.drain(..) {
             let mut sample = admitted.queued.sample;
+            if sample.phase == PointerPhase::Begin {
+                self.temporary_picker_active = admitted.temporary_picker;
+            }
+            let temporary_picker = self.temporary_picker_active;
+            if matches!(sample.phase, PointerPhase::End | PointerPhase::Cancel) {
+                self.temporary_picker_active = false;
+            }
+            let gesture_tool = if temporary_picker {
+                DrawingTool::Eyedropper
+            } else {
+                drawing.tool
+            };
+            // Lock changes are admitted only at an idle artwork boundary.
+            // Still drain every phase, but never create preview or durable ink.
+            // Selection-only gestures remain available on locked artwork.
+            if self.selected_layer_locked
+                && !matches!(
+                    gesture_tool,
+                    DrawingTool::Wand
+                        | DrawingTool::Lasso
+                        | DrawingTool::RectangleSelection
+                        | DrawingTool::Eyedropper
+                )
+            {
+                continue;
+            }
             if self.awaiting_clean_begin && sample.phase != PointerPhase::Begin {
                 self.recovery_quarantined = self.recovery_quarantined.saturating_add(1);
+                if temporary_picker && sample.phase == PointerPhase::End {
+                    self.live_ink
+                        .complete_temporary_pick((sample.device_id, sample.sequence));
+                }
                 continue;
             }
             if self.awaiting_clean_begin {
@@ -3377,7 +3961,17 @@ impl StrokePipeline {
                     sample.sequence, self.recovery_quarantined,
                 );
             }
-            if drawing.tool.is_edit() {
+            if self.transform_projection.is_some() {
+                if !temporary_picker {
+                    self.observe_transform_sample(sample);
+                }
+                if temporary_picker && sample.phase == PointerPhase::End {
+                    self.live_ink
+                        .complete_temporary_pick((sample.device_id, sample.sequence));
+                }
+                continue;
+            }
+            if gesture_tool.is_edit() {
                 match sample.phase {
                     PointerPhase::Begin if admitted.begin_layer != Some(active_layer) => {
                         self.edit_gesture = None;
@@ -3386,9 +3980,27 @@ impl StrokePipeline {
                         ));
                     }
                     PointerPhase::Begin => {
+                        // A clean new Begin also cancels any incomplete paint
+                        // preview; switching to a read must never close it.
+                        if let Some(previous) = self.active.take() {
+                            self.scratch_dabs.clear();
+                            let _ = self.evaluator.end(previous.token, &mut self.scratch_dabs);
+                            self.gpu_ops.push(GpuStrokeOp::Finish {
+                                generation: previous.generation,
+                                disposition: LiveStrokeDisposition::Cancel,
+                            });
+                        }
+                        let settings = if temporary_picker {
+                            nyatidraw_api::EditSettings {
+                                source: nyatidraw_api::EditSource::AllVisible,
+                                ..drawing.edit_settings
+                            }
+                        } else {
+                            drawing.edit_settings
+                        };
                         self.edit_gesture = Some(crate::edit_gesture::EditGesture::begin(
-                            drawing.tool,
-                            drawing.edit_settings,
+                            gesture_tool,
+                            settings,
                             drawing.stroke_color().0,
                             self.selection.is_some(),
                             sample,
@@ -3404,6 +4016,8 @@ impl StrokePipeline {
                     }
                     PointerPhase::End => {
                         if let Some(gesture) = self.edit_gesture.take() {
+                            self.completed_temporary_picker =
+                                temporary_picker.then_some((sample.device_id, sample.sequence));
                             let result = gesture.finish(sample);
                             self.completed_edit = Some(if self.completed_edit.is_none() {
                                 result
@@ -3413,11 +4027,31 @@ impl StrokePipeline {
                                         .into(),
                                 )
                             });
+                        } else if temporary_picker {
+                            self.live_ink
+                                .complete_temporary_pick((sample.device_id, sample.sequence));
                         }
                     }
                 }
                 continue;
             }
+            // Correct only accepted brush positions, once. Raw input diagnostics
+            // are upstream; live dabs and retained replay samples below receive
+            // this identical evaluated stream. Settings are captured at Begin.
+            let mut begin_smoother = (sample.phase == PointerPhase::Begin)
+                .then(|| StrokeSmoother::new(drawing.smoothing_for_stroke(sample.eraser)));
+            let corrected = if let Some(smoother) = &mut begin_smoother {
+                smoother.process(sample)
+            } else if let Some(active) = &mut self.active {
+                active.smoother.process(sample)
+            } else {
+                Ok(sample)
+            };
+            let Ok(corrected) = corrected else {
+                self.cancel_invalid_smoothed_stroke(sample.sequence);
+                continue;
+            };
+            sample = corrected;
             match sample.phase {
                 PointerPhase::Begin => {
                     if self.pending_materializations.len() >= self.materialization_backlog_capacity
@@ -3444,8 +4078,15 @@ impl StrokePipeline {
                     }
                     self.scratch_dabs.clear();
                     let eraser = drawing.tool == DrawingTool::Eraser || sample.eraser;
+                    if self.selected_layer_alpha_locked && eraser {
+                        self.completed_edit = Some(Err(
+                            "투명도 잠금 중에는 지울 수 없습니다. 잠금을 해제하세요.".into(),
+                        ));
+                        self.awaiting_clean_begin = true;
+                        continue;
+                    }
                     sample.eraser = eraser;
-                    let brush = drawing.preset();
+                    let brush = drawing.preset_for_stroke(sample.eraser);
                     let color = drawing.stroke_color();
                     let gpu_color = drawing.gpu_color();
                     let token = begin_round_stroke(
@@ -3463,10 +4104,12 @@ impl StrokePipeline {
                         layer,
                         color: gpu_color,
                         eraser,
+                        alpha_locked: self.selected_layer_alpha_locked,
                     });
                     append_gpu_dabs(&mut self.gpu_ops, generation, &mut self.scratch_dabs);
                     self.active = Some(LiveStroke {
                         token,
+                        smoother: begin_smoother.expect("Begin owns a fresh smoother"),
                         generation,
                         layer,
                         gpu_op_start,
@@ -3475,8 +4118,17 @@ impl StrokePipeline {
                         brush: BrushSnapshot { preset: brush },
                         color,
                         eraser,
+                        alpha_locked: self.selected_layer_alpha_locked,
                         selection: self.selection.clone(),
                     });
+                    // The preset may be the remembered hardware eraser, not
+                    // the UI's selected brush. Record the accepted Begin only.
+                    let used_size = if sample.eraser && drawing.tool != DrawingTool::Eraser {
+                        drawing.remembered[3].size_tenths
+                    } else {
+                        drawing.size_tenths
+                    };
+                    report.record_brush_begin(used_size);
                 }
                 PointerPhase::Move => {
                     if let Some(active) = self.active.as_mut() {
@@ -3542,6 +4194,7 @@ impl StrokePipeline {
                                 samples: active.samples,
                                 brush: active.brush,
                                 color: active.color,
+                                alpha_locked: active.alpha_locked,
                                 selection: active.selection,
                                 end_timestamp_ns: sample.timestamp_ns,
                                 enqueued_at: Instant::now(),
@@ -3583,10 +4236,35 @@ impl StrokePipeline {
         StrokeDrain {
             samples: drained,
             artwork_closed,
+            ..report
         }
     }
 
+    fn cancel_invalid_smoothed_stroke(&mut self, sequence: u64) {
+        if let Some(active) = self.active.take() {
+            self.gpu_ops.truncate(active.gpu_op_start);
+            self.scratch_dabs.clear();
+            let _ = self.evaluator.end(active.token, &mut self.scratch_dabs);
+            self.scratch_dabs.clear();
+            self.gpu_ops.push(GpuStrokeOp::Finish {
+                generation: active.generation,
+                disposition: LiveStrokeDisposition::Cancel,
+            });
+        }
+        self.awaiting_clean_begin = true;
+        self.live_ink.publish_activation_notice(
+            "잘못된 입력 좌표로 현재 선을 취소했습니다. 다시 그려주세요.".into(),
+        );
+        eprintln!(
+            "live-ink event=stroke-cancelled reason=invalid-smoothing-position sequence={sequence} materialized=false recovery=await-clean-begin"
+        );
+    }
+
     fn consume_discontinuity(&mut self, discontinuity: InputDiscontinuity) {
+        if let Some((_, _, original)) = self.transform_gesture.take() {
+            self.pending_transform = Some(original);
+        }
+        self.temporary_picker_active = false;
         if self.edit_gesture.take().is_some() {
             self.completed_edit =
                 Some(Err("입력 연속성이 끊겨 선택 제스처를 취소했습니다.".into()));
@@ -3621,6 +4299,7 @@ impl StrokePipeline {
     }
 
     fn fail_closed(&mut self, reason: &str) {
+        self.temporary_picker_active = false;
         self.edit_gesture = None;
         self.completed_edit = None;
         if self.fatal {
@@ -3736,6 +4415,7 @@ impl StrokePipeline {
             samples: active.samples,
             brush: active.brush,
             color: active.color,
+            alpha_locked: active.alpha_locked,
             selection: active.selection,
             end_timestamp_ns: end.timestamp_ns,
             enqueued_at: Instant::now(),
@@ -3808,8 +4488,24 @@ impl Drop for ActiveCanvas {
         // Begin samples must use those accepted controls even if Close wins
         // the race with the next frame (for example Fill selected after Brush).
         self.stroke.selected_layer = self.active_layer;
+        self.stroke.selected_layer_locked = self
+            .scene
+            .tree()
+            .raster(self.active_layer)
+            .is_none_or(|layer| layer.locked);
+        self.stroke.selected_layer_alpha_locked = self
+            .scene
+            .tree()
+            .raster(self.active_layer)
+            .is_some_and(|layer| layer.alpha_locked);
         self.stroke.drawing = self.drawing;
         self.stroke.prepare_shutdown();
+        // Temporary sampling changes UI color only. A transparent read cannot
+        // become a closing artwork failure, and has nothing durable to flush.
+        if let Some(sequence) = self.stroke.completed_temporary_picker.take() {
+            self.stroke.completed_edit = None;
+            self.stroke.live_ink.complete_temporary_pick(sequence);
+        }
         // A native End received before Close must reach the writer FIFO before
         // export. Blocking here is confined to the dedicated close worker.
         if let Some(result) = self.stroke.completed_edit.take() {
@@ -3860,8 +4556,10 @@ impl Drop for ActiveCanvas {
 }
 
 struct LiveStroke {
+    alpha_locked: bool,
     selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     token: RoundBrushStroke,
+    smoother: StrokeSmoother,
     generation: u64,
     layer: LayerId,
     gpu_op_start: usize,
@@ -3878,6 +4576,7 @@ enum GpuStrokeOp {
         layer: LayerId,
         color: [f32; 4],
         eraser: bool,
+        alpha_locked: bool,
     },
     Dabs {
         generation: u64,
@@ -3942,6 +4641,7 @@ impl LiveStroke {
 }
 
 struct ClosedStrokeRequest {
+    alpha_locked: bool,
     selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     ordinal: u64,
     stroke_generation: u64,
@@ -4020,6 +4720,54 @@ struct MaterializationBootstrap {
     initial_history: HistoryProjection,
 }
 
+enum LayerPixelChange {
+    White(LayerId),
+    Duplicate {
+        source: LayerId,
+        destination: LayerId,
+    },
+}
+
+impl LayerPixelChange {
+    fn apply(self, tiles: &TileSnapshot, canvas: CanvasSpec) -> Result<TileSnapshot, String> {
+        match self {
+            Self::White(layer) => tiles
+                .with_replacements(
+                    opaque_white_layer_tiles(canvas, layer)
+                        .iter()
+                        .map(|(key, tile)| (key, tile.pixels().to_vec())),
+                )
+                .map_err(|error| format!("background tiles: {error:?}")),
+            Self::Duplicate {
+                source,
+                destination,
+            } => {
+                if source == destination || tiles.iter().any(|(key, _)| key.layer == destination) {
+                    return Err("duplicate destination already contains artwork".into());
+                }
+                // Keep signed off-page coordinates and shared immutable pixel objects.
+                TileSnapshot::from_objects(
+                    tiles.iter().map(|(key, tile)| (key, tile.clone())).chain(
+                        tiles
+                            .iter()
+                            .filter(|(key, _)| key.layer == source)
+                            .map(|(key, tile)| {
+                                (
+                                    TileKey {
+                                        layer: destination,
+                                        ..key
+                                    },
+                                    tile.clone(),
+                                )
+                            }),
+                    ),
+                )
+                .map_err(|error| format!("duplicate tiles: {error:?}"))
+            }
+        }
+    }
+}
+
 enum WorkerRequest {
     Stroke(ClosedStrokeRequest),
     Edit {
@@ -4029,7 +4777,7 @@ enum WorkerRequest {
     },
     CommitLayerTree {
         tree: LayerTree,
-        white_layer: Option<LayerId>,
+        pixel_change: Option<LayerPixelChange>,
         reply: SyncSender<Result<ArtworkOutcome, EditFailure>>,
     },
     ExportPng {
@@ -4044,10 +4792,13 @@ enum WorkerRequest {
 
 enum ArtworkOutcome {
     Edit(EditOutcome),
+    Transform(crate::transform_worker::TransformOutcome),
     History(HistoryMove),
 }
 
 struct ArtworkJob {
+    transform: bool,
+    temporary_picker: Option<(u64, u64)>,
     received: Receiver<Result<ArtworkOutcome, EditFailure>>,
     active_layer: Option<LayerId>,
     history_timing: Option<HistoryTiming>,
@@ -4576,6 +5327,7 @@ fn materialization_loop(
     let mut thumbnail_generation = 1_u64;
     let mut exit = WorkerExit::Drained;
     let mut selection = None;
+    let mut transform_worker = crate::transform_worker::TransformWorker::default();
     while let Ok(work) = receiver.recv() {
         // Dequeue freed a bounded writer slot. Wake a Save retained by the
         // canvas even when this work only changes metadata or exports a PNG.
@@ -4609,6 +5361,48 @@ fn materialization_loop(
                     ProjectSink::UntitledRecovery { db, .. }
                     | ProjectSink::ExplicitProject { db, .. } => db,
                 };
+                if let EditCommand::FreeTransform(command) = command {
+                    let result = transform_worker.execute(
+                        command,
+                        target,
+                        preview_canvas,
+                        &preview_tree,
+                        &mut selection,
+                        &mut session,
+                        &mut next_id,
+                        db,
+                    );
+                    if let Ok(outcome) = &result
+                        && outcome.committed
+                    {
+                        preview_tree = outcome.tree.clone();
+                        publish_navigator_frame(
+                            live_ink,
+                            session.tiles(),
+                            &preview_tree,
+                            preview_canvas,
+                        );
+                        thumbnail_generation = thumbnail_generation.saturating_add(1);
+                        publish_layer_thumbnail_frames(
+                            live_ink,
+                            thumbnail_generation,
+                            session.tiles(),
+                            raster_layer_ids(&preview_tree),
+                            preview_canvas,
+                        );
+                    }
+                    let failed = matches!(result, Err(EditFailure::Fatal(_)));
+                    if let Err(EditFailure::Fatal(reason)) = &result {
+                        live_ink.publish_workspace_error(reason.clone());
+                    }
+                    let _ = reply.send(result.map(ArtworkOutcome::Transform));
+                    live_ink.request_redraw();
+                    if failed {
+                        exit = WorkerExit::FailStop;
+                        break;
+                    }
+                    continue;
+                }
                 let result = crate::edit_worker::execute(
                     command,
                     target,
@@ -4622,6 +5416,9 @@ fn materialization_loop(
                 let failed = matches!(result, Err(EditFailure::Fatal(_)));
                 match &result {
                     Ok(outcome) if outcome.tiles.is_some() => {
+                        if let Some(tree) = &outcome.tree {
+                            preview_tree = tree.clone();
+                        }
                         if let Some(canvas) = outcome.canvas {
                             preview_canvas = canvas;
                         }
@@ -4830,7 +5627,7 @@ fn materialization_loop(
             }
             WorkerRequest::CommitLayerTree {
                 tree,
-                white_layer,
+                pixel_change,
                 reply,
             } => {
                 let result = (|| -> Result<HistoryMove, String> {
@@ -4856,14 +5653,8 @@ fn materialization_loop(
                             )
                             .map_err(|error| format!("subtree tiles: {error:?}"))?
                     };
-                    if let Some(layer) = white_layer {
-                        after = after
-                            .with_replacements(
-                                opaque_white_layer_tiles(preview_canvas, layer)
-                                    .iter()
-                                    .map(|(key, tile)| (key, tile.pixels().to_vec())),
-                            )
-                            .map_err(|error| format!("background tiles: {error:?}"))?;
+                    if let Some(change) = pixel_change {
+                        after = change.apply(&after, preview_canvas)?;
                     }
                     let batch = session
                         .prepare_structural_change(
@@ -4933,10 +5724,23 @@ fn materialization_loop(
             }
         };
         let started_at = Instant::now();
+        if preview_tree
+            .raster(request.layer)
+            .is_none_or(|layer| layer.locked || layer.alpha_locked != request.alpha_locked)
+        {
+            // Defense in depth: a stale/invalid producer must never commit ink
+            // to a locked or removed layer, even if it bypassed live admission.
+            live_ink.publish_workspace_error(
+                "Closed stroke targeted a locked or missing layer; reopen before drawing".into(),
+            );
+            pending.fetch_sub(1, Ordering::Release);
+            exit = WorkerExit::FailStop;
+            break;
+        }
         let queue_wait_micros = started_at.duration_since(request.enqueued_at).as_micros();
         let snapshot_id = SnapshotId(next_id);
         let replay_timing = Span::new(Stage::Replay);
-        let result = session.prepare_round_stroke_with_selection(
+        let result = session.prepare_round_stroke_with_options(
             snapshot_id,
             HistoryNodeId(next_id),
             request.end_timestamp_ns,
@@ -4946,6 +5750,7 @@ fn materialization_loop(
             request.color,
             request.samples,
             request.selection,
+            request.alpha_locked,
         );
         drop(replay_timing);
         let keep_running = match result {
@@ -5320,6 +6125,7 @@ fn add_synthetic_seed(width: u32, height: u32, output: &mut Vec<BrushDab>) {
             radius_px: (8.0 + 12.0 * (t * std::f64::consts::PI).sin()) as f32,
             opacity: 0.86,
             flow: 0.42,
+            hardness: 1.0,
         });
     }
 }
@@ -5335,6 +6141,7 @@ fn add_synthetic_background(output: &mut Vec<BrushDab>) {
             radius_px: 54.0,
             opacity: 0.72,
             flow: 0.5,
+            hardness: 1.0,
         });
     }
 }
@@ -5350,6 +6157,49 @@ pub(crate) fn system_timestamp_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flipped_pen_eraser_snapshot_preserves_the_next_painted_stroke() {
+        // Product risk: flipping a soft/low-opacity pen must not erase with
+        // that brush or overwrite the brush used after flipping back.
+        for tool in [
+            DrawingTool::Pencil,
+            DrawingTool::Pen,
+            DrawingTool::Brush,
+            DrawingTool::Eraser,
+        ] {
+            let mut drawing = DrawingConfig::from_projection(&nyatidraw_api::UiProjection::empty());
+            drawing.select_tool(DrawingTool::Eraser);
+            drawing.size_tenths = 120;
+            drawing.opacity_u16 = 40_000;
+            drawing.brush_settings.smoothing = 90;
+            let remembered_eraser = drawing.preset();
+            drawing.select_tool(tool);
+            drawing.size_tenths = 57;
+            drawing.opacity_u16 = 22_000;
+            drawing.brush_settings.hardness_u16 = 8_000;
+            drawing.brush_settings.smoothing = 20;
+            let selected = drawing.preset();
+            for hardware_eraser in [false, true] {
+                let expected = if hardware_eraser && tool != DrawingTool::Eraser {
+                    remembered_eraser
+                } else {
+                    selected
+                };
+                assert_eq!(drawing.preset_for_stroke(hardware_eraser), expected);
+                assert_eq!(
+                    drawing.smoothing_for_stroke(hardware_eraser),
+                    if hardware_eraser && tool != DrawingTool::Eraser {
+                        90
+                    } else {
+                        20
+                    },
+                );
+                assert_eq!(drawing.tool, tool);
+                assert_eq!(drawing.preset_for_stroke(false), selected);
+            }
+        }
+    }
 
     #[test]
     fn white_raster_cannot_overwrite_other_layers_or_leak_beyond_page_edges() {
@@ -5581,6 +6431,1061 @@ mod tests {
     }
 
     #[test]
+    fn temporary_picker_cannot_paint_on_release_cancel_or_queued_next_begin() {
+        // Product risk: releasing Alt or draining the next Begin before the
+        // asynchronous read can paint unexpected marks with the previous color.
+        for (phase, locked) in [
+            (PointerPhase::End, false),
+            (PointerPhase::End, true),
+            (PointerPhase::Cancel, false),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "nyatidraw-temp-picker-{}-{}.ntdr",
+                std::process::id(),
+                system_timestamp_ns()
+            ));
+            let ink = LiveInkBridge::with_capacity(16, LIVE_LAYER);
+            let bootstrap = MaterializationWorker::start(
+                ink.clone(),
+                &ProjectLocation::UntitledRecovery(path.clone()),
+            )
+            .unwrap();
+            let mut pipeline = StrokePipeline::new(ink.clone(), bootstrap.worker);
+            pipeline.selected_layer_locked = locked;
+            let original = pipeline.drawing;
+            ink.push_with_temporary_picker(sample(1, PointerPhase::Begin, -1.0, 4.0), true)
+                .unwrap();
+            pipeline.drain(LIVE_LAYER, original);
+            assert!(pipeline.active.is_none());
+            assert!(pipeline.edit_gesture.is_some());
+            // Alt has been released; only Begin owns its latched tool intent.
+            ink.push(sample(2, PointerPhase::Move, -2.0, 4.0)).unwrap();
+            ink.push(sample(3, phase, -2.0, 4.0)).unwrap();
+            if phase == PointerPhase::End {
+                assert!(ink.push(sample(4, PointerPhase::Begin, 4.0, 4.0)).is_err());
+                assert!(ink.push(sample(5, PointerPhase::End, 5.0, 4.0)).is_err());
+            }
+            pipeline.drain(LIVE_LAYER, original);
+            assert!(pipeline.active.is_none());
+            assert!(pipeline.edit_gesture.is_none());
+            assert!(pipeline.gpu_ops.is_empty());
+            assert_eq!(pipeline.materializer.pending.load(Ordering::Acquire), 0);
+            assert_eq!(pipeline.drawing.tool, original.tool);
+            assert_eq!(pipeline.drawing.size_tenths, original.size_tenths);
+            assert_eq!(pipeline.drawing.color, original.color);
+            if phase == PointerPhase::End {
+                assert!(matches!(
+                    pipeline.completed_edit.take(),
+                    Some(Ok(EditCommand::PickColor {
+                        point: [-2, 4],
+                        source: nyatidraw_api::EditSource::AllVisible
+                    }))
+                ));
+                assert_eq!(pipeline.completed_temporary_picker, Some((7, 3)));
+                assert!(ink.push(sample(6, PointerPhase::Begin, 4.0, 4.0)).is_err());
+                ink.resume_after_edit();
+                assert!(
+                    ink.push(sample(6, PointerPhase::Begin, 4.0, 4.0)).is_err(),
+                    "ordinary edit resume cannot release a pending color read"
+                );
+                ink.complete_temporary_pick((7, 3));
+            } else {
+                assert!(pipeline.completed_edit.is_none());
+            }
+            pipeline.selected_layer_locked = false;
+            ink.push(sample(7, PointerPhase::Begin, 4.0, 4.0)).unwrap();
+            pipeline.drain(LIVE_LAYER, original);
+            assert!(
+                pipeline.active.is_some(),
+                "next clean Begin resumes original brush"
+            );
+            ink.push(sample(8, PointerPhase::Cancel, 4.0, 4.0)).unwrap();
+            pipeline.drain(LIVE_LAYER, original);
+            drop(pipeline);
+            let db = ProjectDb::open(&path).unwrap();
+            assert!(db.load_reopened().unwrap().is_none());
+            drop(db);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn locked_native_input_cannot_preview_save_or_resurrect_on_close() {
+        // Product risk: GPU preview/close-drain can bypass CPU edit protection.
+        let path = std::env::temp_dir().join(format!(
+            "nyatidraw-lock-input-{}-{}.ntdr",
+            std::process::id(),
+            system_timestamp_ns()
+        ));
+        let ink = LiveInkBridge::with_capacity(16, LIVE_LAYER);
+        let bootstrap = MaterializationWorker::start(
+            ink.clone(),
+            &ProjectLocation::UntitledRecovery(path.clone()),
+        )
+        .unwrap();
+        let mut pipeline = StrokePipeline::new(ink.clone(), bootstrap.worker);
+        pipeline.selected_layer_locked = true;
+        let mut sequence = 0;
+        for tool in [
+            DrawingTool::Pencil,
+            DrawingTool::Pen,
+            DrawingTool::Brush,
+            DrawingTool::Eraser,
+            DrawingTool::MoveSelection,
+            DrawingTool::Fill,
+            DrawingTool::Gradient,
+        ] {
+            pipeline.drawing.tool = tool;
+            for phase in [PointerPhase::Begin, PointerPhase::Move, PointerPhase::End] {
+                sequence += 1;
+                ink.push(sample(sequence, phase, 4.0, 4.0)).unwrap();
+            }
+            pipeline.drain(LIVE_LAYER, pipeline.drawing);
+            assert!(pipeline.active.is_none());
+            assert!(pipeline.gpu_ops.is_empty());
+            assert!(pipeline.completed_edit.is_none());
+            assert!(pipeline.pending_materializations.is_empty());
+            assert_eq!(pipeline.materializer.pending.load(Ordering::Acquire), 0);
+        }
+        // Raw input arriving immediately before Close must remain protected.
+        pipeline.drawing.tool = DrawingTool::Brush;
+        ink.push(sample(sequence + 1, PointerPhase::Begin, 8.0, 8.0))
+            .unwrap();
+        ink.push(sample(sequence + 2, PointerPhase::End, 8.0, 8.0))
+            .unwrap();
+        drop(pipeline);
+        assert!(!ink.workspace_failed());
+        let db = ProjectDb::open(&path).unwrap();
+        assert!(db.load_reopened().unwrap().is_none());
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Persisted protection, rejection and undo are one invariant.
+    fn layer_lock_blocks_edits_and_group_deletion_and_survives_restart() {
+        // Product risk: metadata-only locks must not be lost on restart or
+        // bypassed by structural actions; rejected edits cannot consume history.
+        const REOPEN: &str = "NYATIDRAW_TEST_LOCK_REOPEN";
+        let canvas = CanvasSpec {
+            width_px: 8,
+            height_px: 8,
+            pixels_per_inch: 96,
+        };
+        let mut tree = default_layer_tree();
+        let group = GroupId(800);
+        tree.insert(
+            tree.root_id(),
+            1,
+            LayerTreeNode::Group(GroupNode {
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
+                id: group,
+                name: "Sketch".into(),
+                visible: true,
+                opacity_u16: u16::MAX,
+                children: Vec::new(),
+            }),
+        )
+        .unwrap();
+        tree.reorder(nyatidraw_api::LayerTreeNodeId::Raster(LIVE_LAYER), group, 0)
+            .unwrap();
+        let unlocked = tree.clone();
+        tree.set_locked(LIVE_LAYER, true).unwrap();
+        let tiles = TileSnapshot::from_tiles([-1, 0].map(|x| {
+            (
+                TileKey {
+                    layer: LIVE_LAYER,
+                    mip: 0,
+                    x,
+                    y: 0,
+                },
+                vec![64; TILE_BYTE_LEN],
+            )
+        }))
+        .unwrap();
+        if let Some(path) = std::env::var_os(REOPEN) {
+            let (_, actual, actual_tree, _, _, _) =
+                open_materialization_session(&ProjectLocation::UntitledRecovery(path.into()))
+                    .unwrap();
+            assert_eq!(actual, tiles);
+            assert_eq!(actual_tree, tree);
+            assert!(actual_tree.raster(LIVE_LAYER).unwrap().locked);
+            return;
+        }
+        for node in [
+            nyatidraw_api::LayerTreeNodeId::Raster(LIVE_LAYER),
+            nyatidraw_api::LayerTreeNodeId::Group(group),
+        ] {
+            let original = tree.clone();
+            assert_eq!(
+                tree.remove(node),
+                Err(nyatidraw_document::LayerTreeError::LockedNode(node))
+            );
+            assert_eq!(tree, original);
+        }
+        let path = std::env::temp_dir().join(format!(
+            "nyatidraw-lock-history-{}-{}.ntdr",
+            std::process::id(),
+            system_timestamp_ns()
+        ));
+        let (mut session, _, _, _, mut next_id, sink) =
+            open_materialization_session(&ProjectLocation::UntitledRecovery(path.clone())).unwrap();
+        let db = match &sink {
+            ProjectSink::UntitledRecovery { db, .. } | ProjectSink::ExplicitProject { db, .. } => {
+                db
+            }
+        };
+        for metadata in [&unlocked, &tree] {
+            let batch = session
+                .prepare_structural_change(
+                    SnapshotId(next_id),
+                    HistoryNodeId(next_id),
+                    1,
+                    tiles.clone(),
+                )
+                .unwrap();
+            db.commit_structural_with_layer_tree(&batch, metadata)
+                .unwrap();
+            session.accept_structural_change(&batch).unwrap();
+            next_id += 1;
+        }
+        let mut selection = Some(Arc::new(
+            nyatidraw_paint_cpu::lasso_selection(
+                canvas,
+                &[[0, 0], [4, 0], [4, 4], [0, 4]],
+                nyatidraw_paint_cpu::EditLimits::default(),
+            )
+            .unwrap(),
+        ));
+        let head = session.current_snapshot();
+        let expected_next = next_id;
+        for command in [
+            EditCommand::ClearActiveLayer,
+            EditCommand::Transform(nyatidraw_api::RasterTransform {
+                offset: [1, 0],
+                ..Default::default()
+            }),
+            EditCommand::FillSelection { color: [255; 4] },
+            EditCommand::FloodFill {
+                seed: [0, 0],
+                tolerance: 0,
+                source: nyatidraw_api::EditSource::ActiveLayer,
+                color: [255; 4],
+            },
+            EditCommand::GradientSelection {
+                start: [0, 0],
+                end: [3, 3],
+                start_color: [255; 4],
+                end_color: [0; 4],
+            },
+        ] {
+            let before_selection = selection.clone();
+            assert!(matches!(
+                crate::edit_worker::execute(
+                    command,
+                    LIVE_LAYER,
+                    canvas,
+                    &tree,
+                    &mut selection,
+                    &mut session,
+                    &mut next_id,
+                    db
+                ),
+                Err(EditFailure::Rejected(_))
+            ));
+            assert_eq!(session.tiles(), &tiles);
+            assert_eq!(session.current_snapshot(), head);
+            assert_eq!(next_id, expected_next);
+            assert_eq!(selection, before_selection);
+        }
+        // Unlock is itself undoable; after undoing a clear and the unlock,
+        // both the pixels and the protection must be restored together.
+        let batch = session
+            .prepare_structural_change(
+                SnapshotId(next_id),
+                HistoryNodeId(next_id),
+                2,
+                tiles.clone(),
+            )
+            .unwrap();
+        db.commit_structural_with_layer_tree(&batch, &unlocked)
+            .unwrap();
+        session.accept_structural_change(&batch).unwrap();
+        next_id += 1;
+        crate::edit_worker::execute(
+            EditCommand::ClearActiveLayer,
+            LIVE_LAYER,
+            canvas,
+            &unlocked,
+            &mut selection,
+            &mut session,
+            &mut next_id,
+            db,
+        )
+        .ok()
+        .unwrap();
+        assert!(session.tiles().is_empty());
+        for _ in 0..2 {
+            let undo = session.prepare_undo_cursor().unwrap();
+            let restored = db.load_cursor_tiles(undo.target()).unwrap();
+            db.persist_history_cursor(undo.target()).unwrap();
+            session.accept_history_cursor_move(undo, restored).unwrap();
+        }
+        drop(session);
+        drop(sink);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "native_canvas::tests::layer_lock_blocks_edits_and_group_deletion_and_survives_restart"])
+            .env(REOPEN, &path).status().unwrap();
+        assert!(status.success());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One complete gesture/save/restart artwork invariant.
+    fn rectangle_move_preserves_pixels_undo_and_off_page_reopen() {
+        // Product risk: a selection move must cut exactly once, preserve other
+        // artwork, and keep moved off-page pixels durable but out of the PNG.
+        const REOPEN: &str = "NYATIDRAW_TEST_RECTANGLE_MOVE_REOPEN";
+        let canvas = CanvasSpec {
+            width_px: 16,
+            height_px: 16,
+            pixels_per_inch: 96,
+        };
+        let tree = default_layer_tree();
+        let fixture = |moved| {
+            let mut pixels = vec![0; TILE_BYTE_LEN];
+            for (x, y, color) in [
+                (if moved { 33 } else { 1 }, 1, [255, 0, 0, 255]),
+                (if moved { 34 } else { 2 }, 2, [0, 0, 255, 255]),
+                (7, 7, [0, 255, 0, 255]),
+            ] {
+                let offset = (y * 128 + x) * 4;
+                pixels[offset..offset + 4].copy_from_slice(&color);
+            }
+            TileSnapshot::from_tiles([
+                (
+                    TileKey {
+                        layer: LIVE_LAYER,
+                        mip: 0,
+                        x: 0,
+                        y: 0,
+                    },
+                    pixels,
+                ),
+                (
+                    TileKey {
+                        layer: LIVE_LAYER,
+                        mip: 0,
+                        x: -1,
+                        y: 0,
+                    },
+                    vec![64; TILE_BYTE_LEN],
+                ),
+            ])
+            .unwrap()
+        };
+        let before = fixture(false);
+        let expected = fixture(true);
+        let expected_png = nyatidraw_png_io::encode_png_bytes(
+            &flatten_layer_tree_rgba8(&expected, &tree, canvas).unwrap(),
+        )
+        .unwrap();
+        if let Some(path) = std::env::var_os(REOPEN) {
+            let (_, tiles, reopened_tree, reopened_canvas, _, _) =
+                open_materialization_session(&ProjectLocation::UntitledRecovery(path.into()))
+                    .unwrap();
+            assert_eq!(tiles, expected);
+            assert_eq!(reopened_tree, tree);
+            assert_eq!(reopened_canvas, canvas);
+            let actual_png = nyatidraw_png_io::encode_png_bytes(
+                &flatten_layer_tree_rgba8(&tiles, &reopened_tree, reopened_canvas).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(actual_png, expected_png);
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "nyatidraw-rectangle-move-{}-{}.ntdr",
+            std::process::id(),
+            system_timestamp_ns()
+        ));
+        let (mut session, _, _, _, mut next_id, sink) =
+            open_materialization_session(&ProjectLocation::UntitledRecovery(path.clone())).unwrap();
+        let db = match &sink {
+            ProjectSink::UntitledRecovery { db, .. } | ProjectSink::ExplicitProject { db, .. } => {
+                db
+            }
+        };
+        db.persist_canvas_spec(canvas).unwrap();
+        let seed = session
+            .prepare_structural_change(
+                SnapshotId(next_id),
+                HistoryNodeId(next_id),
+                1,
+                before.clone(),
+            )
+            .unwrap();
+        db.commit_structural_with_layer_tree(&seed, &tree).unwrap();
+        session.accept_structural_change(&seed).unwrap();
+        next_id += 1;
+        let mut selection = None;
+        for (tool, start, end, has_selection) in [
+            (
+                DrawingTool::RectangleSelection,
+                [2.0, 2.0],
+                [1.0, 1.0],
+                false,
+            ),
+            (DrawingTool::MoveSelection, [1.0, 1.0], [33.0, 1.0], true),
+        ] {
+            let gesture = crate::edit_gesture::EditGesture::begin(
+                tool,
+                nyatidraw_api::EditSettings::default(),
+                [0; 4],
+                has_selection,
+                sample(1, PointerPhase::Begin, start[0], start[1]),
+            );
+            let command = gesture
+                .finish(sample(2, PointerPhase::End, end[0], end[1]))
+                .unwrap();
+            crate::edit_worker::execute(
+                command,
+                LIVE_LAYER,
+                canvas,
+                &tree,
+                &mut selection,
+                &mut session,
+                &mut next_id,
+                db,
+            )
+            .ok()
+            .expect("gesture applied");
+            if tool == DrawingTool::RectangleSelection {
+                assert_eq!(selection.as_ref().unwrap().selected_pixels(), 4);
+                assert_eq!(
+                    session.tiles(),
+                    &before,
+                    "selection must not modify artwork"
+                );
+            }
+        }
+        assert_eq!(session.tiles(), &expected);
+        assert!(
+            selection.is_none(),
+            "existing transform semantics clear selection after commit"
+        );
+        let undo = session.prepare_undo_cursor().unwrap();
+        let restored = db.load_cursor_tiles(undo.target()).unwrap();
+        assert_eq!(restored, before);
+        db.persist_history_cursor(undo.target()).unwrap();
+        session.accept_history_cursor_move(undo, restored).unwrap();
+        let redo = session.prepare_redo_cursor().unwrap();
+        let restored = db.load_cursor_tiles(redo.target()).unwrap();
+        assert_eq!(restored, expected);
+        db.persist_history_cursor(redo.target()).unwrap();
+        session.accept_history_cursor_move(redo, restored).unwrap();
+        drop(session);
+        drop(sink);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_canvas::tests::rectangle_move_preserves_pixels_undo_and_off_page_reopen",
+            ])
+            .env(REOPEN, &path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the parent/child durability sequence together.
+    fn duplicate_layer_preserves_off_page_artwork_history_and_reopen() {
+        // Product risk: copying only preview pixels loses off-page artwork;
+        // split metadata/pixel commits or shared mutable copies corrupt undo.
+        const REOPEN: &str = "NYATIDRAW_TEST_DUPLICATE_REOPEN";
+        let source = LIVE_LAYER;
+        let destination = LayerId(991);
+        let mut original_tree = default_layer_tree();
+        original_tree
+            .rename(
+                nyatidraw_api::LayerTreeNodeId::Raster(source),
+                &"선".repeat(128),
+            )
+            .unwrap();
+        original_tree.set_reference(source, true).unwrap();
+        original_tree
+            .set_opacity(nyatidraw_api::LayerTreeNodeId::Raster(source), 31_337)
+            .unwrap();
+        let mut tree = original_tree.clone();
+        tree.duplicate_raster(source, destination).unwrap();
+        assert_eq!(
+            tree.parent_and_index(nyatidraw_api::LayerTreeNodeId::Raster(destination)),
+            Some((tree.root_id(), 1))
+        );
+        let LayerTreeNode::Raster(copy) = &tree.root().children[1] else {
+            panic!("raster copy")
+        };
+        assert_eq!(copy.name.chars().count(), 128);
+        assert!(copy.name.ends_with(" 복사"));
+        assert!(copy.reference);
+        assert_eq!(copy.opacity_u16, 31_337);
+        let accepted_tree = tree.clone();
+        assert!(tree.duplicate_raster(source, destination).is_err());
+        assert!(
+            tree.duplicate_raster(LayerId(999_999), LayerId(992))
+                .is_err()
+        );
+        assert_eq!(tree, accepted_tree, "rejected copies are failure-atomic");
+        let before = TileSnapshot::from_tiles([-20, 0, 300].map(|x| {
+            (
+                TileKey {
+                    layer: source,
+                    mip: 0,
+                    x,
+                    y: 0,
+                },
+                vec![128; TILE_BYTE_LEN],
+            )
+        }))
+        .unwrap();
+        let duplicate = || LayerPixelChange::Duplicate {
+            source,
+            destination,
+        };
+        let after = duplicate().apply(&before, CanvasSpec::DEFAULT).unwrap();
+        assert_eq!(after.len(), before.len() * 2);
+        for (key, tile) in before.iter() {
+            assert_eq!(after.get(key), Some(tile));
+            assert_eq!(
+                after.get(TileKey {
+                    layer: destination,
+                    ..key
+                }),
+                Some(tile)
+            );
+        }
+        assert!(duplicate().apply(&after, CanvasSpec::DEFAULT).is_err());
+        assert!(
+            duplicate()
+                .apply(&TileSnapshot::empty(), CanvasSpec::DEFAULT)
+                .unwrap()
+                .is_empty()
+        );
+        let copy_key = TileKey {
+            layer: destination,
+            mip: 0,
+            x: -20,
+            y: 0,
+        };
+        let edited_copy = after
+            .with_replacements([(copy_key, vec![255; TILE_BYTE_LEN])])
+            .unwrap();
+        assert_eq!(
+            edited_copy.get(TileKey {
+                layer: source,
+                ..copy_key
+            }),
+            before.get(TileKey {
+                layer: source,
+                ..copy_key
+            })
+        );
+        assert_eq!(
+            after.get(copy_key).unwrap().pixels(),
+            vec![128; TILE_BYTE_LEN]
+        );
+        // Include non-preset opacity in the persisted structural operation.
+        tree.set_opacity(nyatidraw_api::LayerTreeNodeId::Raster(destination), 17_777)
+            .unwrap();
+        let canvas = CanvasSpec {
+            width_px: 32,
+            height_px: 32,
+            pixels_per_inch: 96,
+        };
+        let expected_export = flatten_layer_tree_rgba8(&after, &tree, canvas).unwrap();
+        if let Some(path) = std::env::var_os(REOPEN) {
+            let (_, tiles, reopened_tree, _, _, _) =
+                open_materialization_session(&ProjectLocation::UntitledRecovery(path.into()))
+                    .unwrap();
+            assert_eq!(tiles, after);
+            assert_eq!(reopened_tree, tree);
+            assert_eq!(
+                flatten_layer_tree_rgba8(&tiles, &reopened_tree, canvas).unwrap(),
+                expected_export
+            );
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "nyatidraw-duplicate-{}-{}.ntdr",
+            std::process::id(),
+            system_timestamp_ns()
+        ));
+        let (mut session, _, _, _, next_id, sink) =
+            open_materialization_session(&ProjectLocation::UntitledRecovery(path.clone())).unwrap();
+        let db = match &sink {
+            ProjectSink::UntitledRecovery { db, .. } | ProjectSink::ExplicitProject { db, .. } => {
+                db
+            }
+        };
+        for (offset, tiles, metadata) in [
+            (0, before.clone(), &original_tree),
+            (1, after.clone(), &tree),
+        ] {
+            let batch = session
+                .prepare_structural_change(
+                    SnapshotId(next_id + offset),
+                    HistoryNodeId(next_id + offset),
+                    u64::try_from(offset + 1).unwrap(),
+                    tiles,
+                )
+                .unwrap();
+            db.commit_structural_with_layer_tree(&batch, metadata)
+                .unwrap();
+            session.accept_structural_change(&batch).unwrap();
+        }
+        let undo = session.prepare_undo_cursor().unwrap();
+        assert_eq!(
+            db.load_cursor_layer_tree(undo.target()).unwrap(),
+            Some(original_tree)
+        );
+        let restored = db.load_cursor_tiles(undo.target()).unwrap();
+        assert_eq!(restored, before);
+        db.persist_history_cursor(undo.target()).unwrap();
+        session.accept_history_cursor_move(undo, restored).unwrap();
+        let redo = session.prepare_redo_cursor().unwrap();
+        assert_eq!(
+            db.load_cursor_layer_tree(redo.target()).unwrap(),
+            Some(tree)
+        );
+        let restored = db.load_cursor_tiles(redo.target()).unwrap();
+        assert_eq!(restored, after);
+        db.persist_history_cursor(redo.target()).unwrap();
+        session.accept_history_cursor_move(redo, restored).unwrap();
+        drop(session);
+        drop(sink);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "native_canvas::tests::duplicate_layer_preserves_off_page_artwork_history_and_reopen"])
+            .env(REOPEN, &path).status().unwrap();
+        assert!(status.success());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn clipboard_cut_paste_preserves_artwork_on_failure_undo_and_process_restart() {
+        // Product risk: clipboard contention must not cut artwork, and paste
+        // must save its new layer and exact alpha atomically with pixel history.
+        use crate::artwork_clipboard::{ArtworkClipboard, MemoryClipboard};
+        use crate::edit_worker::execute_with_clipboard;
+        const REOPEN: &str = "NYATIDRAW_TEST_CLIPBOARD_REOPEN";
+        let tree = default_layer_tree();
+        let canvas = CanvasSpec {
+            width_px: 3,
+            height_px: 1,
+            pixels_per_inch: 96,
+        };
+        let key = |layer, x| TileKey {
+            layer,
+            mip: 0,
+            x,
+            y: 0,
+        };
+        let mut pixels = vec![0; TILE_BYTE_LEN];
+        pixels[..12].copy_from_slice(&[128, 0, 0, 128, 0, 255, 0, 255, 0, 0, 64, 64]);
+        let before = TileSnapshot::from_tiles([
+            (key(LIVE_LAYER, 0), pixels),
+            (key(LIVE_LAYER, -1), vec![64; TILE_BYTE_LEN]),
+        ])
+        .unwrap();
+        let expected_png = nyatidraw_png_io::encode_png_bytes(
+            &flatten_layer_tree_rgba8(&before, &tree, canvas).unwrap(),
+        )
+        .unwrap();
+        if let Some(path) = std::env::var_os(REOPEN) {
+            let (_, tiles, reopened_tree, reopened_canvas, _, _) =
+                open_materialization_session(&ProjectLocation::UntitledRecovery(path.into()))
+                    .unwrap();
+            assert_eq!(reopened_canvas, canvas);
+            let pasted = raster_layer_ids(&reopened_tree)
+                .into_iter()
+                .find(|id| *id != LIVE_LAYER)
+                .unwrap();
+            assert_eq!(reopened_tree.raster(pasted).unwrap().name, "붙여넣기");
+            assert_eq!(
+                tiles.get(key(LIVE_LAYER, -1)),
+                before.get(key(LIVE_LAYER, -1))
+            );
+            assert_eq!(
+                &tiles.get(key(pasted, 0)).unwrap().pixels()[..12],
+                &[128, 0, 0, 128, 0, 0, 0, 0, 0, 0, 64, 64]
+            );
+            assert_eq!(
+                nyatidraw_png_io::encode_png_bytes(
+                    &flatten_layer_tree_rgba8(&tiles, &reopened_tree, canvas).unwrap()
+                )
+                .unwrap(),
+                expected_png
+            );
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "nyatidraw-clipboard-{}-{}.ntdr",
+            std::process::id(),
+            system_timestamp_ns()
+        ));
+        let (mut session, _, _, _, mut next_id, sink) =
+            open_materialization_session(&ProjectLocation::UntitledRecovery(path.clone())).unwrap();
+        let db = match &sink {
+            ProjectSink::UntitledRecovery { db, .. } | ProjectSink::ExplicitProject { db, .. } => {
+                db
+            }
+        };
+        db.persist_canvas_spec(canvas).unwrap();
+        let seed = session
+            .prepare_structural_change(
+                SnapshotId(next_id),
+                HistoryNodeId(next_id),
+                1,
+                before.clone(),
+            )
+            .unwrap();
+        db.commit_structural_with_layer_tree(&seed, &tree).unwrap();
+        session.accept_structural_change(&seed).unwrap();
+        next_id += 1;
+        let mut clipboard = MemoryClipboard::default();
+        let mut selection = Some(Arc::new(
+            nyatidraw_paint_cpu::SelectionMask::from_packed_bits(3, 1, &[0b101]).unwrap(),
+        ));
+        let head = session.current_snapshot();
+        let id_before = next_id;
+        let copied = execute_with_clipboard(
+            EditCommand::CopySelection,
+            LIVE_LAYER,
+            canvas,
+            &tree,
+            &mut selection,
+            &mut session,
+            &mut next_id,
+            db,
+            &mut clipboard,
+        )
+        .ok()
+        .unwrap();
+        assert!(copied.tiles.is_none());
+        assert_eq!(session.current_snapshot(), head);
+        assert_eq!(next_id, id_before);
+        assert_eq!(session.tiles(), &before);
+        assert_eq!(clipboard.read().unwrap().origin(), [0, 0]);
+        let bytes_before = clipboard.bytes.clone();
+        clipboard.reject_write = true;
+        assert!(
+            execute_with_clipboard(
+                EditCommand::CutSelection,
+                LIVE_LAYER,
+                canvas,
+                &tree,
+                &mut selection,
+                &mut session,
+                &mut next_id,
+                db,
+                &mut clipboard
+            )
+            .is_err()
+        );
+        assert_eq!(session.tiles(), &before);
+        assert_eq!(session.current_snapshot(), head);
+        assert_eq!(clipboard.bytes, bytes_before);
+        clipboard.reject_write = false;
+        let mut locked = tree.clone();
+        locked.set_locked(LIVE_LAYER, true).unwrap();
+        assert!(
+            execute_with_clipboard(
+                EditCommand::CutSelection,
+                LIVE_LAYER,
+                canvas,
+                &locked,
+                &mut selection,
+                &mut session,
+                &mut next_id,
+                db,
+                &mut clipboard
+            )
+            .is_err()
+        );
+        assert_eq!(next_id, id_before);
+        let cut = execute_with_clipboard(
+            EditCommand::CutSelection,
+            LIVE_LAYER,
+            canvas,
+            &tree,
+            &mut selection,
+            &mut session,
+            &mut next_id,
+            db,
+            &mut clipboard,
+        )
+        .ok()
+        .unwrap()
+        .tiles
+        .unwrap();
+        assert_eq!(
+            &cut.get(key(LIVE_LAYER, 0)).unwrap().pixels()[..12],
+            &[0, 0, 0, 0, 0, 255, 0, 255, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            cut.get(key(LIVE_LAYER, -1)),
+            before.get(key(LIVE_LAYER, -1))
+        );
+        clipboard.bytes = Some(vec![0; 24]);
+        let cut_id = next_id;
+        assert!(
+            execute_with_clipboard(
+                EditCommand::PasteSelection,
+                LIVE_LAYER,
+                canvas,
+                &tree,
+                &mut selection,
+                &mut session,
+                &mut next_id,
+                db,
+                &mut clipboard
+            )
+            .is_err()
+        );
+        assert_eq!(next_id, cut_id);
+        assert_eq!(session.tiles(), &cut);
+        clipboard.bytes = bytes_before;
+        let pasted = execute_with_clipboard(
+            EditCommand::PasteSelection,
+            LIVE_LAYER,
+            canvas,
+            &tree,
+            &mut selection,
+            &mut session,
+            &mut next_id,
+            db,
+            &mut clipboard,
+        )
+        .ok()
+        .unwrap();
+        let pasted_tree = pasted.tree.unwrap();
+        let pasted_id = pasted.active_layer.unwrap();
+        assert_eq!(
+            pasted_tree
+                .parent_and_index(nyatidraw_api::LayerTreeNodeId::Raster(pasted_id))
+                .unwrap()
+                .1,
+            1
+        );
+        assert!(selection.is_none());
+        let final_tiles = session.tiles().clone();
+        assert_eq!(
+            nyatidraw_png_io::encode_png_bytes(
+                &flatten_layer_tree_rgba8(&final_tiles, &pasted_tree, canvas).unwrap()
+            )
+            .unwrap(),
+            expected_png
+        );
+        let undo = session.prepare_undo_cursor().unwrap();
+        let restored = db.load_cursor_tiles(undo.target()).unwrap();
+        assert_eq!(restored, cut);
+        assert_eq!(
+            db.load_cursor_layer_tree(undo.target()).unwrap().unwrap(),
+            tree
+        );
+        db.persist_history_cursor(undo.target()).unwrap();
+        session.accept_history_cursor_move(undo, restored).unwrap();
+        let redo = session.prepare_redo_cursor().unwrap();
+        let restored = db.load_cursor_tiles(redo.target()).unwrap();
+        assert_eq!(restored, final_tiles);
+        assert_eq!(
+            db.load_cursor_layer_tree(redo.target()).unwrap().unwrap(),
+            pasted_tree
+        );
+        db.persist_history_cursor(redo.target()).unwrap();
+        session.accept_history_cursor_move(redo, restored).unwrap();
+        drop(session);
+        drop(sink);
+        assert!(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "native_canvas::tests::clipboard_cut_paste_preserves_artwork_on_failure_undo_and_process_restart"])
+            .env(REOPEN, &path).status().unwrap().success());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn eyedropper_is_read_only_and_picked_color_survives_paint_save_reopen() {
+        // Product risk: sampling must not create history or alter pixels, and
+        // sampled translucent RGB must not darken subsequent saved artwork.
+        const REOPEN: &str = "NYATIDRAW_TEST_PICK_COLOR_REOPEN";
+        let tree = default_layer_tree();
+        let canvas = nyatidraw_api::CanvasSpec {
+            width_px: 2,
+            height_px: 1,
+            pixels_per_inch: 96,
+        };
+        let key = |x| TileKey {
+            layer: LIVE_LAYER,
+            mip: 0,
+            x,
+            y: 0,
+        };
+        let outside = [128, 0, 0, 128].repeat(TILE_BYTE_LEN / 4);
+        let before = TileSnapshot::from_tiles([(key(-1), outside.clone())]).unwrap();
+        let mut painted = vec![0; TILE_BYTE_LEN];
+        painted[..4].copy_from_slice(&[255, 0, 0, 255]);
+        let expected = TileSnapshot::from_tiles([(key(-1), outside), (key(0), painted)]).unwrap();
+        let expected_png = nyatidraw_png_io::encode_png_bytes(
+            &flatten_layer_tree_rgba8(&expected, &tree, canvas).unwrap(),
+        )
+        .unwrap();
+        if let Some(path) = std::env::var_os(REOPEN) {
+            let (_, tiles, reopened_tree, reopened_canvas, _, _) =
+                open_materialization_session(&ProjectLocation::UntitledRecovery(path.into()))
+                    .unwrap();
+            assert_eq!(tiles, expected);
+            assert_eq!(reopened_tree, tree);
+            assert_eq!(reopened_canvas, canvas);
+            assert_eq!(
+                nyatidraw_png_io::encode_png_bytes(
+                    &flatten_layer_tree_rgba8(&tiles, &tree, canvas).unwrap(),
+                )
+                .unwrap(),
+                expected_png
+            );
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "nyatidraw-pick-color-{}-{}.ntdr",
+            std::process::id(),
+            system_timestamp_ns(),
+        ));
+        let (mut session, _, _, _, mut next_id, sink) =
+            open_materialization_session(&ProjectLocation::UntitledRecovery(path.clone())).unwrap();
+        let db = match &sink {
+            ProjectSink::UntitledRecovery { db, .. } | ProjectSink::ExplicitProject { db, .. } => {
+                db
+            }
+        };
+        db.persist_canvas_spec(canvas).unwrap();
+        let seed = session
+            .prepare_structural_change(
+                SnapshotId(next_id),
+                HistoryNodeId(next_id),
+                1,
+                before.clone(),
+            )
+            .unwrap();
+        db.commit_structural_with_layer_tree(&seed, &tree).unwrap();
+        session.accept_structural_change(&seed).unwrap();
+        next_id += 1;
+        let id_before = next_id;
+        let mut selection = Some(Arc::new(
+            nyatidraw_paint_cpu::lasso_selection(
+                canvas,
+                &[[0, 0], [1, 0], [1, 1], [0, 1]],
+                nyatidraw_paint_cpu::EditLimits::default(),
+            )
+            .unwrap(),
+        ));
+        let mask_before = selection.clone().unwrap();
+        let gesture = crate::edit_gesture::EditGesture::begin(
+            DrawingTool::Eyedropper,
+            nyatidraw_api::EditSettings {
+                source: nyatidraw_api::EditSource::ActiveLayer,
+                ..Default::default()
+            },
+            [0; 4],
+            true,
+            sample(1, PointerPhase::Begin, -1.0, 0.0),
+        );
+        let command = gesture
+            .finish(sample(2, PointerPhase::End, -1.0, 0.0))
+            .unwrap();
+        let picked = crate::edit_worker::execute(
+            command,
+            LIVE_LAYER,
+            canvas,
+            &tree,
+            &mut selection,
+            &mut session,
+            &mut next_id,
+            db,
+        )
+        .ok()
+        .expect("sample signed translucent artwork");
+        assert_eq!(picked.sampled_color, Some([255, 0, 0, 255]));
+        assert!(picked.tiles.is_none());
+        assert_eq!(next_id, id_before);
+        assert_eq!(session.tiles(), &before);
+        assert!(Arc::ptr_eq(selection.as_ref().unwrap(), &mask_before));
+        let displayed = crate::edit_worker::execute(
+            EditCommand::PickDisplayColor {
+                point: [-1, 0],
+                solo: Some(nyatidraw_api::LayerTreeNodeId::Raster(LIVE_LAYER)),
+                input_sequence: (7, 2),
+            },
+            LIVE_LAYER,
+            canvas,
+            &tree,
+            &mut selection,
+            &mut session,
+            &mut next_id,
+            db,
+        )
+        .ok()
+        .expect("temporary display sampling preserves the saved source");
+        assert_eq!(displayed.sampled_color, picked.sampled_color);
+        assert!(displayed.tiles.is_none());
+        assert_eq!(next_id, id_before);
+        assert_eq!(session.tiles(), &before);
+        assert!(Arc::ptr_eq(selection.as_ref().unwrap(), &mask_before));
+        assert!(
+            crate::edit_worker::execute(
+                EditCommand::PickColor {
+                    point: [0, 0],
+                    source: nyatidraw_api::EditSource::AllVisible
+                },
+                LIVE_LAYER,
+                canvas,
+                &tree,
+                &mut selection,
+                &mut session,
+                &mut next_id,
+                db,
+            )
+            .is_err(),
+            "transparent sampling must leave the foreground unchanged"
+        );
+        assert_eq!(next_id, id_before);
+        let color =
+            nyatidraw_tiles::color::srgb8_to_linear_premultiplied(displayed.sampled_color.unwrap());
+        crate::edit_worker::execute(
+            EditCommand::FillSelection { color },
+            LIVE_LAYER,
+            canvas,
+            &tree,
+            &mut selection,
+            &mut session,
+            &mut next_id,
+            db,
+        )
+        .ok()
+        .expect("paint with sampled RGB");
+        assert_eq!(session.tiles(), &expected);
+        let undo = session.prepare_undo_cursor().unwrap();
+        assert_eq!(db.load_cursor_tiles(undo.target()).unwrap(), before);
+        drop(session);
+        drop(sink);
+        assert!(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "native_canvas::tests::eyedropper_is_read_only_and_picked_color_survives_paint_save_reopen"])
+            .env(REOPEN, &path).status().unwrap().success());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn clear_layer_keeps_undo_and_reopens_empty_pixels_without_deleting_layer() {
         // Product risk: clear must be a durable, undoable pixel operation,
         // including outside-page pixels, never deletion of the layer itself.
@@ -5666,6 +7571,124 @@ mod tests {
             .env(REOPEN, &path).status().expect("start fresh verifier");
         assert!(status.success());
         std::fs::remove_file(path).expect("remove scratch fixture");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn smoothing_live_dabs_and_saved_replay_remain_identical_after_process_restart() {
+        // Product risk: filtering only preview or filtering replay a second time
+        // changes the artwork when a stroke closes or the project is reopened.
+        const REOPEN: &str = "NYATIDRAW_TEST_SMOOTHING_REOPEN";
+        const ROOT: &str = "NYATIDRAW_TEST_SMOOTHING_ROOT";
+        let received = [
+            sample(1, PointerPhase::Begin, 30.0, 32.0),
+            sample(2, PointerPhase::Move, 60.0, 70.0),
+            sample(3, PointerPhase::Move, 90.0, 30.0),
+            sample(4, PointerPhase::Move, 120.0, 68.0),
+            sample(5, PointerPhase::End, 150.0, 40.0),
+        ];
+        let mut smoother = StrokeSmoother::new(100);
+        let expected: Vec<_> = received
+            .iter()
+            .map(|sample| smoother.process(*sample).unwrap())
+            .collect();
+        if let Some(path) = std::env::var_os(REOPEN).map(PathBuf::from) {
+            let database = ProjectDb::open(&path).unwrap();
+            let reopened = database.load_reopened().unwrap().unwrap();
+            assert_eq!(reopened.current().unwrap().stroke.samples(), expected);
+            assert_eq!(
+                format!("{:?}", reopened.current_tiles().root()),
+                std::env::var(ROOT).unwrap()
+            );
+            let output = flatten_layer_tree_rgba8(
+                reopened.current_tiles(),
+                &default_layer_tree(),
+                CanvasSpec::default(),
+            )
+            .unwrap();
+            let png =
+                nyatidraw_png_io::decode_png(&path.with_extension("png"), LIVE_LAYER).unwrap();
+            let imported =
+                flatten_layer_tree_rgba8(&png.tiles, &default_layer_tree(), png.canvas).unwrap();
+            assert!(
+                output.pixels == imported.pixels,
+                "fresh-process PNG decode must match the pre-close artwork exactly"
+            );
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "nyatidraw-smoothing-{}-{}.ntdr",
+            std::process::id(),
+            system_timestamp_ns()
+        ));
+        let live_ink = LiveInkBridge::with_capacity(16, LIVE_LAYER);
+        let bootstrap = MaterializationWorker::start(
+            live_ink.clone(),
+            &ProjectLocation::UntitledRecovery(path.clone()),
+        )
+        .unwrap();
+        let mut pipeline = StrokePipeline::new(live_ink.clone(), bootstrap.worker);
+        let mut drawing = pipeline.drawing;
+        drawing.brush_settings.smoothing = 100;
+        live_ink.push(received[0]).unwrap();
+        pipeline.drain(LIVE_LAYER, drawing);
+        // Mid-stroke UI settings are not allowed to change captured correction.
+        drawing.brush_settings.smoothing = 0;
+        for sample in &received[1..] {
+            live_ink.push(*sample).unwrap();
+        }
+        assert!(pipeline.drain(LIVE_LAYER, drawing).artwork_closed);
+        let live_dabs: Vec<_> = pipeline
+            .gpu_ops
+            .iter()
+            .filter_map(|op| match op {
+                GpuStrokeOp::Dabs { dabs, .. } => Some(dabs.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        assert!(!live_dabs.is_empty());
+        drop(pipeline);
+        assert!(!live_ink.workspace_failed());
+        let database = ProjectDb::open(&path).unwrap();
+        let reopened = database.load_reopened().unwrap().unwrap();
+        let stroke = &reopened.current().unwrap().stroke;
+        assert_eq!(stroke.samples(), expected);
+        assert_ne!(
+            stroke.samples()[1].position_document,
+            received[1].position_document
+        );
+        let mut replay_dabs = Vec::new();
+        nyatidraw_brush::replay_round_stroke(
+            &stroke.brush,
+            &stroke.recorded,
+            stroke.samples(),
+            &mut replay_dabs,
+        )
+        .unwrap();
+        assert_eq!(
+            live_dabs, replay_dabs,
+            "GPU command stream and durable CPU replay use identical evaluated positions"
+        );
+        let root = format!("{:?}", reopened.current_tiles().root());
+        let page = flatten_layer_tree_rgba8(
+            reopened.current_tiles(),
+            &default_layer_tree(),
+            CanvasSpec::default(),
+        )
+        .unwrap();
+        assert!(page.pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        nyatidraw_png_io::encode_png(&path.with_extension("png"), &page).unwrap();
+        drop(database);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "native_canvas::tests::smoothing_live_dabs_and_saved_replay_remain_identical_after_process_restart"])
+            .env(REOPEN, &path)
+            .env(ROOT, root)
+            .status().unwrap();
+        assert!(status.success());
+        std::fs::remove_file(path.with_extension("png")).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -5868,6 +7891,7 @@ mod tests {
             "discontinuity",
             "limit",
             "sequence",
+            "smoothing-invalid",
         ] {
             let path = std::env::temp_dir().join(format!(
                 "nyatidraw-active-close-{}-{nonce}-{case}.ntdr",
@@ -5880,6 +7904,9 @@ mod tests {
             )
             .expect("scratch writer");
             let mut pipeline = StrokePipeline::new(live_ink.clone(), bootstrap.worker);
+            if case == "smoothing-invalid" {
+                pipeline.drawing.brush_settings.smoothing = 100;
+            }
             let mut received = vec![sample(1, PointerPhase::Begin, -4.0, 12.0)];
             if case != "tap" {
                 received.push(sample(2, PointerPhase::Move, 150.0, 120.0));
@@ -5909,6 +7936,14 @@ mod tests {
                         .last_mut()
                         .unwrap()
                         .sequence = u64::MAX;
+                }
+                "smoothing-invalid" => {
+                    live_ink
+                        .push(sample(3, PointerPhase::Move, f64::NAN, 120.0))
+                        .unwrap();
+                    pipeline.drain(LIVE_LAYER, pipeline.drawing);
+                    assert!(pipeline.active.is_none());
+                    assert!(pipeline.awaiting_clean_begin);
                 }
                 _ => {}
             }
@@ -5957,6 +7992,7 @@ mod tests {
             evaluator.push(&mut token, &[end], &mut dabs);
             ClosedStrokeRequest {
                 selection: None,
+                alpha_locked: false,
                 ordinal,
                 stroke_generation: ordinal,
                 layer: LIVE_LAYER,

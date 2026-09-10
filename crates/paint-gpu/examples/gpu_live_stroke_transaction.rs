@@ -154,6 +154,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn tree() -> Result<LayerTree, nyatidraw_document::LayerTreeError> {
     LayerTree::new(GroupNode {
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id: ROOT,
         name: "Root".into(),
         visible: true,
@@ -164,6 +166,9 @@ fn tree() -> Result<LayerTree, nyatidraw_document::LayerTreeError> {
 
 fn raster(id: LayerId, name: &str) -> LayerTreeNode {
     LayerTreeNode::Raster(LayerNode {
+        alpha_locked: false,
+        clip_to_below: false,
+        blend_mode: nyatidraw_api::LayerBlendMode::Normal,
         id,
         name: name.into(),
         visible: true,
@@ -183,6 +188,7 @@ fn identity_viewport() -> ViewportTransform {
         pan: Point::default(),
         zoom: 1.0,
         rotation_radians: 0.0,
+        mirrored_horizontal: false,
     }
 }
 
@@ -192,6 +198,7 @@ fn dab(x: f64, y: f64) -> BrushDab {
         radius_px: 18.0,
         opacity: 0.9,
         flow: 0.85,
+        hardness: 1.0,
     }
 }
 

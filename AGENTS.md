@@ -2,11 +2,13 @@
 
 ## Current milestone
 
-Implement the Windows-first vertical slice through Sprint 3. Close the remaining
-Sprint 1 software gates, then finish Sprint 2 durability/reopen/export and
-Sprint 3 viewport, layer/composite, docking, UI-projection, and hot-path
-isolation gates. macOS, vector/Vello, animation, and advanced brushes remain
-out of scope until Sprint 4 or later.
+Follow `docs/illustration-workflow.md` and its W0-W5 illustration workflow
+gates. Preserve the Sprint 1-3 architecture and evidence requirements; do not
+automatically continue feature-count-driven F3b/merge work. Basic brush control,
+shape correction, flat coloring, shading, and finishing take precedence over
+performance optimization and advanced features. Windows remains the current
+implementation target; macOS/Linux, vector/Vello, animation, and advanced
+textured/wet brushes remain deferred.
 
 Physical-pen, high-refresh display, and backend-specific hardware evidence may
 remain explicitly unverified when the required hardware interaction is not

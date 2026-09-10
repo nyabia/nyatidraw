@@ -5,6 +5,7 @@ use wgpu::util::DeviceExt;
 pub struct GpuSelectionMask {
     bits: wgpu::Buffer,
     dimensions: [u32; 2],
+    origin: [i32; 2],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,12 +17,19 @@ pub enum GpuSelectionError {
 impl GpuSelectionMask {
     pub(crate) fn new(
         device: &wgpu::Device,
+        origin: [i32; 2],
         dimensions: [u32; 2],
         packed: &[u8],
     ) -> Result<Self, GpuSelectionError> {
         let [width, height] = dimensions;
         let pixels = u64::from(width) * u64::from(height);
-        if pixels == 0 || pixels > 16 * 1024 * 1024 {
+        if pixels == 0
+            || pixels > 16 * 1024 * 1024
+            || origin
+                .into_iter()
+                .zip(dimensions)
+                .any(|(start, size)| i64::from(start) + i64::from(size) > i64::from(i32::MAX) + 1)
+        {
             return Err(GpuSelectionError::InvalidDimensions);
         }
         if u64::try_from(packed.len()).ok() != Some(pixels.div_ceil(8))
@@ -36,7 +44,11 @@ impl GpuSelectionMask {
             contents: &words,
             usage: wgpu::BufferUsages::STORAGE,
         });
-        Ok(Self { bits, dimensions })
+        Ok(Self {
+            bits,
+            dimensions,
+            origin,
+        })
     }
 }
 
@@ -140,6 +152,10 @@ impl SelectionBinding {
         self.mask.as_ref().map(|mask| mask.dimensions)
     }
 
+    pub(crate) fn mask_origin(&self) -> [i32; 2] {
+        self.mask.as_ref().map_or([0, 0], |mask| mask.origin)
+    }
+
     pub(crate) fn set_origin(&mut self, queue: &wgpu::Queue, origin: [i64; 2]) -> bool {
         if self.mask.is_none() {
             return true;
@@ -164,11 +180,12 @@ impl SelectionBinding {
         {
             slot.copy_from_slice(&value.to_le_bytes());
         }
-        for (slot, value) in
-            bytes[16..]
-                .chunks_exact_mut(4)
-                .zip([self.origin[0], self.origin[1], 0, 0])
-        {
+        for (slot, value) in bytes[16..].chunks_exact_mut(4).zip([
+            self.origin[0],
+            self.origin[1],
+            self.mask_origin()[0],
+            self.mask_origin()[1],
+        ]) {
             slot.copy_from_slice(&value.to_le_bytes());
         }
         queue.write_buffer(&self.uniform, 0, &bytes);
