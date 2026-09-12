@@ -306,8 +306,11 @@ pub const LAYER_COMPOSITING_SCHEMA_FLAG: u64 = 0x800;
 /// Semantic alpha-locked strokes require source-atop replay, independently of
 /// whatever layer settings are selected when the project is reopened.
 pub const ALPHA_LOCK_STROKE_SCHEMA_FLAG: u64 = 0x1000;
+/// Upright dry-pencil v3 requires its document-space procedural grain replay.
+pub const PENCIL_BRUSH_SCHEMA_FLAG: u64 = 0x2000;
 pub const SCHEMA_CAPABILITY_FLAGS: u64 = COMPRESSED_TILE_SCHEMA_FLAG
     | CONFIGURABLE_BRUSH_SCHEMA_FLAG
     | SIGNED_SELECTION_SCHEMA_FLAG
     | LAYER_COMPOSITING_SCHEMA_FLAG
-    | ALPHA_LOCK_STROKE_SCHEMA_FLAG;
+    | ALPHA_LOCK_STROKE_SCHEMA_FLAG
+    | PENCIL_BRUSH_SCHEMA_FLAG;

@@ -15,6 +15,43 @@ pub(crate) enum EditFailure {
     Fatal(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PickerSource {
+    Artwork(EditSource),
+    Display(Option<nyatidraw_api::LayerTreeNodeId>),
+}
+
+pub(crate) fn sample_picker_pixel(
+    tiles: &TileSnapshot,
+    tree: &LayerTree,
+    target: LayerId,
+    point: [i32; 2],
+    source: PickerSource,
+) -> Result<[u8; 4], EditFailure> {
+    match source {
+        PickerSource::Display(solo) => {
+            nyatidraw_paint_cpu::sample_display_pixel(tiles, tree, point, solo)
+        }
+        PickerSource::Artwork(source) => {
+            let source = match source {
+                EditSource::ActiveLayer => SelectionSource::ActiveLayer,
+                EditSource::ReferenceLayers => SelectionSource::ReferenceLayers,
+                EditSource::AllVisible => SelectionSource::AllVisible,
+            };
+            nyatidraw_paint_cpu::sample_artwork_pixel(tiles, tree, target, point, source)
+        }
+    }
+    .map_err(|error| EditFailure::Rejected(format!("{error:?}")))
+}
+
+pub(crate) fn picker_color(pixel: [u8; 4]) -> Option<[u8; 4]> {
+    nyatidraw_tiles::color::linear_premultiplied_to_srgb8(pixel).map(|mut color| {
+        // Pick RGB only; brush opacity remains an independent control.
+        color[3] = 255;
+        color
+    })
+}
+
 pub(crate) struct EditOutcome {
     pub(crate) tree: Option<LayerTree>,
     pub(crate) active_layer: Option<LayerId>,
@@ -177,33 +214,15 @@ pub(crate) fn execute_with_clipboard(
             None
         }
         EditCommand::PickColor { point, .. } | EditCommand::PickDisplayColor { point, .. } => {
-            let pixel = match command {
-                EditCommand::PickDisplayColor { solo, .. } => {
-                    nyatidraw_paint_cpu::sample_display_pixel(session.tiles(), tree, point, solo)
-                }
-                EditCommand::PickColor { source, .. } => {
-                    let source = match source {
-                        EditSource::ActiveLayer => SelectionSource::ActiveLayer,
-                        EditSource::ReferenceLayers => SelectionSource::ReferenceLayers,
-                        EditSource::AllVisible => SelectionSource::AllVisible,
-                    };
-                    nyatidraw_paint_cpu::sample_artwork_pixel(
-                        session.tiles(),
-                        tree,
-                        target,
-                        point,
-                        source,
-                    )
-                }
+            let source = match command {
+                EditCommand::PickDisplayColor { solo, .. } => PickerSource::Display(solo),
+                EditCommand::PickColor { source, .. } => PickerSource::Artwork(source),
                 _ => unreachable!("picker arm"),
-            }
-            .map_err(reject)?;
-            let mut color = nyatidraw_tiles::color::linear_premultiplied_to_srgb8(pixel)
-                .ok_or_else(|| {
-                    EditFailure::Rejected("투명한 픽셀입니다. 현재 색상을 유지합니다.".into())
-                })?;
-            // Pick hue/RGB only; brush opacity remains an independent control.
-            color[3] = 255;
+            };
+            let pixel = sample_picker_pixel(session.tiles(), tree, target, point, source)?;
+            let color = picker_color(pixel).ok_or_else(|| {
+                EditFailure::Rejected("투명한 픽셀입니다. 현재 색상을 유지합니다.".into())
+            })?;
             sampled_color = Some(color);
             None
         }

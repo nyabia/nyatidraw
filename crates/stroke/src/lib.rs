@@ -379,12 +379,10 @@ fn selection_intersects_tile(selection: &StrokeSelection, key: TileKey) -> bool 
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn tile_local_dab(mut dab: BrushDab, origin_x: i64, origin_y: i64) -> BrushDab {
+fn tile_local_dab(dab: BrushDab, origin_x: i64, origin_y: i64) -> BrushDab {
     // Tile origins derive from an i32 tile index times 128 and are therefore
     // well within f64's exact integer range.
-    dab.center.x -= origin_x as f64;
-    dab.center.y -= origin_y as f64;
-    dab
+    dab.to_local(origin_x, origin_y)
 }
 
 /// Runs the selected materialization strategy without silently substituting a
@@ -550,6 +548,10 @@ fn hash_legacy_commit(commit: &StrokeCommit) -> ObjectHash {
         ] {
             payload.extend_from_slice(&value.to_bits().to_le_bytes());
         }
+    }
+    if preset.engine_version == nyatidraw_brush::PENCIL_ENGINE_VERSION {
+        payload.push(nyatidraw_brush::PENCIL_GRAIN_VERSION);
+        payload.extend_from_slice(&nyatidraw_brush::PENCIL_PAPER_SEED.to_le_bytes());
     }
     payload.extend_from_slice(&commit.recorded.random_seed.to_le_bytes());
     payload.extend_from_slice(&commit.recorded.sample_count.to_le_bytes());

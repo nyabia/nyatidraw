@@ -3015,11 +3015,7 @@ fn translated_dabs(key: TileKey, dabs: &[BrushDab]) -> Vec<BrushDab> {
     let (origin_x, origin_y) = key.pixel_origin();
     dabs.iter()
         .copied()
-        .map(|mut dab| {
-            dab.center.x -= origin_x as f64;
-            dab.center.y -= origin_y as f64;
-            dab
-        })
+        .map(|dab| dab.to_local(origin_x, origin_y))
         .collect()
 }
 

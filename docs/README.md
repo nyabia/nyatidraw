@@ -6,6 +6,10 @@
 
 | 문서 | 답하는 질문 |
 |---|---|
+| [실사용 UX 수정 묶음](sprints/ux-feedback.md) | 취소·도구·색상·레이어·자체 연필을 어디까지 구현하고 어느 실행본을 검증했는가? |
+| [이번 UX 요청 체크리스트](sprints/ux-feedback-checklist.md) | 요청별로 구현된 것·일부 남은 것·미구현과 최신 빌드 검증을 어떻게 구별하는가? |
+| [X/Y 반복 구현 경계](research/repeat-implementation.md) | 반복 표시·읽기 전용 복사본·원본 보존을 왜 저장·획 재생·렌더·입력까지 함께 구현해야 하는가? |
+| [브러시 엔진 비교](research/brush-engines.md) | Procreate/CSP/Krita/MyPaint/Fresco에서 어떤 아이디어를 가져오며 무엇은 확인되지 않았는가? |
 | [2026-09-08 완료 타일 중복 복사](status-completion-adoption-2026-09-08.md) | 연속 획의 CPU 재복사를 얼마나 제거했고 재시작 검사는 무엇이 남았는가? |
 | [2026-09-08 초기 실행·프레임 진단](status-frame-triage-2026-09-08.md) | 간헐적 초기 실행 정지와 입력 tail을 같은 실행 경계로 어떻게 좁혔는가? |
 | [2026-09-08 렌더 격리·CPU 합성](status-performance-2026-09-08.md) | Windows 렌더 대기·창 수명·동일 4K 전후 성능을 어떻게 검증하는가? |

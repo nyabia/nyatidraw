@@ -210,6 +210,8 @@ impl DesktopCanvasHandle {
             eprintln!("desktop-shell event=canvas-position-failed error={error}");
             return;
         }
+        self.live_ink
+            .set_canvas_client_css_origin(Some([f64::from(x) / scale, f64::from(y) / scale]));
         // The region-shaped web input sink stays above this child; the parent
         // DirectComposition visual draws web chrome above both HWNDs.
         // SAFETY: the child HWND is owned by this desktop window.
@@ -220,6 +222,7 @@ impl DesktopCanvasHandle {
     }
 
     pub(crate) fn hide(&self) {
+        self.live_ink.set_canvas_client_css_origin(None);
         self.live_ink.invalidate_canvas_viewport();
         // SAFETY: hiding a live or already-destroyed child is harmless.
         let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
@@ -613,6 +616,7 @@ unsafe extern "system" fn canvas_wnd_proc(
     if let Some(state) = state {
         match message {
             WM_NAYATI_CANCEL_INPUT | WM_KILLFOCUS => {
+                state.live_ink.invalidate_picker();
                 let timestamp = current_message(hwnd, message, wparam, lparam).time;
                 state.viewport.drag = None;
                 state.mouse.capture_lost(timestamp);
@@ -761,6 +765,11 @@ impl WindowsViewportInput {
     fn observe(&mut self, hwnd: HWND, message: &MSG) -> bool {
         match message.message {
             WM_KEYDOWN => {
+                // Holding Escape must not cancel a draft and then clear its
+                // retained selection when the worker completes asynchronously.
+                if message.wParam.0 == 0x1b && message.lParam.0 & (1 << 30) != 0 {
+                    return true;
+                }
                 let command = match message.wParam.0 {
                     0x0d if self.live_ink.protocol_snapshot().0.edit.transform.is_some() => self
                         .live_ink
@@ -831,7 +840,7 @@ impl WindowsViewportInput {
                     0x46 => Some(nyatidraw_api::EditorCommand::Tool(
                         nyatidraw_api::ToolCommand::CycleFillFamily,
                     )),
-                    0x49 => Some(nyatidraw_api::EditorCommand::Tool(
+                    0x43 if !control_is_down() => Some(nyatidraw_api::EditorCommand::Tool(
                         nyatidraw_api::ToolCommand::Select(nyatidraw_api::DrawingTool::Eyedropper),
                     )),
                     0x58 => Some(nyatidraw_api::EditorCommand::Tool(

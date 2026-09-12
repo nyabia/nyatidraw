@@ -11,6 +11,7 @@ use nyatidraw_api::{
 use nyatidraw_input::{Point, PointerPhase, StylusSample, ViewportTransform};
 use nyatidraw_input_queue::{InputQueue, PushError, QueuedSample};
 
+use crate::native_canvas::PickerSnapshot;
 use crate::preview::{
     LayerThumbnailFrame, LayerThumbnailSnapshot, NavigatorFrame, NavigatorSnapshot,
     NavigatorViewport,
@@ -109,6 +110,17 @@ impl CanvasViewportSnapshot {
             && logical.y * self.scale < f64::from(self.height_px)
     }
 
+    pub(crate) fn client_css_for_document(self, point: Point) -> Option<[f64; 2]> {
+        let logical = self
+            .window_viewport_transform()?
+            .document_to_logical(point)?;
+        let origin = self.origin_client_px?;
+        Some([
+            logical.x + origin.x / self.scale,
+            logical.y + origin.y / self.scale,
+        ])
+    }
+
     pub(crate) fn contains_client_point(self, point: Point) -> bool {
         let Some(origin) = self.origin_client_px else {
             return false;
@@ -158,6 +170,9 @@ struct LiveInkInner {
     export: Mutex<ExportMailbox>,
     navigator: Mutex<NavigatorSnapshot>,
     layer_thumbnails: Mutex<LayerThumbnailSnapshot>,
+    picker: Mutex<Option<PickerSnapshot>>,
+    picker_epoch: AtomicU64,
+    canvas_client_css_origin: Mutex<Option<[f64; 2]>>,
     activation_notice: Mutex<Option<String>>,
     save_as_path: Mutex<Option<std::path::PathBuf>>,
     saving_as: AtomicBool,
@@ -241,7 +256,7 @@ struct RawInputState {
     /// contains only transitions. The producer never waits for the consumer.
     pending_transitions: VecDeque<StylusSample>,
     transition_capacity: usize,
-    begin_layers: VecDeque<(u64, LayerId, bool)>,
+    begin_layers: VecDeque<(u64, LayerId, bool, u64)>,
     admission_layer: LayerId,
     admitted_active: bool,
     admitted_temporary_picker: bool,
@@ -275,6 +290,7 @@ pub(crate) struct AdmittedSample {
     pub(crate) begin_layer: Option<LayerId>,
     /// Begin-only intent, ordered with the raw sample rather than UI commands.
     pub(crate) temporary_picker: bool,
+    pub(crate) picker_epoch: u64,
 }
 
 impl LiveInkBridge {
@@ -354,6 +370,9 @@ impl LiveInkBridge {
                 }),
                 navigator: Mutex::new(NavigatorSnapshot::default()),
                 layer_thumbnails: Mutex::new(LayerThumbnailSnapshot::default()),
+                picker: Mutex::new(None),
+                picker_epoch: AtomicU64::new(0),
+                canvas_client_css_origin: Mutex::new(None),
                 activation_notice: Mutex::new(None),
                 save_as_path: Mutex::new(None),
                 saving_as: AtomicBool::new(false),
@@ -382,6 +401,9 @@ impl LiveInkBridge {
         temporary_picker: bool,
     ) -> Result<bool, PushError> {
         let performance_start = crate::performance::start();
+        if sample.phase == PointerPhase::Cancel {
+            self.invalidate_picker();
+        }
         let mut raw = self.raw_input();
         if self.is_closing() || self.inner.saving_as.load(Ordering::Acquire) {
             return Err(PushError::TransitionQueueFull);
@@ -429,6 +451,7 @@ impl LiveInkBridge {
                         raw.stats.discontinuities_latched.saturating_add(1);
                     let total = raw.stats.discontinuities_latched;
                     drop(raw);
+                    self.invalidate_picker();
                     eprintln!(
                         "native-input event=input-discontinuity-latched first_lost_sequence={} phase={:?} total={} admission=quarantine-until-consumer-ack",
                         sample.sequence, sample.phase, total,
@@ -446,8 +469,12 @@ impl LiveInkBridge {
         if sample.phase == PointerPhase::Begin {
             raw.admitted_active = true;
             raw.admitted_temporary_picker = temporary_picker;
-            raw.begin_layers
-                .push_back((sample.sequence, admission_layer, temporary_picker));
+            raw.begin_layers.push_back((
+                sample.sequence,
+                admission_layer,
+                temporary_picker,
+                self.picker_epoch(),
+            ));
         } else if matches!(sample.phase, PointerPhase::End | PointerPhase::Cancel) {
             raw.admitted_active = false;
             raw.temporary_read_pending = (sample.phase == PointerPhase::End
@@ -659,6 +686,7 @@ impl LiveInkBridge {
     /// strictly newer projection. No raw sample, queued command, preview, or
     /// export state from the previous document can cross this boundary.
     pub(crate) fn reset_for_project_activation(&self) {
+        self.invalidate_picker();
         // The next document must submit its own frame before a native Begin
         // can use a mapping. Surface geometry is still owned by the UI thread.
         {
@@ -842,6 +870,77 @@ impl LiveInkBridge {
             .clone()
     }
 
+    pub(crate) fn picker_epoch(&self) -> u64 {
+        self.inner.picker_epoch.load(Ordering::Acquire)
+    }
+
+    /// The native child's input mapping stays child-local. Only disposable UI
+    /// feedback adds its measured position in the composition `WebView` client.
+    pub(crate) fn set_canvas_client_css_origin(&self, origin: Option<[f64; 2]>) {
+        let changed = {
+            let mut current = self
+                .inner
+                .canvas_client_css_origin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *current == origin {
+                false
+            } else {
+                *current = origin;
+                true
+            }
+        };
+        if changed {
+            self.invalidate_picker();
+        }
+    }
+
+    pub(crate) fn picker_client_css(&self, point: Point) -> Option<[f64; 2]> {
+        let origin = (*self
+            .inner
+            .canvas_client_css_origin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))?;
+        let local = self
+            .canvas_viewport_snapshot()
+            .client_css_for_document(point)?;
+        Some([local[0] + origin[0], local[1] + origin[1]])
+    }
+
+    /// Invalidate even a read whose End already left the native adapter.
+    pub(crate) fn invalidate_picker(&self) {
+        self.inner.picker_epoch.fetch_add(1, Ordering::AcqRel);
+        self.publish_picker_snapshot(None);
+        self.request_redraw();
+    }
+
+    pub(crate) fn picker_snapshot(&self) -> Option<PickerSnapshot> {
+        self.inner
+            .picker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn publish_picker_snapshot(&self, snapshot: Option<PickerSnapshot>) {
+        let changed = {
+            let mut picker = self
+                .inner
+                .picker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *picker == snapshot {
+                false
+            } else {
+                *picker = snapshot;
+                true
+            }
+        };
+        if changed {
+            self.notify_ui();
+        }
+    }
+
     /// Replaces the one-frame mailbox after a durable CPU state change.
     pub(crate) fn publish_navigator_frame(&self, frame: NavigatorFrame) {
         let changed = {
@@ -950,6 +1049,7 @@ impl LiveInkBridge {
     /// Latches the first fatal workspace error. The same mailbox projection is
     /// the renderer and UI authority until process restart/recovery.
     pub(crate) fn publish_workspace_error(&self, summary: String) -> bool {
+        self.invalidate_picker();
         self.inner
             .fatal_input_quarantine
             .store(true, Ordering::Release);
@@ -1056,6 +1156,7 @@ impl LiveInkBridge {
         drop(commands);
         drop(raw);
         if first {
+            self.invalidate_picker();
             self.publish_close_status(CloseStatus::SavingProject);
         }
         first
@@ -1074,6 +1175,7 @@ impl LiveInkBridge {
         self.inner.closing.store(true, Ordering::Release);
         drop(commands);
         drop(raw);
+        self.invalidate_picker();
     }
 
     pub(crate) fn close_status(&self) -> CloseStatus {
@@ -1181,6 +1283,7 @@ impl LiveInkBridge {
                 queued,
                 begin_layer: None,
                 temporary_picker: false,
+                picker_epoch: 0,
             });
         }
         while let Some(sample) = raw.pending_transitions.pop_front() {
@@ -1192,19 +1295,23 @@ impl LiveInkBridge {
                 },
                 begin_layer: None,
                 temporary_picker: false,
+                picker_epoch: 0,
             });
         }
         for admitted in &mut output[first..] {
             if admitted.queued.sample.phase != PointerPhase::Begin {
                 continue;
             }
-            let Some((sequence, layer, temporary_picker)) = raw.begin_layers.pop_front() else {
+            let Some((sequence, layer, temporary_picker, picker_epoch)) =
+                raw.begin_layers.pop_front()
+            else {
                 debug_assert!(false, "every admitted Begin retains its admission layer");
                 continue;
             };
             debug_assert_eq!(sequence, admitted.queued.sample.sequence);
             admitted.begin_layer = Some(layer);
             admitted.temporary_picker = temporary_picker;
+            admitted.picker_epoch = picker_epoch;
         }
         let discontinuity = raw.discontinuity.take();
         if discontinuity.is_some() {

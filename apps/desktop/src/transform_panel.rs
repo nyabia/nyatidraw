@@ -75,6 +75,7 @@ fn send(
     command: TransformCommand,
     mut error: Signal<Option<String>>,
 ) {
+    crate::focus_editor_shortcuts();
     let result =
         bridge.push_ui_editor_command(EditorCommand::Edit(EditCommand::FreeTransform(command)));
     error.set(
@@ -88,7 +89,6 @@ fn send(
 pub(crate) fn TransformPanel(ui_projection: Signal<UiProjection>) -> Element {
     let bridge = use_context::<LiveInkBridge>();
     let begin_bridge = bridge.clone();
-    let escape_bridge = bridge.clone();
     let preview_bridge = bridge.clone();
     let commit_bridge = bridge.clone();
     let cancel_bridge = bridge.clone();
@@ -96,7 +96,6 @@ pub(crate) fn TransformPanel(ui_projection: Signal<UiProjection>) -> Element {
     let mut inputs = use_signal(|| TransformInputs::from(AffineTransform::default()));
     let mut dirty = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
-    let mut started = use_signal(|| false);
     let mut previous = use_signal(|| None::<nyatidraw_api::TransformProjection>);
     use_effect(move || {
         let current = ui_projection.read().edit.transform.clone();
@@ -117,18 +116,19 @@ pub(crate) fn TransformPanel(ui_projection: Signal<UiProjection>) -> Element {
                 error.set(None);
             }
             previous.set(current);
-            started.set(true);
         } else if previous.peek().is_some() {
             // Admission is not completion. Only the authoritative removal closes this panel.
             opened.set(false);
-        } else if !*started.peek() {
-            started.set(true);
-            send(&begin_bridge, ui_projection, TransformCommand::Begin, error);
+            previous.set(None);
+            inputs.set(TransformInputs::from(AffineTransform::default()));
+            dirty.set(false);
         }
     });
     let current = ui_projection.read();
     let transform = current.edit.transform.as_ref();
     let busy = current.edit.busy;
+    let can_cancel = current.edit.can_cancel;
+    let has_selection = current.edit.has_selection;
     let active = transform.is_some();
     let can_commit = transform.is_some_and(|value| value.can_commit) && !busy && !dirty();
     let generation = transform.map_or(0, |value| value.generation);
@@ -136,16 +136,10 @@ pub(crate) fn TransformPanel(ui_projection: Signal<UiProjection>) -> Element {
     let values = inputs.read().clone();
     rsx! {
         section { class: "transform-properties", aria_label: "자유 변형",
-            onkeydown: move |event| {
-                event.stop_propagation();
-                if event.key() == Key::Escape {
-                    event.prevent_default();
-                    send(&escape_bridge, ui_projection, TransformCommand::Cancel, error);
-                    if !busy && !active { opened.set(false); }
-                }
+            if active {
+            div { class: "transform-grid", onkeydown: move |event| {
+                if event.key() != Key::Escape { event.stop_propagation(); }
             },
-            onkeyup: move |event| event.stop_propagation(),
-            h3 { "변형" }
             label { "X (px)"
                 input { r#type: "number", step: "0.001", value: values.x, disabled: !active || busy,
                     aria_label: "가로 이동", oninput: move |e| { inputs.write().x = e.value(); dirty.set(true); } }
@@ -174,9 +168,15 @@ pub(crate) fn TransformPanel(ui_projection: Signal<UiProjection>) -> Element {
                 input { r#type: "checkbox", checked: values.flip_y, disabled: !active || busy,
                     onchange: move |e| { inputs.write().flip_y = e.checked(); dirty.set(true); } } "상하 반전"
             }
-            if !active {
-                button { disabled: busy, onclick: move |_| send(&bridge, ui_projection, TransformCommand::Begin, error), "시작" }
             }
+            }
+            if !active && !has_selection {
+                p { class: "transform-help", "변형할 영역을 먼저 선택하세요." }
+            }
+            div { class: "transform-actions",
+            if !active {
+                button { disabled: busy || !has_selection, onclick: move |_| send(&bridge, ui_projection, TransformCommand::Begin, error), "변형 시작" }
+            } else {
             button { disabled: !active || busy, onclick: move |_| {
                 match inputs.read().parse() {
                     Ok(value) => send(&preview_bridge, ui_projection, TransformCommand::Preview(value), error),
@@ -186,11 +186,13 @@ pub(crate) fn TransformPanel(ui_projection: Signal<UiProjection>) -> Element {
             button { disabled: !can_commit, onclick: move |_| {
                 send(&commit_bridge, ui_projection, TransformCommand::Commit { generation }, error);
             }, "확정" }
-            button { disabled: busy, onclick: move |_| {
+            }
+            if active || can_cancel {
+            button { disabled: !can_cancel, title: "변형 취소 (Esc)", onclick: move |_| {
                 send(&cancel_bridge, ui_projection, TransformCommand::Cancel, error);
-                // With no draft, no authoritative removal can arrive (e.g. Begin rejected).
-                if ui_projection.read().edit.transform.is_none() { opened.set(false); }
             }, "취소" }
+            }
+            }
             if let Some(message) = error().or(worker_error) { p { role: "alert", "{message}" } }
         }
     }

@@ -14,24 +14,29 @@ pub(crate) fn PagePanel(ui_projection: Signal<UiProjection>) -> Element {
     let mut height = use_signal(|| ui_projection.read().canvas.height_px.to_string());
     let mut error = use_signal(|| None::<String>);
     let current = ui_projection.read();
-    let canvas = current.canvas;
     let busy = current.edit.busy;
     let can_crop = current.edit.has_selection && !busy;
     rsx! {
-        section { class: "transform-properties", aria_label: "페이지 크기",
+        div { class: "page-backdrop", onclick: move |_| opened.set(false),
+        section { id: "page-settings-dialog", class: "page-dialog transform-properties", role: "dialog", aria_modal: "true", aria_label: "페이지 크기",
+            onmounted: move |_| crate::contain_overlay_focus("page-settings-dialog"),
+            onclick: move |event| event.stop_propagation(),
             onkeydown: move |event| {
                 event.stop_propagation();
-                if event.key() == Key::Escape { opened.set(false); }
+                if event.key() == Key::Escape { event.prevent_default(); opened.set(false); }
             },
-            h3 { "페이지" }
-            p { "현재 {canvas.width_px} × {canvas.height_px} px" br {} "{canvas.pixels_per_inch} ppi" }
+            h3 { "페이지 크기" }
+            div { class: "transform-grid",
             label { "폭 (px)"
-                input { r#type: "number", min: "1", step: "1", value: "{width}", aria_label: "페이지 폭", oninput: move |e| width.set(e.value()) }
+                input { r#type: "number", min: "1", step: "1", value: "{width}", aria_label: "페이지 폭",
+                    oninput: move |e| width.set(e.value()) }
             }
             label { "높이 (px)"
                 input { r#type: "number", min: "1", step: "1", value: "{height}", aria_label: "페이지 높이", oninput: move |e| height.set(e.value()) }
             }
+            }
             p { class: "transform-help", "왼쪽 위를 기준으로 출력 크기를 바꿉니다. 그림 크기와 바깥쪽 그림은 유지됩니다." }
+            div { class: "transform-actions",
             button { disabled: busy, onclick: move |_| {
                 let size = [width().parse::<u32>(), height().parse::<u32>()];
                 let [Ok(w), Ok(h)] = size else {
@@ -46,16 +51,16 @@ pub(crate) fn PagePanel(ui_projection: Signal<UiProjection>) -> Element {
                 if result.is_ok() { opened.set(false); }
                 else { error.set(Some("현재 작업이 끝난 뒤 다시 적용하세요.".into())); }
             }, "크기 적용" }
-            p { class: "transform-help", "선택 영역의 사각 경계에 페이지를 맞춥니다. 모든 레이어가 함께 이동하며 바깥쪽 그림은 보존됩니다." }
-            button { disabled: !can_crop, onclick: move |_| {
+            button { disabled: !can_crop, title: "선택 경계에 페이지를 맞춥니다. 바깥 그림도 보존하며 함께 이동합니다.", onclick: move |_| {
                 let result = crop_ink.push_editor_command(ui_projection.read().revision, EditorCommand::Edit(EditCommand::CropPageToSelection));
                 println!("desktop-page event=crop-selection admission={result:?}");
                 if result.is_ok() { opened.set(false); }
                 else { error.set(Some("현재 작업이 끝난 뒤 다시 적용하세요.".into())); }
             }, "선택에 맞추기" }
-            p { class: "transform-help", "적용하면 선택은 해제됩니다. 실행 취소로 페이지와 그림을 함께 복원할 수 있습니다." }
             button { onclick: move |_| opened.set(false), "닫기" }
+            }
             if let Some(message) = error() { p { role: "alert", "{message}" } }
+        }
         }
     }
 }

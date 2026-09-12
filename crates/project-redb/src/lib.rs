@@ -524,6 +524,11 @@ impl ProjectDb {
                         } else {
                             0
                         }
+                        | if batch.stroke.brush.preset.engine_version >= 3 {
+                            nyatidraw_project::PENCIL_BRUSH_SCHEMA_FLAG
+                        } else {
+                            0
+                        }
                         | if batch
                             .stroke
                             .selection()
@@ -853,6 +858,7 @@ impl ProjectDb {
         let stroke = decode_stroke_commit(&stroke_envelope.payload, &before)
             .map_err(|error| self.corrupt(error))?;
         if stroke.alpha_locked()
+            || stroke.brush.preset.engine_version >= 3
             || stroke
                 .selection()
                 .is_some_and(|selection| selection.origin() != [0, 0])
@@ -875,6 +881,11 @@ impl ProjectDb {
             }
             if stroke.alpha_locked() && schema & ALPHA_LOCK_STROKE_SCHEMA_FLAG == 0 {
                 return Err(self.corrupt("alpha-locked stroke lacks required reader capability"));
+            }
+            if stroke.brush.preset.engine_version >= 3
+                && schema & nyatidraw_project::PENCIL_BRUSH_SCHEMA_FLAG == 0
+            {
+                return Err(self.corrupt("pencil stroke lacks required reader capability"));
             }
         }
         drop(strokes);
@@ -2037,6 +2048,146 @@ mod tests {
         );
         drop(db);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pencil_reopen_preserves_signed_grain_history_and_atomic_reader_gate() {
+        // Product risk: grain shifts on reopen, or a metadata/Undo update makes
+        // a v3 project writable by a reader that only understands round brushes.
+        use nyatidraw_brush::{PencilKind, pencil_preset};
+        use nyatidraw_project::PENCIL_BRUSH_SCHEMA_FLAG;
+        use nyatidraw_stroke::{CpuReplayMaterializer, StrokeMaterializer};
+        const REOPEN: &str = "NYATIDRAW_PENCIL_REOPEN";
+        let template = prepared_batch();
+        let mut roots = Vec::new();
+        for (index, kind) in [PencilKind::Mechanical2H, PencilKind::Graphite2B]
+            .into_iter()
+            .enumerate()
+        {
+            let preset = BrushPreset {
+                size_px: 5.0,
+                ..pencil_preset(kind)
+            };
+            let samples = template.stroke.samples().to_vec();
+            let mut evaluator = RoundBrushEvaluator::new(42);
+            let mut dabs = Vec::new();
+            let mut token = begin_round_stroke(&mut evaluator, &preset, samples[0], &mut dabs);
+            evaluator.push(&mut token, &samples[1..], &mut dabs);
+            let recorded = evaluator.end(token, &mut dabs);
+            let batch = HeadlessStrokeSession::new(SnapshotId(1), TileSnapshot::empty())
+                .prepare_round_stroke(
+                    SnapshotId(2),
+                    HistoryNodeId(3),
+                    12_000,
+                    LayerId(4),
+                    BrushSnapshot { preset },
+                    recorded,
+                    StrokeColor::new([0, 0, 0, 255]).unwrap(),
+                    samples,
+                )
+                .unwrap();
+            roots.push(batch.materialized.after.root());
+            if let Some(path) = std::env::var_os(REOPEN) {
+                if std::env::var("NYATIDRAW_PENCIL_KIND").unwrap() != index.to_string() {
+                    continue;
+                }
+                let db = ProjectDb::open(&PathBuf::from(path)).unwrap();
+                let loaded = db.load_current().unwrap().unwrap();
+                assert_eq!(loaded.stroke, batch.stroke);
+                assert_eq!(loaded.materialized.after, batch.materialized.after);
+                assert_eq!(
+                    CpuReplayMaterializer
+                        .materialize(&loaded.stroke, &loaded.before)
+                        .unwrap()
+                        .after,
+                    batch.materialized.after
+                );
+                continue;
+            }
+            let path = temp("pencil-reopen");
+            let db = ProjectDb::open(&path).unwrap();
+            let marker = |db: &ProjectDb| {
+                db.db
+                    .begin_read()
+                    .unwrap()
+                    .open_table(META)
+                    .unwrap()
+                    .get("schema_version")
+                    .unwrap()
+                    .unwrap()
+                    .value()
+            };
+            assert!(
+                db.commit_with_failure(&batch, CommitFailurePoint::BeforeCommitAbort)
+                    .is_err()
+            );
+            assert_eq!(marker(&db) & PENCIL_BRUSH_SCHEMA_FLAG, 0);
+            db.commit(&batch).unwrap();
+            assert_ne!(marker(&db) & PENCIL_BRUSH_SCHEMA_FLAG, 0);
+            let old_flags = SCHEMA_CAPABILITY_FLAGS & !PENCIL_BRUSH_SCHEMA_FLAG;
+            assert!(!(1..=4).contains(&(marker(&db) & !old_flags)));
+            let session =
+                HeadlessStrokeSession::from_reopened(db.load_reopened().unwrap().unwrap());
+            db.persist_history_cursor(session.prepare_undo_cursor().unwrap().target())
+                .unwrap();
+            assert_eq!(
+                db.load_reopened().unwrap().unwrap().current_tiles(),
+                &batch.before
+            );
+            let session =
+                HeadlessStrokeSession::from_reopened(db.load_reopened().unwrap().unwrap());
+            db.persist_history_cursor(session.prepare_redo_cursor().unwrap().target())
+                .unwrap();
+            let session =
+                HeadlessStrokeSession::from_reopened(db.load_reopened().unwrap().unwrap());
+            let change = session
+                .prepare_structural_change(
+                    SnapshotId(3),
+                    HistoryNodeId(4),
+                    13_000,
+                    session.tiles().clone(),
+                )
+                .unwrap();
+            db.commit_structural_with_canvas(&change, CanvasSpec::DEFAULT)
+                .unwrap();
+            assert_ne!(marker(&db) & PENCIL_BRUSH_SCHEMA_FLAG, 0);
+            // Restore the stroke cursor before asking a fresh process to replay it.
+            let session =
+                HeadlessStrokeSession::from_reopened(db.load_reopened().unwrap().unwrap());
+            db.persist_history_cursor(session.prepare_undo_cursor().unwrap().target())
+                .unwrap();
+            drop(db);
+            assert!(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::pencil_reopen_preserves_signed_grain_history_and_atomic_reader_gate"
+                    ])
+                    .env(REOPEN, &path)
+                    .env("NYATIDRAW_PENCIL_KIND", index.to_string())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let db = ProjectDb::open(&path).unwrap();
+            let tx = db.db.begin_write().unwrap();
+            tx.open_table(META)
+                .unwrap()
+                .insert("schema_version", marker(&db) & !PENCIL_BRUSH_SCHEMA_FLAG)
+                .unwrap();
+            tx.commit().unwrap();
+            assert!(
+                db.load_current().is_err(),
+                "missing material reader capability is corruption"
+            );
+            drop(db);
+            std::fs::remove_file(path).unwrap();
+        }
+        assert_ne!(
+            roots[0], roots[1],
+            "equal size must not make the grades aliases"
+        );
     }
 
     #[test]

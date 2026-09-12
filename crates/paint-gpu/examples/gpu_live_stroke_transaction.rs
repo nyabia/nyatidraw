@@ -199,6 +199,7 @@ fn dab(x: f64, y: f64) -> BrushDab {
         opacity: 0.9,
         flow: 0.85,
         hardness: 1.0,
+        grain: None,
     }
 }
 

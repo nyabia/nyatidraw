@@ -41,6 +41,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for fixture in fixtures {
         let (submission_count, strict, accepted) = run_fixture(&device, &queue, &fixture)?;
         passed &= accepted.is_within();
+        if fixture.name.starts_with("pencil_") {
+            passed &= strict.is_within();
+        }
         fixture_output.push(format!(
             concat!(
                 "{{\"name\":\"{}\",\"dabs_submitted\":{},\"dabs_applied\":{},",
@@ -193,8 +196,9 @@ fn diff_json(stats: ImageDiffStats) -> String {
     )
 }
 
+#[allow(clippy::too_many_lines)] // Keep legacy and pencil differential fixtures in one audit table.
 fn probe_fixtures() -> Vec<ProbeFixture> {
-    vec![
+    let mut fixtures = vec![
         ProbeFixture {
             name: "soft_tips_and_clipped_falloff",
             brush_rgba8: [64, 128, 192, 255],
@@ -279,7 +283,63 @@ fn probe_fixtures() -> Vec<ProbeFixture> {
             brush_rgba8: [232, 24, 192, 255],
             dabs: overlapping_dabs(12, 23.0, 13.0, 3.75, 0.38, 0.52),
         },
-    ]
+    ];
+    for kind in [
+        nyatidraw_brush::PencilKind::Mechanical2H,
+        nyatidraw_brush::PencilKind::Graphite2B,
+    ] {
+        use nyatidraw_brush::{
+            BrushEvaluator, RoundBrushEvaluator, begin_round_stroke, pencil_preset,
+        };
+        use nyatidraw_input::{PenButtons, PointerPhase, StylusSample};
+        let preset = nyatidraw_brush::BrushPreset {
+            size_px: 5.0,
+            ..pencil_preset(kind)
+        };
+        let samples = (0_u32..39)
+            .map(|index| StylusSample {
+                sequence: u64::from(index),
+                timestamp_ns: u64::from(index) * 4_000_000,
+                device_id: 1,
+                phase: if index == 0 {
+                    PointerPhase::Begin
+                } else if index == 38 {
+                    PointerPhase::End
+                } else {
+                    PointerPhase::Move
+                },
+                position_document: Point {
+                    x: -124.0 + f64::from(index % 13) * 2.0,
+                    y: -119.0 + f64::from(index / 13) * 3.0,
+                },
+                #[allow(clippy::cast_precision_loss)]
+                pressure: 0.1 + (index % 13) as f32 * 0.075,
+                tilt: None,
+                twist_radians: None,
+                tangential_pressure: None,
+                buttons: PenButtons::default(),
+                eraser: false,
+                viewport_revision: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut evaluator = RoundBrushEvaluator::new(42);
+        let mut dabs = Vec::new();
+        let mut stroke = begin_round_stroke(&mut evaluator, &preset, samples[0], &mut dabs);
+        evaluator.push(&mut stroke, &samples[1..], &mut dabs);
+        evaluator.end(stroke, &mut dabs);
+        fixtures.push(ProbeFixture {
+            name: match kind {
+                nyatidraw_brush::PencilKind::Mechanical2H => "pencil_2h_signed_pressure_grain",
+                nyatidraw_brush::PencilKind::Graphite2B => "pencil_2b_signed_pressure_grain",
+            },
+            brush_rgba8: [0, 0, 0, 255],
+            dabs: dabs
+                .into_iter()
+                .map(|dab| dab.to_local(-128, -128))
+                .collect(),
+        });
+    }
+    fixtures
 }
 
 fn dab(x: f64, y: f64, radius_px: f32, opacity: f32, flow: f32) -> BrushDab {
@@ -289,6 +349,7 @@ fn dab(x: f64, y: f64, radius_px: f32, opacity: f32, flow: f32) -> BrushDab {
         opacity,
         flow,
         hardness: 1.0,
+        grain: None,
     }
 }
 

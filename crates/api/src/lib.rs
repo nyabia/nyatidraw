@@ -14,9 +14,9 @@ pub use protocol::{
     EditCommand, EditProjection, EditSettings, EditSource, EditorCommand, EditorEvent,
     EventEnvelope, FillSettings, HISTORY_PROJECTION_MAX_ENTRIES, HistoryBranchProjection,
     HistoryCommand, HistoryEntryProjection, HistoryOperationLabel, HistoryProjection,
-    LayerBlendMode, LayerCommand, LayerProjection, LayerProjectionKind, ProjectCommand,
-    RasterTransform, SelectionMode, ToolCommand, TransformCommand, TransformProjection,
-    UiProjection, ViewportCommand, ViewportProjection, WorkspaceProjection,
+    LayerBlendMode, LayerCommand, LayerProjection, LayerProjectionKind, PencilTemplate,
+    ProjectCommand, RasterTransform, SelectionMode, ToolCommand, TransformCommand,
+    TransformProjection, UiProjection, ViewportCommand, ViewportProjection, WorkspaceProjection,
 };
 
 macro_rules! id_type {

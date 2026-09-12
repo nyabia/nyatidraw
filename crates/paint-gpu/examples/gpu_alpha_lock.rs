@@ -88,6 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     opacity: 0.65,
                     flow: 0.55,
                     hardness,
+                    grain: None,
                 })
                 .collect::<Vec<_>>();
             let token = scene.begin_live_stroke(LAYER).map_err(debug_error)?;

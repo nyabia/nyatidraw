@@ -996,6 +996,10 @@ fn encode_brush_preset(output: &mut Vec<u8>, preset: BrushPreset) {
             output.extend_from_slice(&value.to_bits().to_le_bytes());
         }
     }
+    if preset.engine_version == nyatidraw_brush::PENCIL_ENGINE_VERSION {
+        output.push(nyatidraw_brush::PENCIL_GRAIN_VERSION);
+        output.extend_from_slice(&nyatidraw_brush::PENCIL_PAPER_SEED.to_le_bytes());
+    }
 }
 
 fn decode_brush_preset(decoder: &mut Decoder<'_>) -> Result<BrushPreset, WireError> {
@@ -1027,6 +1031,12 @@ fn decode_brush_preset(decoder: &mut Decoder<'_>) -> Result<BrushPreset, WireErr
         preset.size_min_ratio = f32::from_bits(decoder.u32()?);
         preset.opacity_min_ratio = f32::from_bits(decoder.u32()?);
         preset.hardness = f32::from_bits(decoder.u32()?);
+    }
+    if preset.engine_version == nyatidraw_brush::PENCIL_ENGINE_VERSION
+        && (decoder.u8()? != nyatidraw_brush::PENCIL_GRAIN_VERSION
+            || decoder.u32()? != nyatidraw_brush::PENCIL_PAPER_SEED)
+    {
+        return Err(WireError::InvalidData("unsupported pencil paper contract"));
     }
     Ok(preset)
 }
@@ -1366,7 +1376,12 @@ mod project_head_compatibility_tests {
         ];
         let before = TileSnapshot::empty();
         let mut roots = Vec::new();
-        for preset in [legacy, current] {
+        for preset in [
+            legacy,
+            current,
+            nyatidraw_brush::pencil_preset(nyatidraw_brush::PencilKind::Mechanical2H),
+            nyatidraw_brush::pencil_preset(nyatidraw_brush::PencilKind::Graphite2B),
+        ] {
             let mut evaluator = RoundBrushEvaluator::new(12);
             let mut dabs = Vec::new();
             let mut token = begin_round_stroke(&mut evaluator, &preset, samples[0], &mut dabs);
@@ -1407,6 +1422,23 @@ mod project_head_compatibility_tests {
         for end in 40..54 {
             assert!(decode_brush_preset(&mut Decoder::new(&current_bytes[..end])).is_err());
         }
+        assert_ne!(
+            roots[2], roots[3],
+            "2H and 2B must produce different artwork"
+        );
+        let mut pencil_bytes = Vec::new();
+        encode_brush_preset(
+            &mut pencil_bytes,
+            nyatidraw_brush::pencil_preset(nyatidraw_brush::PencilKind::Graphite2B),
+        );
+        for end in 54..59 {
+            assert!(decode_brush_preset(&mut Decoder::new(&pencil_bytes[..end])).is_err());
+        }
+        pencil_bytes[54] ^= 1;
+        assert!(
+            decode_brush_preset(&mut Decoder::new(&pencil_bytes)).is_err(),
+            "unknown paper algorithm cannot be silently substituted"
+        );
     }
 
     #[test]

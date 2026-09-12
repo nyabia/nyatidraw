@@ -23,9 +23,9 @@ use wgpu::util::DeviceExt;
 
 pub const WORKING_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-const FLOATS_PER_INSTANCE: usize = 9;
+const FLOATS_PER_INSTANCE: usize = 12;
 const BYTES_PER_INSTANCE: usize = FLOATS_PER_INSTANCE * size_of::<f32>();
-const INSTANCE_STRIDE: wgpu::BufferAddress = 36;
+const INSTANCE_STRIDE: wgpu::BufferAddress = 48;
 const INITIAL_INSTANCE_CAPACITY: usize = 64;
 const RGBA8_BYTES_PER_PIXEL: u32 = 4;
 
@@ -447,6 +447,11 @@ impl GpuRoundDabPainter {
                             offset: 32,
                             shader_location: 5,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Uint32x3,
+                            offset: 36,
+                            shader_location: 6,
+                        },
                     ],
                 }],
             },
@@ -788,6 +793,16 @@ impl PreparedDabs {
                 },
             ];
             bytes.extend_from_slice(&encode_f32s(&instance));
+            let grain = dab.grain.map_or([0; 3], |grain| {
+                [
+                    u32::from(grain.deposit) + 1,
+                    grain.origin[0],
+                    grain.origin[1],
+                ]
+            });
+            for value in grain {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
         }
 
         let count = u32::try_from(bytes.len() / BYTES_PER_INSTANCE)

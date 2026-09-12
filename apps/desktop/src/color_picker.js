@@ -9,7 +9,6 @@ const options = { capture: true, signal: controller.signal };
 const wheel = root.querySelector('.color-wheel');
 const square = root.querySelector('.sv-square');
 const value = root.querySelector('.value-strip');
-const preview = root.querySelector('[data-color-preview]');
 let hsv = [0, 0, 0];
 let alpha = 255;
 let drag = null;
@@ -43,9 +42,6 @@ function render() {
     wheel.setAttribute('aria-valuenow', Math.round(h));
     square.setAttribute('aria-label', `채도 ${Math.round(s * 100)}%, 명도 ${Math.round(v * 100)}%`);
     value.setAttribute('aria-valuenow', Math.round(v * 100));
-    const color = rgba();
-    preview.textContent = '#' + color.slice(0, 3).map(c => c.toString(16).padStart(2, '0')).join('').toUpperCase();
-    preview.style.borderLeftColor = `rgba(${color[0]},${color[1]},${color[2]},${alpha / 255})`;
 }
 function restore() {
     const color = root.dataset.colorRgba.split(',').map(Number);

@@ -51,7 +51,6 @@ pub(super) fn ColorPicker(color: [u8; 4]) -> Element {
                     span { class: "value-picker" }
                 }
             }
-            output { class: "color-value", "data-color-preview": "", aria_label: "선택 색상" }
         }
     }
 }

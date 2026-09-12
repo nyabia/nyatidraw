@@ -28,6 +28,19 @@ later features merely to make an earlier spike look complete.
 - Project saving and image export are separate failure domains.
 - Avoid catch-all `common`, `shared`, or `utils` crates.
 
+## Code clarity and comments
+
+- Code should speak for itself through precise names, cohesive functions, and
+  appropriate abstraction boundaries.
+- If ordinary control flow needs comments to be understandable, first examine
+  the naming, abstraction level, and design. Improve the code instead of using
+  explanatory comments to compensate for unclear structure.
+- Keep comments minimal. Do not narrate what the code already says or introduce
+  unnecessary abstractions merely to eliminate a comment.
+- Retain concise explanations of non-obvious intent, algorithmic invariants,
+  compatibility constraints, and `unsafe` safety arguments. Put extended design
+  rationale in linked documentation rather than long inline essays.
+
 ## Evidence
 
 - Target numbers in `docs/performance.md` are not verified results.

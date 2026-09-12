@@ -182,6 +182,9 @@ pub struct TransformProjection {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EditProjection {
     pub busy: bool,
+    /// Writer-owned cancellation availability, including a transform starting
+    /// or previewing asynchronously. Committing artwork is not cancellable.
+    pub can_cancel: bool,
     pub has_selection: bool,
     pub selected_pixels: u64,
     pub error: Option<String>,
@@ -221,6 +224,15 @@ impl DrawingTool {
     }
 }
 
+/// Built-in dry-pencil templates. Session selection is separate from the
+/// immutable engine-versioned preset captured by each artwork stroke.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PencilTemplate {
+    #[default]
+    Mechanical2H,
+    Graphite2B,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FillSettings {
     pub gap_close_px: u8,
@@ -257,7 +269,7 @@ impl Default for EditSettings {
     }
 }
 
-/// Fixed-point, session-only controls for the current round brush.
+/// Fixed-point, session-only controls for the current brush template.
 /// Ratios use the full `u16` range; no raw input or renderer state crosses UI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BrushSettings {
@@ -273,16 +285,33 @@ pub struct BrushSettings {
 impl BrushSettings {
     #[must_use]
     pub const fn for_tool(tool: DrawingTool) -> Self {
+        if matches!(tool, DrawingTool::Pencil) {
+            return Self::for_pencil_template(PencilTemplate::Mechanical2H);
+        }
         Self {
             size_pressure: true,
-            opacity_pressure: matches!(tool, DrawingTool::Pencil),
+            opacity_pressure: false,
             size_minimum_u16: 0,
             opacity_minimum_u16: 0,
             hardness_u16: match tool {
-                DrawingTool::Pencil => 32_768,
                 DrawingTool::Brush => 0,
                 _ => u16::MAX,
             },
+            smoothing: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn for_pencil_template(template: PencilTemplate) -> Self {
+        Self {
+            size_pressure: true,
+            opacity_pressure: true,
+            size_minimum_u16: match template {
+                PencilTemplate::Mechanical2H => 53_739,
+                PencilTemplate::Graphite2B => 22_937,
+            },
+            opacity_minimum_u16: 3_277,
+            hardness_u16: u16::MAX,
             smoothing: 0,
         }
     }
@@ -296,9 +325,12 @@ impl Default for BrushSettings {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolCommand {
-    /// Cancels only an unfinished native edit gesture, leaving artwork intact.
+    /// Cancels a transform draft (including its pending start), otherwise an
+    /// active native gesture, otherwise clears the completed selection. Each
+    /// command consumes one stage and never deletes selected artwork.
     CancelGesture,
     Select(DrawingTool),
+    SelectPencilTemplate(PencilTemplate),
     CycleBrushFamily,
     CycleSelectionFamily,
     CycleFillFamily,
@@ -612,6 +644,7 @@ pub struct UiProjection {
     pub dock: DockTree,
     pub viewport: ViewportProjection,
     pub drawing_tool: DrawingTool,
+    pub pencil_template: PencilTemplate,
     pub brush_size_tenths: u16,
     /// Sizes used at accepted drawing Begin, newest first, at most four unique
     /// tenths of a pixel. Session-only; selection and Undo/Redo do not update it.
@@ -621,7 +654,8 @@ pub struct UiProjection {
     /// Straight sRGB8 UI color; alpha is linear. Convert before artwork commands.
     pub brush_color: [u8; 4],
     pub background_color: [u8; 4],
-    /// Session palette, newest first, at most eight unique straight sRGB8 colors.
+    /// Accepted painting Begin colors, newest first, at most ten unique sRGB8
+    /// colors. Selection, eyedropper, eraser and Undo/Redo do not update this.
     pub recent_colors: Vec<[u8; 4]>,
     pub edit_settings: EditSettings,
 }
@@ -656,14 +690,15 @@ impl UiProjection {
                 zoom_ppm: 1_000_000,
                 ..ViewportProjection::default()
             },
-            drawing_tool: DrawingTool::Brush,
+            drawing_tool: DrawingTool::Pencil,
+            pencil_template: PencilTemplate::Mechanical2H,
             brush_size_tenths: 50,
             recent_brush_sizes: Vec::new(),
             brush_opacity_u16: u16::MAX,
-            brush_settings: BrushSettings::default(),
-            brush_color: [26, 199, 232, 255],
+            brush_settings: BrushSettings::for_tool(DrawingTool::Pencil),
+            brush_color: [0, 0, 0, 255],
             background_color: [255; 4],
-            recent_colors: vec![[26, 199, 232, 255]],
+            recent_colors: Vec::new(),
             edit_settings: EditSettings::default(),
         }
     }

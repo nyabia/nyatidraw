@@ -85,6 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 opacity: 1.0,
                 flow: 1.0,
                 hardness: 1.0,
+                grain: None,
             }],
         )
         .map_err(debug_error)?;
@@ -123,6 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 opacity: 1.0,
                 flow: 1.0,
                 hardness: 1.0,
+                grain: None,
             }],
         )
         .map_err(debug_error)?;
@@ -141,6 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 opacity: 1.0,
                 flow: 1.0,
                 hardness: 1.0,
+                grain: None,
             }],
         )
         .map_err(debug_error)?;

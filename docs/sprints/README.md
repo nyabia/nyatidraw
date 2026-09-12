@@ -3,6 +3,9 @@
 문서 정리 기준 시각: 2026-09-09T18:52:14+09:00
 
 현재 실행 우선순위는 [일러스트 워크플로우 감사와 W0~W5](../illustration-workflow.md)를 따른다.
+실사용 피드백에 따른 현재 조작/UI 수정은 [UX-1~3 묶음](ux-feedback.md)을 따른다.
+브러시 [비교 조사](../research/brush-engines.md) 뒤 사용자 승인으로
+[최소 자체 2H/2B 연필](../research/pencil-brush-design.md)을 구현했다. 범용·습식 확장은 별도 과제다.
 기준 그림의 막힘 확인 → 러프/선화/덧칠 → 형태 수정 → 밑색 → 명암 → 마무리 순서다.
 W1a/W1b 기록은 [W1 기본 드로잉 조작](workflow-w1.md), 이후의 현재 구현·검증 경계는
 [Essentials E1~E3](essentials-goal.md)에 기록한다. E1~E3 구현/자동 검증을 마쳤으며,

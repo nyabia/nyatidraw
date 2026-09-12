@@ -9,8 +9,16 @@
 
 use nyatidraw_input::{Point, StylusSample};
 
+mod pencil;
+pub use pencil::{
+    PENCIL_ENGINE_VERSION, PENCIL_GRAIN_VERSION, PENCIL_PAPER_SEED, PENCIL_PRESET_SCHEMA_VERSION,
+    PencilGrain, PencilKind, pencil_coverage_units, pencil_preset,
+};
+
 pub const ROUND_BRUSH_ENGINE_VERSION: u32 = 2;
 pub const ROUND_BRUSH_PRESET_SCHEMA_VERSION: u32 = 2;
+pub const MAX_PENCIL_DABS_PER_SEGMENT: u64 = 4_096;
+pub const MAX_PENCIL_DABS_PER_STROKE: u64 = 1_048_576;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BrushPresetId(pub u128);
@@ -51,6 +59,27 @@ pub struct BrushDab {
     pub opacity: f32,
     pub flow: f32,
     pub hardness: f32,
+    /// Versioned, document-anchored dry graphite coverage; absent for round v1/v2.
+    pub grain: Option<PencilGrain>,
+}
+
+impl BrushDab {
+    /// Translates geometry without moving the paper grain into tile-local space.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub fn to_local(mut self, origin_x: i64, origin_y: i64) -> Self {
+        self.center.x -= origin_x as f64;
+        self.center.y -= origin_y as f64;
+        if let Some(grain) = &mut self.grain {
+            grain.origin[0] = grain.origin[0].wrapping_add(origin_x as u32);
+            grain.origin[1] = grain.origin[1].wrapping_add(origin_y as u32);
+        }
+        self
+    }
 }
 
 /// Metadata required to replay the same deterministic brush engine version.
@@ -78,6 +107,7 @@ pub enum RoundBrushReplayError {
     SampleSequenceMismatch,
     NonFiniteSample,
     InvalidPreset,
+    DabBudgetExceeded,
 }
 
 pub trait BrushEvaluator {
@@ -127,6 +157,16 @@ pub struct RoundBrushStroke {
     random_seed: u64,
     sample_count: u64,
     first_sample_sequence: u64,
+    emitted_dabs: u64,
+    evaluation_failed: bool,
+}
+
+impl RoundBrushStroke {
+    /// A v3 budget failure requires cancellation, never a shortened valid stroke.
+    #[must_use]
+    pub const fn is_discontinuous(&self) -> bool {
+        self.evaluation_failed
+    }
 }
 
 impl BrushEvaluator for RoundBrushEvaluator {
@@ -143,6 +183,8 @@ impl BrushEvaluator for RoundBrushEvaluator {
             random_seed,
             sample_count: 1,
             first_sample_sequence: first.sequence,
+            emitted_dabs: 1,
+            evaluation_failed: false,
         }
     }
 
@@ -196,8 +238,10 @@ pub fn replay_round_stroke(
     out: &mut Vec<BrushDab>,
 ) -> Result<(), RoundBrushReplayError> {
     let preset = snapshot.preset;
-    if !matches!(preset.engine_version, 1 | ROUND_BRUSH_ENGINE_VERSION)
-        || recorded.brush_engine_version != preset.engine_version
+    if !matches!(
+        preset.engine_version,
+        1 | ROUND_BRUSH_ENGINE_VERSION | PENCIL_ENGINE_VERSION
+    ) || recorded.brush_engine_version != preset.engine_version
     {
         return Err(RoundBrushReplayError::UnsupportedEngineVersion(
             recorded.brush_engine_version,
@@ -238,10 +282,15 @@ pub fn replay_round_stroke(
         random_seed: recorded.random_seed,
         sample_count: 1,
         first_sample_sequence: first.sequence,
+        emitted_dabs: 1,
+        evaluation_failed: false,
     };
     out.push(dab_for(&preset, first));
     let mut evaluator = RoundBrushEvaluator::default();
     evaluator.push(&mut token, remaining, out);
+    if token.evaluation_failed {
+        return Err(RoundBrushReplayError::DabBudgetExceeded);
+    }
     let replayed = evaluator.end(token, out);
     debug_assert_eq!(&replayed, recorded);
     Ok(())
@@ -250,18 +299,46 @@ pub fn replay_round_stroke(
 fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut Vec<BrushDab>) {
     let start = token.last_input;
     token.sample_count = token.sample_count.saturating_add(1);
+    if token.evaluation_failed {
+        token.last_input = next;
+        return;
+    }
 
     let dx = next.position_document.x - start.position_document.x;
     let dy = next.position_document.y - start.position_document.y;
     let mut remaining = dx.hypot(dy);
     if !remaining.is_finite() {
+        if token.preset.engine_version == PENCIL_ENGINE_VERSION {
+            token.evaluation_failed = true;
+        }
         token.last_input = next;
         return;
     }
 
     let spacing = f64::from(spacing_px(&token.preset));
+    if token.preset.engine_version == PENCIL_ENGINE_VERSION {
+        let projected = ((remaining + token.distance_since_dab) / spacing).floor();
+        #[allow(clippy::cast_precision_loss)]
+        let available = MAX_PENCIL_DABS_PER_STROKE
+            .saturating_sub(token.emitted_dabs)
+            .min(MAX_PENCIL_DABS_PER_SEGMENT) as f64;
+        if projected > available {
+            token.evaluation_failed = true;
+            token.last_input = next;
+            return;
+        }
+    }
     let mut segment_progress = 0.0_f64;
+    let mut segment_dabs = 0_u64;
     while remaining + token.distance_since_dab >= spacing {
+        if token.preset.engine_version == PENCIL_ENGINE_VERSION
+            && (token.emitted_dabs >= MAX_PENCIL_DABS_PER_STROKE
+                || segment_dabs >= MAX_PENCIL_DABS_PER_SEGMENT)
+        {
+            token.evaluation_failed = true;
+            token.last_input = next;
+            return;
+        }
         let advance = spacing - token.distance_since_dab;
         let step = if remaining > 0.0 {
             (advance / remaining).clamp(0.0, 1.0)
@@ -271,6 +348,8 @@ fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut 
         segment_progress += (1.0 - segment_progress) * step;
         let dab_sample = interpolate_sample(start, next, segment_progress);
         out.push(dab_for(&token.preset, dab_sample));
+        token.emitted_dabs = token.emitted_dabs.saturating_add(1);
+        segment_dabs += 1;
         remaining -= advance;
         token.distance_since_dab = 0.0;
 
@@ -293,6 +372,9 @@ fn spacing_px(preset: &BrushPreset) -> f32 {
 
 #[must_use]
 fn dab_for(preset: &BrushPreset, sample: StylusSample) -> BrushDab {
+    if preset.engine_version == PENCIL_ENGINE_VERSION {
+        return pencil::dab_for(preset, sample);
+    }
     let pressure = unit(sample.pressure);
     let legacy = preset.engine_version == 1;
     let size = if legacy {
@@ -315,6 +397,7 @@ fn dab_for(preset: &BrushPreset, sample: StylusSample) -> BrushDab {
         opacity: unit(preset.opacity) * opacity,
         flow: unit(preset.flow),
         hardness: if legacy { 1.0 } else { unit(preset.hardness) },
+        grain: None,
     }
 }
 
@@ -336,6 +419,9 @@ fn pressure_factor(enabled: bool, minimum: f32, pressure: f32) -> f32 {
 }
 
 fn valid_preset(preset: &BrushPreset) -> bool {
+    if preset.engine_version == PENCIL_ENGINE_VERSION {
+        return pencil::valid_preset(preset);
+    }
     [
         preset.size_px,
         preset.opacity,
@@ -530,7 +616,8 @@ mod tests {
                 radius_px: 2.5,
                 opacity: 0.2,
                 flow: 0.5,
-                hardness: 1.0
+                hardness: 1.0,
+                grain: None,
             }
         );
         for value in [f32::NAN, f32::INFINITY, -1.0, 2.0] {
@@ -545,5 +632,93 @@ mod tests {
                 dab.radius_px.is_finite() && dab.opacity.is_finite() && dab.hardness.is_finite()
             );
         }
+    }
+
+    #[test]
+    fn pencil_artwork_is_packet_stable_and_paper_does_not_restart_at_tiles() {
+        // Product risk: batching, grade aliasing, or tile-local grain changes
+        // the pixels shown live versus the same saved stroke.
+        let samples = [
+            sample(1, -3.0, 0.1),
+            sample(2, 2.0, 0.6),
+            sample(3, 130.0, 1.0),
+        ];
+        let mut outputs = Vec::new();
+        for kind in [PencilKind::Mechanical2H, PencilKind::Graphite2B] {
+            let preset = BrushPreset {
+                size_px: 5.0,
+                ..pencil_preset(kind)
+            };
+            let mut evaluator = RoundBrushEvaluator::new(9);
+            let mut dabs = Vec::new();
+            let mut token = begin_round_stroke(&mut evaluator, &preset, samples[0], &mut dabs);
+            for next in &samples[1..] {
+                evaluator.push(&mut token, &[*next], &mut dabs);
+            }
+            let recorded = evaluator.end(token, &mut dabs);
+            let mut replay = Vec::new();
+            replay_round_stroke(&BrushSnapshot { preset }, &recorded, &samples, &mut replay)
+                .unwrap();
+            assert_eq!(dabs, replay);
+            let mut tilted = samples;
+            for sample in &mut tilted {
+                sample.tilt = Some([65.0, -25.0]);
+            }
+            replay.clear();
+            replay_round_stroke(&BrushSnapshot { preset }, &recorded, &tilted, &mut replay)
+                .unwrap();
+            assert_eq!(
+                dabs, replay,
+                "v3 upright fallback must not depend on device tilt"
+            );
+            let full = dab_for(&preset, sample(8, 130.0, 1.0));
+            let local = full.to_local(128, 0);
+            for x in 128..134 {
+                assert_eq!(
+                    pencil_coverage_units(full, x, 0),
+                    pencil_coverage_units(local, x - 128, 0)
+                );
+            }
+            assert_eq!(full.to_local(-128, 0).to_local(128, 0), full);
+            let invalid = BrushPreset {
+                id: BrushPresetId(0),
+                ..preset
+            };
+            assert!(
+                !valid_preset(&invalid),
+                "unknown material must not silently become 2H"
+            );
+            outputs.push(dabs);
+            let discontinuous = [samples[0], sample(2, 1_000_000.0, 1.0)];
+            let mut evaluator = RoundBrushEvaluator::default();
+            let mut partial = Vec::new();
+            let mut token =
+                begin_round_stroke(&mut evaluator, &preset, discontinuous[0], &mut partial);
+            evaluator.push(&mut token, &discontinuous[1..], &mut partial);
+            assert!(
+                token.is_discontinuous(),
+                "oversized input jump must be explicit"
+            );
+            assert_eq!(
+                partial.len(),
+                1,
+                "budget rejection must happen before allocation"
+            );
+            let recorded = evaluator.end(token, &mut partial);
+            assert_eq!(
+                replay_round_stroke(
+                    &BrushSnapshot { preset },
+                    &recorded,
+                    &discontinuous,
+                    &mut Vec::new()
+                ),
+                Err(RoundBrushReplayError::DabBudgetExceeded)
+            );
+        }
+        assert_ne!(outputs[0][0].grain, outputs[1][0].grain);
+        assert_ne!(
+            outputs[0][0].radius_px.to_bits(),
+            outputs[1][0].radius_px.to_bits()
+        );
     }
 }

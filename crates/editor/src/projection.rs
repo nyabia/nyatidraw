@@ -57,11 +57,6 @@ impl ProjectionState {
         self.current.drawing_tool = tool;
         self.current.brush_size_tenths = size_tenths;
         self.current.brush_opacity_u16 = opacity_u16;
-        if self.current.brush_color != color {
-            self.current.recent_colors.retain(|recent| *recent != color);
-            self.current.recent_colors.insert(0, color);
-            self.current.recent_colors.truncate(8);
-        }
         self.current.brush_color = color;
         self.current.background_color = background_color;
     }
@@ -78,6 +73,20 @@ impl ProjectionState {
             .retain(|size| *size != size_tenths);
         self.current.recent_brush_sizes.insert(0, size_tenths);
         self.current.recent_brush_sizes.truncate(4);
+        true
+    }
+
+    /// Records the source sRGB color of an accepted painting Begin. Picking a
+    /// color and using an eraser are not painting-color usage. Like brush-size
+    /// usage, this session MRU never changes artwork roots, dirty state or history.
+    /// Returns whether a semantic publication is needed.
+    pub fn stage_used_brush_color(&mut self, color: [u8; 4]) -> bool {
+        if self.current.recent_colors.first() == Some(&color) {
+            return false;
+        }
+        self.current.recent_colors.retain(|recent| *recent != color);
+        self.current.recent_colors.insert(0, color);
+        self.current.recent_colors.truncate(10);
         true
     }
 
@@ -103,6 +112,10 @@ impl ProjectionState {
 
     pub fn stage_brush_settings(&mut self, settings: nyatidraw_api::BrushSettings) {
         self.current.brush_settings = settings;
+    }
+
+    pub fn stage_pencil_template(&mut self, template: nyatidraw_api::PencilTemplate) {
+        self.current.pencil_template = template;
     }
 
     /// Publishes document metadata at one monotonically increasing revision.

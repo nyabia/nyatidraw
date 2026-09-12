@@ -1,8 +1,10 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod artwork_clipboard;
+mod brush_preview;
 #[cfg(windows)]
 mod canvas_host;
+mod color_panel;
 mod color_picker;
 #[cfg(windows)]
 mod desktop_canvas;
@@ -54,6 +56,8 @@ const ROOT_GROUP: GroupId = GroupId(100);
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 const STYLES: &str = include_str!("../assets/styles.css");
 const STYLESHEET: Asset = asset!("/assets/styles.css");
+const COLOR_STYLES: &str = include_str!("../assets/colors.css");
+const COLOR_STYLESHEET: Asset = asset!("/assets/colors.css");
 
 #[derive(Clone, Copy, Debug)]
 struct NavigatorDrag {
@@ -136,6 +140,7 @@ fn app() -> Element {
         initial.dock = initial_dock;
         initial
     });
+    color_panel::use_palette_preferences(ui_projection);
     let (authoritative, latest_event) = live_ink.protocol_snapshot();
     if latest_event.is_some()
         && authoritative.revision >= ui_projection.peek().revision
@@ -145,7 +150,9 @@ fn app() -> Element {
     }
     dock_drag::use_dock_drag(live_ink.clone());
     use_context_provider(|| transform_panel::TransformPanelOpen(Signal::new(false)));
-    use_context_provider(|| page_panel::PagePanelOpen(Signal::new(false)));
+    let page_panel::PagePanelOpen(page_open) =
+        use_context_provider(|| page_panel::PagePanelOpen(Signal::new(false)));
+    let mut page_shortcuts = page_open;
     let mut navigator_drag = use_context_provider(|| Signal::new(Option::<NavigatorDrag>::None));
     let projected_revision = ui_projection.read().revision.0;
     let dock = ui_projection.read().dock.clone();
@@ -157,7 +164,7 @@ fn app() -> Element {
     let layout_notice = live_ink.layout_notice();
     let has_layout_notice = layout_notice.is_some();
     let edit = ui_projection.read().edit.clone();
-    let clear_edit_ink = live_ink.clone();
+    let picker = live_ink.picker_snapshot();
     let shortcut_ink = live_ink.clone();
     let navigator_move_ink = shortcut_ink.clone();
     let navigator_up_ink = shortcut_ink.clone();
@@ -171,8 +178,11 @@ fn app() -> Element {
         // network provider does not guarantee dioxus:// asset fetches.
         document::Link { rel: "stylesheet", href: STYLESHEET }
         style { {STYLES} }
+        document::Link { rel: "stylesheet", href: COLOR_STYLESHEET }
+        style { {COLOR_STYLES} }
         main {
             onmounted: move |_| {
+                focus_editor_shortcuts();
                 if startup_diagnostics {
                     println!("desktop-startup event=root-dom-mounted");
                 }
@@ -197,6 +207,16 @@ fn app() -> Element {
             },
             onkeydown: move |event| {
                 let key = event.key().to_string();
+                if page_shortcuts() {
+                    if key == "Escape" { page_shortcuts.set(false); }
+                    event.prevent_default();
+                    event.stop_propagation();
+                    return;
+                }
+                if key == "Escape" && event.is_auto_repeating() {
+                    event.prevent_default();
+                    return;
+                }
                 if handle_editor_shortcut(&shortcut_ink, &key, event.modifiers().shift(), event.modifiers().ctrl()) {
                     event.prevent_default();
                     return;
@@ -213,9 +233,8 @@ fn app() -> Element {
                         navigator_drag.set(None);
                         None
                     }
-                    // Dioxus Native does not expose supported programmatic
-                    // mounted-element focus, so F6 reveals the normal
-                    // keyboard-reachable Canvas focus target instead.
+                    // F6 reveals the keyboard-reachable canvas panel;
+                    // native drawing input has its own focus route.
                     _ => None,
                 };
                 if let Some(panel) = panel {
@@ -233,29 +252,82 @@ fn app() -> Element {
                 DockNodeView { node: dock.root().clone(), ui_projection }
             }
             if dirty { span { class: "unsaved-dot", title: "저장되지 않은 변경", "•" } }
-            if edit.busy || edit.has_selection || edit.error.is_some() {
+            if edit.busy {
                 aside { class: "edit-status", role: "status", aria_live: "polite",
-                    if edit.busy { span { "작업 처리 중…" } }
-                    else {
-                        span { "선택 {edit.selected_pixels} px" }
-                        button { onclick: move |_| {
-                            let (current, _) = clear_edit_ink.protocol_snapshot();
-                            let _ = clear_edit_ink.push_editor_command(current.revision,
-                                EditorCommand::Edit(nyatidraw_api::EditCommand::ClearSelection));
-                        }, "선택 해제" }
-                    }
-                    if let Some(reason) = &edit.error { span { role: "alert", "편집 실패: {reason}" } }
+                    span { "작업 처리 중…" }
                 }
             }
+            if let Some(reason) = &edit.error {
+                TransientNotice { key: "edit-{reason}", message: format!("편집 실패: {reason}") }
+            }
             if let Some((command, reason)) = rejection {
-                span { class: "status-toast error", role: "alert", "명령 #{command.0}: {reject_label(reason)}" }
+                TransientNotice { key: "reject-{command.0}", message: reject_label(reason).to_owned() }
             }
             if let Some(notice) = activation_notice {
-                span { class: "status-toast error activation-notice", role: "alert", "파일 열기 실패: {notice}" }
+                TransientNotice { key: "notice-{notice}", message: notice }
             }
+            if page_open() { page_panel::PagePanel { ui_projection } }
+            if let Some(snapshot) = picker { {picker_loupe(snapshot)} }
             CloseProgress { status: close_status }
         }
     }
+}
+
+/// Read-only feedback: raw input and release/cancel remain in the native actor.
+fn picker_loupe(snapshot: native_canvas::PickerSnapshot) -> Element {
+    let [x, y] = snapshot.cursor_css;
+    let top = if y >= 190.0 { y - 180.0 } else { y + 26.0 };
+    let position = format!(
+        "left:clamp(6px,{}px,calc(100vw - 138px));top:clamp(6px,{top}px,calc(100vh - 160px))",
+        x - 66.0
+    );
+    let candidate = snapshot.frame.as_ref().and_then(|frame| frame.candidate);
+    let swatch = candidate.map_or_else(String::new, |[r, g, b, _]| {
+        format!("background:rgb({r} {g} {b})")
+    });
+    let status = if snapshot.pending {
+        "…"
+    } else if snapshot.error.is_some() && snapshot.frame.is_none() {
+        "채취 실패"
+    } else if candidate.is_none() {
+        "투명"
+    } else {
+        ""
+    };
+    rsx! {
+        aside { class: "picker-loupe", style: position, aria_label: "스포이트 확대 미리보기",
+            div { class: "picker-pixels",
+                if let Some(frame) = snapshot.frame {
+                    img { src: frame.data_uri.to_string(), alt: "커서 주변 픽셀", draggable: "false", "data-pixel-size": "{frame.size}" }
+                }
+                span { class: "picker-center" }
+            }
+            div { class: "picker-candidate",
+                span { class: "picker-swatch", style: swatch }
+                span { "{status}" }
+            }
+        }
+    }
+}
+
+/// Dismiss presentation only. Save/export failures retain their retry/recovery state.
+#[component]
+fn TransientNotice(message: String) -> Element {
+    let mut visible = use_signal(|| true);
+    use_future(move || async move {
+        let mut timer =
+            document::eval("await new Promise(r => setTimeout(r, 8000)); dioxus.send(true);");
+        if timer.recv::<bool>().await.is_ok() {
+            visible.set(false);
+        }
+    });
+    if !visible() {
+        return rsx! {};
+    }
+    rsx! { aside { class: "status-toast error transient-notice", role: "alert",
+        span { "{message}" }
+        button { title: "알림 닫기", aria_label: "알림 닫기", onclick: move |_| visible.set(false), "×" }
+    } }
 }
 
 #[component]
@@ -345,7 +417,7 @@ fn handle_editor_shortcut(live_ink: &LiveInkBridge, key: &str, shift: bool, ctrl
         Some(EditorCommand::Tool(ToolCommand::CycleSelectionFamily))
     } else if key.eq_ignore_ascii_case("f") {
         Some(EditorCommand::Tool(ToolCommand::CycleFillFamily))
-    } else if key.eq_ignore_ascii_case("i") {
+    } else if !ctrl && key.eq_ignore_ascii_case("c") {
         Some(EditorCommand::Tool(ToolCommand::Select(
             DrawingTool::Eyedropper,
         )))
@@ -414,13 +486,6 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
                 onclick: move |_| menu_open.toggle(),
                 span { class: "hamburger", i {}, i {}, i {} }
             }
-            if menu_open() {
-                ClipboardActions { ui_projection }
-                button { class: "command", onclick: move |_| {
-                    send_dock_command(&reset_layout_ink, DockCommand::ResetToSafeDefault);
-                    menu_open.set(false);
-                }, "기본 화면 배치" }
-            }
             FileButtons {}
             if live_ink.is_saving_as() {
                 span { class: "export-status", role: "status", "다른 이름으로 저장 중…" }
@@ -456,9 +521,31 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
             }
             div { class: "toolbar-top-space", "data-dock-top": "" }
             span { class: "document-name", title: "현재 그림: {ui_projection.read().document_title}", "{ui_projection.read().document_title}" }
-            UpdateControl {}
             if let Some(message) = error.read().as_ref() {
                 span { class: "commandbar-error", role: "alert", "{message}" }
+            }
+            if menu_open() {
+                div { class: "menu-dismiss-scrim", aria_hidden: "true", onclick: move |_| menu_open.set(false) }
+                div { id: "app-menu-overlay", class: "menu-line-overlay", aria_label: "앱 메뉴",
+                    onmounted: move |_| contain_overlay_focus("app-menu-overlay"),
+                    onkeydown: move |event| {
+                        event.stop_propagation();
+                        if event.key() == Key::Escape { event.prevent_default(); menu_open.set(false); }
+                    },
+                    button { class: "command hamburger-button", autofocus: true, title: "메뉴 닫기", aria_label: "메뉴 닫기",
+                        onclick: move |_| menu_open.set(false), "×"
+                    }
+                    FileButtons { extended: true }
+                    span { class: "divider" }
+                    ClipboardActions { ui_projection }
+                    span { class: "divider" }
+                    button { class: "command", onclick: move |_| {
+                        send_dock_command(&reset_layout_ink, DockCommand::ResetToSafeDefault);
+                        menu_open.set(false);
+                    }, "기본 화면 배치" }
+                    div { class: "menu-line-spacer" }
+                    UpdateControl {}
+                }
             }
         }
     }
@@ -523,7 +610,7 @@ fn UpdateControl() -> Element {
 }
 
 #[component]
-fn FileButtons() -> Element {
+fn FileButtons(#[props(default = false)] extended: bool) -> Element {
     #[cfg(windows)]
     {
         let host = try_use_context::<desktop_canvas::DesktopCanvasHandle>();
@@ -531,7 +618,7 @@ fn FileButtons() -> Element {
         let mut busy = use_signal(|| false);
         let window = dioxus_desktop::window().window.clone();
         return rsx! {
-            for file_action in [0_u8, 1, 2] {
+            for file_action in (0_u8..=2).filter(|action| extended || *action == 0) {
                 button {
                     class: "command", disabled: busy() || host.is_none(),
                     title: match file_action { 1 => "새 그림의 저장 위치 선택", 2 => "현재 그림과 모든 실행 취소 기록을 다른 이름으로 저장", _ => "PNG 또는 NyatiDraw 프로젝트 열기" },
@@ -596,7 +683,7 @@ fn CanvasActions(ui_projection: Signal<UiProjection>) -> Element {
     let live_ink = use_context::<LiveInkBridge>();
     let clear_ink = live_ink.clone();
     let transform_ink = live_ink.clone();
-    let page_ink = live_ink.clone();
+    let cancel_ink = live_ink.clone();
     let transform_panel::TransformPanelOpen(mut transform_open) = use_context();
     let page_panel::PagePanelOpen(mut page_open) = use_context();
     let error = use_signal(|| Option::<String>::None);
@@ -608,19 +695,43 @@ fn CanvasActions(ui_projection: Signal<UiProjection>) -> Element {
                 button { class: "command", title: "흰 배경 추가", onclick: move |_| {
                     send_editor_command(&white_ink, EditorCommand::Layer(LayerCommand::AddWhiteBackground), error);
                 }, UiIcon { name: "white" } span { class: "command-label", "흰 배경" } }
-                button { class: if ui_projection.read().edit.transform.is_some() { "command active" } else { "command" }, title: "선택 영역 또는 현재 레이어 변형 · 확정 / 취소", onclick: move |_| {
+                button { class: if ui_projection.read().edit.transform.is_some() { "command active" } else { "command" }, title: "선택 영역 변형 · 먼저 영역을 선택하세요", disabled: !ui_projection.read().edit.has_selection || ui_projection.read().edit.busy || ui_projection.read().edit.transform.is_some(), onclick: move |_| {
                     page_open.set(false);
                     transform_open.set(true);
-                    send_dock_command(&transform_ink, DockCommand::ActivatePanel(PanelKind::ToolProperties));
+                    focus_editor_shortcuts();
+                    send_editor_command(&transform_ink, EditorCommand::Edit(nyatidraw_api::EditCommand::FreeTransform(nyatidraw_api::TransformCommand::Begin)), error);
                 },
                     UiIcon { name: "transform" } span { class: "command-label", "변형" }
                 }
-                button { class: "command", title: "페이지 크기 및 선택 영역에 맞추기", disabled: transform_open() || ui_projection.read().edit.transform.is_some(), onclick: move |_| {
+                button { class: "command", title: "페이지 크기 및 선택 영역에 맞추기", disabled: ui_projection.read().edit.busy || ui_projection.read().edit.transform.is_some(), onclick: move |_| {
                     transform_open.set(false);
                     page_open.set(true);
-                    send_dock_command(&page_ink, DockCommand::ActivatePanel(PanelKind::ToolProperties));
                 }, span { class: "command-label", "페이지" } }
+                button { class: "command", title: "현재 조작 취소 / 선택 해제 (Esc)", disabled: !page_open() && !ui_projection.read().edit.can_cancel && (!ui_projection.read().edit.has_selection || ui_projection.read().edit.busy),
+                    onclick: move |_| {
+                        if page_open() { page_open.set(false); }
+                        else {
+                            focus_editor_shortcuts();
+                            send_editor_command(&cancel_ink, EditorCommand::Tool(ToolCommand::CancelGesture), error);
+                        }
+                    }, span { class: "command-label", "취소" } span { class: "shortcut", "Esc" }
+                }
     }
+}
+
+fn focus_editor_shortcuts() {
+    // Starting/ending an operation can disable or remove its focused button.
+    // Put focus on the keyboard scope before that change, not on document.body.
+    let _ =
+        document::eval("document.querySelector('main.app-shell')?.focus({ preventScroll: true });");
+}
+
+fn contain_overlay_focus(id: &'static str) {
+    // IDs are internal constants; script owns listeners only for the mounted overlay.
+    let _ = document::eval(&format!(
+        "const overlay = document.getElementById('{id}');\n{}",
+        include_str!("overlay_focus.js")
+    ));
 }
 
 #[component]
@@ -663,25 +774,7 @@ fn ViewportActions(ui_projection: Signal<UiProjection>) -> Element {
 
 #[component]
 fn QuickColors(ui_projection: Signal<UiProjection>) -> Element {
-    let live_ink = use_context::<LiveInkBridge>();
-    let error = use_signal(|| Option::<String>::None);
-    let current = ui_projection.read().brush_color;
-    let background = ui_projection.read().background_color;
-    let background_color = format!(
-        "#{:02X}{:02X}{:02X}",
-        background[0], background[1], background[2]
-    );
-    let current_color = format!("#{:02X}{:02X}{:02X}", current[0], current[1], current[2]);
-    rsx! {
-                button { class: "color-stack", title: "전경/배경 색상 교환 (X)", aria_label: "전경/배경 색상 교환",
-                    onclick: move |_| send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::SwapColors), error),
-                    span { class: "color-chip back", style: "background:{background_color}" }
-                    span { class: "color-chip front", style: "background:{current_color}" }
-                    sub { class: "color-swap-shortcut", "x" }
-                }
-                RecentColors { ui_projection, compact: true }
-
-    }
+    rsx! { color_panel::QuickColors { ui_projection } }
 }
 
 #[component]
@@ -691,43 +784,6 @@ fn TopToolbar(panel: PanelKind, ui_projection: Signal<UiProjection>) -> Element 
             span { class: "toolbar-grip", title: "{panel_label(panel)} 이동", "data-dock-source": "{panel_slug(panel)}" }
             ToolbarContents { panel, ui_projection }
         }
-    }
-}
-
-#[component]
-fn RecentColors(ui_projection: Signal<UiProjection>, compact: bool) -> Element {
-    let colors = ui_projection.read().recent_colors.clone();
-    rsx! {
-        div { class: if compact { "quick-colors" } else { "recent-colors" }, aria_label: "최근 선택한 색상",
-            for rgba in colors {
-                ColorSwatch { rgba, recent: true }
-            }
-        }
-    }
-}
-
-#[component]
-fn ColorSwatch(rgba: [u8; 4], recent: bool) -> Element {
-    let live_ink = use_context::<LiveInkBridge>();
-    let error = use_signal(|| Option::<String>::None);
-    let color = if rgba[3] == 255 {
-        format!("#{:02X}{:02X}{:02X}", rgba[0], rgba[1], rgba[2])
-    } else {
-        format!(
-            "#{:02X}{:02X}{:02X}{:02X}",
-            rgba[0], rgba[1], rgba[2], rgba[3]
-        )
-    };
-    let label = format!(
-        "{} {color}",
-        if recent {
-            "최근 색상"
-        } else {
-            "기본 색상"
-        }
-    );
-    rsx! {
-        button { class: "quick-color", style: "background:{color}", title: "{label}", aria_label: "{label}", onclick: move |_| send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::SetColor(rgba)), error) }
     }
 }
 
@@ -1069,7 +1125,7 @@ fn ToolsPanel(ui_projection: Signal<UiProjection>) -> Element {
     rsx! {
         nav { class: "tool-list", aria_label: "도구",
             ToolButton { label: "화면 이동", icon: "hand", shortcut: "g", tool: Some(DrawingTool::Move), active: active == DrawingTool::Move }
-            ToolButton { label: "선택 픽셀 이동", icon: "move", shortcut: "g", tool: Some(DrawingTool::MoveSelection), active: active == DrawingTool::MoveSelection }
+            ToolButton { label: "변형", icon: "transform", shortcut: "g", tool: Some(DrawingTool::MoveSelection), active: active == DrawingTool::MoveSelection }
             ToolButton { label: "마법봉", icon: "wand", shortcut: "g", tool: Some(DrawingTool::Wand), active: active == DrawingTool::Wand }
             ToolButton { label: "올가미", icon: "lasso", shortcut: "g", tool: Some(DrawingTool::Lasso), active: active == DrawingTool::Lasso }
             ToolButton { label: "사각형 선택", icon: "rectangle-selection", shortcut: "g", tool: Some(DrawingTool::RectangleSelection), active: active == DrawingTool::RectangleSelection }
@@ -1083,7 +1139,7 @@ fn ToolsPanel(ui_projection: Signal<UiProjection>) -> Element {
             ToolButton { label: "채우기", icon: "bucket", shortcut: "f", tool: Some(DrawingTool::Fill), active: active == DrawingTool::Fill }
             ToolButton { label: "그라데이션", icon: "gradient", shortcut: "f", tool: Some(DrawingTool::Gradient), active: active == DrawingTool::Gradient }
             span { class: "tool-separator" }
-            ToolButton { label: "스포이트", icon: "eyedropper", shortcut: "i", tool: Some(DrawingTool::Eyedropper), active: active == DrawingTool::Eyedropper }
+            ToolButton { label: "스포이트", icon: "eyedropper", shortcut: "c", tool: Some(DrawingTool::Eyedropper), active: active == DrawingTool::Eyedropper }
         }
     }
 }
@@ -1102,7 +1158,7 @@ fn ToolButton(
         button {
             class: if active { "tool active" } else { "tool" },
             disabled: tool.is_none(),
-            title: if tool == Some(DrawingTool::Eyedropper) { "스포이트 (I) · Alt+클릭: 보이는 그림에서 임시 색 채취" } else { "{label} ({shortcut})" },
+            title: if tool == Some(DrawingTool::Eyedropper) { "스포이트 (C) · Alt+클릭: 보이는 그림에서 임시 색 채취" } else { "{label} ({shortcut})" },
             aria_label: "{label}, 단축키 {shortcut}",
             onclick: move |_| {
                 if let Some(tool) = tool {
@@ -1117,24 +1173,53 @@ fn ToolButton(
 
 #[component]
 fn BrushPanel(ui_projection: Signal<UiProjection>) -> Element {
+    let live_ink = use_context::<LiveInkBridge>();
+    let error = use_signal(|| Option::<String>::None);
+    let tool = ui_projection.read().drawing_tool;
+    let pencil_template = ui_projection.read().pencil_template;
+    let name = match tool {
+        DrawingTool::Pencil => "기본 연필",
+        DrawingTool::Pen => "기본 펜",
+        DrawingTool::Brush => "소프트 브러시",
+        DrawingTool::Eraser => "기본 지우개",
+        DrawingTool::MoveSelection => "자유 변형",
+        DrawingTool::Move => "화면 이동",
+        DrawingTool::Wand => "마법봉",
+        DrawingTool::Lasso => "올가미",
+        DrawingTool::RectangleSelection => "사각형 선택",
+        DrawingTool::Fill => "영역 채우기",
+        DrawingTool::Gradient => "선형 그라데이션",
+        DrawingTool::Eyedropper => "스포이트",
+    };
     rsx! {
         div { class: "subtool-list",
-            SubtoolButton { name: "연필", tool: Some(DrawingTool::Pencil), active: ui_projection.read().drawing_tool == DrawingTool::Pencil }
-            SubtoolButton { name: "G펜", tool: Some(DrawingTool::Pen), active: ui_projection.read().drawing_tool == DrawingTool::Pen }
-            SubtoolButton { name: "소프트 브러시", tool: Some(DrawingTool::Brush), active: ui_projection.read().drawing_tool == DrawingTool::Brush }
+            if tool == DrawingTool::Pencil {
+                for (template, name) in [
+                    (nyatidraw_api::PencilTemplate::Mechanical2H, "2H 샤프펜슬"),
+                    (nyatidraw_api::PencilTemplate::Graphite2B, "2B 연필"),
+                ] {
+                    button { class: if template == pencil_template { "subtool selected" } else { "subtool" },
+                        title: name, aria_pressed: template == pencil_template,
+                        onclick: { let ink = live_ink.clone(); move |_| send_editor_command(&ink, EditorCommand::Tool(ToolCommand::SelectPencilTemplate(template)), error) },
+                        span { class: "subtool-name", "{name}" }
+                    }
+                }
+            } else {
+            SubtoolButton { name, tool: Some(tool), active: true }
+            }
+            if tool == DrawingTool::MoveSelection {
+                button { class: "subtool unavailable", disabled: true, "메시 변형 · 준비 중" }
+            }
         }
     }
 }
 
 #[component]
 fn ToolPropertiesPanel(ui_projection: Signal<UiProjection>) -> Element {
-    let transform_panel::TransformPanelOpen(transform_open) = use_context();
-    let page_panel::PagePanelOpen(page_open) = use_context();
-    if transform_open() || ui_projection.read().edit.transform.is_some() {
+    if ui_projection.read().edit.transform.is_some()
+        || ui_projection.read().drawing_tool == DrawingTool::MoveSelection
+    {
         return rsx! { transform_panel::TransformPanel { ui_projection } };
-    }
-    if page_open() {
-        return rsx! { page_panel::PagePanel { ui_projection } };
     }
     if ui_projection.read().drawing_tool.is_edit() {
         return rsx! { EditToolPanel { ui_projection } };
@@ -1143,14 +1228,18 @@ fn ToolPropertiesPanel(ui_projection: Signal<UiProjection>) -> Element {
     let opacity =
         (u32::from(ui_projection.read().brush_opacity_u16) * 100 + 32_767) / u32::from(u16::MAX);
     let settings = ui_projection.read().brush_settings;
+    let tool = ui_projection.read().drawing_tool;
+    let opacity_u16 = ui_projection.read().brush_opacity_u16;
+    let pencil_template = ui_projection.read().pencil_template;
     rsx! {
-        div { class: "tool-properties", onkeydown: move |event| event.stop_propagation(),
+        div { class: "tool-properties", onkeydown: move |event| { if event.key() != Key::Escape { event.stop_propagation(); } },
+            brush_preview::BrushStrokePreview { tool, pencil_template, size_tenths: current_size, opacity_u16, settings }
             BrushSizeControl { size_tenths: current_size }
             OpacityControl { percent: opacity }
-            BrushHardnessControl { hardness_u16: settings.hardness_u16 }
             BrushSmoothingControl { strength: settings.smoothing }
             details { class: "brush-extra-options",
                 summary { "추가 옵션" }
+                if tool != DrawingTool::Pencil { BrushHardnessControl { hardness_u16: settings.hardness_u16 } }
                 BrushPressureControl { size_axis: true, enabled: settings.size_pressure, minimum_u16: settings.size_minimum_u16 }
                 BrushPressureControl { size_axis: false, enabled: settings.opacity_pressure, minimum_u16: settings.opacity_minimum_u16 }
             }
@@ -1216,8 +1305,8 @@ fn BrushHardnessControl(hardness_u16: u16) -> Element {
     }));
     rsx! {
         label { class: "property-row", title: "0%는 부드러운 경계, 100%는 단단한 경계",
-            span { "경도" }
-            input { class: "property-number", r#type: "number", min: "0", max: "100", step: "1", value: "{draft}", aria_label: "브러시 경도 %",
+            span { "가장자리 경도" }
+            input { class: "property-number", r#type: "number", min: "0", max: "100", step: "1", value: "{draft}", aria_label: "브러시 가장자리 경도 %",
                 oninput: move |event| draft.set(event.value()),
                 onchange: move |_| {
                     if let Ok(value) = draft().parse::<u32>() {
@@ -1351,13 +1440,12 @@ fn SubtoolButton(name: &'static str, tool: Option<DrawingTool>, active: bool) ->
         button {
             class: if active { "subtool selected" } else { "subtool" },
             disabled: tool.is_none(),
-            title: if tool.is_none() { "준비 중 · 아직 사용할 수 없습니다" } else { "기본 원형 브러시" },
+            title: if tool.is_none() { "준비 중 · 아직 사용할 수 없습니다" } else { name },
             onclick: move |_| {
                 if let Some(tool) = tool {
                     send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::Select(tool)), error);
                 }
             },
-            span { class: "stroke-sample" }
             span { class: "subtool-name", "{name}", if tool.is_none() { small { " 준비 중" } } }
         }
     }
@@ -1411,8 +1499,7 @@ fn EditToolPanel(ui_projection: Signal<UiProjection>) -> Element {
         _ => "선택 영역에서 끌어 현재 색 → 투명 그라데이션을 만듭니다.",
     };
     rsx! {
-        div { class: "edit-tool-properties",
-            p { "{help}" }
+        div { class: "edit-tool-properties", "aria-description": help,
             if matches!(tool, DrawingTool::Lasso | DrawingTool::RectangleSelection) {
                 select { aria_label: "선택 조합",
                     value: match settings.selection_mode {
@@ -1434,7 +1521,7 @@ fn EditToolPanel(ui_projection: Signal<UiProjection>) -> Element {
                 }
             }
             if matches!(tool, DrawingTool::Lasso | DrawingTool::RectangleSelection | DrawingTool::Wand | DrawingTool::MoveSelection) {
-                SelectionActions {}
+                SelectionActions { ui_projection }
             }
             if matches!(tool, DrawingTool::Wand | DrawingTool::Fill | DrawingTool::Eyedropper) {
                 label { "참조 범위"
@@ -1506,22 +1593,26 @@ fn FillBoundaryControls(ui_projection: Signal<UiProjection>) -> Element {
 }
 
 #[component]
-fn SelectionActions() -> Element {
+fn SelectionActions(ui_projection: Signal<UiProjection>) -> Element {
     let live_ink = use_context::<LiveInkBridge>();
     let error = use_signal(|| Option::<String>::None);
     let mut radius = use_signal(|| 1_u8);
+    let busy = ui_projection.read().edit.busy;
+    let has_selection = ui_projection.read().edit.has_selection;
     rsx! { div { class: "selection-actions",
-        for (label, title, command) in [
-            ("전체", "페이지 + 현재 레이어 타일 + 현재 선택 범위", nyatidraw_api::EditCommand::SelectAll),
-            ("반전", "전체선택과 같은 유한 범위에서 선택 반전", nyatidraw_api::EditCommand::InvertSelection),
-            ("해제", "선택만 해제", nyatidraw_api::EditCommand::ClearSelection),
-            ("삭제", "현재 레이어의 선택한 픽셀만 삭제", nyatidraw_api::EditCommand::DeleteSelectedPixels),
-            ("그림에서 선택", "현재 레이어의 알파가 0보다 큰 픽셀로 선택을 교체합니다. 레이어 불투명도와 다른 레이어는 반영하지 않습니다.", nyatidraw_api::EditCommand::SelectLayerAlpha),
+        div { class: "selection-toolbar", role: "group", aria_label: "선택 영역 명령",
+        for (label, icon, title, needs_selection, command) in [
+            ("전체 선택", "rectangle-selection", "전체 선택 (Ctrl+A) · 페이지와 현재 레이어·선택의 유한 범위", false, nyatidraw_api::EditCommand::SelectAll),
+            ("선택 반전", "invert-selection", "선택 반전 (Ctrl+Shift+I)", false, nyatidraw_api::EditCommand::InvertSelection),
+            ("선택 해제", "deselect", "선택만 해제 (Esc)", true, nyatidraw_api::EditCommand::ClearSelection),
+            ("선택 픽셀 삭제", "trash", "선택 픽셀 삭제 (Delete) · 현재 레이어만", true, nyatidraw_api::EditCommand::DeleteSelectedPixels),
+            ("그림에서 선택", "select-alpha", "현재 레이어의 불투명 픽셀 선택 · 레이어 불투명도와 다른 레이어는 반영하지 않음", false, nyatidraw_api::EditCommand::SelectLayerAlpha),
         ] {
-            button { title, onclick: {
+            button { title, aria_label: label, disabled: busy || (needs_selection && !has_selection), onclick: {
                 let ink = live_ink.clone();
                 move |_| send_editor_command(&ink, EditorCommand::Edit(command.clone()), error)
-            }, "{label}" }
+            }, UiIcon { name: icon } }
+        }
         }
         label { class: "property-row", title: "선택 확장·축소 반경, 문서 픽셀 단위",
             span { "선택 경계" }
@@ -1530,15 +1621,17 @@ fn SelectionActions() -> Element {
             }
             span { "px" }
         }
-        for (label, grow) in [("확장", true), ("축소", false)] {
-            button { title: "선택 영역 {label}", onclick: {
+        div { class: "selection-morph-actions",
+        for (label, icon, grow) in [("확장", "plus", true), ("축소", "minus", false)] {
+            button { title: "선택 영역 {label}", disabled: busy || !has_selection, onclick: {
                 let ink = live_ink.clone();
                 move |_| {
                     let command = if grow { nyatidraw_api::EditCommand::GrowSelection { radius: radius() } }
                         else { nyatidraw_api::EditCommand::ShrinkSelection { radius: radius() } };
                     send_editor_command(&ink, EditorCommand::Edit(command), error);
                 }
-            }, "{label}" }
+            }, UiIcon { name: icon } span { "{label}" } }
+        }
         }
     } }
 }
@@ -1790,20 +1883,7 @@ fn finish_navigator_drag(
 
 #[component]
 fn ColorPanel(ui_projection: Signal<UiProjection>) -> Element {
-    let current = ui_projection.read().brush_color;
-    rsx! {
-        div { class: "color-panel",
-            color_picker::ColorPicker { color: current }
-            span { class: "palette-caption", "최근 색상" }
-            RecentColors { ui_projection, compact: false }
-            span { class: "palette-caption", "기본 색상" }
-            div { class: "recent-colors", aria_label: "기본 색상 팔레트",
-                for rgba in [[23,23,23,255], [255,255,255,255], [232,48,48,255], [32,185,74,255], [38,123,224,255], [241,201,74,255], [143,97,201,255], [239,140,53,255]] {
-                    ColorSwatch { rgba, recent: false }
-                }
-            }
-        }
-    }
+    rsx! { color_panel::ColorPanel { ui_projection } }
 }
 
 #[component]
@@ -1813,14 +1893,19 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
     let duplicate_ink = live_ink.clone();
     let add_group_ink = live_ink.clone();
     let white_ink = live_ink.clone();
-    let reference_ink = live_ink.clone();
-    let lock_ink = live_ink.clone();
     let delete_ink = live_ink.clone();
     let layers = ui_projection.read().layers.clone();
     let active = ui_projection.read().active_layer;
-    let active_reference = layers.iter().any(|layer| {
-        layer.id == LayerTreeNodeId::Raster(active.unwrap_or(LayerId(0))) && layer.reference
-    });
+    let mut group_settings = use_signal(|| None::<GroupId>);
+    use_effect(use_reactive((&active,), move |_| group_settings.set(None)));
+    let settings_node = group_settings()
+        .map(LayerTreeNodeId::Group)
+        .or_else(|| active.map(LayerTreeNodeId::Raster));
+    let settings_layer = layers
+        .iter()
+        .find(|layer| Some(layer.id) == settings_node)
+        .cloned();
+    let settings_id = settings_layer.as_ref().map(|layer| layer.id);
     let active_locked = layers.iter().any(|layer| {
         layer.id == LayerTreeNodeId::Raster(active.unwrap_or(LayerId(0))) && layer.locked
     });
@@ -1854,7 +1939,7 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
                 button { title: "래스터 레이어 추가", onclick: move |_| {
                     send_editor_command(&add_raster_ink, EditorCommand::Layer(LayerCommand::AddRaster), error);
                 }, UiIcon { name: "plus" } }
-                button { title: "선택 래스터 레이어 복제", disabled: active.is_none(), onclick: move |_| {
+                button { title: "선택 래스터 레이어 복제", disabled: active.is_none() || group_settings().is_some(), onclick: move |_| {
                     if let Some(layer) = active {
                         send_editor_command(&duplicate_ink, EditorCommand::Layer(LayerCommand::DuplicateRaster(layer)), error);
                     }
@@ -1865,30 +1950,16 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
                 button { title: "흰 배경 추가", onclick: move |_| {
                     send_editor_command(&white_ink, EditorCommand::Layer(LayerCommand::AddWhiteBackground), error);
                 }, UiIcon { name: "white" } }
-                layer_drag::LayerMoveButtons { projection: ui_projection, error }
+                if group_settings().is_none() { layer_drag::LayerMoveButtons { projection: ui_projection, error } }
             }
-            div { class: "layer-settings",
-                button { class: "unavailable", disabled: true, title: "레이어 색상화 · 준비 중", span { class: "layer-color-chip" } "색상화 · 준비 중" }
-                button {
-                    disabled: active.is_none(), aria_pressed: "{active_reference}",
-                    title: "선택·채우기 참조 레이어 표시 (일반 PNG에는 영향 없음)",
-                    onclick: move |_| {
-                        if let Some(layer) = active {
-                            send_editor_command(&reference_ink, EditorCommand::Layer(LayerCommand::SetReference {
-                                layer, reference: !active_reference,
-                            }), error);
-                        }
-                    },
-                    UiIcon { name: "reference" } "참조"
+            if let Some(layer) = settings_layer {
+                if group_settings().is_some() {
+                    div { class: "group-settings-label",
+                        span { "그룹 설정 · {layer.name}" }
+                        button { title: "그리는 레이어 설정으로 돌아가기", onclick: move |_| group_settings.set(None), "×" }
+                    }
                 }
-                button { disabled: active.is_none(), aria_pressed: "{active_locked}",
-                    title: if active_locked { "선택 레이어 잠금 해제" } else { "선택 레이어 픽셀 잠금" },
-                    onclick: move |_| {
-                        if let Some(layer) = active {
-                            send_editor_command(&lock_ink, EditorCommand::Layer(LayerCommand::SetLocked { layer, locked: !active_locked }), error);
-                        }
-                    }, if active_locked { UiIcon { name: "lock" } } else { UiIcon { name: "unlock" } }
-                }
+                LayerStyleControls { layer, error }
             }
             div { class: "layer-list",
                 for layer in visible_layers {
@@ -1897,14 +1968,14 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
                             LayerTreeNodeId::Raster(layer_id) => thumbnails.frame(layer_id),
                             LayerTreeNodeId::Group(_) => None,
                         };
-                        rsx! { LayerRow { key: "{layer.id:?}", layer, thumbnail, active, solo_node, error, collapsed_groups } }
+                        rsx! { LayerRow { key: "{layer.id:?}", layer, thumbnail, active, solo_node, error, collapsed_groups, group_settings } }
                     }
                 }
             }
             if let Some(message) = error.read().as_ref() { div { class: "command-error", role: "alert", "{message}" } }
-            div { class: "layers-footer", button { disabled: active.is_none() || active_locked, title: "선택 레이어 삭제 (Undo로 복원)", onclick: move |_| {
-                if let Some(layer) = active {
-                    send_editor_command(&delete_ink, EditorCommand::Layer(LayerCommand::Delete(LayerTreeNodeId::Raster(layer))), error);
+            div { class: "layers-footer", button { disabled: settings_id.is_none() || (group_settings().is_none() && active_locked), title: "설정 대상 레이어/그룹 삭제 (Undo로 복원)", onclick: move |_| {
+                if let Some(node) = settings_id {
+                    send_editor_command(&delete_ink, EditorCommand::Layer(LayerCommand::Delete(node)), error);
                 }
             }, UiIcon { name: "trash" } } }
         }
@@ -1919,6 +1990,7 @@ fn LayerRow(
     solo_node: Option<LayerTreeNodeId>,
     error: Signal<Option<String>>,
     mut collapsed_groups: Signal<BTreeSet<GroupId>>,
+    mut group_settings: Signal<Option<GroupId>>,
 ) -> Element {
     let live_ink = use_context::<LiveInkBridge>();
     let active_ink = live_ink.clone();
@@ -1929,9 +2001,6 @@ fn LayerRow(
     let mut renaming = use_signal(|| false);
     let solo_ink = live_ink.clone();
     let delete_ink = live_ink.clone();
-    let alpha_ink = live_ink.clone();
-    let clip_ink = live_ink.clone();
-    let blend_ink = live_ink.clone();
     let id = layer.id;
     let is_active = matches!(id, LayerTreeNodeId::Raster(layer_id) if active == Some(layer_id));
     let is_group = layer.kind == LayerProjectionKind::Group;
@@ -1982,7 +2051,10 @@ fn LayerRow(
                 title: "페이지 내 원본 픽셀 미리보기 · 끌어서 레이어 순서 또는 그룹 변경",
                 onclick: move |_| {
                     if let LayerTreeNodeId::Raster(layer_id) = id {
+                        group_settings.set(None);
                         send_editor_command(&thumbnail_ink, EditorCommand::Layer(LayerCommand::SetActive(layer_id)), error);
+                    } else if let LayerTreeNodeId::Group(group) = id {
+                        group_settings.set(Some(group));
                     }
                 },
                 if let Some(thumbnail) = thumbnail {
@@ -2000,7 +2072,10 @@ fn LayerRow(
             }
             div { class: "layer-meta", onclick: move |_| {
                 if let LayerTreeNodeId::Raster(layer_id) = id {
+                    group_settings.set(None);
                     send_editor_command(&active_ink, EditorCommand::Layer(LayerCommand::SetActive(layer_id)), error);
+                } else if let LayerTreeNodeId::Group(group) = id {
+                    group_settings.set(Some(group));
                 }
             },
                 input {
@@ -2030,31 +2105,13 @@ fn LayerRow(
                 span { class: "layer-detail",
                     if layer.locked { span { title: "픽셀 잠김", UiIcon { name: "lock" } } }
                     if layer.reference { "참조 · " }
-                    if is_group { "그룹" } else { "{opacity}%" }
-                }
-                div { class: "layer-shading-controls", onclick: move |event| event.stop_propagation(),
-                    if let LayerTreeNodeId::Raster(layer_id) = id {
-                        button { title: "투명도 잠금: 기존 alpha를 유지하며 재칠", aria_label: "투명도 잠금", aria_pressed: "{layer.alpha_locked}",
-                            onclick: move |_| send_editor_command(&alpha_ink, EditorCommand::Layer(LayerCommand::SetAlphaLocked { layer: layer_id, alpha_locked: !layer.alpha_locked }), error),
-                            "α"
-                        }
-                    }
-                    button { title: "하위 클리핑: 같은 그룹의 아래 base로 제한", aria_label: "하위 레이어 클리핑", aria_pressed: "{layer.clip_to_below}",
-                        onclick: move |_| send_editor_command(&clip_ink, EditorCommand::Layer(LayerCommand::SetClipToBelow { node: id, clip_to_below: !layer.clip_to_below }), error),
-                        "↳"
-                    }
-                    select { class: "layer-blend", aria_label: "레이어 합성 모드", title: "레이어 합성 모드",
-                        value: if layer.blend_mode == nyatidraw_api::LayerBlendMode::Multiply { "multiply" } else { "normal" },
-                        onchange: move |event| {
-                            let blend_mode = if event.value() == "multiply" { nyatidraw_api::LayerBlendMode::Multiply } else { nyatidraw_api::LayerBlendMode::Normal };
-                            send_editor_command(&blend_ink, EditorCommand::Layer(LayerCommand::SetBlendMode { node: id, blend_mode }), error);
-                        },
-                        option { value: "normal", "Normal" }
-                        option { value: "multiply", "Multiply" }
-                    }
+                    if layer.alpha_locked { "α · " }
+                    if layer.clip_to_below { "↳ · " }
+                    if layer.blend_mode == nyatidraw_api::LayerBlendMode::Multiply { "곱하기 · " }
+                    if is_group { "그룹 · " }
+                    "{opacity}%"
                 }
             }
-            LayerOpacityControl { node: id, opacity_u16: layer.opacity_u16, error }
             button {
                 class: "layer-delete", title: "삭제 (Undo로 복원)", aria_label: "{layer.name} 삭제",
                 disabled: layer.locked,
@@ -2066,22 +2123,86 @@ fn LayerRow(
 }
 
 #[component]
+fn LayerStyleControls(layer: LayerProjection, error: Signal<Option<String>>) -> Element {
+    let live_ink = use_context::<LiveInkBridge>();
+    let alpha_ink = live_ink.clone();
+    let clip_ink = live_ink.clone();
+    let reference_ink = live_ink.clone();
+    let lock_ink = live_ink.clone();
+    let id = layer.id;
+    rsx! { div { class: "layer-style-controls", aria_label: "{layer.name} 합성 설정",
+        div { class: "layer-style-row",
+        select { class: "layer-blend", aria_label: "레이어 합성 모드", title: "{layer.name} 합성 모드",
+            value: if layer.blend_mode == nyatidraw_api::LayerBlendMode::Multiply { "multiply" } else { "normal" },
+            onkeydown: move |event| event.stop_propagation(),
+            onchange: move |event| {
+                let blend_mode = if event.value() == "multiply" { nyatidraw_api::LayerBlendMode::Multiply } else { nyatidraw_api::LayerBlendMode::Normal };
+                send_editor_command(&live_ink, EditorCommand::Layer(LayerCommand::SetBlendMode { node: id, blend_mode }), error);
+            },
+            option { value: "normal", "표준" }
+            option { value: "multiply", "곱하기" }
+        }
+        div { class: "layer-style-flags", role: "group", aria_label: "레이어 속성",
+        if let LayerTreeNodeId::Raster(layer_id) = id {
+            button { title: if layer.locked { "픽셀 잠금 해제" } else { "픽셀 잠금" }, aria_label: "픽셀 잠금", aria_pressed: "{layer.locked}",
+                onclick: move |_| send_editor_command(&lock_ink, EditorCommand::Layer(LayerCommand::SetLocked { layer: layer_id, locked: !layer.locked }), error),
+                if layer.locked { UiIcon { name: "lock" } } else { UiIcon { name: "unlock" } }
+            }
+            button { title: "투명도 잠금", aria_label: "투명도 잠금", aria_pressed: "{layer.alpha_locked}",
+                onclick: move |_| send_editor_command(&alpha_ink, EditorCommand::Layer(LayerCommand::SetAlphaLocked { layer: layer_id, alpha_locked: !layer.alpha_locked }), error), "α"
+            }
+        }
+        button { title: "아래 레이어에 클리핑", aria_label: "아래 레이어에 클리핑", aria_pressed: "{layer.clip_to_below}",
+            onclick: move |_| send_editor_command(&clip_ink, EditorCommand::Layer(LayerCommand::SetClipToBelow { node: id, clip_to_below: !layer.clip_to_below }), error), "↳"
+        }
+        if let LayerTreeNodeId::Raster(layer_id) = id {
+            button { title: "선택·채우기 참조 레이어 (PNG에는 영향 없음)", aria_label: "참조 레이어", aria_pressed: "{layer.reference}",
+                onclick: move |_| send_editor_command(&reference_ink, EditorCommand::Layer(LayerCommand::SetReference { layer: layer_id, reference: !layer.reference }), error),
+                UiIcon { name: "reference" }
+            }
+        }
+        button { class: "unavailable", disabled: true, title: "레이어 색상화 · 준비 중", aria_label: "레이어 색상화 · 준비 중", span { class: "layer-color-chip" } }
+        }
+        }
+        LayerOpacityControl { key: "{id:?}", node: id, opacity_u16: layer.opacity_u16, error }
+    } }
+}
+
+#[component]
 fn LayerOpacityControl(
     node: LayerTreeNodeId,
     opacity_u16: u16,
     error: Signal<Option<String>>,
 ) -> Element {
     let live_ink = use_context::<LiveInkBridge>();
+    let slider_ink = live_ink.clone();
     let percent = (u32::from(opacity_u16) * 100 + 32_767) / u32::from(u16::MAX);
     let mut draft = use_signal(|| percent.to_string());
     use_effect(use_reactive((&percent,), move |(value,)| {
         draft.set(value.to_string());
     }));
     rsx! {
-        label { class: "layer-opacity", title: "레이어 불투명도",
+        div { class: "layer-opacity", role: "group", aria_label: "레이어 불투명도",
+            input { class: "layer-opacity-slider", r#type: "range", min: "0", max: "100", step: "1",
+                title: "불투명도 · 드래그 후 놓으면 적용", aria_label: "레이어 불투명도 드래그 조절",
+                value: "{draft}",
+                onkeydown: move |event| { if event.key() != Key::Escape { event.stop_propagation(); } },
+                oninput: move |event| draft.set(event.value()),
+                onchange: move |event| {
+                    if let Ok(value) = event.value().parse::<u32>() {
+                        let value = value.min(100);
+                        if value != percent {
+                            let opacity_u16 = u16::try_from((value * 65_535 + 50) / 100).expect("bounded opacity");
+                            send_editor_command(&slider_ink, EditorCommand::Layer(LayerCommand::SetOpacity { node, opacity_u16 }), error);
+                        }
+                        draft.set(value.to_string());
+                    }
+                }
+            }
             input { r#type: "number", min: "0", max: "100", step: "1",
+                class: "layer-opacity-number", title: "레이어 불투명도 수치",
                 aria_label: "레이어 불투명도 %", value: "{draft}",
-                onkeydown: move |event| event.stop_propagation(),
+                onkeydown: move |event| { if event.key() != Key::Escape { event.stop_propagation(); } },
                 oninput: move |event| draft.set(event.value()),
                 onchange: move |_| {
                     if let Ok(value) = draft().parse::<i64>() {
@@ -2286,6 +2407,28 @@ fn UiIcon(name: &'static str) -> Element {
             "M13 21h-2",
             "M7 21H3v-4",
             "M3 13v-2",
+        ],
+        "invert-selection" => &[
+            "M3 3h18v18H3z",
+            "M3 21 21 3",
+            "M3 8h5",
+            "M3 13h10",
+            "M3 18h15",
+        ],
+        "deselect" => &[
+            "M7 3H3v4",
+            "M17 3h4v4",
+            "M21 17v4h-4",
+            "M7 21H3v-4",
+            "m8 8 8 8",
+            "m16 8-8 8",
+        ],
+        "select-alpha" => &[
+            "M7 3H3v4",
+            "M17 3h4v4",
+            "M21 17v4h-4",
+            "M7 21H3v-4",
+            "M12 6c-2 3-5 5-5 8a5 5 0 0 0 10 0c0-3-3-5-5-8z",
         ],
         "wand" => &[
             "m4 20 10-10",

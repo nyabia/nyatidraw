@@ -87,6 +87,14 @@ impl EditGesture {
         )
     }
 
+    pub(crate) fn picker_point(&self, sample: StylusSample) -> Option<[i32; 2]> {
+        (self.tool == DrawingTool::Eyedropper
+            && self.error.is_none()
+            && sample.viewport_revision == self.viewport_revision)
+            .then(|| document_pixel(sample))
+            .flatten()
+    }
+
     pub(crate) fn finish(mut self, sample: StylusSample) -> Result<EditCommand, String> {
         if sample.phase != PointerPhase::End {
             return Err("선택 제스처가 취소됐습니다.".into());

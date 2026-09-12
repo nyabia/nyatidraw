@@ -500,13 +500,24 @@ impl CpuCanvas {
 
         for y in bounds.top..bounds.bottom {
             for x in bounds.left..bounds.right {
-                let coverage = circle_coverage(dab.center, radius, dab.hardness, x, y);
+                let coverage = if dab.grain.is_some() {
+                    // Integer circle membership and document-space paper match WGSL.
+                    #[allow(clippy::cast_precision_loss)]
+                    let value = nyatidraw_brush::pencil_coverage_units(dab, x, y) as f32 / 4080.0;
+                    value
+                } else {
+                    circle_coverage(dab.center, radius, dab.hardness, x, y)
+                };
                 if coverage == 0.0 {
                     continue;
                 }
                 composite(
                     &mut self.pixels[pixel_offset(self.width, x, y)..][..4],
-                    coverage * alpha,
+                    if dab.grain.is_some() {
+                        (coverage * alpha * 255.0).round() / 255.0
+                    } else {
+                        coverage * alpha
+                    },
                 );
             }
         }
@@ -840,6 +851,7 @@ mod tests {
                 opacity: 0.5,
                 flow: 0.5,
                 hardness: 1.0,
+                grain: None,
             },
             PremultipliedRgba8::new(128, 64, 32, 128),
         );
@@ -909,6 +921,7 @@ mod tests {
                 opacity,
                 flow: 1.0,
                 hardness: 1.0,
+                grain: None,
             };
             canvas.apply_dab_alpha_locked(dab, PremultipliedRgba8(color));
             assert_eq!(canvas.pixel(0, 0).unwrap().0, expected);
@@ -931,6 +944,7 @@ mod tests {
             opacity: 0.5,
             flow: 1.0,
             hardness: 1.0,
+            grain: None,
         });
 
         assert_eq!(

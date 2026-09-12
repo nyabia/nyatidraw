@@ -96,7 +96,7 @@ pub(crate) fn layer_thumbnail_frame(
     })
 }
 
-fn png_data_uri(png: &[u8], maximum: usize, label: &str) -> Result<Arc<str>, String> {
+pub(crate) fn png_data_uri(png: &[u8], maximum: usize, label: &str) -> Result<Arc<str>, String> {
     const PREFIX: &str = "data:image/png;base64,";
     let encoded_len = png.len().div_ceil(3).saturating_mul(4);
     let total_len = PREFIX.len().saturating_add(encoded_len);

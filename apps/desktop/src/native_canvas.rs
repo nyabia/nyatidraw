@@ -40,6 +40,10 @@ mod transform_gpu_acceptance;
 #[path = "transform_runtime.rs"]
 mod transform_runtime;
 
+#[path = "picker_preview.rs"]
+mod picker_preview;
+pub(crate) use picker_preview::PickerSnapshot;
+
 use nyatidraw_api::{
     BrushSettings, CanvasSpec, CommandEnvelope, CommandRejectReason, ContentRootId, DockCommand,
     DockTree, DrawingTool, EditCommand, EditorCommand, EditorEvent, GroupId, HistoryNodeId,
@@ -173,14 +177,19 @@ fn history_probe_command() -> Option<EditorCommand> {
     .map(EditorCommand::History)
 }
 
+pub(crate) fn preset_for_ui_preview(projection: &nyatidraw_api::UiProjection) -> BrushPreset {
+    DrawingConfig::from_projection(projection).preset()
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DrawingConfig {
     edit_settings: nyatidraw_api::EditSettings,
     tool: DrawingTool,
+    pencil_template: nyatidraw_api::PencilTemplate,
     size_tenths: u16,
     opacity_u16: u16,
     brush_settings: BrushSettings,
-    remembered: [RememberedBrush; 4],
+    remembered: [RememberedBrush; 5],
     last_painting_slot: usize,
     color: [u8; 4],
     background_color: [u8; 4],
@@ -208,6 +217,7 @@ impl DrawingConfig {
         let mut drawing = Self {
             edit_settings: projection.edit_settings,
             tool: projection.drawing_tool,
+            pencil_template: projection.pencil_template,
             size_tenths: projection.brush_size_tenths,
             opacity_u16: projection.brush_opacity_u16,
             brush_settings: projection.brush_settings,
@@ -216,11 +226,22 @@ impl DrawingConfig {
                 RememberedBrush::for_tool(DrawingTool::Pen),
                 RememberedBrush::for_tool(DrawingTool::Brush),
                 RememberedBrush::for_tool(DrawingTool::Eraser),
+                RememberedBrush {
+                    settings: BrushSettings::for_pencil_template(
+                        nyatidraw_api::PencilTemplate::Graphite2B,
+                    ),
+                    ..RememberedBrush::for_tool(DrawingTool::Pencil)
+                },
             ],
             last_painting_slot: Self::painting_slot(projection.drawing_tool).unwrap_or(2),
             color: projection.brush_color,
             background_color: projection.background_color,
         };
+        if projection.drawing_tool == DrawingTool::Pencil
+            && projection.pencil_template == nyatidraw_api::PencilTemplate::Graphite2B
+        {
+            drawing.last_painting_slot = 4;
+        }
         drawing.remember_current();
         drawing
     }
@@ -246,7 +267,12 @@ impl DrawingConfig {
     fn select_tool(&mut self, tool: DrawingTool) {
         self.remember_current();
         self.tool = tool;
-        if let Some(slot) = Self::painting_slot(tool) {
+        if let Some(mut slot) = Self::painting_slot(tool) {
+            if tool == DrawingTool::Pencil
+                && self.pencil_template == nyatidraw_api::PencilTemplate::Graphite2B
+            {
+                slot = 4;
+            }
             let brush = self.remembered[slot];
             self.last_painting_slot = slot;
             self.size_tenths = brush.size_tenths;
@@ -256,6 +282,27 @@ impl DrawingConfig {
     }
 
     fn preset(self) -> BrushPreset {
+        if self.tool == DrawingTool::Pencil {
+            let kind = match self.pencil_template {
+                nyatidraw_api::PencilTemplate::Mechanical2H => {
+                    nyatidraw_brush::PencilKind::Mechanical2H
+                }
+                nyatidraw_api::PencilTemplate::Graphite2B => {
+                    nyatidraw_brush::PencilKind::Graphite2B
+                }
+            };
+            return BrushPreset {
+                size_px: f32::from(self.size_tenths) / 10.0,
+                opacity: f32::from(self.opacity_u16) / f32::from(u16::MAX),
+                size_pressure: self.brush_settings.size_pressure,
+                opacity_pressure: self.brush_settings.opacity_pressure,
+                size_min_ratio: f32::from(self.brush_settings.size_minimum_u16)
+                    / f32::from(u16::MAX),
+                opacity_min_ratio: f32::from(self.brush_settings.opacity_minimum_u16)
+                    / f32::from(u16::MAX),
+                ..nyatidraw_brush::pencil_preset(kind)
+            };
+        }
         let (id, flow, spacing_ratio) = match self.tool {
             DrawingTool::Pencil => (BrushPresetId(2), 0.82, 0.08),
             DrawingTool::Pen => (BrushPresetId(3), 1.0, 0.08),
@@ -701,7 +748,11 @@ impl SharedGpuCanvas {
         // Drain admitted native samples before same-frame semantic requests.
         canvas.render(size[0], size[1], scale, self.geometry_epoch);
         if canvas.stroke.transform_projection.is_some()
-            || canvas.artwork_job.as_ref().is_some_and(|job| job.transform)
+            || canvas.stroke.transform_starting
+            || canvas
+                .artwork_job
+                .as_ref()
+                .is_some_and(|job| job.transform.is_some())
         {
             return Err("변형을 확정하거나 취소한 뒤 저장하세요.".into());
         }
@@ -1654,7 +1705,17 @@ impl ActiveCanvas {
             return None;
         }
 
-        let history_timing = self.poll_artwork();
+        // Native picker results are adopted after queued Cancel/focus loss and
+        // this frame's samples, so a completed read cannot overtake cancellation.
+        let history_timing = if self
+            .artwork_job
+            .as_ref()
+            .is_some_and(|job| job.picker_token.is_some())
+        {
+            None
+        } else {
+            self.poll_artwork()
+        };
         // Native samples already carry the renderer-published document
         // coordinates from their admission moment. Consume their End and put
         // its closed stroke in the writer FIFO before accepting same-frame UI
@@ -1669,8 +1730,16 @@ impl ActiveCanvas {
             .tree()
             .raster(self.active_layer)
             .is_some_and(|layer| layer.alpha_locked);
+        self.stroke.picker_solo = self.projection.current().solo_node;
         let drained = self.stroke.drain(self.active_layer, self.drawing);
         self.execute_gpu_ops(drained.samples);
+        let previous_cancel = self.projection.current().edit.can_cancel;
+        self.stage_cancel_availability();
+        if previous_cancel != self.projection.current().edit.can_cancel {
+            self.async_publication_base_revision
+                .get_or_insert(self.projection.current().revision);
+            self.publish_current_projection();
+        }
         if self.synchronize_workspace_failure() {
             return None;
         }
@@ -1678,13 +1747,16 @@ impl ActiveCanvas {
         // Retry once after End so a newly available writer slot cannot let Save
         // overtake a retained closed stroke.
         self.stroke.flush_pending_materializations();
-        let mut recent_sizes_changed = false;
+        let mut recent_usage_changed = false;
         for size in drained.started_brush_sizes.into_iter().flatten().rev() {
-            recent_sizes_changed |= self.projection.stage_used_brush_size(size);
+            recent_usage_changed |= self.projection.stage_used_brush_size(size);
+        }
+        for color in drained.started_brush_colors.into_iter().flatten().rev() {
+            recent_usage_changed |= self.projection.stage_used_brush_color(color);
         }
         if drained.artwork_closed {
             self.publish_closed_stroke_dirty();
-        } else if recent_sizes_changed {
+        } else if recent_usage_changed {
             self.async_publication_base_revision
                 .get_or_insert(self.projection.current().revision);
             self.publish_current_projection();
@@ -1693,6 +1765,14 @@ impl ActiveCanvas {
         self.adopt_native_edit();
         self.flush_transform_preview();
         self.apply_commands(width, height, scale);
+        self.update_picker_preview();
+        if self
+            .artwork_job
+            .as_ref()
+            .is_some_and(|job| job.picker_token.is_some())
+        {
+            let _ = self.poll_artwork();
+        }
         if self.synchronize_workspace_failure() {
             return None;
         }
@@ -1922,9 +2002,38 @@ impl ActiveCanvas {
         height: u32,
         scale: f64,
     ) -> Result<bool, CommandRejectReason> {
-        if self.stroke.transform_projection.is_some() {
+        if self
+            .stroke
+            .picker
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.released)
+            && !matches!(
+                command,
+                EditorCommand::Tool(ToolCommand::CancelGesture)
+                    | EditorCommand::Dock(_)
+                    | EditorCommand::Viewport(_)
+                    | EditorCommand::Project(ProjectCommand::Save)
+            )
+        {
+            return Err(CommandRejectReason::CommandQueueBusy);
+        }
+        if self.transform_active() {
             if matches!(command, EditorCommand::Tool(ToolCommand::CancelGesture)) {
                 return self.enqueue_free_transform(nyatidraw_api::TransformCommand::Cancel);
+            }
+            if let EditorCommand::Tool(tool_command) = command
+                && let Some(tool) = transform_runtime::selected_tool(
+                    self.stroke.pending_tool.unwrap_or(self.drawing.tool),
+                    tool_command,
+                )
+            {
+                let template = match tool_command {
+                    ToolCommand::SelectPencilTemplate(template) => Some(template),
+                    _ => None,
+                };
+                self.switch_transform_tool(tool, template);
+                return Ok(false);
             }
             if !matches!(
                 command,
@@ -2163,18 +2272,17 @@ impl ActiveCanvas {
                 Ok(false)
             }
             EditorCommand::Tool(ToolCommand::CancelGesture) => {
-                self.stroke.edit_gesture = None;
-                self.stroke.completed_edit = None;
-                if let Some(sequence) = self.stroke.completed_temporary_picker.take() {
-                    self.stroke.live_ink.complete_temporary_pick(sequence);
+                if self.stroke.cancel_native_gesture() {
+                    self.execute_gpu_ops(0);
+                    self.stage_cancel_availability();
+                    return Ok(false);
+                }
+                if self.selection.is_some() {
+                    return self.enqueue_edit(EditCommand::ClearSelection);
                 }
                 Ok(false)
             }
             EditorCommand::Tool(command) => {
-                let start_transform =
-                    matches!(command, ToolCommand::Select(DrawingTool::MoveSelection))
-                        || (command == ToolCommand::CycleSelectionFamily
-                            && self.drawing.tool == DrawingTool::Move);
                 // A pending eyedropper result must not overwrite a newer color
                 // command. Serialize color mutations with the artwork worker.
                 if (self.artwork_job.is_some() || self.stroke.live_ink.temporary_pick_pending())
@@ -2195,6 +2303,12 @@ impl ActiveCanvas {
                             self.stroke
                                 .live_ink
                                 .set_navigation_tool(tool == DrawingTool::Move);
+                        }
+                        ToolCommand::SelectPencilTemplate(template) => {
+                            self.drawing.remember_current();
+                            self.drawing.pencil_template = template;
+                            self.drawing.select_tool(DrawingTool::Pencil);
+                            self.stroke.live_ink.set_navigation_tool(false);
                         }
                         ToolCommand::CycleBrushFamily => {
                             let tool = match self.drawing.tool {
@@ -2311,6 +2425,8 @@ impl ActiveCanvas {
                     }
                     self.drawing.remember_current();
                     self.projection
+                        .stage_pencil_template(self.drawing.pencil_template);
+                    self.projection
                         .stage_brush_settings(self.drawing.brush_settings);
                     self.projection.stage_drawing_controls(
                         self.drawing.tool,
@@ -2323,14 +2439,6 @@ impl ActiveCanvas {
                         .stage_edit_settings(self.drawing.edit_settings);
                     Ok(false)
                 })();
-                if result.is_ok() && start_transform && self.selection.is_some() {
-                    let started =
-                        self.enqueue_free_transform(nyatidraw_api::TransformCommand::Begin);
-                    if self.artwork_job.is_none() {
-                        self.stroke.live_ink.resume_after_edit();
-                    }
-                    return started;
-                }
                 if self.artwork_job.is_none() {
                     self.stroke.live_ink.resume_after_edit();
                 }
@@ -2711,13 +2819,13 @@ impl ActiveCanvas {
             } => Some(*input_sequence),
             _ => None,
         };
-        let transform = matches!(
-            &request,
+        let transform = match &request {
             WorkerRequest::Edit {
-                command: EditCommand::FreeTransform(_),
+                command: EditCommand::FreeTransform(command),
                 ..
-            }
-        );
+            } => Some(command.clone()),
+            _ => None,
+        };
         let queued = self
             .stroke
             .materializer
@@ -2729,14 +2837,23 @@ impl ActiveCanvas {
             return Err(CommandRejectReason::CommandQueueBusy);
         }
         self.artwork_job = Some(ArtworkJob {
-            transform,
+            transform: transform.clone(),
             temporary_picker,
+            picker_token: None,
             received,
             active_layer,
             history_timing: (kind == "history").then(HistoryTiming::queued).flatten(),
         });
         let mut edit = self.projection.current().edit.clone();
         edit.busy = true;
+        edit.can_cancel = matches!(
+            transform,
+            Some(
+                nyatidraw_api::TransformCommand::Begin
+                    | nyatidraw_api::TransformCommand::Paste
+                    | nyatidraw_api::TransformCommand::Preview(_)
+            )
+        );
         edit.error = None;
         self.projection.stage_edit(edit);
         println!(
@@ -2750,17 +2867,41 @@ impl ActiveCanvas {
             return;
         };
         let temporary_picker = std::mem::take(&mut self.stroke.completed_temporary_picker);
+        let picker_token = self
+            .stroke
+            .picker
+            .gesture
+            .as_ref()
+            .filter(|gesture| gesture.released)
+            .map(|gesture| gesture.token);
         let result = result.and_then(|command| {
-            let command = match command {
-                EditCommand::PickColor { point, .. } if temporary_picker.is_some() => {
-                    EditCommand::PickDisplayColor {
-                        point,
-                        solo: self.projection.current().solo_node,
-                        input_sequence: temporary_picker.expect("matched temporary read"),
-                    }
+            if matches!(
+                command,
+                EditCommand::PickColor { .. } | EditCommand::PickDisplayColor { .. }
+            ) && picker_token.is_none_or(|token| !self.stroke.picker_token_valid(token))
+            {
+                self.stroke.cancel_picker();
+                if let Some(sequence) = temporary_picker {
+                    self.stroke.live_ink.complete_temporary_pick(sequence);
                 }
-                other => other,
-            };
+                return Ok(());
+            }
+            let command =
+                match command {
+                    EditCommand::PickColor { point, .. } if temporary_picker.is_some() => {
+                        EditCommand::PickDisplayColor {
+                            point,
+                            solo: self.stroke.picker.gesture.as_ref().and_then(|gesture| {
+                                match gesture.source {
+                                    crate::edit_worker::PickerSource::Display(solo) => solo,
+                                    crate::edit_worker::PickerSource::Artwork(_) => None,
+                                }
+                            }),
+                            input_sequence: temporary_picker.expect("matched temporary read"),
+                        }
+                    }
+                    other => other,
+                };
             if let EditCommand::Transform(legacy) = &command
                 && self.drawing.tool == DrawingTool::MoveSelection
             {
@@ -2776,7 +2917,7 @@ impl ActiveCanvas {
                 return Ok(());
             }
             let queued = self.enqueue_edit(command.clone());
-            if temporary_picker.is_some()
+            if (temporary_picker.is_some() || picker_token.is_some())
                 && matches!(
                     queued,
                     Err(CommandRejectReason::CommandQueueBusy
@@ -2787,11 +2928,22 @@ impl ActiveCanvas {
                 self.stroke.completed_temporary_picker = temporary_picker;
                 return Ok(());
             }
+            if queued.is_ok()
+                && let Some(job) = &mut self.artwork_job
+            {
+                job.picker_token = picker_token;
+                if picker_token.is_some() {
+                    self.stage_cancel_availability();
+                }
+            }
             queued
                 .map(|_| ())
                 .map_err(|error| format!("편집을 적용하지 못했습니다. 다시 시도하세요: {error:?}"))
         });
         if let Err(error) = result {
+            if picker_token.is_some() {
+                self.stroke.cancel_picker();
+            }
             if let Some(sequence) = temporary_picker {
                 self.stroke.live_ink.complete_temporary_pick(sequence);
                 self.stroke.live_ink.resume_after_edit();
@@ -2820,10 +2972,15 @@ impl ActiveCanvas {
         };
         let active_layer = job.active_layer;
         let temporary_picker = job.temporary_picker;
+        let picker_token = job.picker_token;
+        let picker_cancelled =
+            picker_token.is_some_and(|token| !self.stroke.picker_token_valid(token));
+        let transform_command = job.transform.clone();
         let mut history_timing = job.history_timing;
         let mut history_changed = false;
         let mut error = None;
         match result {
+            Ok(ArtworkOutcome::Edit(_)) | Err(EditFailure::Rejected(_)) if picker_cancelled => {}
             Ok(ArtworkOutcome::Transform(outcome)) => {
                 if let Err(reason) = self.install_transform_outcome(outcome) {
                     self.stroke.live_ink.publish_workspace_error(reason);
@@ -2887,6 +3044,7 @@ impl ActiveCanvas {
                 }
             }
             Err(EditFailure::Rejected(reason)) => {
+                self.reject_transform_outcome(transform_command.as_ref());
                 if let Some(transform) = &mut self.stroke.transform_projection {
                     transform.can_commit = false;
                 }
@@ -2898,6 +3056,9 @@ impl ActiveCanvas {
             }
         }
         self.artwork_job = None;
+        if picker_token.is_some() {
+            self.stroke.cancel_picker();
+        }
         if let Some(sequence) = temporary_picker {
             self.stroke.live_ink.complete_temporary_pick(sequence);
         }
@@ -2907,6 +3068,7 @@ impl ActiveCanvas {
             .map_or(0, |mask| mask.selected_pixels());
         self.projection.stage_edit(nyatidraw_api::EditProjection {
             busy: false,
+            can_cancel: self.stroke.transform_projection.is_some(),
             has_selection: self.selection.is_some(),
             selected_pixels,
             error,
@@ -3141,6 +3303,7 @@ impl ActiveCanvas {
     /// History is staged separately after writer confirmation; a usage-only
     /// publication must not claim an active stroke is durably committed.
     fn publish_current_projection(&mut self) {
+        self.stage_cancel_availability();
         let _timing = Span::new(Stage::Projection);
         let publish = self.projection.publish_editor_state(
             self.project_title.clone(),
@@ -3790,6 +3953,12 @@ fn input_probe_sample(sequence: u64, phase: PointerPhase) -> StylusSample {
 // discontinuity/fatal/shutdown lifecycle flags; it is not another lifecycle state.
 #[allow(clippy::struct_excessive_bools)]
 struct StrokePipeline {
+    /// Native-only pending Begin and one latest target; no sample enters UI.
+    transform_starting: bool,
+    transform_paste: bool,
+    pending_tool: Option<DrawingTool>,
+    pending_pencil_template: Option<nyatidraw_api::PencilTemplate>,
+    revalidating_transform: bool,
     transform_projection: Option<nyatidraw_api::TransformProjection>,
     transform_gesture: Option<(
         crate::transform_gesture::TransformGesture,
@@ -3801,6 +3970,8 @@ struct StrokePipeline {
     edit_gesture: Option<crate::edit_gesture::EditGesture>,
     temporary_picker_active: bool,
     completed_temporary_picker: Option<(u64, u64)>,
+    picker: picker_preview::PickerRuntime,
+    picker_solo: Option<nyatidraw_api::LayerTreeNodeId>,
     completed_edit: Option<Result<EditCommand, String>>,
     selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     live_ink: LiveInkBridge,
@@ -3833,10 +4004,13 @@ struct StrokeDrain {
     artwork_closed: bool,
     /// Bounded newest-first Begin usage; never carries samples through the UI.
     started_brush_sizes: [Option<u16>; 4],
+    /// Source sRGB colors captured with the accepted immutable stroke config.
+    /// Erasing consumes no painting color. This lane has the same bound as MRU.
+    started_brush_colors: [Option<[u8; 4]>; 10],
 }
 
 impl StrokeDrain {
-    fn record_brush_begin(&mut self, size: u16) {
+    fn record_brush_begin(&mut self, size: u16, color: Option<[u8; 4]>) {
         let index = self
             .started_brush_sizes
             .iter()
@@ -3844,6 +4018,15 @@ impl StrokeDrain {
             .unwrap_or(self.started_brush_sizes.len() - 1);
         self.started_brush_sizes[..=index].rotate_right(1);
         self.started_brush_sizes[0] = Some(size);
+        if let Some(color) = color {
+            let index = self
+                .started_brush_colors
+                .iter()
+                .position(|entry| *entry == Some(color))
+                .unwrap_or(self.started_brush_colors.len() - 1);
+            self.started_brush_colors[..=index].rotate_right(1);
+            self.started_brush_colors[0] = Some(color);
+        }
     }
 }
 
@@ -3852,6 +4035,11 @@ impl StrokePipeline {
         let materialization_backlog_capacity = live_ink.maximum_drain_len();
         Self {
             live_ink,
+            transform_starting: false,
+            transform_paste: false,
+            pending_tool: None,
+            pending_pencil_template: None,
+            revalidating_transform: false,
             transform_projection: None,
             transform_gesture: None,
             pending_transform: None,
@@ -3860,6 +4048,8 @@ impl StrokePipeline {
             edit_gesture: None,
             temporary_picker_active: false,
             completed_temporary_picker: None,
+            picker: picker_preview::PickerRuntime::default(),
+            picker_solo: None,
             completed_edit: None,
             evaluator: RoundBrushEvaluator::new(0x4e41_5941_5449),
             active: None,
@@ -3921,6 +4111,7 @@ impl StrokePipeline {
         for admitted in queued_samples.drain(..) {
             let mut sample = admitted.queued.sample;
             if sample.phase == PointerPhase::Begin {
+                self.cancel_picker();
                 self.temporary_picker_active = admitted.temporary_picker;
             }
             let temporary_picker = self.temporary_picker_active;
@@ -3961,13 +4152,20 @@ impl StrokePipeline {
                     sample.sequence, self.recovery_quarantined,
                 );
             }
-            if self.transform_projection.is_some() {
+            if self.transform_projection.is_some() || self.transform_starting {
                 if !temporary_picker {
                     self.observe_transform_sample(sample);
                 }
                 if temporary_picker && sample.phase == PointerPhase::End {
                     self.live_ink
                         .complete_temporary_pick((sample.device_id, sample.sequence));
+                }
+                continue;
+            }
+            if gesture_tool == DrawingTool::MoveSelection && !temporary_picker {
+                if sample.phase != PointerPhase::Begin || admitted.begin_layer == Some(active_layer)
+                {
+                    self.begin_native_transform(sample);
                 }
                 continue;
             }
@@ -4005,20 +4203,42 @@ impl StrokePipeline {
                             self.selection.is_some(),
                             sample,
                         ));
+                        if let Some(point) = self
+                            .edit_gesture
+                            .as_ref()
+                            .and_then(|gesture| gesture.picker_point(sample))
+                        {
+                            let source = if temporary_picker {
+                                crate::edit_worker::PickerSource::Display(self.picker_solo)
+                            } else {
+                                crate::edit_worker::PickerSource::Artwork(settings.source)
+                            };
+                            self.begin_picker(sample, point, admitted.picker_epoch, source);
+                        }
                     }
                     PointerPhase::Move => {
                         if let Some(gesture) = &mut self.edit_gesture {
                             gesture.push(sample);
                         }
+                        let point = self
+                            .edit_gesture
+                            .as_ref()
+                            .and_then(|gesture| gesture.picker_point(sample));
+                        self.move_picker(sample, point);
                     }
                     PointerPhase::Cancel => {
                         self.edit_gesture = None;
+                        self.cancel_picker();
                     }
                     PointerPhase::End => {
                         if let Some(gesture) = self.edit_gesture.take() {
                             self.completed_temporary_picker =
                                 temporary_picker.then_some((sample.device_id, sample.sequence));
                             let result = gesture.finish(sample);
+                            if let Some(picker) = &mut self.picker.gesture {
+                                picker.released = true;
+                                self.live_ink.publish_picker_snapshot(None);
+                            }
                             self.completed_edit = Some(if self.completed_edit.is_none() {
                                 result
                             } else {
@@ -4128,7 +4348,15 @@ impl StrokePipeline {
                     } else {
                         drawing.size_tenths
                     };
-                    report.record_brush_begin(used_size);
+                    // Preserve the exact sRGB source chosen for this accepted
+                    // stroke, rather than round-tripping quantized tile bytes.
+                    let used_color = (!eraser
+                        && matches!(
+                            drawing.tool,
+                            DrawingTool::Pencil | DrawingTool::Pen | DrawingTool::Brush
+                        ))
+                    .then_some(drawing.color);
+                    report.record_brush_begin(used_size, used_color);
                 }
                 PointerPhase::Move => {
                     if let Some(active) = self.active.as_mut() {
@@ -4137,6 +4365,14 @@ impl StrokePipeline {
                         self.scratch_dabs.clear();
                         self.evaluator
                             .push(&mut active.token, &[sample], &mut self.scratch_dabs);
+                        if active.token.is_discontinuous() {
+                            self.cancel_native_brush_discontinuity(
+                                sample.sequence,
+                                "brush-dab-budget",
+                                "입력 간격이 너무 커 현재 선을 취소했습니다. 다시 그려주세요.",
+                            );
+                            continue;
+                        }
                         append_gpu_dabs(
                             &mut self.gpu_ops,
                             active.generation,
@@ -4151,6 +4387,15 @@ impl StrokePipeline {
                         self.scratch_dabs.clear();
                         self.evaluator
                             .push(&mut active.token, &[sample], &mut self.scratch_dabs);
+                        if active.token.is_discontinuous() {
+                            self.active = Some(active);
+                            self.cancel_native_brush_discontinuity(
+                                sample.sequence,
+                                "brush-dab-budget",
+                                "입력 간격이 너무 커 현재 선을 취소했습니다. 다시 그려주세요.",
+                            );
+                            continue;
+                        }
                         append_gpu_dabs(
                             &mut self.gpu_ops,
                             active.generation,
@@ -4241,6 +4486,14 @@ impl StrokePipeline {
     }
 
     fn cancel_invalid_smoothed_stroke(&mut self, sequence: u64) {
+        self.cancel_native_brush_discontinuity(
+            sequence,
+            "invalid-smoothing-position",
+            "잘못된 입력 좌표로 현재 선을 취소했습니다. 다시 그려주세요.",
+        );
+    }
+
+    fn cancel_native_brush_discontinuity(&mut self, sequence: u64, reason: &str, message: &str) {
         if let Some(active) = self.active.take() {
             self.gpu_ops.truncate(active.gpu_op_start);
             self.scratch_dabs.clear();
@@ -4252,15 +4505,25 @@ impl StrokePipeline {
             });
         }
         self.awaiting_clean_begin = true;
-        self.live_ink.publish_activation_notice(
-            "잘못된 입력 좌표로 현재 선을 취소했습니다. 다시 그려주세요.".into(),
-        );
+        self.live_ink.publish_activation_notice(message.into());
         eprintln!(
-            "live-ink event=stroke-cancelled reason=invalid-smoothing-position sequence={sequence} materialized=false recovery=await-clean-begin"
+            "live-ink event=stroke-cancelled reason={reason} sequence={sequence} materialized=false recovery=await-clean-begin"
         );
     }
 
     fn consume_discontinuity(&mut self, discontinuity: InputDiscontinuity) {
+        self.cancel_picker();
+        if matches!(
+            self.completed_edit,
+            Some(Ok(
+                EditCommand::PickColor { .. } | EditCommand::PickDisplayColor { .. }
+            ))
+        ) {
+            self.completed_edit = None;
+            if let Some(sequence) = self.completed_temporary_picker.take() {
+                self.live_ink.complete_temporary_pick(sequence);
+            }
+        }
         if let Some((_, _, original)) = self.transform_gesture.take() {
             self.pending_transform = Some(original);
         }
@@ -4299,6 +4562,7 @@ impl StrokePipeline {
     }
 
     fn fail_closed(&mut self, reason: &str) {
+        self.cancel_picker();
         self.temporary_picker_active = false;
         self.edit_gesture = None;
         self.completed_edit = None;
@@ -4769,6 +5033,10 @@ impl LayerPixelChange {
 }
 
 enum WorkerRequest {
+    PickerPreview {
+        request: picker_preview::PickerRead,
+        reply: SyncSender<Result<picker_preview::PickerFrame, String>>,
+    },
     Stroke(ClosedStrokeRequest),
     Edit {
         command: nyatidraw_api::EditCommand,
@@ -4797,8 +5065,9 @@ enum ArtworkOutcome {
 }
 
 struct ArtworkJob {
-    transform: bool,
+    transform: Option<nyatidraw_api::TransformCommand>,
     temporary_picker: Option<(u64, u64)>,
+    picker_token: Option<picker_preview::PickerToken>,
     received: Receiver<Result<ArtworkOutcome, EditFailure>>,
     active_layer: Option<LayerId>,
     history_timing: Option<HistoryTiming>,
@@ -5350,6 +5619,12 @@ fn materialization_loop(
             continue;
         }
         let request = match work {
+            WorkerRequest::PickerPreview { request, reply } => {
+                let result = picker_preview::sample_patch(request, session.tiles(), &preview_tree);
+                let _ = reply.send(result);
+                live_ink.request_redraw();
+                continue;
+            }
             WorkerRequest::Stroke(request) => request,
             WorkerRequest::Edit {
                 command,
@@ -6118,6 +6393,7 @@ fn add_synthetic_seed(width: u32, height: u32, output: &mut Vec<BrushDab>) {
     for index in 0..=48_u32 {
         let t = f64::from(index) / 48.0;
         output.push(BrushDab {
+            grain: None,
             center: nyatidraw_input::Point {
                 x: width * t.mul_add(0.68, 0.16),
                 y: height * (0.5 + (t * std::f64::consts::TAU).sin() * 0.18),
@@ -6134,6 +6410,7 @@ fn add_synthetic_background(output: &mut Vec<BrushDab>) {
     for index in 0..18_u32 {
         let t = f64::from(index) / 17.0;
         output.push(BrushDab {
+            grain: None,
             center: Point {
                 x: 170.0 + t * 680.0,
                 y: 570.0 - t * 360.0,
@@ -6431,6 +6708,107 @@ mod tests {
     }
 
     #[test]
+    fn escape_quarantines_gesture_tail_without_committing_artwork() {
+        // Product risk: the End following Escape commits a cancelled line or
+        // selection, or usage-only metadata changes dirty/history state. An
+        // accepted cancelled stroke still used its immutable source color.
+        for (tool, hardware_eraser, uses_color) in [
+            (DrawingTool::Pencil, false, true),
+            (DrawingTool::Pen, false, true),
+            (DrawingTool::Brush, false, true),
+            (DrawingTool::Brush, true, false),
+            (DrawingTool::Eraser, false, false),
+            (DrawingTool::Lasso, false, false),
+            (DrawingTool::Fill, false, false),
+            (DrawingTool::Eyedropper, false, false),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "nyatidraw-cancel-gesture-{}-{}.ntdr",
+                std::process::id(),
+                system_timestamp_ns()
+            ));
+            let ink = LiveInkBridge::with_capacity(16, LIVE_LAYER);
+            let bootstrap = MaterializationWorker::start(
+                ink.clone(),
+                &ProjectLocation::UntitledRecovery(path.clone()),
+            )
+            .unwrap();
+            let mut pipeline = StrokePipeline::new(ink.clone(), bootstrap.worker);
+            let mut drawing = pipeline.drawing;
+            drawing.select_tool(tool);
+            drawing.color = if tool == DrawingTool::Pencil {
+                [0, 0, 0, 255]
+            } else {
+                [17, 83, 211, 255]
+            };
+            let mut projection = ProjectionState::new(DockTree::safe_default());
+            let original_history = projection.current().history.clone();
+            projection.stage_drawing_controls(
+                tool,
+                drawing.size_tenths,
+                drawing.opacity_u16,
+                drawing.color,
+                drawing.background_color,
+            );
+            assert!(
+                projection.current().recent_colors.is_empty(),
+                "selecting a color is not an artwork Begin"
+            );
+            let mut begin = sample(1, PointerPhase::Begin, 4.0, 4.0);
+            begin.eraser = hardware_eraser;
+            ink.push(begin).unwrap();
+            let started = pipeline.drain(LIVE_LAYER, drawing);
+            let expected_color = uses_color.then_some(drawing.color);
+            assert_eq!(started.started_brush_colors[0], expected_color);
+            if uses_color {
+                assert_eq!(
+                    pipeline.active.as_ref().unwrap().color,
+                    drawing.stroke_color()
+                );
+            }
+            for color in started.started_brush_colors.into_iter().flatten().rev() {
+                projection.stage_used_brush_color(color);
+            }
+            assert!(pipeline.cancel_native_gesture());
+            assert!(
+                !pipeline.cancel_native_gesture(),
+                "one Escape consumes only one gesture"
+            );
+            drawing.select_tool(DrawingTool::Pen);
+            ink.push(sample(2, PointerPhase::Move, 8.0, 4.0)).unwrap();
+            ink.push(sample(3, PointerPhase::End, 12.0, 4.0)).unwrap();
+            let drained = pipeline.drain(LIVE_LAYER, drawing);
+            assert!(!drained.artwork_closed);
+            assert!(pipeline.active.is_none());
+            assert!(pipeline.completed_edit.is_none());
+            assert!(pipeline.pending_materializations.is_empty());
+            assert_eq!(pipeline.materializer.pending.load(Ordering::Acquire), 0);
+            assert_eq!(
+                projection.current().recent_colors,
+                expected_color.into_iter().collect::<Vec<_>>()
+            );
+            assert_eq!(projection.current().history, original_history);
+            assert!(
+                !projection.current().dirty,
+                "painting usage must not mark cancelled artwork dirty"
+            );
+            ink.push(sample(4, PointerPhase::Begin, 5.0, 5.0)).unwrap();
+            pipeline.drain(LIVE_LAYER, drawing);
+            assert!(
+                pipeline.active.is_some(),
+                "new contact must recover after cancellation"
+            );
+            ink.push(sample(5, PointerPhase::Cancel, 5.0, 5.0)).unwrap();
+            pipeline.drain(LIVE_LAYER, drawing);
+            drop(pipeline);
+            let db = ProjectDb::open(&path).unwrap();
+            assert!(db.load_reopened().unwrap().is_none());
+            drop(db);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn temporary_picker_cannot_paint_on_release_cancel_or_queued_next_begin() {
         // Product risk: releasing Alt or draining the next Begin before the
         // asynchronous read can paint unexpected marks with the previous color.
@@ -6455,9 +6833,12 @@ mod tests {
             let original = pipeline.drawing;
             ink.push_with_temporary_picker(sample(1, PointerPhase::Begin, -1.0, 4.0), true)
                 .unwrap();
-            pipeline.drain(LIVE_LAYER, original);
+            let started = pipeline.drain(LIVE_LAYER, original);
+            assert!(started.started_brush_colors.iter().all(Option::is_none));
             assert!(pipeline.active.is_none());
             assert!(pipeline.edit_gesture.is_some());
+            let picker_token = pipeline.picker.gesture.as_ref().unwrap().token;
+            assert!(pipeline.picker_token_valid(picker_token));
             // Alt has been released; only Begin owns its latched tool intent.
             ink.push(sample(2, PointerPhase::Move, -2.0, 4.0)).unwrap();
             ink.push(sample(3, phase, -2.0, 4.0)).unwrap();
@@ -6474,6 +6855,8 @@ mod tests {
             assert_eq!(pipeline.drawing.size_tenths, original.size_tenths);
             assert_eq!(pipeline.drawing.color, original.color);
             if phase == PointerPhase::End {
+                assert!(pipeline.picker.gesture.as_ref().unwrap().released);
+                assert!(pipeline.picker_token_valid(picker_token));
                 assert!(matches!(
                     pipeline.completed_edit.take(),
                     Some(Ok(EditCommand::PickColor {
@@ -6489,8 +6872,13 @@ mod tests {
                     "ordinary edit resume cannot release a pending color read"
                 );
                 ink.complete_temporary_pick((7, 3));
+                // End may already be in the worker when focus leaves. Its
+                // old read must no longer be eligible to change foreground.
+                ink.invalidate_picker();
+                assert!(!pipeline.picker_token_valid(picker_token));
             } else {
                 assert!(pipeline.completed_edit.is_none());
+                assert!(!pipeline.picker_token_valid(picker_token));
             }
             pipeline.selected_layer_locked = false;
             ink.push(sample(7, PointerPhase::Begin, 4.0, 4.0)).unwrap();
@@ -6540,7 +6928,8 @@ mod tests {
                 sequence += 1;
                 ink.push(sample(sequence, phase, 4.0, 4.0)).unwrap();
             }
-            pipeline.drain(LIVE_LAYER, pipeline.drawing);
+            let started = pipeline.drain(LIVE_LAYER, pipeline.drawing);
+            assert!(started.started_brush_colors.iter().all(Option::is_none));
             assert!(pipeline.active.is_none());
             assert!(pipeline.gpu_ops.is_empty());
             assert!(pipeline.completed_edit.is_none());
