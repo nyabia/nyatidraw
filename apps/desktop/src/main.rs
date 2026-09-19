@@ -703,10 +703,10 @@ fn CanvasActions(ui_projection: Signal<UiProjection>) -> Element {
                 },
                     UiIcon { name: "transform" } span { class: "command-label", "변형" }
                 }
-                button { class: "command", title: "페이지 크기 및 선택 영역에 맞추기", disabled: ui_projection.read().edit.busy || ui_projection.read().edit.transform.is_some(), onclick: move |_| {
+                button { class: "command", title: "캔버스 크기·프리셋 및 선택 영역에 맞추기", disabled: ui_projection.read().edit.busy || ui_projection.read().edit.transform.is_some(), onclick: move |_| {
                     transform_open.set(false);
                     page_open.set(true);
-                }, span { class: "command-label", "페이지" } }
+                }, span { class: "command-label", "캔버스" } }
                 button { class: "command", title: "현재 조작 취소 / 선택 해제 (Esc)", disabled: !page_open() && !ui_projection.read().edit.can_cancel && (!ui_projection.read().edit.has_selection || ui_projection.read().edit.busy),
                     onclick: move |_| {
                         if page_open() { page_open.set(false); }
@@ -2386,6 +2386,7 @@ fn UiIcon(name: &'static str) -> Element {
         "lock" => &["M5 10h14v11H5z", "M8 10V6a4 4 0 0 1 8 0v4", "M12 14v3"],
         "unlock" => &["M5 10h14v11H5z", "M8 10V6a4 4 0 0 1 8 0", "M12 14v3"],
         "rotate" => &["M20 11a8 8 0 1 0-2 6", "M20 4v7h-7"],
+        "swap-axes" => &["M4 8h16", "m16 4 4 4-4 4", "M20 16H4", "m8 12-4 4 4 4"],
         "mirror-horizontal" => &["M12 3v3m0 4v4m0 4v3", "M3 18 8 6v12z", "m21 18-5-12v12z"],
         "move" => &[
             "M3 3v15l4-4 4 7 3-2-4-7h6z",
