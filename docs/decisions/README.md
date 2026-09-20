@@ -64,3 +64,4 @@
 | 자유 변형 코어 | [원본 고정 보간·세대별 미리보기·확정/취소 계약](ADR-0055-free-transform-transaction.md) |
 | 선화 밑색 | [참조 연결 채우기·틈 닫기·AA 받침·선택 경계 연산](ADR-0056-flat-fill-and-selection-morphology.md) |
 | 명암 합성 | [Alpha lock·하위 clipping stack·Normal/Multiply 계약](ADR-0057-shading-compositing-contract.md) |
+| Root 인덱스 저장 | [무손실 압축과 일회성 알파 재구성](ADR-0058-compressed-root-storage.md) |

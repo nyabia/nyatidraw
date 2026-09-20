@@ -161,6 +161,7 @@ pub(crate) struct LiveInkBridge {
 
 struct LiveInkInner {
     layout: OnceLock<crate::layout_store::LayoutStore>,
+    workspace_appearance: Mutex<crate::workspace_appearance::WorkspaceAppearance>,
     raw_input: Mutex<RawInputState>,
     canvas_viewport: Mutex<CanvasViewportSnapshot>,
     editor_commands: Mutex<VecDeque<CanvasCommand>>,
@@ -172,6 +173,7 @@ struct LiveInkInner {
     layer_thumbnails: Mutex<LayerThumbnailSnapshot>,
     picker: Mutex<Option<PickerSnapshot>>,
     picker_epoch: AtomicU64,
+    project_epoch: AtomicU64,
     canvas_client_css_origin: Mutex<Option<[f64; 2]>>,
     activation_notice: Mutex<Option<String>>,
     save_as_path: Mutex<Option<std::path::PathBuf>>,
@@ -303,6 +305,12 @@ impl LiveInkBridge {
             }
         }));
         if self.inner.layout.set(store).is_ok() {
+            *self
+                .inner
+                .workspace_appearance
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                crate::workspace_appearance::WorkspaceAppearance::load();
             self.inner
                 .protocol
                 .lock()
@@ -331,6 +339,35 @@ impl LiveInkBridge {
         }
     }
 
+    pub(crate) fn workspace_appearance(&self) -> crate::workspace_appearance::WorkspaceAppearance {
+        *self
+            .inner
+            .workspace_appearance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn set_workspace_appearance(
+        &self,
+        appearance: crate::workspace_appearance::WorkspaceAppearance,
+    ) {
+        let mut current = self
+            .inner
+            .workspace_appearance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *current == appearance {
+            return;
+        }
+        *current = appearance;
+        drop(current);
+        if let Some(store) = self.inner.layout.get() {
+            store.submit_appearance(appearance);
+        }
+        self.request_redraw();
+        self.notify_ui();
+    }
+
     pub(crate) fn flush_layout(&self) {
         if let Some(store) = self.inner.layout.get() {
             store.flush();
@@ -341,6 +378,9 @@ impl LiveInkBridge {
         Self {
             inner: Arc::new(LiveInkInner {
                 layout: OnceLock::new(),
+                workspace_appearance: Mutex::new(
+                    crate::workspace_appearance::WorkspaceAppearance::default(),
+                ),
                 raw_input: Mutex::new(RawInputState {
                     performance_batch_start: None,
                     queue: InputQueue::with_capacity(capacity),
@@ -372,6 +412,7 @@ impl LiveInkBridge {
                 layer_thumbnails: Mutex::new(LayerThumbnailSnapshot::default()),
                 picker: Mutex::new(None),
                 picker_epoch: AtomicU64::new(0),
+                project_epoch: AtomicU64::new(0),
                 canvas_client_css_origin: Mutex::new(None),
                 activation_notice: Mutex::new(None),
                 save_as_path: Mutex::new(None),
@@ -679,6 +720,10 @@ impl LiveInkBridge {
         (protocol.projection.clone(), protocol.latest_event.clone())
     }
 
+    pub(crate) fn project_epoch(&self) -> u64 {
+        self.inner.project_epoch.load(Ordering::Acquire)
+    }
+
     /// Clears only process-local presentation and admission state before the
     /// canvas replaces one already-drained durable project with another.
     ///
@@ -686,6 +731,7 @@ impl LiveInkBridge {
     /// strictly newer projection. No raw sample, queued command, preview, or
     /// export state from the previous document can cross this boundary.
     pub(crate) fn reset_for_project_activation(&self) {
+        self.inner.project_epoch.fetch_add(1, Ordering::AcqRel);
         self.invalidate_picker();
         // The next document must submit its own frame before a native Begin
         // can use a mapping. Surface geometry is still owned by the UI thread.

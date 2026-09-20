@@ -25,7 +25,7 @@ const PANELS: [PanelKind; 12] = [
     PanelKind::BrushSizes,
 ];
 
-fn settings_path() -> Option<PathBuf> {
+pub(crate) fn settings_path() -> Option<PathBuf> {
     std::env::var_os("NAYATI_LAYOUT_PATH")
         .map(PathBuf::from)
         .or_else(|| {
@@ -261,6 +261,7 @@ struct Shared {
 struct State {
     latest: Vec<u8>,
     pending_heights: Option<Vec<u8>>,
+    pending_appearance: Option<Vec<u8>>,
     pending: bool,
     writing: bool,
     stopping: bool,
@@ -296,6 +297,7 @@ impl LayoutStore {
             state: Mutex::new(State {
                 latest: encode(&tree),
                 pending_heights: None,
+                pending_appearance: None,
                 pending: false,
                 writing: false,
                 stopping: false,
@@ -307,12 +309,13 @@ impl LayoutStore {
         let worker = std::thread::Builder::new().name("nyatidraw-layout".into()).spawn(move || {
             loop {
                 let mut state = task.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                while !state.pending && state.pending_heights.is_none() && !state.stopping {
+                while !state.pending && state.pending_heights.is_none() && state.pending_appearance.is_none() && !state.stopping {
                     state = task.changed.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
-                if !state.pending && state.pending_heights.is_none() { break; }
+                if !state.pending && state.pending_heights.is_none() && state.pending_appearance.is_none() { break; }
                 let bytes = state.pending.then(|| state.latest.clone());
                 let heights = state.pending_heights.take();
+                let appearance = state.pending_appearance.take();
                 state.pending = false;
                 state.writing = true;
                 drop(state);
@@ -320,16 +323,17 @@ impl LayoutStore {
                     .and_then(|path| {
                         if let Some(bytes) = &bytes { replace(path, bytes)?; }
                         if let Some(heights) = &heights { replace(&path.with_extension("heights"), heights)?; }
+                        if let Some(appearance) = &appearance { replace(&path.with_extension("appearance"), appearance)?; }
                         Ok(())
                     });
                 let mut state = task.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.writing = false;
                 state.notice = result.err().map(|error| {
                     eprintln!("native-layout event=save-failed error={error}");
-                    "화면 배치를 저장하지 못했습니다. 배치를 다시 변경하거나 기본 배치로 복원해 재시도하세요. 작품 저장은 별개입니다.".into()
+                    "화면 설정을 저장하지 못했습니다. 설정을 다시 변경해 재시도하세요. 작품 저장은 별개입니다.".into()
                 });
                 if state.notice.is_none() {
-                    println!("native-layout event=saved bytes={} heights={}", bytes.as_ref().map_or(0, Vec::len), heights.is_some());
+                    println!("native-layout event=saved bytes={} heights={} appearance={}", bytes.as_ref().map_or(0, Vec::len), heights.is_some(), appearance.is_some());
                 }
                 task.changed.notify_all();
                 drop(state);
@@ -387,6 +391,24 @@ impl LayoutStore {
         self.shared.changed.notify_one();
     }
 
+    pub(crate) fn submit_appearance(
+        &self,
+        appearance: crate::workspace_appearance::WorkspaceAppearance,
+    ) {
+        if self.worker.is_none() {
+            return;
+        }
+        let Some(bytes) = appearance.encode() else {
+            return;
+        };
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_appearance = Some(bytes);
+        self.shared.changed.notify_one();
+    }
+
     /// Only the background close owner waits; UI and renderer merely submit.
     pub(crate) fn flush(&self) {
         let mut state = self
@@ -394,7 +416,11 @@ impl LayoutStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while state.pending || state.pending_heights.is_some() || state.writing {
+        while state.pending
+            || state.pending_heights.is_some()
+            || state.pending_appearance.is_some()
+            || state.writing
+        {
             state = self
                 .shared
                 .changed
@@ -436,7 +462,7 @@ fn load(path: &Path) -> std::io::Result<Option<DockTree>> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{error:?}")))
 }
 
-fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

@@ -1,10 +1,9 @@
 //! Immutable output-page metadata. Upgrade, page and pixels share one commit.
 use super::{
     CANVAS_HISTORY_SCHEMA_VERSION, CanvasSpec, Envelope, MAX_REOPEN_HISTORY_NODES, META, ProjectDb,
-    ProjectHistoryCursor, ProjectOpenError, ReadableTable, RecordKind, SNAPSHOTS, SnapshotId,
-    TableDefinition, decode_envelope, write_canvas_metadata,
+    ProjectHistoryCursor, ProjectOpenError, ReadableTable, RecordKind, SCHEMA_CAPABILITY_FLAGS,
+    SNAPSHOTS, SnapshotId, TableDefinition, decode_envelope, write_canvas_metadata,
 };
-use nyatidraw_project::SCHEMA_CAPABILITY_FLAGS;
 use std::collections::BTreeSet;
 
 pub(super) const SNAPSHOT_CANVAS: TableDefinition<&[u8], &[u8]> =

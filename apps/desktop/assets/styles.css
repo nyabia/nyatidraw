@@ -77,7 +77,8 @@ html.dock-resizing-height, html.dock-resizing-height * { cursor: row-resize !imp
 .dock-tab.active { background: #898989; color: #fff; }
 .dock-tabs > .dock-panel > .panel-header { display: none; }
 
-.canvas-panel { display: flex; flex: 1 1 0; padding: 17px; overflow: hidden; background: #181818; }
+.canvas-panel { position: relative; display: flex; flex: 1 1 0; padding: 17px; overflow: hidden; background: #181818; }
+.workspace-error-notice { position: absolute; inset: 16px 16px auto; z-index: 10; max-height: 70%; overflow: auto; padding: 16px; border: 1px solid #777; background: #333; color: #fff; }
 .canvas-frame { display: flex; min-width: 0; min-height: 0; flex: 1 1 0; padding: 2px; overflow: hidden; background: #050505; border: 1px solid #000; }
 #shared-gpu-canvas { display: block; width: 100%; height: 100%; flex: 1 1 0; border: 0; border-radius: 0; }
 
@@ -317,6 +318,16 @@ html.dock-resizing-height, html.dock-resizing-height * { cursor: row-resize !imp
 .canvas-dimensions .canvas-swap { display: grid; place-items: center; width: 32px; height: 27px; margin: 0 0 4px; padding: 0; border: 1px solid #aaa; }
 .canvas-swap .icon { width: 20px; height: 20px; }
 .canvas-size-error { color: #ffe0a8; font-size: 11px; }
+.canvas-background-settings { min-width: 0; margin: 12px 0; padding: 8px 0 0; border: 0; border-top: 1px solid #929292; }
+.canvas-background-settings legend { padding: 0 8px 0 0; }
+.canvas-background-options { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+.canvas-background-options button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: 1; min-height: 32px; margin: 0; border: 1px solid #aaa; }
+.canvas-background-options button[aria-pressed="true"] { background: #454545; box-shadow: inset 0 0 0 1px #eee; }
+.canvas-background-swatch { width: 24px; height: 20px; border: 1px solid #333; }
+.canvas-background-checker { background: conic-gradient(#bcbcbc 25%,#acacac 0 50%,#bcbcbc 0 75%,#acacac 0); background-size: 12px 12px; }
+.canvas-background-options input[type="color"] { flex: 0 0 38px; width: 38px; height: 32px; padding: 2px; background: #555; border: 1px solid #aaa; cursor: pointer; }
+.canvas-background-options input[type="color"]:disabled { opacity: .38; cursor: default; }
+.canvas-background-settings small { color: #eee; font-size: 11px; }
 .layer-shading-controls { display:flex;align-items:center;gap:2px;min-width:0 }
 .layer-shading-controls button { min-width:20px;padding:0 3px;height:20px }
 .layer-shading-controls button[aria-pressed="true"] { background:#484848;color:white;outline:1px solid #ddd;outline-offset:-1px }

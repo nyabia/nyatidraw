@@ -252,6 +252,7 @@ pub(crate) fn PagePanel(ui_projection: Signal<UiProjection>) -> Element {
     let crop_ink = live_ink.clone();
     let PagePanelOpen(mut opened) = use_context();
     let mut draft = use_signal(|| CanvasDraft::new(ui_projection.read().canvas));
+    let mut appearance = use_signal(|| live_ink.workspace_appearance());
     let mut error = use_signal(|| None::<String>);
     let current = ui_projection.read();
     let busy = current.edit.busy;
@@ -333,19 +334,51 @@ pub(crate) fn PagePanel(ui_projection: Signal<UiProjection>) -> Element {
             }
             p { class: "transform-help", "왼쪽 위 기준으로 출력 영역만 변경합니다. 그림과 바깥쪽 내용은 유지됩니다." }
             if let Err(message) = size { p { class: "canvas-size-error", role: "status", "{message}" } }
+            fieldset { class: "canvas-background-settings",
+                legend { "바깥 배경" }
+                div { class: "canvas-background-options", role: "group", aria_label: "캔버스 바깥 배경",
+                    button { aria_pressed: appearance.read().checkerboard,
+                        onclick: move |_| appearance.write().checkerboard = true,
+                        span { class: "canvas-background-swatch canvas-background-checker", aria_hidden: "true" }
+                        "체크무늬"
+                    }
+                    button { aria_pressed: !appearance.read().checkerboard,
+                        onclick: move |_| appearance.write().checkerboard = false,
+                        "단색"
+                    }
+                    input { r#type: "color", aria_label: "바깥 배경색", title: "바깥 배경색",
+                        disabled: appearance.read().checkerboard,
+                        value: appearance.read().solid_hex(),
+                        oninput: move |event| appearance.write().set_solid_hex(&event.value()),
+                    }
+                }
+                small { "화면에만 적용 · 그림과 출력은 그대로" }
+            }
             div { class: "transform-actions",
                 button { disabled: busy || size.is_err(), onclick: move |_| {
                     let Ok([w, h]) = draft.read().current.size() else { return; };
+                    let canvas = ui_projection.read().canvas;
+                    if [w, h] == [canvas.width_px, canvas.height_px] {
+                        live_ink.set_workspace_appearance(appearance());
+                        opened.set(false);
+                        return;
+                    }
                     let command = EditCommand::ResizePage { size: [w, h] };
                     let result = live_ink.push_editor_command(ui_projection.read().revision, EditorCommand::Edit(command));
                     println!("desktop-page event=resize size={w}x{h} admission={result:?}");
-                    if result.is_ok() { opened.set(false); }
+                    if result.is_ok() {
+                        live_ink.set_workspace_appearance(appearance());
+                        opened.set(false);
+                    }
                     else { error.set(Some("현재 작업이 끝난 뒤 다시 적용하세요.".into())); }
                 }, "적용" }
                 button { disabled: !can_crop, title: "선택 경계에 캔버스를 맞춥니다. 바깥 그림도 보존하며 함께 이동합니다.", onclick: move |_| {
                     let result = crop_ink.push_editor_command(ui_projection.read().revision, EditorCommand::Edit(EditCommand::CropPageToSelection));
                     println!("desktop-page event=crop-selection admission={result:?}");
-                    if result.is_ok() { opened.set(false); }
+                    if result.is_ok() {
+                        crop_ink.set_workspace_appearance(appearance());
+                        opened.set(false);
+                    }
                     else { error.set(Some("현재 작업이 끝난 뒤 다시 적용하세요.".into())); }
                 }, "선택에 맞추기" }
                 button { onclick: move |_| opened.set(false), "닫기" }

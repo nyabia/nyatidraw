@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use super::{
-    Envelope, META, OBJECTS, ObjectHash, ProjectDb, ProjectOpenError, ROOTS, ReadableTable,
-    RecordKind, TableDefinition, TileSnapshot, decode_root_manifest, store_root,
+    META, OBJECTS, ObjectHash, ProjectDb, ProjectOpenError, ROOTS, ReadableTable, TableDefinition,
+    TileSnapshot, decode_root_manifest, root_codec, store_root,
 };
 
 pub(super) const REFERENCE_VERSION_KEY: &str = "tile_root_refs_version";
@@ -79,8 +79,7 @@ impl ProjectDb {
                 .ok_or_else(|| self.corrupt("evicted root missing"))?
                 .value()
                 .to_vec();
-            let envelope =
-                Envelope::decode(&bytes, RecordKind::ContentRoot).map_err(|e| self.corrupt(e))?;
+            let envelope = root_codec::decode(&bytes).map_err(|e| self.corrupt(e))?;
             let manifest = decode_root_manifest(&envelope.payload).map_err(|e| self.corrupt(e))?;
             if manifest.root.hash != *hash {
                 return Err(self.corrupt("evicted root hash mismatch"));

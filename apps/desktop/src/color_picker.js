@@ -13,7 +13,7 @@ let hsv = [0, 0, 0];
 let alpha = 255;
 let drag = null;
 const clamp = x => Math.max(0, Math.min(1, x));
-const revision = () => document.querySelector('[data-dock-revision]')?.dataset.dockRevision;
+const colorBasis = () => ({ epoch: root.dataset.colorEpoch, color: root.dataset.colorRgba });
 function rgbToHsv([r, g, b]) {
     r /= 255; g /= 255; b /= 255;
     const max = Math.max(r, g, b), min = Math.min(r, g, b), delta = max - min;
@@ -52,8 +52,9 @@ function restore() {
 function commit(basedOn) {
     const selected = rgba().join(',');
     restore(); // Display authority again until the accepted command is projected.
-    if (basedOn && basedOn === revision() && selected !== root.dataset.colorRgba) {
-        dioxus.send([selected, basedOn]);
+    if (basedOn.epoch === root.dataset.colorEpoch && basedOn.color === root.dataset.colorRgba
+        && selected !== root.dataset.colorRgba) {
+        dioxus.send([selected, basedOn.epoch, basedOn.color]);
     }
 }
 function updatePointer(event) {
@@ -74,12 +75,13 @@ function finish(accepted) {
     const ended = drag;
     drag = null;
     if (ended.element.hasPointerCapture(ended.id)) ended.element.releasePointerCapture(ended.id);
-    if (accepted) commit(ended.revision);
+    if (accepted) commit(ended.basis);
     else { hsv = ended.hsv; restore(); }
 }
 root.addEventListener('pointerdown', event => {
     const element = event.target.closest('[data-color-axis]');
-    if (!element || drag || !event.isPrimary || event.button !== 0) return;
+    const contact = event.pointerType === 'pen' ? (event.buttons & 1) || event.pressure > 0 : event.button === 0;
+    if (!element || drag || !contact) return;
     const axis = element.dataset.colorAxis;
     if (axis === 'h') {
         const rect = element.getBoundingClientRect();
@@ -90,14 +92,15 @@ root.addEventListener('pointerdown', event => {
     element.focus();
     try { element.setPointerCapture(event.pointerId); } catch { return; }
     if (!element.hasPointerCapture(event.pointerId)) return;
-    drag = { element, axis, id: event.pointerId, revision: revision(), hsv: [...hsv] };
+    drag = { element, axis, id: event.pointerId, basis: colorBasis(), hsv: [...hsv] };
     event.preventDefault();
     event.stopImmediatePropagation();
     updatePointer(event);
 }, options);
 document.addEventListener('pointermove', event => {
     if (!drag || event.pointerId !== drag.id) return;
-    if (!(event.buttons & 1) || !root.isConnected) { finish(false); return; }
+    const contact = (event.buttons & 1) || (event.pointerType === 'pen' && event.pressure > 0);
+    if (!contact || !root.isConnected) { finish(false); return; }
     event.preventDefault(); event.stopImmediatePropagation();
     updatePointer(event);
 }, options);
@@ -107,11 +110,12 @@ document.addEventListener('pointerup', event => {
     finish(true);
     event.preventDefault(); event.stopImmediatePropagation();
 }, options);
-for (const name of ['pointercancel', 'lostpointercapture']) {
-    document.addEventListener(name, event => {
-        if (drag?.id === event.pointerId) finish(false);
-    }, options);
-}
+document.addEventListener('pointercancel', event => {
+    if (drag?.id === event.pointerId) finish(false);
+}, options);
+document.addEventListener('lostpointercapture', event => {
+    if (drag?.id === event.pointerId && event.target === drag.element) finish(false);
+}, options);
 document.addEventListener('keydown', event => {
     if (event.key === 'Escape' && drag) {
         finish(false); event.preventDefault(); event.stopImmediatePropagation(); return;
@@ -129,13 +133,13 @@ document.addEventListener('keydown', event => {
         const index = axis === 'v' || key === 'ArrowUp' || key === 'ArrowDown' ? 2 : 1;
         hsv[index] = key === 'Home' ? 0 : key === 'End' ? 1 : clamp(hsv[index] + direction * step / 100);
     }
-    render(); commit(revision());
+    render(); commit(colorBasis());
     event.preventDefault(); event.stopImmediatePropagation();
 }, options);
 window.addEventListener('blur', event => { if (event.target === window) finish(false); }, options);
 document.addEventListener('visibilitychange', () => { if (document.hidden) finish(false); }, options);
 const observer = new MutationObserver(() => { finish(false); restore(); });
-observer.observe(root, { attributes: true, attributeFilter: ['data-color-rgba'] });
+observer.observe(root, { attributes: true, attributeFilter: ['data-color-rgba', 'data-color-epoch'] });
 window.__nyatidrawColorDispose = () => { finish(false); observer.disconnect(); controller.abort(); resolveLifetime(); };
 restore();
 await lifetime;

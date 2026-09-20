@@ -8,7 +8,9 @@ use std::{
 
 use redb::ReadableDatabase;
 
-use super::{COMPRESSED_TILE_SCHEMA_FLAG, Envelope, ProjectDb, ProjectOpenError, RecordKind};
+use super::{
+    COMPRESSED_TILE_SCHEMA_FLAG, Envelope, ProjectDb, ProjectOpenError, RecordKind, root_codec,
+};
 
 const STORAGE_REVISION: &str = "tile_storage_revision";
 
@@ -20,8 +22,8 @@ pub(super) fn needs_repack(db: &ProjectDb) -> Result<bool, ProjectOpenError> {
         .map_err(|e| db.io(e))?
         .map(|v| v.value())
     {
-        None => Ok(true),
-        Some(1) => Ok(false),
+        None | Some(1) => Ok(true),
+        Some(2) => Ok(false),
         Some(_) => Err(db.corrupt("unsupported tile storage revision")),
     }
 }
@@ -183,7 +185,7 @@ fn migrate_inner(
 }
 
 // Reinsert into a fresh DB: compacting the old allocation alone cannot eliminate
-// oversized raw-value pages. All non-tile records are copied byte-for-byte.
+// oversized raw-value pages. Non-pixel/non-root records are copied byte-for-byte.
 fn rebuild_storage(source: &redb::Database, target: &Path) -> Result<(), String> {
     use redb::{ReadableTable, TableDefinition, TableHandle};
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -191,7 +193,7 @@ fn rebuild_storage(source: &redb::Database, target: &Path) -> Result<(), String>
         if read
             .open_table(super::META)?
             .get(STORAGE_REVISION)?
-            .is_some_and(|value| value.value() != 1)
+            .is_some_and(|value| !matches!(value.value(), 1 | 2))
         {
             return Err("unsupported tile storage revision".into());
         }
@@ -224,8 +226,19 @@ fn rebuild_storage(source: &redb::Database, target: &Path) -> Result<(), String>
                         dest.insert(key.value(), encoded.as_slice())?;
                     }
                 }
-                "roots" | "history" | "snapshots" | "strokes" | "snapshot_layers"
-                | "snapshot_canvas" => copy_table!(&[u8], &[u8]),
+                "roots" => {
+                    let table = read.open_table(super::ROOTS)?;
+                    let mut dest = write.open_table(super::ROOTS)?;
+                    for entry in table.iter()? {
+                        let (key, value) = entry?;
+                        let root = root_codec::decode(value.value())?;
+                        let encoded = root_codec::encode(&root);
+                        dest.insert(key.value(), encoded.as_slice())?;
+                    }
+                }
+                "history" | "snapshots" | "strokes" | "snapshot_layers" | "snapshot_canvas" => {
+                    copy_table!(&[u8], &[u8]);
+                }
                 _ => return Err(format!("unknown project table {name}").into()),
             }
         }
@@ -235,8 +248,11 @@ fn rebuild_storage(source: &redb::Database, target: &Path) -> Result<(), String>
                 .get("schema_version")?
                 .ok_or("missing schema marker")?
                 .value();
-            meta.insert("schema_version", version | COMPRESSED_TILE_SCHEMA_FLAG)?;
-            meta.insert(STORAGE_REVISION, 1)?;
+            meta.insert(
+                "schema_version",
+                version | COMPRESSED_TILE_SCHEMA_FLAG | root_codec::SCHEMA_FLAG,
+            )?;
+            meta.insert(STORAGE_REVISION, 2)?;
         }
         write.commit()?;
         output.compact()?;
@@ -286,7 +302,7 @@ macro_rules! record_digest {
                         let (k, v) = entry.map_err(|e| e.to_string())?;
                         if k.value() != STORAGE_REVISION {
                             let value = if k.value() == "schema_version" {
-                                v.value() & !COMPRESSED_TILE_SCHEMA_FLAG
+                                v.value() & !(COMPRESSED_TILE_SCHEMA_FLAG | root_codec::SCHEMA_FLAG)
                             } else {
                                 v.value()
                             };
@@ -324,6 +340,9 @@ macro_rules! record_digest {
                             let tile = Envelope::decode(v.value(), RecordKind::Tile)
                                 .map_err(|e| e.to_string())?;
                             row(k.value(), &tile.encode());
+                        } else if name == "roots" {
+                            let root = root_codec::decode(v.value())?;
+                            row(k.value(), &root.encode());
                         } else {
                             row(k.value(), v.value());
                         }
@@ -348,6 +367,7 @@ fn current_digest(read: redb::ReadTransaction) -> Result<[u8; 32], String> {
 pub(super) mod tests {
     use super::*;
     use redb::{ReadableTable, TableHandle};
+    use redb_legacy::ReadableTable as _;
 
     // Recreate current application wire records in a genuine redb 2.6 v2
     // container. Only called with fresh, test-owned paths.
@@ -375,10 +395,12 @@ pub(super) mod tests {
             match name {
                 "meta" => {
                     copy_table!(&str, u64);
-                    write
+                    let mut meta = write
                         .open_table(redb_legacy::TableDefinition::<&str, u64>::new(name))
-                        .unwrap()
-                        .remove(STORAGE_REVISION)
+                        .unwrap();
+                    meta.remove(STORAGE_REVISION).unwrap();
+                    let version = meta.get("schema_version").unwrap().unwrap().value();
+                    meta.insert("schema_version", version & !root_codec::SCHEMA_FLAG)
                         .unwrap();
                 }
                 "state" => copy_table!(&str, &[u8]),
@@ -393,6 +415,17 @@ pub(super) mod tests {
                         let raw = Envelope::decode(value.value(), RecordKind::Tile)
                             .unwrap()
                             .encode();
+                        dest.insert(key.value(), raw.as_slice()).unwrap();
+                    }
+                }
+                "roots" => {
+                    let table = read.open_table(super::super::ROOTS).unwrap();
+                    let mut dest = write
+                        .open_table(redb_legacy::TableDefinition::<&[u8], &[u8]>::new(name))
+                        .unwrap();
+                    for entry in table.iter().unwrap() {
+                        let (key, value) = entry.unwrap();
+                        let raw = root_codec::decode(value.value()).unwrap().encode();
                         dest.insert(key.value(), raw.as_slice()).unwrap();
                     }
                 }
@@ -428,6 +461,193 @@ pub(super) mod tests {
             "backup must be original bytes"
         );
         fs::remove_file(&backups[0]).unwrap();
+    }
+
+    fn validate_all_roots(db: &ProjectDb) -> (usize, usize) {
+        let reopened = db.load_reopened().unwrap().unwrap();
+        let history_count = reopened.history().node_count();
+        let parts = reopened.into_parts();
+        for cursor in parts.cursors.values() {
+            assert_eq!(db.load_cursor_tiles(*cursor).unwrap().root(), cursor.root);
+            db.load_cursor_layer_tree(*cursor).unwrap();
+            db.load_cursor_canvas_spec(*cursor).unwrap();
+        }
+        (history_count, parts.cursors.len())
+    }
+
+    fn root_storage_bytes(db: &ProjectDb) -> (usize, usize) {
+        let read = db.db.begin_read().unwrap();
+        read.open_table(super::super::ROOTS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .fold((0, 0), |(stored, decoded), entry| {
+                let (_, value) = entry.unwrap();
+                (
+                    stored + value.value().len(),
+                    decoded + root_codec::decode(value.value()).unwrap().encode().len(),
+                )
+            })
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn root_repack_preserves_every_record_history_cursor_and_recoverable_source() {
+        use nyatidraw_api::{HistoryNodeId, LayerId, SnapshotId};
+        use nyatidraw_history::{HistoryNode, OperationRecord};
+        use nyatidraw_project::ProjectStructuralBatch;
+        use nyatidraw_tiles::{TILE_BYTE_LEN, TileKey, TileObject, TileSnapshot};
+
+        if let Some(source) = std::env::var_os("NYATIDRAW_ROOT_REPACK_SCRATCH") {
+            let source = PathBuf::from(source).canonicalize().unwrap();
+            let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".nyatidraw")
+                .canonicalize()
+                .unwrap();
+            assert!(
+                source.starts_with(scratch),
+                "acceptance may only use a workspace scratch copy"
+            );
+            let target = source.with_extension("root-compressed.ntdr");
+            assert!(!target.exists());
+            let raw = redb::ReadOnlyDatabase::open(&source).unwrap();
+            let before = current_digest(raw.begin_read().unwrap()).unwrap();
+            drop(raw);
+            let original = fs::read(&source).unwrap();
+            migrate_legacy_copy(&source, &target).unwrap();
+            assert_eq!(fs::read(&source).unwrap(), original);
+            let db = ProjectDb::open(&target).unwrap();
+            assert_eq!(current_digest(db.db.begin_read().unwrap()).unwrap(), before);
+            let (history, cursors) = validate_all_roots(&db);
+            let root_bytes = root_storage_bytes(&db);
+            drop(db);
+            let db = ProjectDb::open(&target).unwrap();
+            assert_eq!(current_digest(db.db.begin_read().unwrap()).unwrap(), before);
+            assert_eq!(validate_all_roots(&db), (history, cursors));
+            drop(db);
+            println!(
+                "root-repack-acceptance original_bytes={} rebuilt_bytes={} history={history} checked_cursors={cursors} roots_stored_bytes={} roots_canonical_bytes={} records_equal=true second_reopen_equal=true source_unchanged=true",
+                original.len(),
+                fs::metadata(&target).unwrap().len(),
+                root_bytes.0,
+                root_bytes.1
+            );
+            return;
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "nyatidraw-root-repack-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.ntdr");
+        let db = ProjectDb::open(&source).unwrap();
+        let mut before = TileSnapshot::empty();
+        for index in 1..=3_u8 {
+            let tile = TileObject::new(vec![index; TILE_BYTE_LEN]).unwrap();
+            let after = TileSnapshot::from_objects((-600..600).map(|x| {
+                (
+                    TileKey {
+                        layer: LayerId(1),
+                        mip: 0,
+                        x,
+                        y: -1,
+                    },
+                    tile.clone(),
+                )
+            }))
+            .unwrap();
+            let node = HistoryNode {
+                id: HistoryNodeId(u128::from(index)),
+                parent: (index > 1).then(|| HistoryNodeId(u128::from(index - 1))),
+                before_root: before.root().id,
+                after_root: after.root().id,
+                operation: OperationRecord::StructuralChange,
+                timestamp_ns: 0,
+            };
+            let batch = ProjectStructuralBatch::new(
+                SnapshotId(u128::from(index)),
+                before.clone(),
+                after.clone(),
+                node,
+            )
+            .unwrap();
+            db.commit_structural(&batch).unwrap();
+            before = after;
+        }
+        db.persist_editor_tool_state(b"preserve optional tool state exactly")
+            .unwrap();
+        let write = db.db.begin_write().unwrap();
+        {
+            let mut roots = write.open_table(super::super::ROOTS).unwrap();
+            let raw: Vec<_> = roots
+                .iter()
+                .unwrap()
+                .map(|entry| {
+                    let (key, value) = entry.unwrap();
+                    (
+                        key.value().to_vec(),
+                        root_codec::decode(value.value()).unwrap().encode(),
+                    )
+                })
+                .collect();
+            for (key, value) in raw {
+                roots.insert(key.as_slice(), value.as_slice()).unwrap();
+            }
+            let mut meta = write.open_table(super::super::META).unwrap();
+            let version = meta.get("schema_version").unwrap().unwrap().value();
+            meta.insert("schema_version", version & !root_codec::SCHEMA_FLAG)
+                .unwrap();
+            meta.insert(STORAGE_REVISION, 1).unwrap();
+        }
+        write.commit().unwrap();
+        let digest = current_digest(db.db.begin_read().unwrap()).unwrap();
+        drop(db);
+        let original = fs::read(&source).unwrap();
+        let db = ProjectDb::open(&source).unwrap();
+        assert_eq!(current_digest(db.db.begin_read().unwrap()).unwrap(), digest);
+        assert_eq!(validate_all_roots(&db), (3, 4));
+        let (stored, raw) = root_storage_bytes(&db);
+        assert!(stored < raw / 4);
+        let version = db
+            .db
+            .begin_read()
+            .unwrap()
+            .open_table(super::super::META)
+            .unwrap()
+            .get("schema_version")
+            .unwrap()
+            .unwrap()
+            .value();
+        assert!(
+            !(1..=4).contains(&(version & !nyatidraw_project::SCHEMA_CAPABILITY_FLAGS)),
+            "old reader must reject the new storage capability before writing"
+        );
+        drop(db);
+        remove_verified_backup(&source, &original);
+        let db = ProjectDb::open(&source).unwrap();
+        assert_eq!(current_digest(db.db.begin_read().unwrap()).unwrap(), digest);
+        assert_eq!(validate_all_roots(&db), (3, 4));
+        let write = db.db.begin_write().unwrap();
+        write
+            .open_table(super::super::META)
+            .unwrap()
+            .insert(STORAGE_REVISION, 3)
+            .unwrap();
+        write.commit().unwrap();
+        drop(db);
+        let future = fs::read(&source).unwrap();
+        assert!(ProjectDb::open(&source).is_err());
+        assert_eq!(fs::read(&source).unwrap(), future);
+        fs::remove_file(&source).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]

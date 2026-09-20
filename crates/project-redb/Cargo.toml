@@ -23,6 +23,7 @@ nyatidraw-project.workspace = true
 nyatidraw-stroke.workspace = true
 nyatidraw-tiles.workspace = true
 redb = "=4.2.0"
+zstd = { version = "=0.14.0", default-features = false }
 redb-legacy = { package = "redb", version = "=2.6.3", optional = true }
 blake3 = { workspace = true, optional = true }
 

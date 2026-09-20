@@ -3213,6 +3213,7 @@ dependencies = [
  "redb 2.6.3",
  "redb 4.2.0",
  "rusqlite",
+ "zstd",
 ]
 
 [[package]]

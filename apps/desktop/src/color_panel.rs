@@ -148,10 +148,12 @@ pub(crate) fn use_palette_preferences(ui_projection: Signal<UiProjection>) {
 
 #[component]
 pub(crate) fn ColorPanel(ui_projection: Signal<UiProjection>) -> Element {
+    let live_ink = use_context::<LiveInkBridge>();
     let current = ui_projection.read().brush_color;
+    let epoch = live_ink.project_epoch();
     rsx! {
         div { class: "color-panel compact-color-panel",
-            crate::color_picker::ColorPicker { color: current }
+            crate::color_picker::ColorPicker { color: current, epoch }
             PaletteRow { current, compact: false }
         }
     }

@@ -33,6 +33,7 @@ mod transform_panel;
 mod transform_worker;
 #[cfg(windows)]
 mod updates;
+mod workspace_appearance;
 
 use std::time::{Duration, Instant};
 use std::{
@@ -992,6 +993,9 @@ fn PanelContents(
     workspace: WorkspaceProjection,
     ui_projection: Signal<UiProjection>,
 ) -> Element {
+    if panel == PanelKind::Canvas {
+        return rsx! { CanvasWorkspace { workspace } };
+    }
     match workspace {
         WorkspaceProjection::Empty => rsx! {
             div { class: "workspace-state empty",
@@ -1005,12 +1009,7 @@ fn PanelContents(
                 p { "Panels will receive semantic metadata when loading completes." }
             }
         },
-        WorkspaceProjection::Error { summary } => rsx! {
-            div { class: "workspace-state error", role: "alert",
-                strong { "Project could not be opened" }
-                p { "{summary}" }
-            }
-        },
+        WorkspaceProjection::Error { .. } => rsx! {},
         WorkspaceProjection::Recovery { summary } => rsx! {
             div { class: "workspace-state recovery",
                 strong { "Recovered a safe workspace" }
@@ -1021,17 +1020,29 @@ fn PanelContents(
     }
 }
 
+#[component]
+fn CanvasWorkspace(workspace: WorkspaceProjection) -> Element {
+    rsx! {
+        div {
+            class: "canvas-panel",
+            tabindex: 0,
+            role: "application",
+            aria_label: "그리기 영역",
+            div { class: "canvas-frame", SharedCanvas {} }
+            if let WorkspaceProjection::Error { summary } = workspace {
+                div { class: "workspace-error-notice", role: "alert",
+                    strong { "작업을 계속할 수 없습니다" }
+                    p { "저장된 작품은 보존됩니다. 창을 닫으면 저장 상태를 확인할 수 있습니다." }
+                    p { "{summary}" }
+                }
+            }
+        }
+    }
+}
+
 fn panel_ready_contents(panel: PanelKind, ui_projection: Signal<UiProjection>) -> Element {
     match panel {
-        PanelKind::Canvas => rsx! {
-            div {
-                class: "canvas-panel",
-                tabindex: 0,
-                role: "application",
-                aria_label: "Drawing canvas. Use F6 to reveal this panel, then Tab to this focus target.",
-                div { class: "canvas-frame", SharedCanvas {} }
-            }
-        },
+        PanelKind::Canvas => rsx! {},
         PanelKind::Tools => rsx! { ToolsPanel { ui_projection } },
         PanelKind::Navigator => rsx! { NavigatorPanel { ui_projection } },
         PanelKind::Layers => rsx! { LayersPanel { ui_projection } },
@@ -2259,6 +2270,7 @@ fn SharedCanvas() -> Element {
     use_effect(move || {
         use dioxus_desktop::wry::WebViewExtWindows as _;
         let canvas_host = canvas_host.clone();
+        let desktop = desktop.clone();
         let input_hwnd = desktop.webview.composition_input_hwnd();
         spawn(async move {
             if startup_diagnostics {
@@ -2272,6 +2284,11 @@ fn SharedCanvas() -> Element {
             let router = match canvas_host::windows::CanvasInputRouter::new(
                 canvas_host.input_router_hwnd(),
                 input_hwnd,
+                std::rc::Rc::new(move || {
+                    let _ = desktop.webview.evaluate_script(
+                        "document.activeElement?.blur?.(); document.querySelector('main.app-shell')?.focus({ preventScroll: true });",
+                    );
+                }),
             ) {
                 Ok(router) => router,
                 Err(error) => {

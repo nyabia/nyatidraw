@@ -141,6 +141,9 @@ mod tests {
                 pixels_per_inch: 96,
             })
             .unwrap();
+        database
+            .persist_editor_tool_state(b"fixture tool preferences")
+            .unwrap();
         drop(database); // Untouched project deliberately has no layer metadata.
         let original = fs::read(&source).unwrap();
         for (index, extension, bytes) in [
@@ -160,6 +163,10 @@ mod tests {
         copy_closed_project(&source, &target).unwrap();
         let reopened = ProjectDb::open(&target).unwrap();
         assert!(reopened.load_reopened().unwrap().is_none());
+        assert_eq!(
+            reopened.load_editor_tool_state().unwrap().unwrap(),
+            b"fixture tool preferences"
+        );
         assert!(target.with_extension("png").is_file());
         drop(reopened);
         for path in [&source, &target, &target.with_extension("png")] {

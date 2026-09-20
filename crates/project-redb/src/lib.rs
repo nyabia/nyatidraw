@@ -5,11 +5,13 @@
 use std::path::{Path, PathBuf};
 
 mod canvas_history;
+mod editor_state;
 mod history_retention;
 mod layer_history;
 #[cfg(feature = "legacy-migration")]
 mod migration;
 mod object_retention;
+mod root_codec;
 #[cfg(feature = "legacy-migration")]
 pub use migration::migrate_legacy_copy;
 
@@ -29,10 +31,10 @@ use nyatidraw_project::{
     CONFIGURABLE_BRUSH_SCHEMA_FLAG, Envelope, LAYER_COMPOSITING_SCHEMA_FLAG,
     LAYER_HISTORY_SCHEMA_VERSION, MAX_LAYER_TREE_RECORD_BYTES, OpenMode, ProjectCommitBatch,
     ProjectHistoryCursor, ProjectOpenError, ProjectRepository, ProjectStructuralBatch, RecordKind,
-    ReopenedProject, RootManifest, SCHEMA_CAPABILITY_FLAGS, SCHEMA_VERSION,
-    SELECTION_STROKE_SCHEMA_VERSION, SIGNED_SELECTION_SCHEMA_FLAG, decode_history_cursor,
-    decode_history_node, decode_initial_history_cursor, decode_layer_tree, decode_project_head,
-    decode_root_manifest, decode_stroke_commit, encode_history_cursor, encode_history_node,
+    ReopenedProject, RootManifest, SCHEMA_VERSION, SELECTION_STROKE_SCHEMA_VERSION,
+    SIGNED_SELECTION_SCHEMA_FLAG, decode_history_cursor, decode_history_node,
+    decode_initial_history_cursor, decode_layer_tree, decode_project_head, decode_root_manifest,
+    decode_stroke_commit, encode_history_cursor, encode_history_node,
     encode_initial_history_cursor, encode_layer_tree, encode_project_head, encode_root_manifest,
     encode_stroke_commit, open_mode,
 };
@@ -56,6 +58,8 @@ const CANVAS_METADATA_VERSION_KEY: &str = "canvas_metadata_version";
 const CANVAS_WIDTH_KEY: &str = "canvas_width_px";
 const CANVAS_HEIGHT_KEY: &str = "canvas_height_px";
 const CANVAS_PPI_KEY: &str = "canvas_pixels_per_inch";
+const SCHEMA_CAPABILITY_FLAGS: u64 =
+    nyatidraw_project::SCHEMA_CAPABILITY_FLAGS | root_codec::SCHEMA_FLAG;
 /// Reopen must enumerate persisted nodes to rebuild redo branches. This cap
 /// bounds malformed or hostile projects before allocating an arbitrary graph.
 const MAX_REOPEN_HISTORY_NODES: usize = 100_000;
@@ -658,7 +662,10 @@ impl ProjectDb {
                 .ok_or_else(|| self.corrupt("schema marker missing"))?
                 .value();
             metadata
-                .insert("schema_version", version | COMPRESSED_TILE_SCHEMA_FLAG)
+                .insert(
+                    "schema_version",
+                    version | COMPRESSED_TILE_SCHEMA_FLAG | root_codec::SCHEMA_FLAG,
+                )
                 .map_err(|e| self.io(e))?;
         }
         match control {
@@ -1426,14 +1433,14 @@ impl ProjectDb {
             table
                 .insert(
                     "schema_version",
-                    SCHEMA_VERSION | COMPRESSED_TILE_SCHEMA_FLAG,
+                    SCHEMA_VERSION | COMPRESSED_TILE_SCHEMA_FLAG | root_codec::SCHEMA_FLAG,
                 )
                 .map_err(|error| self.io(error))?;
             table
                 .insert(object_retention::REFERENCE_VERSION_KEY, 1)
                 .map_err(|e| self.io(e))?;
             table
-                .insert("tile_storage_revision", 1)
+                .insert("tile_storage_revision", 2)
                 .map_err(|e| self.io(e))?;
             write_canvas_metadata(&mut table, CanvasSpec::DEFAULT)
                 .map_err(|error| self.io(error))?;
@@ -1451,6 +1458,13 @@ impl ProjectDb {
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
             Err(error) => return Err(self.io(error)),
         };
+        if table
+            .get("tile_storage_revision")
+            .map_err(|error| self.io(error))?
+            .is_some_and(|value| !matches!(value.value(), 1 | 2))
+        {
+            return Err(self.corrupt("unsupported tile storage revision"));
+        }
         Ok(table
             .get("schema_version")
             .map_err(|error| self.io(error))?
@@ -1574,7 +1588,10 @@ fn store_root(
     table: &mut redb::Table<'_, &[u8], &[u8]>,
     snapshot: &TileSnapshot,
 ) -> Result<(), redb::StorageError> {
-    let envelope = Envelope::new(RecordKind::ContentRoot, encode_root_manifest(snapshot)).encode();
+    let envelope = root_codec::encode(&Envelope::new(
+        RecordKind::ContentRoot,
+        encode_root_manifest(snapshot),
+    ));
     insert_changed_envelope(table, snapshot.root().hash.0.as_slice(), &envelope)?;
     Ok(())
 }
@@ -1602,7 +1619,7 @@ fn load_root(
     expected: ContentRoot,
 ) -> Result<TileSnapshot, String> {
     let manifest_bytes = get_required(roots, expected.hash.0.as_slice(), "root manifest missing")?;
-    let envelope = decode_envelope(RecordKind::ContentRoot, &manifest_bytes)
+    let envelope = root_codec::decode(&manifest_bytes)
         .map_err(|message| format!("root manifest corrupt: {message}"))?;
     let manifest = decode_root_manifest(&envelope.payload)
         .map_err(|error| format!("root manifest corrupt: {error}"))?;
@@ -2191,6 +2208,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn configurable_brush_survives_reopen_and_metadata_upgrades_without_losing_reader_gate() {
         // Risk: old writers must not discard configurable brush meaning, even
         // after a layer/page upgrade or Undo preserves the v2 redo branch.
@@ -2283,6 +2301,7 @@ mod tests {
                 | COMPRESSED_TILE_SCHEMA_FLAG
                 | CONFIGURABLE_BRUSH_SCHEMA_FLAG
                 | LAYER_COMPOSITING_SCHEMA_FLAG
+                | root_codec::SCHEMA_FLAG
         );
         // The original reader masked compression only; this must not resemble
         // one of its known levels 1..=4.
@@ -2373,7 +2392,10 @@ mod tests {
         #[cfg(feature = "legacy-migration")]
         {
             let rebuilt = raw_records(&path);
-            assert_eq!(rebuilt.1, original.1 | COMPRESSED_TILE_SCHEMA_FLAG);
+            assert_eq!(
+                rebuilt.1,
+                original.1 | COMPRESSED_TILE_SCHEMA_FLAG | root_codec::SCHEMA_FLAG
+            );
             assert_eq!(rebuilt.0.len(), original.0.len());
             let mut before_len = 0;
             let mut after_len = 0;
@@ -2408,7 +2430,10 @@ mod tests {
             .unwrap()
             .unwrap()
             .value();
-        assert_eq!(marker, SCHEMA_VERSION | COMPRESSED_TILE_SCHEMA_FLAG);
+        assert_eq!(
+            marker,
+            SCHEMA_VERSION | COMPRESSED_TILE_SCHEMA_FLAG | root_codec::SCHEMA_FLAG
+        );
         assert!(!matches!(marker, 1..=4));
         drop(read);
         drop(db);
@@ -3082,6 +3107,7 @@ mod tests {
                 | COMPRESSED_TILE_SCHEMA_FLAG
                 | SIGNED_SELECTION_SCHEMA_FLAG
                 | LAYER_COMPOSITING_SCHEMA_FLAG
+                | root_codec::SCHEMA_FLAG
         );
         assert!(
             !(1..=4).contains(
@@ -3209,7 +3235,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .value(),
-            SELECTION_STROKE_SCHEMA_VERSION | COMPRESSED_TILE_SCHEMA_FLAG,
+            SELECTION_STROKE_SCHEMA_VERSION | COMPRESSED_TILE_SCHEMA_FLAG | root_codec::SCHEMA_FLAG,
             "Undo must not downgrade a project with selected redo branches"
         );
         drop(transaction);

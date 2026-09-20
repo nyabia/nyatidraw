@@ -14,7 +14,9 @@ use windows::Win32::{
     },
     UI::{
         Controls::WM_MOUSELEAVE,
-        Input::Pointer::{GetPointerInfo, POINTER_FLAG_INCONTACT, POINTER_INFO},
+        Input::Pointer::{
+            GetPointerInfo, POINTER_FLAG_INCONTACT, POINTER_FLAG_THIRDBUTTON, POINTER_INFO,
+        },
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
             GetClientRect, GetMessageExtraInfo, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
@@ -137,6 +139,7 @@ pub(crate) struct CanvasInputRouter {
     canvas_live: Cell<bool>,
     input_live: Cell<bool>,
     state: RefCell<RoutingState>,
+    on_canvas_focus: Rc<dyn Fn()>,
 }
 impl CanvasInputRouter {
     fn send_ui(&self, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -149,15 +152,24 @@ impl CanvasInputRouter {
         if !self.canvas_live.get() {
             return LRESULT(0);
         }
-        unsafe { DefSubclassProc(self.canvas, msg, wp, lp) }
+        let result = unsafe { DefSubclassProc(self.canvas, msg, wp, lp) };
+        if matches!(msg, WM_POINTERDOWN | WM_LBUTTONDOWN | WM_MBUTTONDOWN) {
+            (self.on_canvas_focus)();
+        }
+        result
     }
-    pub(crate) fn new(canvas: isize, input: isize) -> Result<Rc<Self>, String> {
+    pub(crate) fn new(
+        canvas: isize,
+        input: isize,
+        on_canvas_focus: Rc<dyn Fn()>,
+    ) -> Result<Rc<Self>, String> {
         let router = Rc::new(Self {
             canvas: HWND(canvas as _),
             input: HWND(input as _),
             canvas_live: Cell::new(true),
             input_live: Cell::new(true),
             state: RefCell::new(RoutingState::default()),
+            on_canvas_focus,
         });
         let ptr = Rc::as_ptr(&router) as usize;
         unsafe {
@@ -185,6 +197,7 @@ impl Drop for CanvasInputRouter {
                 let _ = RemoveWindowSubclass(self.input, Some(route_input), ROUTER_SUBCLASS);
             }
         }
+        restore_input(self);
     }
 }
 fn button(msg: u32, wp: WPARAM) -> (u32, bool, bool) {
@@ -241,8 +254,37 @@ unsafe extern "system" fn route_input(
     }
     let (mask, down, up) = button(msg, wp);
     if hwnd == router.input {
+        if matches!(
+            msg,
+            WM_POINTERDOWN
+                | WM_POINTERUPDATE
+                | WM_POINTERUP
+                | WM_POINTERLEAVE
+                | WM_POINTERCAPTURECHANGED
+        ) {
+            let id = wp.0 as u32 & 0xffff;
+            let canvas_owned = router
+                .state
+                .borrow()
+                .pointers
+                .contains(&Some((id, Owner::Canvas)));
+            if canvas_owned && router.canvas_live.get() {
+                return unsafe { SendMessageW(router.canvas, msg, Some(wp), Some(lp)) };
+            }
+        }
         {
             let mut state = router.state.borrow_mut();
+            if msg == WM_POINTERDOWN {
+                let id = wp.0 as u32 & 0xffff;
+                if !state.pointers.iter().any(|p| p.is_some_and(|p| p.0 == id)) {
+                    if let Some(slot) = state.pointers.iter_mut().find(|slot| slot.is_none()) {
+                        *slot = Some((id, Owner::Ui));
+                    } else {
+                        state.pointer_overflow = true;
+                        return LRESULT(0);
+                    }
+                }
+            }
             if down {
                 state.mouse = Some(Owner::Ui);
                 state.buttons |= mask;
@@ -265,6 +307,9 @@ unsafe extern "system" fn route_input(
                     {
                         *pointer = None;
                     }
+                }
+                if state.pointers.iter().all(Option::is_none) {
+                    state.pointer_overflow = false;
                 }
             }
         }
@@ -341,7 +386,10 @@ unsafe extern "system" fn route_input(
                     state.pointers[index] = None;
                 }
                 (existing, true)
-            } else if msg == WM_POINTERDOWN {
+            } else if msg == WM_POINTERDOWN
+                || (msg == WM_POINTERUPDATE
+                    && native.pointerFlags.contains(POINTER_FLAG_THIRDBUTTON))
+            {
                 if let Some(owner) = existing {
                     (Some(owner), false)
                 } else if state.pointer_overflow {
@@ -373,7 +421,10 @@ unsafe extern "system" fn route_input(
                         None
                     }
                 });
-                if msg == WM_POINTERUP
+                if (msg == WM_POINTERUP
+                    || (msg == WM_POINTERUPDATE
+                        && !native.pointerFlags.contains(POINTER_FLAG_INCONTACT)
+                        && !native.pointerFlags.contains(POINTER_FLAG_THIRDBUTTON)))
                     && let Some(index) = index
                 {
                     state.pointers[index] = None;

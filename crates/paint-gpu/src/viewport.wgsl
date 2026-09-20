@@ -2,6 +2,8 @@ struct ViewportParams {
     document_x: vec4<f32>,
     document_y: vec4<f32>,
     document_size: vec4<f32>,
+    workspace_light: vec4<f32>,
+    workspace_dark: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -30,6 +32,10 @@ fn fragment_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
         dot(params.document_y.xy, position.xy) + params.document_y.z,
     );
 
+    let checker_cell = 16.0;
+    let checker = (i32(floor(document.x / checker_cell))
+        + i32(floor(document.y / checker_cell))) & 1;
+
     // The disposable viewport projection owns page chrome. Raster/group
     // textures retain premultiplied artwork only; neither this checkerboard nor
     // the workspace/border colors enter durable pixels.
@@ -49,17 +55,12 @@ fn fragment_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
             select(1e20, x_pixels, beyond_x),
             select(1e20, y_pixels, beyond_y),
         );
-        let workspace = vec3<f32>(0.035);
+        let workspace = select(params.workspace_dark.rgb, params.workspace_light.rgb, checker == 0);
         let border = vec3<f32>(0.0);
         return vec4<f32>(select(workspace, border, edge_distance_pixels <= 2.0), 1.0);
     }
 
-    // Checkerboard is a page-only alpha backdrop. It cannot leak into the
-    // workspace and it never alters the composite source texture. Anchor to
-    // document pixel edges, so panning/zooming/rotation move it with artwork.
-    let checker_cell = 16.0;
-    let checker = (i32(floor(document.x / checker_cell))
-        + i32(floor(document.y / checker_cell))) & 1;
+    // Both backdrops follow document pixels without altering the source texture.
     let checker_value = select(0.58, 0.72, checker == 0);
     let checkerboard = vec3<f32>(checker_value);
     let uv = document / params.document_size.xy;

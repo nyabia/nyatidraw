@@ -22,18 +22,22 @@ use windows::{
         UI::Input::KeyboardAndMouse::{
             GetCapture, GetKeyState, ReleaseCapture, SetCapture, VK_SPACE,
         },
+        UI::Input::Pointer::{
+            GetPointerPenInfo, POINTER_FLAG_CANCELED, POINTER_FLAG_INCONTACT,
+            POINTER_FLAG_SECONDBUTTON, POINTER_FLAG_THIRDBUTTON, POINTER_PEN_INFO,
+        },
         UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         UI::WindowsAndMessaging::{
             CREATESTRUCTW, CS_HREDRAW, CS_OWNDC, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
             DestroyWindow, GWLP_USERDATA, GetClientRect, GetMessagePos, GetMessageTime, GetParent,
-            GetWindowLongPtrW, HWND_BOTTOM, IDC_ARROW, LoadCursorW, MSG, PostMessageW,
-            RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer, SetWindowLongPtrW,
-            SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED,
-            WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-            WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-            WM_NCDESTROY, WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP,
-            WM_POINTERUPDATE, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
-            WS_CLIPSIBLINGS, WS_VISIBLE,
+            GetWindowLongPtrW, HWND_BOTTOM, IDC_ARROW, LoadCursorW, MSG, PEN_FLAG_BARREL,
+            PostMessageW, RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer,
+            SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP,
+            WM_CAPTURECHANGED, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+            WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+            WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_POINTERCAPTURECHANGED,
+            WM_POINTERDOWN, WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE, WM_SIZE, WM_TIMER,
+            WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
         },
     },
     core::w,
@@ -525,10 +529,10 @@ impl CanvasWindowState {
         }
     }
 
-    fn observe_input(&mut self, message: &MSG) -> bool {
+    fn observe_input(&mut self, message: &MSG, controls: Option<PenControls>) -> bool {
         match message.message {
             WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP | WM_POINTERCAPTURECHANGED => {
-                self.pen.observe(message)
+                self.pen.observe(message, controls)
             }
             WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP | WM_CAPTURECHANGED => {
                 self.mouse.observe(message)
@@ -537,8 +541,13 @@ impl CanvasWindowState {
         }
     }
 
-    fn observe_viewport(&mut self, hwnd: HWND, message: &MSG) -> bool {
-        self.viewport.observe(hwnd, message)
+    fn observe_viewport(
+        &mut self,
+        hwnd: HWND,
+        message: &MSG,
+        controls: Option<PenControls>,
+    ) -> bool {
+        self.viewport.observe(hwnd, message, controls)
     }
 
     fn reopen_after_close_failure(&mut self) {
@@ -675,6 +684,7 @@ unsafe extern "system" fn canvas_wnd_proc(
             | WM_POINTERUPDATE
             | WM_POINTERUP
             | WM_POINTERCAPTURECHANGED
+            | WM_POINTERLEAVE
             | WM_LBUTTONDOWN
             | WM_MOUSEMOVE
             | WM_LBUTTONUP
@@ -688,9 +698,19 @@ unsafe extern "system" fn canvas_wnd_proc(
                     return LRESULT(0);
                 }
                 let msg = current_message(hwnd, message, wparam, lparam);
+                let controls = matches!(message, WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP)
+                    .then(|| pen_controls(wparam))
+                    .flatten();
                 let capture_was_active =
-                    state.viewport.drag.is_some() || state.mouse.active.is_some();
-                let viewport_handled = state.observe_viewport(hwnd, &msg);
+                    state.viewport.mouse_capture() || state.mouse.active.is_some();
+                if matches!(message, WM_POINTERDOWN | WM_POINTERUPDATE)
+                    && controls.is_some_and(|controls| {
+                        controls.shortcut == PenShortcut::Grab && !controls.cancelled
+                    })
+                {
+                    state.pen.finish_active(msg.time);
+                }
+                let viewport_handled = state.observe_viewport(hwnd, &msg, controls);
                 if viewport_handled {
                     if state.viewport.drag.is_some() && state.mouse.active.is_some() {
                         // Navigation taking over the same HWND capture does
@@ -698,14 +718,14 @@ unsafe extern "system" fn canvas_wnd_proc(
                         state.mouse.capture_lost(msg.time);
                     }
                     state.live_ink.request_redraw();
-                } else if state.observe_input(&msg) {
+                } else if state.observe_input(&msg, controls) {
                     // Admission already requests a wakeup. This is idempotent
                     // for capture/phase-only paths, without entering rendering
                     // from this input dispatch.
                     state.live_ink.request_redraw();
                 }
                 let capture_is_active =
-                    state.viewport.drag.is_some() || state.mouse.active.is_some();
+                    state.viewport.mouse_capture() || state.mouse.active.is_some();
                 // No state access after capture APIs: ReleaseCapture can
                 // synchronously dispatch WM_CAPTURECHANGED to this procedure.
                 if !capture_was_active && capture_is_active {
@@ -735,6 +755,15 @@ unsafe extern "system" fn canvas_wnd_proc(
 #[derive(Clone, Copy)]
 struct ViewportDrag {
     last_client_px: [i32; 2],
+    source: ViewportDragSource,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ViewportDragSource {
+    MousePrimary,
+    MouseMiddle,
+    PenContact(u32),
+    PenButton(u32),
 }
 
 struct WindowsViewportInput {
@@ -759,10 +788,85 @@ impl WindowsViewportInput {
         }
     }
 
+    fn mouse_capture(&self) -> bool {
+        self.drag.is_some_and(|drag| {
+            matches!(
+                drag.source,
+                ViewportDragSource::MousePrimary | ViewportDragSource::MouseMiddle
+            )
+        })
+    }
+
+    fn pen_drag(&self, pointer: u32) -> bool {
+        self.drag.is_some_and(|drag| {
+            matches!(drag.source, ViewportDragSource::PenContact(id) | ViewportDragSource::PenButton(id) if id == pointer)
+        })
+    }
+
+    fn observe_pen(&mut self, hwnd: HWND, message: &MSG, controls: Option<PenControls>) -> bool {
+        let pointer = u32::try_from(message.wParam.0 & 0xffff).expect("pointer id is 16-bit");
+        if matches!(message.message, WM_POINTERCAPTURECHANGED | WM_POINTERLEAVE) {
+            if self.pen_drag(pointer) {
+                self.drag = None;
+            }
+            return false;
+        }
+        if controls.is_some_and(|controls| controls.cancelled) {
+            if self.pen_drag(pointer) {
+                self.drag = None;
+            }
+            return false;
+        }
+        if message.message == WM_POINTERUP && self.pen_drag(pointer) {
+            self.move_drag(hwnd, screen_message_point(hwnd, message.lParam));
+            self.drag = None;
+            return true;
+        }
+        if message.message == WM_POINTERUPDATE
+            && self
+                .drag
+                .is_some_and(|drag| drag.source == ViewportDragSource::PenButton(pointer))
+            && !controls.is_some_and(|controls| controls.shortcut == PenShortcut::Grab)
+        {
+            self.drag = None;
+            return true;
+        }
+        if matches!(message.message, WM_POINTERDOWN | WM_POINTERUPDATE)
+            && controls.is_some_and(|controls| controls.shortcut == PenShortcut::Grab)
+        {
+            if self.pen_drag(pointer) {
+                self.move_drag(hwnd, screen_message_point(hwnd, message.lParam));
+            } else if self.drag.is_none() {
+                self.drag = Some(ViewportDrag {
+                    last_client_px: screen_message_point(hwnd, message.lParam),
+                    source: ViewportDragSource::PenButton(pointer),
+                });
+            }
+            return true;
+        }
+        if message.message == WM_POINTERDOWN
+            && (space_is_down()
+                || (self.live_ink.navigation_tool()
+                    && !alt_is_down()
+                    && !controls.is_some_and(|controls| controls.shortcut == PenShortcut::Picker)))
+        {
+            self.drag = Some(ViewportDrag {
+                last_client_px: screen_message_point(hwnd, message.lParam),
+                source: ViewportDragSource::PenContact(pointer),
+            });
+            return true;
+        }
+        if message.message == WM_POINTERUPDATE && self.pen_drag(pointer) {
+            self.move_drag(hwnd, screen_message_point(hwnd, message.lParam));
+            return true;
+        }
+        false
+    }
+
     /// Returns true when the message belongs to viewport navigation and must
     /// not reach the paint input path.
     #[allow(clippy::too_many_lines)]
-    fn observe(&mut self, hwnd: HWND, message: &MSG) -> bool {
+    fn observe(&mut self, hwnd: HWND, message: &MSG, controls: Option<PenControls>) -> bool {
         match message.message {
             WM_KEYDOWN => {
                 // Holding Escape must not cancel a draft and then clear its
@@ -867,6 +971,7 @@ impl WindowsViewportInput {
             WM_MBUTTONDOWN => {
                 self.drag = Some(ViewportDrag {
                     last_client_px: client_point(message.lParam),
+                    source: ViewportDragSource::MouseMiddle,
                 });
                 true
             }
@@ -875,46 +980,44 @@ impl WindowsViewportInput {
             {
                 self.drag = Some(ViewportDrag {
                     last_client_px: client_point(message.lParam),
+                    source: ViewportDragSource::MousePrimary,
                 });
                 true
             }
             WM_POINTERDOWN
-                if space_is_down() || (self.live_ink.navigation_tool() && !alt_is_down()) =>
-            {
-                self.drag = Some(ViewportDrag {
-                    last_client_px: screen_message_point(hwnd, message.lParam),
-                });
-                true
-            }
-            WM_POINTERUPDATE if self.drag.is_some() => {
-                let point = screen_message_point(hwnd, message.lParam);
-                self.move_drag(hwnd, point);
-                true
-            }
+            | WM_POINTERUPDATE
+            | WM_POINTERUP
+            | WM_POINTERCAPTURECHANGED
+            | WM_POINTERLEAVE => self.observe_pen(hwnd, message, controls),
             WM_MOUSEMOVE => {
-                if self.drag.is_none() {
+                if !self.mouse_capture() {
                     return false;
                 }
                 self.move_drag(hwnd, client_point(message.lParam));
                 true
             }
-            WM_MBUTTONUP => {
+            WM_MBUTTONUP
+                if self
+                    .drag
+                    .is_some_and(|drag| drag.source == ViewportDragSource::MouseMiddle) =>
+            {
                 self.move_drag(hwnd, client_point(message.lParam));
                 self.drag = None;
                 true
             }
-            WM_LBUTTONUP if self.drag.is_some() => {
+            WM_LBUTTONUP
+                if self
+                    .drag
+                    .is_some_and(|drag| drag.source == ViewportDragSource::MousePrimary) =>
+            {
                 self.move_drag(hwnd, client_point(message.lParam));
-                self.drag = None;
-                true
-            }
-            WM_POINTERUP if self.drag.is_some() => {
-                self.move_drag(hwnd, screen_message_point(hwnd, message.lParam));
                 self.drag = None;
                 true
             }
             WM_CAPTURECHANGED => {
-                self.drag = None;
+                if self.mouse_capture() {
+                    self.drag = None;
+                }
                 // Paint owns an independent active phase and must receive
                 // capture loss even when navigation had no active drag.
                 false
@@ -1029,6 +1132,39 @@ fn alt_is_down() -> bool {
     // Read current native thread state, not a latched DOM modifier: Alt release
     // outside the canvas/window cannot leave the temporary picker enabled.
     unsafe { GetKeyState(0x12) < 0 }
+}
+
+#[derive(Clone, Copy)]
+struct PenControls {
+    shortcut: PenShortcut,
+    contact: bool,
+    cancelled: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PenShortcut {
+    None,
+    Grab,
+    Picker,
+}
+
+fn pen_controls(wparam: WPARAM) -> Option<PenControls> {
+    let pointer = u32::try_from(wparam.0 & 0xffff).ok()?;
+    let mut pen = POINTER_PEN_INFO::default();
+    // SAFETY: Windows fills one owned record for the current pointer message.
+    unsafe { GetPointerPenInfo(pointer, &raw mut pen) }.ok()?;
+    let flags = pen.pointerInfo.pointerFlags;
+    Some(PenControls {
+        shortcut: if flags.contains(POINTER_FLAG_THIRDBUTTON) {
+            PenShortcut::Grab
+        } else if flags.contains(POINTER_FLAG_SECONDBUTTON) || pen.penFlags & PEN_FLAG_BARREL != 0 {
+            PenShortcut::Picker
+        } else {
+            PenShortcut::None
+        },
+        contact: flags.contains(POINTER_FLAG_INCONTACT),
+        cancelled: flags.contains(POINTER_FLAG_CANCELED),
+    })
 }
 
 fn screen_message_point(hwnd: HWND, lparam: LPARAM) -> [i32; 2] {
@@ -1701,6 +1837,8 @@ struct WindowsPenInput {
     policy: nyatidraw_input::InStrokeViewportPolicy,
     live_ink: LiveInkBridge,
     active_pointer: Option<u32>,
+    temporary_picker: bool,
+    barrel_picker: bool,
 }
 
 impl WindowsPenInput {
@@ -1713,13 +1851,37 @@ impl WindowsPenInput {
             policy: nyatidraw_input::InStrokeViewportPolicy::default(),
             live_ink,
             active_pointer: None,
+            temporary_picker: false,
+            barrel_picker: false,
         }
     }
 
-    fn observe(&mut self, message: &MSG) -> bool {
-        if message.message == WM_POINTERDOWN {
+    fn observe(&mut self, message: &MSG, controls: Option<PenControls>) -> bool {
+        let mut effective_message = *message;
+        if message.message == WM_POINTERUPDATE
+            && self.active_pointer.is_some()
+            && let Some(controls) = controls.filter(|controls| !controls.cancelled)
+        {
+            if self.barrel_picker && controls.shortcut != PenShortcut::Picker && !alt_is_down() {
+                return self.finish_active(message.time);
+            }
+            if !self.temporary_picker
+                && controls.shortcut == PenShortcut::Picker
+                && controls.contact
+            {
+                self.finish_active(message.time);
+                effective_message.message = WM_POINTERDOWN;
+            }
+        }
+        if effective_message.message == WM_POINTERDOWN {
             self.active_pointer = u32::try_from(message.wParam.0 & 0xffff).ok();
-        } else if matches!(message.message, WM_POINTERUP | WM_POINTERCAPTURECHANGED) {
+            self.barrel_picker =
+                controls.is_some_and(|controls| controls.shortcut == PenShortcut::Picker);
+            self.temporary_picker = self.barrel_picker || alt_is_down();
+        } else if matches!(
+            effective_message.message,
+            WM_POINTERUP | WM_POINTERCAPTURECHANGED
+        ) {
             self.active_pointer = None;
         }
         let viewport = self.live_ink.canvas_viewport_snapshot();
@@ -1734,7 +1896,7 @@ impl WindowsPenInput {
             nyatidraw_input_platform::record_win32_message_into(
                 &mut self.recorder,
                 &mut self.batch,
-                std::ptr::from_ref(message).cast(),
+                std::ptr::from_ref(&effective_message).cast(),
             )
         } {
             eprintln!("desktop-input event=pen-error error={error:?}");
@@ -1753,6 +1915,22 @@ impl WindowsPenInput {
             let viewport = self.live_ink.canvas_viewport_snapshot();
             self.admit(record, viewport, false);
         }
+        self.temporary_picker = false;
+        self.barrel_picker = false;
+    }
+
+    fn finish_active(&mut self, timestamp_ms: u32) -> bool {
+        let closed = if let Some(pointer) = self.active_pointer.take()
+            && let Some(mut record) = self.recorder.cancel_active(pointer, timestamp_ms)
+        {
+            record.sample.phase = nyatidraw_input::PointerPhase::End;
+            self.admit(record, self.live_ink.canvas_viewport_snapshot(), false)
+        } else {
+            false
+        };
+        self.temporary_picker = false;
+        self.barrel_picker = false;
+        closed
     }
 
     fn admit(
@@ -1780,7 +1958,8 @@ impl WindowsPenInput {
         self.live_ink
             .push_with_temporary_picker(
                 recorded.sample,
-                recorded.sample.phase == nyatidraw_input::PointerPhase::Begin && alt_is_down(),
+                recorded.sample.phase == nyatidraw_input::PointerPhase::Begin
+                    && self.temporary_picker,
             )
             .is_ok()
     }

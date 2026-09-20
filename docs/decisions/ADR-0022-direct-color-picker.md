@@ -7,8 +7,10 @@ scenarios below. Physical-device cancellation and latency evidence remain open.
 
 The Color panel supplies a hue ring, central saturation/value square and value
 strip, with pointer capture and keyboard adjustment. Local HSV preview remains
-in the WebView. Completion sends at most one RGBA tool command bound to the
-revision at gesture start through the existing bounded semantic queue. The
+in the WebView. Completion sends at most one RGBA tool command through the
+existing bounded semantic queue. The gesture is bound to its project activation
+epoch and starting color; completion uses the latest semantic revision so an
+unrelated history publication cannot discard the selection. The
 picker returns to authoritative RGBA until an accepted command is projected;
 current/recent colors use that same projection. No raw samples enter UI state.
 
@@ -21,8 +23,13 @@ listeners/observer and resolves the previous evaluation lifetime.
 
 This changes session drawing controls, not the artwork/history format. The
 chosen color affects the next drawing/edit operation. Recent colors and drawing
-controls remain session state rather than preferences persisted across restart.
-No dependencies were added and no core input or brush invariants changed.
+usage remains session state. Drawing controls now persist separately from artwork
+as described in [editor tool state](../editor-tool-state.md).
+No dependencies were added.
+
+The subsequent pen-routing, activation guard and capture-ownership changes are
+tracked in [the current repair gate](../sprints/pen-session-reliability.md).
+The historical evidence below does not verify those changes on a physical pen.
 
 ## Evidence
 

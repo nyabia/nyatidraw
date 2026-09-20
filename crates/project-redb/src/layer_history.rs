@@ -2,12 +2,11 @@
 use super::{
     CURRENT_LAYER_TREE, Envelope, LAYER_COMPOSITING_SCHEMA_FLAG, LAYER_HISTORY_SCHEMA_VERSION,
     LayerTree, MAX_LAYER_TREE_RECORD_BYTES, MAX_REOPEN_HISTORY_NODES, META, ProjectDb,
-    ProjectHistoryCursor, ProjectOpenError, ReadableTable, RecordKind, SNAPSHOTS, STATE,
-    SnapshotId, TableDefinition, decode_envelope, decode_layer_tree, encode_layer_tree,
+    ProjectHistoryCursor, ProjectOpenError, ReadableTable, RecordKind, SCHEMA_CAPABILITY_FLAGS,
+    SNAPSHOTS, STATE, SnapshotId, TableDefinition, decode_envelope, decode_layer_tree,
+    encode_layer_tree,
 };
-use nyatidraw_project::{
-    CANVAS_HISTORY_SCHEMA_VERSION, SCHEMA_CAPABILITY_FLAGS, SELECTION_STROKE_SCHEMA_VERSION,
-};
+use nyatidraw_project::{CANVAS_HISTORY_SCHEMA_VERSION, SELECTION_STROKE_SCHEMA_VERSION};
 use std::collections::BTreeSet;
 
 pub(super) const SNAPSHOT_LAYERS: TableDefinition<&[u8], &[u8]> =

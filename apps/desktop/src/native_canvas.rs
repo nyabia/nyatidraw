@@ -56,7 +56,9 @@ use nyatidraw_brush::{
     RoundBrushEvaluator, RoundBrushStroke, begin_round_stroke,
 };
 use nyatidraw_document::{GroupNode, LayerNode, LayerTree, LayerTreeNode};
-use nyatidraw_editor::{HeadlessStrokeSession, ProjectionError, ProjectionState};
+use nyatidraw_editor::{
+    HeadlessStrokeError, HeadlessStrokeSession, ProjectionError, ProjectionState,
+};
 use nyatidraw_input::{
     PenButtons, Point, PointerPhase, StrokeSmoother, StylusSample, ViewportTransform,
 };
@@ -69,7 +71,7 @@ use nyatidraw_paint_gpu::{
 };
 use nyatidraw_project::{ProjectOpenError, ReopenedProject};
 use nyatidraw_project_redb::ProjectDb;
-use nyatidraw_stroke::{MAX_SAMPLES_PER_STROKE, StrokeColor};
+use nyatidraw_stroke::{MAX_SAMPLES_PER_STROKE, StrokeColor, StrokeCommitError};
 use nyatidraw_tiles::{TILE_BYTE_LEN, TILE_EDGE, TileKey, TileSnapshot};
 
 use crate::{
@@ -181,7 +183,10 @@ pub(crate) fn preset_for_ui_preview(projection: &nyatidraw_api::UiProjection) ->
     DrawingConfig::from_projection(projection).preset()
 }
 
-#[derive(Clone, Copy, Debug)]
+mod export_receipt;
+mod tool_state;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DrawingConfig {
     edit_settings: nyatidraw_api::EditSettings,
     tool: DrawingTool,
@@ -195,7 +200,7 @@ struct DrawingConfig {
     background_color: [u8; 4],
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RememberedBrush {
     size_tenths: u16,
     opacity_u16: u16,
@@ -213,6 +218,19 @@ impl RememberedBrush {
 }
 
 impl DrawingConfig {
+    fn stage_projection(&self, projection: &mut ProjectionState) {
+        projection.stage_pencil_template(self.pencil_template);
+        projection.stage_brush_settings(self.brush_settings);
+        projection.stage_drawing_controls(
+            self.tool,
+            self.size_tenths,
+            self.opacity_u16,
+            self.color,
+            self.background_color,
+        );
+        projection.stage_edit_settings(self.edit_settings);
+    }
+
     fn from_projection(projection: &nyatidraw_api::UiProjection) -> Self {
         let mut drawing = Self {
             edit_settings: projection.edit_settings,
@@ -651,6 +669,7 @@ impl SharedGpuCanvas {
         // Honor semantic requests admitted before Close, especially Save.
         // Raw samples stay in their bounded native lane for shutdown drain.
         canvas.apply_commands(width, height, scale);
+        canvas.retirement = CanvasRetirement::Close;
         match thread::Builder::new()
             .name("nyatidraw-close".into())
             .spawn(move || drop(canvas))
@@ -1027,6 +1046,12 @@ enum CanvasState {
     Failed,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum CanvasRetirement {
+    Recreate,
+    Close,
+}
+
 struct ActiveCanvas {
     painter: GpuRoundDabPainter,
     alpha_painter: GpuRoundDabPainter,
@@ -1042,6 +1067,7 @@ struct ActiveCanvas {
     project_export_path: Option<PathBuf>,
     pending_initial_viewport: Option<ViewportCommand>,
     pending_save: Option<u64>,
+    retirement: CanvasRetirement,
     artwork_job: Option<ArtworkJob>,
     selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     canvas_spec: CanvasSpec,
@@ -1165,7 +1191,8 @@ impl ActiveCanvas {
             )
         };
 
-        let drawing = DrawingConfig::from_projection(projection.current());
+        let drawing = materialization.initial_drawing;
+        drawing.stage_projection(&mut projection);
         scene
             .set_solo(projection.current().solo_node)
             .map_err(|error| format!("restored-solo:{error:?}"))?;
@@ -1191,6 +1218,7 @@ impl ActiveCanvas {
             pending_initial_viewport: (!restoring_projection)
                 .then_some(ViewportCommand::FitDocument),
             pending_save: None,
+            retirement: CanvasRetirement::Recreate,
             artwork_job: None,
             selection: None,
             canvas_spec,
@@ -1220,9 +1248,8 @@ impl ActiveCanvas {
             gpu_batches: 0,
             gpu_batch_logs_remaining: 16,
         };
-        if restoring_projection {
-            canvas.publish_current_projection();
-        } else {
+        canvas.publish_current_projection();
+        if !restoring_projection {
             canvas.enqueue_initial_commands(live_ink);
         }
         live_ink.set_admission_layer(active_layer);
@@ -1859,6 +1886,12 @@ impl ActiveCanvas {
             self.scene.set_gesture_preview(guide, closed);
         }
         let composite_timing = Span::new(Stage::Composite);
+        self.scene.set_workspace_background(
+            self.stroke
+                .live_ink
+                .workspace_appearance()
+                .background_colors(),
+        );
         crate::performance::frame_mark(crate::performance::FrameMark::ViewportBegin);
         let rendered = self.scene.render_viewport(viewport);
         crate::performance::frame_mark(crate::performance::FrameMark::ViewportEnd);
@@ -2283,6 +2316,7 @@ impl ActiveCanvas {
                 Ok(false)
             }
             EditorCommand::Tool(command) => {
+                let previous_drawing = self.drawing;
                 // A pending eyedropper result must not overwrite a newer color
                 // command. Serialize color mutations with the artwork worker.
                 if (self.artwork_job.is_some() || self.stroke.live_ink.temporary_pick_pending())
@@ -2424,19 +2458,10 @@ impl ActiveCanvas {
                         }
                     }
                     self.drawing.remember_current();
-                    self.projection
-                        .stage_pencil_template(self.drawing.pencil_template);
-                    self.projection
-                        .stage_brush_settings(self.drawing.brush_settings);
-                    self.projection.stage_drawing_controls(
-                        self.drawing.tool,
-                        self.drawing.size_tenths,
-                        self.drawing.opacity_u16,
-                        self.drawing.color,
-                        self.drawing.background_color,
-                    );
-                    self.projection
-                        .stage_edit_settings(self.drawing.edit_settings);
+                    self.drawing.stage_projection(&mut self.projection);
+                    if self.drawing != previous_drawing {
+                        self.stroke.materializer.persist_tool_state(self.drawing);
+                    }
                     Ok(false)
                 })();
                 if self.artwork_job.is_none() {
@@ -2993,6 +3018,7 @@ impl ActiveCanvas {
                 }
                 if let Some(color) = outcome.sampled_color {
                     self.drawing.color = color;
+                    self.stroke.materializer.persist_tool_state(self.drawing);
                     self.projection.stage_drawing_controls(
                         self.drawing.tool,
                         self.drawing.size_tenths,
@@ -4797,7 +4823,25 @@ impl Drop for ActiveCanvas {
                     .publish_workspace_error(format!("Closing edit was not applied: {error}"));
             }
         }
-        if let Some(generation) = self.pending_save.take() {
+        let mut closing_export = self.pending_save.take();
+        if closing_export.is_none()
+            && self.retirement == CanvasRetirement::Close
+            && self.project_export_path.is_some()
+        {
+            if let Ok(generation) = self.stroke.materializer.reserve_export() {
+                closing_export = Some(generation);
+            } else {
+                self.stroke
+                    .live_ink
+                    .publish_export_status(ExportStatus::Failed {
+                        generation: u64::MAX,
+                    });
+                eprintln!(
+                    "native-canvas event=closing-export-failed reason=generation-exhausted project_durability=unaffected"
+                );
+            }
+        }
+        if let Some(generation) = closing_export {
             if self.stroke.live_ink.workspace_failed() {
                 self.stroke.live_ink.fail_incomplete_export();
                 self.stroke.live_ink.flush_layout();
@@ -4936,9 +4980,11 @@ struct MaterializationWorker {
     pending: Arc<AtomicUsize>,
     display_retired: Arc<AtomicBool>,
     export_generations: Arc<Mutex<ExportGenerationGate>>,
+    tool_state: tool_state::Pending,
     live_ink: LiveInkBridge,
 }
 
+#[derive(Debug)]
 enum ExportEnqueueError {
     Busy,
     Disconnected,
@@ -4982,6 +5028,7 @@ struct MaterializationBootstrap {
     initial_tree: LayerTree,
     initial_canvas: CanvasSpec,
     initial_history: HistoryProjection,
+    initial_drawing: DrawingConfig,
 }
 
 enum LayerPixelChange {
@@ -5033,6 +5080,7 @@ impl LayerPixelChange {
 }
 
 enum WorkerRequest {
+    FlushToolState,
     PickerPreview {
         request: picker_preview::PickerRead,
         reply: SyncSender<Result<picker_preview::PickerFrame, String>>,
@@ -5051,6 +5099,7 @@ enum WorkerRequest {
     ExportPng {
         generation: u64,
         path: PathBuf,
+        reuse_current: bool,
     },
     MoveHistory {
         command: nyatidraw_api::HistoryCommand,
@@ -5294,6 +5343,17 @@ impl MaterializationWorker {
     ) -> Result<MaterializationBootstrap, String> {
         let (session, initial_tiles, initial_tree, initial_canvas, next_id, sink) =
             open_materialization_session(project_location)?;
+        let db = match &sink {
+            ProjectSink::UntitledRecovery { db, .. } | ProjectSink::ExplicitProject { db, .. } => {
+                db
+            }
+        };
+        let (mut tool_preferences, initial_drawing) = tool_state::Store::load(db, &live_ink);
+        let initial_drawing = initial_drawing.unwrap_or_else(|| {
+            DrawingConfig::from_projection(&nyatidraw_api::UiProjection::empty())
+        });
+        let tool_state = tool_state::Pending::default();
+        let worker_tool_state = tool_state.clone();
         let initial_history = session.history_projection();
         publish_navigator_frame(&live_ink, &initial_tiles, &initial_tree, initial_canvas);
         publish_layer_thumbnail_frames(
@@ -5317,6 +5377,11 @@ impl MaterializationWorker {
             .name("nyatidraw-project-writer".into())
             .spawn(move || {
                 let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let db = match &sink {
+                        ProjectSink::UntitledRecovery { db, .. }
+                        | ProjectSink::ExplicitProject { db, .. } => db,
+                    };
+                    tool_preferences.initialize(db, initial_drawing, &worker_live_ink);
                     materialization_loop(
                         &receiver,
                         &completed_sender,
@@ -5329,6 +5394,8 @@ impl MaterializationWorker {
                         &sink,
                         &worker_live_ink,
                         worker_export_generations.as_ref(),
+                        &worker_tool_state,
+                        &mut tool_preferences,
                     )
                 }));
                 match exit {
@@ -5353,13 +5420,23 @@ impl MaterializationWorker {
                 pending,
                 display_retired,
                 export_generations,
+                tool_state,
                 live_ink,
             },
             initial_tiles,
             initial_tree,
             initial_canvas,
             initial_history,
+            initial_drawing,
         })
+    }
+
+    fn persist_tool_state(&self, drawing: DrawingConfig) {
+        if self.tool_state.submit(drawing)
+            && let Some(sender) = &self.sender
+        {
+            let _ = sender.try_send(WorkerRequest::FlushToolState);
+        }
     }
 
     fn try_enqueue(&self, request: ClosedStrokeRequest) -> TryEnqueueStatus {
@@ -5412,7 +5489,11 @@ impl MaterializationWorker {
             .sender
             .as_ref()
             .ok_or(ExportEnqueueError::Disconnected)?;
-        let request = WorkerRequest::ExportPng { generation, path };
+        let request = WorkerRequest::ExportPng {
+            generation,
+            path,
+            reuse_current: shutdown,
+        };
         // Never hold the replacement gate while waiting on worker capacity:
         // an older encoder may need it before it can free that capacity.
         if shutdown {
@@ -5588,8 +5669,11 @@ fn materialization_loop(
     sink: &ProjectSink,
     live_ink: &LiveInkBridge,
     export_generations: &Mutex<ExportGenerationGate>,
+    tool_state: &tool_state::Pending,
+    tool_preferences: &mut tool_state::Store,
 ) -> WorkerExit {
     let mut processed = 0_u64;
+    let mut last_export: Option<export_receipt::ExportReceipt> = None;
     // This is intentionally independent of the project snapshot id: undo can
     // select an older durable snapshot while still needing a newer mailbox
     // publication than the frame currently visible in Dioxus.
@@ -5597,7 +5681,11 @@ fn materialization_loop(
     let mut exit = WorkerExit::Drained;
     let mut selection = None;
     let mut transform_worker = crate::transform_worker::TransformWorker::default();
+    let db = match sink {
+        ProjectSink::UntitledRecovery { db, .. } | ProjectSink::ExplicitProject { db, .. } => db,
+    };
     while let Ok(work) = receiver.recv() {
+        tool_state.flush(tool_preferences, db, live_ink);
         // Dequeue freed a bounded writer slot. Wake a Save retained by the
         // canvas even when this work only changes metadata or exports a PNG.
         live_ink.request_redraw();
@@ -5619,6 +5707,7 @@ fn materialization_loop(
             continue;
         }
         let request = match work {
+            WorkerRequest::FlushToolState => continue,
             WorkerRequest::PickerPreview { request, reply } => {
                 let result = picker_preview::sample_patch(request, session.tiles(), &preview_tree);
                 let _ = reply.send(result);
@@ -5733,7 +5822,11 @@ fn materialization_loop(
                 }
                 continue;
             }
-            WorkerRequest::ExportPng { generation, path } => {
+            WorkerRequest::ExportPng {
+                generation,
+                path,
+                reuse_current,
+            } => {
                 let current = export_generations
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5741,6 +5834,19 @@ fn materialization_loop(
                 if !current {
                     println!(
                         "native-canvas event=png-export-skipped generation={} path={} reason=superseded-before-start",
+                        generation,
+                        path.display(),
+                    );
+                    continue;
+                }
+                if reuse_current
+                    && last_export
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.matches(session.current_snapshot(), &path))
+                {
+                    live_ink.publish_export_status(ExportStatus::Current { generation });
+                    println!(
+                        "native-canvas event=png-export-skipped generation={} path={} reason=already-current",
                         generation,
                         path.display(),
                     );
@@ -5759,6 +5865,10 @@ fn materialization_loop(
                     export_generations,
                 ) {
                     Ok(ExportPngOutcome::Replaced) => {
+                        last_export = export_receipt::ExportReceipt::capture(
+                            session.current_snapshot(),
+                            &path,
+                        );
                         live_ink.publish_export_status(ExportStatus::Current { generation });
                         println!(
                             "native-canvas event=png-export-finished generation={} path={} snapshot={} root={:032x}",
@@ -6134,6 +6244,23 @@ fn materialization_loop(
                     }
                 }
             }
+            Err(HeadlessStrokeError::Seal(StrokeCommitError::NoAffectedTiles)) => {
+                println!(
+                    "live-ink event=empty-stroke-retired stroke={} history-unchanged=true",
+                    request.ordinal,
+                );
+                publish_closed_completion(
+                    completed,
+                    display_retired,
+                    live_ink,
+                    ClosedStrokeCompletion {
+                        ordinal: request.ordinal,
+                        stroke_generation: request.stroke_generation,
+                        tiles: Vec::new(),
+                        history: None,
+                    },
+                )
+            }
             Err(error) => {
                 eprintln!(
                     "live-ink event=stroke-materialization-failed source=native-input stroke={} stage=cpu-replay error={error:?} worker=fail-stop",
@@ -6151,6 +6278,7 @@ fn materialization_loop(
             break;
         }
     }
+    tool_state.flush(tool_preferences, db, live_ink);
     let mode = match sink {
         ProjectSink::UntitledRecovery { path, .. } => {
             println!(
@@ -6704,6 +6832,89 @@ mod tests {
             buttons: PenButtons::default(),
             eraser: false,
             viewport_revision: 0,
+        }
+    }
+
+    #[test]
+    fn empty_strokes_do_not_stop_later_artwork_or_create_history_after_restart() {
+        const REOPEN: &str = "NYATIDRAW_TEST_EMPTY_STROKE_REOPEN";
+        const ROOT: &str = "NYATIDRAW_TEST_EMPTY_STROKE_ROOT";
+        if let Some(path) = std::env::var_os(REOPEN).map(PathBuf::from) {
+            let db = ProjectDb::open(&path).unwrap();
+            let reopened = db.load_reopened().unwrap().unwrap();
+            assert_eq!(
+                format!("{:?}", reopened.current_tiles().root()),
+                std::env::var(ROOT).unwrap()
+            );
+            let session = HeadlessStrokeSession::from_reopened(reopened);
+            assert_eq!(
+                session
+                    .history_projection()
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.operation == nyatidraw_api::HistoryOperationLabel::Stroke
+                    })
+                    .count(),
+                2
+            );
+            return;
+        }
+        for empty_by_pressure in [true, false] {
+            let path = std::env::temp_dir().join(format!(
+                "nyatidraw-empty-stroke-{}-{}.ntdr",
+                std::process::id(),
+                system_timestamp_ns()
+            ));
+            let ink = LiveInkBridge::with_capacity(16, LIVE_LAYER);
+            let bootstrap = MaterializationWorker::start(
+                ink.clone(),
+                &ProjectLocation::UntitledRecovery(path.clone()),
+            )
+            .unwrap();
+            let mut pipeline = StrokePipeline::new(ink.clone(), bootstrap.worker);
+            let mut drawing = pipeline.drawing;
+            drawing.select_tool(DrawingTool::Pen);
+            drawing.brush_settings.size_pressure = true;
+            drawing.brush_settings.size_minimum_u16 = 0;
+            for ordinal in 0..4_u32 {
+                let empty = ordinal % 2 == 0;
+                drawing.opacity_u16 = if empty && !empty_by_pressure {
+                    0
+                } else {
+                    u16::MAX
+                };
+                for (offset, phase) in [(1, PointerPhase::Begin), (2, PointerPhase::End)] {
+                    let mut input = sample(
+                        u64::from(ordinal) * 2 + offset,
+                        phase,
+                        10.0 + f64::from(ordinal) * 8.0,
+                        16.0,
+                    );
+                    input.pressure = if empty && empty_by_pressure {
+                        0.0
+                    } else {
+                        0.75
+                    };
+                    ink.push(input).unwrap();
+                }
+                pipeline.drain(LIVE_LAYER, drawing);
+            }
+            drop(pipeline);
+            assert!(
+                !ink.workspace_failed(),
+                "a zero-coverage contact must not stop subsequent durable strokes"
+            );
+            let db = ProjectDb::open(&path).unwrap();
+            let reopened = db.load_reopened().unwrap().unwrap();
+            assert!(!reopened.current_tiles().is_empty());
+            let root = format!("{:?}", reopened.current_tiles().root());
+            drop(db);
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "native_canvas::tests::empty_strokes_do_not_stop_later_artwork_or_create_history_after_restart"])
+                .env(REOPEN, &path).env(ROOT, root).status().unwrap();
+            assert!(status.success());
+            std::fs::remove_file(path).unwrap();
         }
     }
 
@@ -8403,6 +8614,7 @@ mod tests {
             pending: Arc::new(AtomicUsize::new(0)),
             display_retired: Arc::new(AtomicBool::new(false)),
             export_generations: Arc::new(Mutex::new(ExportGenerationGate::default())),
+            tool_state: tool_state::Pending::default(),
             live_ink: live_ink.clone(),
         };
         let mut pipeline = StrokePipeline::new(live_ink, worker);
@@ -8426,6 +8638,109 @@ mod tests {
             );
         }
         assert!(pipeline.pending_materializations.is_empty());
+    }
+
+    #[test]
+    fn closing_export_matches_drained_artwork_and_failure_preserves_project_after_restart() {
+        const REOPEN: &str = "NYATIDRAW_TEST_CLOSING_EXPORT_REOPEN";
+        const FAILED: &str = "NYATIDRAW_TEST_CLOSING_EXPORT_FAILED";
+        if let Some(directory) = std::env::var_os(REOPEN).map(PathBuf::from) {
+            let location = ProjectLocation::Explicit {
+                path: directory.join("drawing.ntdr"),
+                bootstrap_png: None,
+            };
+            let (session, tiles, tree, canvas, _, sink) =
+                open_materialization_session(&location).unwrap();
+            assert_eq!(session.current_snapshot(), SnapshotId(2));
+            assert!(!tiles.is_empty());
+            if std::env::var_os(FAILED).is_none() {
+                let mut generations = ExportGenerationGate::default();
+                generations.accept_submission(1);
+                let expected = directory.join("reopened.png");
+                export_current_png(
+                    &expected,
+                    &tiles,
+                    &tree,
+                    canvas,
+                    1,
+                    &Mutex::new(generations),
+                )
+                .unwrap();
+                assert_eq!(
+                    std::fs::read(directory.join("drawing.png")).unwrap(),
+                    std::fs::read(expected).unwrap()
+                );
+            }
+            drop(sink);
+            return;
+        }
+        for (early_save, failing_output) in [(false, false), (true, false), (false, true)] {
+            let directory = std::env::temp_dir().join(format!(
+                "nyatidraw-closing-export-{}-{}",
+                std::process::id(),
+                system_timestamp_ns()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let source = directory.join("source.png");
+            nyatidraw_png_io::encode_png(
+                &source,
+                &nyatidraw_tiles::FlattenedRgba8 {
+                    origin_x: 0,
+                    origin_y: 0,
+                    width: 32,
+                    height: 32,
+                    pixels: vec![0; 32 * 32 * 4],
+                },
+            )
+            .unwrap();
+            let ink = LiveInkBridge::with_capacity(8, LIVE_LAYER);
+            let bootstrap = MaterializationWorker::start(
+                ink.clone(),
+                &ProjectLocation::Explicit {
+                    path: directory.join("drawing.ntdr"),
+                    bootstrap_png: Some(source),
+                },
+            )
+            .unwrap();
+            let mut pipeline = StrokePipeline::new(ink.clone(), bootstrap.worker);
+            let output = directory.join("drawing.png");
+            if early_save {
+                let generation = pipeline.materializer.reserve_export().unwrap();
+                pipeline
+                    .materializer
+                    .enqueue_export(generation, output.clone(), false)
+                    .unwrap();
+            }
+            if failing_output {
+                std::fs::create_dir(&output).unwrap();
+            }
+            ink.push(sample(1, PointerPhase::Begin, 12.0, 12.0))
+                .unwrap();
+            ink.push(sample(2, PointerPhase::Move, 20.0, 20.0)).unwrap();
+            pipeline.prepare_shutdown();
+            let generation = pipeline.materializer.reserve_export().unwrap();
+            pipeline
+                .materializer
+                .enqueue_export(generation, output, true)
+                .unwrap();
+            drop(pipeline);
+            assert!(
+                !ink.workspace_failed(),
+                "PNG failure must not damage durable artwork"
+            );
+            assert_eq!(
+                matches!(ink.export_status_snapshot(), ExportStatus::Failed { .. }),
+                failing_output
+            );
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "native_canvas::tests::closing_export_matches_drained_artwork_and_failure_preserves_project_after_restart"])
+                .env(REOPEN, &directory).env_remove(FAILED);
+            if failing_output {
+                child.env(FAILED, "1");
+            }
+            assert!(child.status().unwrap().success());
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

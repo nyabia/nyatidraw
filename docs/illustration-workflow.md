@@ -22,6 +22,9 @@
 - 실제 불가능, 반복 수작업으로 우회 가능, 편의 개선을 구분한다. 무조건 경쟁 앱의 모든
   기능을 복제하지 않는다. 저장 손상·크래시·입력 유실은 어느 단계보다 먼저 수정한다.
 
+현재 실사용 보수 항목은 [펜 작업 중단과 설정 복원](sprints/pen-session-reliability.md)에
+모은다. 빈 획 확정 실패·저배율 GPU 한도·펜 UI 입력 및 설정 복원을 우선한다.
+
 ## 1. 단계별 비교
 
 | 그리는 사람이 하는 일 | Krita의 대표 경로 | Clip Studio Paint의 대표 경로 | NyatiDraw가 제공해야 할 조작 |
@@ -69,7 +72,7 @@ Krita의 회화식 경로와 CSP의 선화식 튜토리얼은 비교 관점이�
 | 도구/기능 | 현재 확인 | 기존 계획 | 작업에 주는 영향 / 새 위치 |
 |---|---|---|---|
 | 필압 펜·연필·브러시·지우개 | W1a: round engine에 크기/농도 필압 독립·최소값·경도 연결; 실사용 검증 대기 | 고급 브러시 Sprint 4에서 기본 부분을 당김 | 굵기만 변화하는 진한 선, 흐린 러프, 부드러운 칠을 구분 |
-| 크기·불투명도 | 숫자/슬라이더/최근 크기 + W1a 도구별 세션 기억, `[`/`]` 상대 조절 | 도구별 preset 확장 | 앱 재시작 후 설정 기억은 미구현; 필압·경도 포함한 실제 전환 조작 확인 필요 |
+| 크기·불투명도 | 숫자/슬라이더/최근 크기 + 도구별 기억, `[`/`]` 상대 조절 | 도구별 preset 확장 | [프로젝트별 설정 복원](editor-tool-state.md) 구현·핵심 검사 통과; 필압·경도 포함한 실제 펜 전환은 별도 확인 |
 | 딱딱한/부드러운 브러시, 끝맺음, 보정 | W1a hard/soft 경도 + E1a 끄기/강도 조절 위치 보정 | Sprint 4 / E1a | 기본 필터이며 강한 보정의 End 직선 연결 한계. 실제 펜 감각 검증 대기 |
 | 색상환·최근 색·스포이트·X 교환 | UX-1 고정 C + W1b Alt 접촉의 임시 색 채취 연결 | F2b / W1b / UX-1 | 임시는 Solo를 포함한 그림 합성을 읽고 도구는 바꾸지 않음; 물리 조작 검증 대기 |
 | 팬·줌·회전·Fit·1:1 | W1b 보기 좌우 반전·각도 초기화·중심/포인터 기준 확대 연결 | Sprint 3 / W1b | 임의 각도 연속 회전은 후속. 보기 조작은 픽셀 반전과 별개 |
@@ -103,8 +106,10 @@ Krita의 회화식 경로와 CSP의 선화식 튜토리얼은 비교 관점이�
 - `crates/brush/src/lib.rs`: W1a engine2는 size/opacity 필압 독립·최소 비율·경도를 기록한다.
   engine1 재생은 기존 sqrt-size/linear-opacity/hard circle을 보존한다. 임의 curve 없음.
   `crates/input/src/smoothing.rs`의 E1a 보정은 GPU 평가/저장 sample 전에 한 번만 적용한다.
-- `apps/desktop/src/native_canvas.rs`: W1a `DrawingConfig`는 네 그리기 도구의 마지막 설정을
-  세션 중 기억하고 Begin의 immutable preset으로 고정한다. 재시작 설정 보존은 후속이다.
+- `apps/desktop/src/native_canvas.rs`: W1a `DrawingConfig`는 그리기 도구/연필 템플릿의 마지막
+  설정을 Begin의 immutable preset으로 고정한다. [도구 상태 저장](editor-tool-state.md)은
+  작품 이력과 별개의 프로젝트 메타데이터로 재시작 복원을 구현하고 Windows 릴리즈 창에서
+  2B/20px/선택 색 복원을 확인했다. 물리 펜 감각·드라이버별 검수는 별개다.
 - `crates/api/src/protocol.rs`: W1b ViewportCommand에 보기 mirror/reset 추가. RasterTransform의
   정수 offset/quarter-turn/flip/size와는 별개다. E3 LayerCommand에 alpha lock/clip/blend 추가.
 - `crates/document/src/layers.rs`: visible/locked/reference/opacity/content_root와 E3 raster
