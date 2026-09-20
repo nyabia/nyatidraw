@@ -82,7 +82,16 @@ alpha.3은 라이선스 결정 전에 패키징했으므로 두 전문은 Releas
 
 ## 현재 실측 증거
 
-### alpha.12 릴리스 후보
+### alpha.12 게시 완료
+
+`067efd0` / `v0.1.0-alpha.12`를 게시했다.
+[Windows CI](https://github.com/nyabia/nyatidraw/actions/runs/35540593787)와
+[릴리스·Pages](https://github.com/nyabia/nyatidraw/actions/runs/35540593976)가 모두 성공했다.
+[공개 릴리스](https://github.com/nyabia/nyatidraw/releases/tag/v0.1.0-alpha.12)에서 받은
+6개 산출물의 SHA-256을 체크섬 목록과 대조했다. 설치 파일은 14,057,445 bytes,
+전체 업데이트 패키지는 9,575,909 bytes다. 업데이트 피드의 제품 ID/버전/크기/SHA-1/SHA-256,
+Portable의 실행 파일·CSS·라이선스도 확인했다. 홈페이지 HTTP 200과 live `release.json`이
+alpha.12 설치 파일을 가리키는 것을 확인했다. 설치 실행이나 로컬 설치판 교체는 하지 않았다.
 
 실사용 중 발견된 빈 획 실패·오류 후 종료 불가·저배율 타일 한도와 펜/설정 복원 보수를
 사용자가 릴리즈까지 요청했다. 최신 PNG를 종료 때 자동 예약하는 경로도 함께 보수했다.
