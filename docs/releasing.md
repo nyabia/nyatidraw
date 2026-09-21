@@ -3,6 +3,26 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
+## alpha.13 배포 확인
+
+- 소스 `68be12c`, 태그 `v0.1.0-alpha.13`.
+  [Windows CI](https://github.com/nyabia/nyatidraw/actions/runs/35602111189)는 성공했다.
+  [릴리즈 작업](https://github.com/nyabia/nyatidraw/actions/runs/35602111516)의 전체 기능
+  테스트·Clippy·release 빌드·패키징·사전 릴리즈 공개도 통과했다.
+- [공개 릴리즈](https://github.com/nyabia/nyatidraw/releases/tag/v0.1.0-alpha.13)의
+  7개 자산을 내려받아 GitHub SHA256 digest 7/7과 `SHA256SUMS.txt`의 6개 항목을 확인했다.
+- 설치 파일은 14,106,404 bytes,
+  SHA256 `17a56f516d2cc002a89a32eaf9323e28a447d23532d8cbd9d3e5e72a520caa49`.
+  전체 업데이트 패키지는 9,624,868 bytes,
+  SHA256 `a0379835043ee49c5bbdf8c5d92d7d6643925ccc9f259dd129de11c6bdf346fe`.
+- 피드와 포터블 내부 `sq.version`은 `PackageId=NyatiDraw`, `Version=0.1.0-alpha.13`,
+  채널 `nyatidraw-alpha`, 실행 파일 `nyatidraw.exe`다. 포터블은 실행 파일·두 라이선스와
+  타사 고지를 포함하며 UI CSS/JS는 실행 파일에 내장한다. 이번 설치·업데이트 설치는
+  실행하지 않았고 로컬 설치본은 그대로다.
+- 웹 공개판 Worker 저장, 실제 NTDR 다운로드, native/web 재열기, 격리 Edge 프로세스
+  재시작 복원을 확인했다. [웹 검증 기록](web-support.md#worker-공개-배포-확인) 참고.
+  실제 펜과 대형 작품 장시간 사용을 검증한 것으로 확대하지 않는다.
+
 ## 자동화 범위
 
 - `Windows CI`: PR/main의 코드 변경에서 기존 핵심 테스트, fmt, Clippy, DX release 빌드.

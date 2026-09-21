@@ -231,6 +231,20 @@ native pencil/history 검증도 있다. 전체 기능 테스트와 전체 타깃
 실물 펜과 큰 그림 장시간 시험은 아직 미검증이다. Worker 저장 분리만으로 모든 웹
 입력 지연을 해결했다고 판정하지 않는다. 공개 배포 상태와 설치본 교체는 별도로 확인한다.
 
+### Worker 공개 배포 확인
+
+소스 `68be12c`, [Website 35602111285](https://github.com/nyabia/nyatidraw/actions/runs/35602111285)가
+검사·빌드·개인 경로 검사·Pages 배포를 통과했다. 공개 `/draw/worker/manifest.json`은
+HTTP 200이며 protocol 1, entry `recovery-b7b2357f9d3cbb8b2592.js`다.
+
+격리한 Edge 프로필에서 공개 웹판으로 시험 NTDR를 열고 실제 Worker가 생성되는 것을
+확인했다. 저장 버튼의 다운로드는 오류 없이 완료됐고 native/web reader의 타일 root가
+일치했다. 새 짧은 획을 추가한 차분 저장 파일도 양쪽 리더에서 일치했다.
+그 후 브라우저 프로세스를 종료·재실행해 복원한 미리보기 SHA256은 저장 전과 같은
+`4836a93b8f4fe46bce93466a711fd7e737b9ded4f2a4b4d8296c454bc70f9e80`이다.
+공개판에서도 도메인 루트 favicon 404와 Chromium powerPreference 안내만 있었고,
+앱/Worker 오류는 없었다. 이는 한 시험 그림의 결과이며 실제 펜·장시간 검증은 아니다.
+
 ## 자원 상한
 
 - 페이지는 각 축 최대 4096px, 현재 픽셀은 최대 1024개의 128×128 타일(64MiB), 래스터는 32개.
