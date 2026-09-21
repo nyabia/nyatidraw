@@ -303,6 +303,7 @@ impl WebUiBackend {
             return;
         }
         if let Some(runtime) = self.editor.runtime.peek().borrow_mut().as_mut() {
+            runtime.fit_to_canvas = false;
             let rect = runtime.canvas.get_bounding_client_rect();
             let center = Point {
                 x: rect.width() * 0.5,

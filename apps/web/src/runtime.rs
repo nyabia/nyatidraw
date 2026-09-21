@@ -18,6 +18,7 @@ pub struct Runtime {
     pub renderer: WebRenderer,
     pub canvas: HtmlCanvasElement,
     pub viewport: ViewportTransform,
+    pub fit_to_canvas: bool,
     pub recent_colors: Vec<[u8; 4]>,
     pub recent_sizes: Vec<u16>,
     pub selected_tool: DrawingTool,
@@ -143,6 +144,7 @@ impl Editor {
                 mirrored_horizontal: false,
             },
             recent_colors: Vec::new(),
+            fit_to_canvas: true,
             recent_sizes: Vec::new(),
             selected_tool,
             project_epoch: 1,
@@ -295,9 +297,14 @@ impl Editor {
                     let update = runtime.document.cancel_stroke();
                     runtime.apply(&update)?;
                     runtime.resize();
+                    if runtime.fit_to_canvas {
+                        runtime.fit();
+                    }
+                    refresh = true;
                     return Ok(());
                 }
                 "panBegin" => {
+                    runtime.fit_to_canvas = false;
                     runtime.pan_start = Some((point, runtime.viewport.pan));
                     return Ok(());
                 }
@@ -728,6 +735,7 @@ impl Runtime {
     }
 
     fn fit(&mut self) {
+        self.fit_to_canvas = true;
         let rect = self.canvas.get_bounding_client_rect();
         let page = self.document.canvas();
         let zoom = ((rect.width() - 64.0) / f64::from(page.width_px))
@@ -744,6 +752,7 @@ impl Runtime {
     }
 
     pub fn zoom_at(&mut self, focus: Point, factor: f64) {
+        self.fit_to_canvas = false;
         if let Some(view) = self.viewport.with_view_at(
             focus,
             (self.viewport.zoom * factor).clamp(0.1, 16.0),
