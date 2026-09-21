@@ -1,0 +1,29 @@
+[package]
+name = "nyatidraw-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+dioxus = { version = "=0.7.9", default-features = false, features = ["web", "launch", "lib"] }
+nyatidraw-api.workspace = true
+nyatidraw-input.workspace = true
+nyatidraw-document.workspace = true
+nyatidraw-tiles.workspace = true
+nyatidraw-paint-gpu.workspace = true
+nyatidraw-paint-cpu.workspace = true
+nyatidraw-web-core.workspace = true
+png.workspace = true
+wgpu.workspace = true
+wasm-bindgen = "=0.2.127"
+wasm-bindgen-futures = "=0.4.77"
+js-sys = "=0.3.104"
+base64 = "=0.22.1"
+web-sys = { version = "=0.3.104", features = ["Window", "Document", "Element", "HtmlCanvasElement", "DomRect", "Location", "console"] }
+
+[features]
+default = ["web"]
+web = []
+
+[lints]
+workspace = true

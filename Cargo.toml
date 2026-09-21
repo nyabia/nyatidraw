@@ -4,6 +4,7 @@ exclude = ["third_party/wry", "third_party/dioxus-desktop"]
 members = [
     "apps/cli",
     "apps/desktop",
+    "apps/web",
     "crates/api",
     "crates/brush",
     "crates/diagnostics",
@@ -20,6 +21,7 @@ members = [
     "crates/project-redb",
     "crates/stroke",
     "crates/tiles",
+    "crates/web-core",
 ]
 
 [workspace.package]
@@ -44,6 +46,7 @@ nyatidraw-project = { path = "crates/project" }
 nyatidraw-project-redb = { path = "crates/project-redb" }
 nyatidraw-stroke = { path = "crates/stroke" }
 nyatidraw-tiles = { path = "crates/tiles" }
+nyatidraw-web-core = { path = "crates/web-core" }
 blake3 = "=1.8.7"
 dioxus = { version = "=0.7.9", default-features = false, features = ["desktop", "launch", "lib"] }
 dioxus-desktop = { version = "=0.7.9", default-features = false, features = ["tokio_runtime"] }

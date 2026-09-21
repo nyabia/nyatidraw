@@ -42,16 +42,11 @@ fn fragment_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
     // off-page artwork. The border is presentation chrome, not artwork.
     let outside_x = max(max(-document.x, document.x - params.document_size.x), 0.0);
     let outside_y = max(max(-document.y, document.y - params.document_size.y), 0.0);
-    let beyond_x = document.x < 0.0 || document.x >= params.document_size.x;
-    let beyond_y = document.y < 0.0 || document.y >= params.document_size.y;
     let x_pixels = outside_x
         / max(length(vec2<f32>(params.document_x.x, params.document_x.y)), 0.000001);
     let y_pixels = outside_y
         / max(length(vec2<f32>(params.document_y.x, params.document_y.y)), 0.000001);
-    let edge_distance_pixels = min(
-        select(1e20, x_pixels, beyond_x),
-        select(1e20, y_pixels, beyond_y),
-    );
+    let edge_distance_pixels = max(x_pixels, y_pixels);
     if edge_distance_pixels <= 2.0 {
         discard;
     }

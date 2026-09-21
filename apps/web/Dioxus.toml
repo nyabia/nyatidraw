@@ -1,0 +1,16 @@
+[application]
+name = "nyatidraw-web"
+asset_dir = "assets"
+
+[web.app]
+title = "NyatiDraw · Web"
+
+[web.resource]
+style = []
+script = []
+
+[web.resource.dev]
+script = []
+
+[web.wasm_opt]
+level = "0"

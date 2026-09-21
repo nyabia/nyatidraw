@@ -51,10 +51,7 @@ fn fragment_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
             / max(length(vec2<f32>(params.document_x.x, params.document_x.y)), 0.000001);
         let y_pixels = outside_y
             / max(length(vec2<f32>(params.document_y.x, params.document_y.y)), 0.000001);
-        let edge_distance_pixels = min(
-            select(1e20, x_pixels, beyond_x),
-            select(1e20, y_pixels, beyond_y),
-        );
+        let edge_distance_pixels = max(x_pixels, y_pixels);
         let workspace = select(params.workspace_dark.rgb, params.workspace_light.rgb, checker == 0);
         let border = vec3<f32>(0.0);
         return vec4<f32>(select(workspace, border, edge_distance_pixels <= 2.0), 1.0);

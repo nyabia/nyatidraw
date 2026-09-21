@@ -2,7 +2,18 @@ name: Website
 on:
   push:
     branches: [main]
-    paths: ['site/**', 'tools/build-site.ps1', '.github/workflows/pages.yml']
+    paths:
+      - 'site/**'
+      - 'apps/web/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'tools/dioxus-cli.version'
+      - 'tools/build-web.ps1'
+      - 'tools/setup-web-ci.ps1'
+      - 'tools/build-site.ps1'
+      - '.github/workflows/pages.yml'
   release:
     types: [published, unpublished, deleted, edited]
   workflow_dispatch:
@@ -13,7 +24,59 @@ concurrency:
   group: pages
   cancel-in-progress: false
 jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: main
+      - name: Install project Rust and WebAssembly target
+        run: |
+          $version = (Select-String '^channel = "([^"]+)"' rust-toolchain.toml).Matches.Groups[1].Value
+          rustup toolchain install $version --profile minimal --component clippy,rustfmt --target wasm32-unknown-unknown
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: web-pages
+          cache-on-failure: false
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Browser artwork and recovery core tests
+        run: cargo test -p nyatidraw-web-core --locked
+      - name: WebAssembly Clippy
+        run: cargo clippy -p nyatidraw-web --target wasm32-unknown-unknown --locked -- -D warnings
+      - name: Install verified Dioxus CLI
+        run: ./tools/setup-web-ci.ps1
+      - name: Build web editor
+        run: ./tools/build-web.ps1
+      - name: Assemble website and verified web output
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./tools/build-site.ps1 -RequireWeb
+      - name: Reject private source paths in public assets
+        run: |
+          $privatePath = '(?i)(?:[A-Z]:[\\/](?:Users|sources)[\\/]|/Users/[^/]+/|/home/(?!runner/)[^/]+/)'
+          foreach ($asset in (Get-ChildItem target/site -Recurse -File)) {
+            $text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($asset.FullName))
+            if ($text -match $privatePath) { throw "Private source path found in public asset: $($asset.Name)" }
+          }
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: target/site
   deploy:
+    needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -24,19 +87,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-          ref: main
-      - name: Build static website and release link
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: ./tools/build-site.ps1
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
-      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
-        with:
-          path: target/site
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
