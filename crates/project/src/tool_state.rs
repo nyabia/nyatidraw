@@ -286,12 +286,8 @@ mod tests {
                         _ => None,
                     };
                     let decoded = decode_editor_tool_state(&encode_editor_tool_state(&state));
-                    assert_eq!(
-                        decoded,
-                        expected_slot
-                            .is_none_or(|value| value == slot)
-                            .then_some(state)
-                    );
+                    let matching_slot = expected_slot.is_none_or(|value| value == slot);
+                    assert_eq!(decoded, matching_slot.then_some(state));
                 }
             }
         }
