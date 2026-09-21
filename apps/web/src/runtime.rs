@@ -2,7 +2,9 @@ use std::{cell::RefCell, io::Cursor, rc::Rc};
 
 use dioxus::prelude::*;
 use js_sys::{Array, Uint8Array};
+use nyatidraw_api::DrawingTool;
 use nyatidraw_input::{Point, ViewportTransform};
+use nyatidraw_project_web::WebProject;
 use nyatidraw_web_core::{CanvasSpec, CanvasUpdate, StrokePoint, WebDocument, WebError, WebTool};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -12,18 +14,22 @@ use crate::{browser, gpu::WebRenderer};
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct Runtime {
-    pub document: WebDocument,
+    pub document: WebProject,
     pub renderer: WebRenderer,
     pub canvas: HtmlCanvasElement,
     pub viewport: ViewportTransform,
     pub recent_colors: Vec<[u8; 4]>,
+    pub recent_sizes: Vec<u16>,
+    pub selected_tool: DrawingTool,
+    pub project_epoch: u64,
+    pub preview_generation: u64,
     frame_pending: bool,
     pub gpu_failed: bool,
     pan_start: Option<(Point, Point)>,
     save_generation: u64,
     save_running: bool,
     save_pending: bool,
-    pending_document: Option<WebDocument>,
+    pending_document: Option<WebProject>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -105,11 +111,11 @@ impl Editor {
             .map_err(|e| browser::error_text(&e))?;
         let restored = !saved.is_null();
         let document = if restored {
-            WebDocument::decode_portable(&Uint8Array::new(&saved).to_vec()).map_err(|e| {
+            WebProject::decode_ntdr(&Uint8Array::new(&saved).to_vec()).map_err(|e| {
                 format!("저장된 작업을 열지 못했습니다. 원본 복구 데이터는 유지됩니다: {e}")
             })?
         } else {
-            WebDocument::default()
+            WebProject::from_document(WebDocument::default())
         };
         let canvas = web_sys::window()
             .and_then(|w| w.document())
@@ -118,6 +124,10 @@ impl Editor {
             .dyn_into::<HtmlCanvasElement>()
             .map_err(|_| "캔버스 초기화 실패")?;
         let renderer = WebRenderer::new(canvas.clone(), &document).await?;
+        let document_tool = document.tool();
+        let import_notice = document.import_notice();
+        let selected_tool = supported_restored_tool(&document)
+            .unwrap_or_else(|| crate::adapter::drawing_tool(document_tool));
         let mut runtime = Runtime {
             document,
             renderer,
@@ -133,6 +143,10 @@ impl Editor {
                 mirrored_horizontal: false,
             },
             recent_colors: Vec::new(),
+            recent_sizes: Vec::new(),
+            selected_tool,
+            project_epoch: 1,
+            preview_generation: 1,
             frame_pending: false,
             gpu_failed: false,
             pan_start: None,
@@ -148,6 +162,7 @@ impl Editor {
             move |phase: String, x, y, pressure, time| self.input(&phase, x, y, pressure, time),
         );
         browser::bind_canvas(&canvas, callback.as_ref().unchecked_ref());
+        browser::set_canvas_tool(canvas_input_mode(selected_tool));
         callback.forget();
         self.ready.set(true);
         self.report(if restored {
@@ -157,25 +172,36 @@ impl Editor {
         });
         self.refresh();
         self.redraw();
+        if let Some(notice) = import_notice {
+            self.warn(notice);
+        }
         Ok(())
     }
 
     pub fn edit(self, operation: impl FnOnce(&mut WebDocument) -> Result<CanvasUpdate, WebError>) {
+        if let Err(error) = self.try_edit(operation) {
+            self.warn(error);
+        }
+    }
+
+    pub fn try_edit(
+        self,
+        operation: impl FnOnce(&mut WebDocument) -> Result<CanvasUpdate, WebError>,
+    ) -> Result<(), String> {
         if self.modal.peek().is_some() {
-            return;
+            return Err("열려 있는 대화상자를 먼저 닫아주세요.".into());
         }
         let cell = self.runtime.peek().clone();
         let result = {
             let mut borrow = cell.borrow_mut();
             let Some(runtime) = borrow.as_mut() else {
-                return;
+                return Err("그림을 여는 중입니다.".into());
             };
             if runtime.document.is_drawing() {
-                return;
+                return Err("먼저 현재 획을 마쳐주세요.".into());
             }
             if runtime.gpu_failed {
-                self.warn("화면이 중단되었습니다. 작업 저장 후 새로고침해주세요.");
-                return;
+                return Err("화면이 중단되었습니다. 작업 저장 후 새로고침해주세요.".into());
             }
             operation(&mut runtime.document)
                 .map_err(|e| e.to_string())
@@ -192,24 +218,24 @@ impl Editor {
                 self.refresh();
                 self.redraw();
                 self.persist();
+                Ok(())
             }
             Err(error) => {
                 self.refresh();
                 self.persist();
-                self.warn(error);
+                Err(error)
             }
         }
     }
 
-    pub fn preferences(self, operation: impl FnOnce(&mut WebDocument) -> Result<(), WebError>) {
-        self.edit(|document| {
+    pub fn try_preferences(
+        self,
+        operation: impl FnOnce(&mut WebDocument) -> Result<(), WebError>,
+    ) -> Result<(), String> {
+        self.try_edit(|document| {
             operation(document)?;
             Ok(CanvasUpdate::default())
-        });
-    }
-
-    pub fn select_tool(self, tool: WebTool) {
-        self.preferences(|document| document.select_tool(tool));
+        })
     }
 
     pub fn fit(self) {
@@ -226,28 +252,11 @@ impl Editor {
         self.redraw();
     }
 
-    pub fn zoom(self, factor: f64) {
-        if self.modal.peek().is_some() {
-            return;
-        }
-        if let Some(runtime) = self.runtime.peek().borrow_mut().as_mut() {
-            if runtime.document.is_drawing() {
-                return;
-            }
-            let rect = runtime.canvas.get_bounding_client_rect();
-            runtime.zoom_at(
-                Point {
-                    x: rect.width() / 2.0,
-                    y: rect.height() / 2.0,
-                },
-                factor,
-            );
-        }
-        self.refresh();
-        self.redraw();
-    }
-
-    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
     pub fn input(self, phase: &str, x: f64, y: f64, pressure: f64, time_ms: f64) {
         if phase == "dismissModal" {
             self.close_modal();
@@ -267,14 +276,6 @@ impl Editor {
             }
             "save" => {
                 self.download_project();
-                return;
-            }
-            "brush" => {
-                self.select_tool(WebTool::Pencil2H);
-                return;
-            }
-            "eraser" => {
-                self.select_tool(WebTool::Eraser);
                 return;
             }
             _ => {}
@@ -307,11 +308,13 @@ impl Editor {
                             y: pan.y + y - start.y,
                         };
                         runtime.viewport.revision += 1;
+                        refresh = true;
                     }
                     return Ok(());
                 }
                 "panEnd" => {
                     runtime.pan_start = None;
+                    refresh = true;
                     return Ok(());
                 }
                 "zoom" => {
@@ -347,6 +350,19 @@ impl Editor {
                 pressure: pressure as f32,
                 time_ms,
             };
+            if phase == "pickEnd" {
+                let color = runtime
+                    .document
+                    .sample_rgba8(position.x.floor() as i32, position.y.floor() as i32)
+                    .map_err(|error| error.to_string())?;
+                if color[3] == 0 {
+                    return Ok(());
+                }
+                runtime.document.set_foreground(color);
+                save = true;
+                refresh = true;
+                return Ok(());
+            }
             let update = match phase {
                 "begin" => runtime.document.begin_stroke(sample),
                 "move" if runtime.document.is_drawing() => runtime.document.move_stroke(sample),
@@ -367,6 +383,10 @@ impl Editor {
                 }
             };
             if phase == "begin" {
+                let size = (runtime.document.brush_settings().size_px * 10.0).round() as u16;
+                runtime.recent_sizes.retain(|previous| *previous != size);
+                runtime.recent_sizes.insert(0, size);
+                runtime.recent_sizes.truncate(4);
                 let color = runtime.document.foreground();
                 if runtime.document.tool() != WebTool::Eraser {
                     runtime.recent_colors.retain(|previous| *previous != color);
@@ -464,7 +484,7 @@ impl Editor {
                     runtime.save_pending = false;
                     runtime
                         .document
-                        .encode_portable()
+                        .encode_ntdr()
                         .map(|bytes| (runtime.save_generation, bytes))
                 };
                 let (generation, bytes) = match encoded {
@@ -519,16 +539,21 @@ impl Editor {
     }
 
     pub fn download_project(self) {
-        let Some(result) = self.read(|runtime| runtime.document.encode_portable()) else {
-            return;
+        let result = {
+            let cell = self.runtime.peek().clone();
+            let mut borrow = cell.borrow_mut();
+            let Some(runtime) = borrow.as_mut() else {
+                return;
+            };
+            runtime.document.encode_ntdr()
         };
         match result {
             Ok(bytes) => browser::download_bytes(
                 &Uint8Array::from(bytes.as_slice()),
-                "drawing.nyatidraw-web",
-                "application/vnd.nyatidraw.web-document",
+                "drawing.ntdr",
+                "application/octet-stream",
             ),
-            Err(error) => self.warn(error.to_string()),
+            Err(error) => self.warn(error),
         }
     }
 
@@ -536,11 +561,19 @@ impl Editor {
         spawn_local(async move {
             match JsFuture::from(browser::load_workspace()).await {
                 Ok(saved) if saved.is_null() => self.warn("이 브라우저에 저장된 작업이 없습니다."),
-                Ok(saved) => browser::download_bytes(
-                    &Uint8Array::new(&saved),
-                    "recovered.nyatidraw-web",
-                    "application/vnd.nyatidraw.web-document",
-                ),
+                Ok(saved) => {
+                    let bytes = Uint8Array::new(&saved);
+                    let legacy = bytes.subarray(0, 8).to_vec() == b"NYWEB001";
+                    browser::download_bytes(
+                        &bytes,
+                        if legacy {
+                            "recovered.nyatidraw-web"
+                        } else {
+                            "recovered.ntdr"
+                        },
+                        "application/octet-stream",
+                    );
+                }
                 Err(error) => self.warn(format!(
                     "복구 데이터를 읽지 못했습니다. 기존 데이터는 유지됩니다: {}",
                     browser::error_text(&error)
@@ -564,13 +597,13 @@ impl Editor {
     }
 
     pub fn new_document(self, width: u32, height: u32) {
-        match WebDocument::new(CanvasSpec {
+        match WebProject::new(CanvasSpec {
             width_px: width,
             height_px: height,
             pixels_per_inch: 96,
         }) {
             Ok(document) => self.stage_replacement(document),
-            Err(error) => self.warn(error.to_string()),
+            Err(error) => self.warn(error),
         }
     }
 
@@ -590,9 +623,9 @@ impl Editor {
             let name = file.get(0).as_string().unwrap_or_default();
             let bytes = Uint8Array::new(&file.get(1)).to_vec();
             let document = if name.to_lowercase().ends_with(".png") {
-                decode_png(&bytes)
+                decode_png(&bytes).map(WebProject::from_document)
             } else {
-                WebDocument::decode_portable(&bytes).map_err(|e| e.to_string())
+                WebProject::decode_ntdr(&bytes)
             };
             match document {
                 Ok(document) => self.stage_replacement(document),
@@ -603,7 +636,7 @@ impl Editor {
         });
     }
 
-    fn stage_replacement(self, document: WebDocument) {
+    fn stage_replacement(self, document: WebProject) {
         {
             let cell = self.runtime.peek().clone();
             let mut borrow = cell.borrow_mut();
@@ -619,7 +652,8 @@ impl Editor {
         self.show_modal(EditorModal::ReplaceDocument);
     }
 
-    fn replace(self, document: WebDocument) {
+    fn replace(self, document: WebProject) {
+        let import_notice = document.import_notice();
         let cell = self.runtime.peek().clone();
         let result = {
             let mut borrow = cell.borrow_mut();
@@ -631,7 +665,12 @@ impl Editor {
             }
             match runtime.renderer.sync_document(&document) {
                 Ok(()) => {
+                    runtime.selected_tool = supported_restored_tool(&document)
+                        .unwrap_or_else(|| crate::adapter::drawing_tool(document.tool()));
                     runtime.document = document;
+                    runtime.project_epoch += 1;
+                    runtime.preview_generation += 1;
+                    browser::set_canvas_tool(canvas_input_mode(runtime.selected_tool));
                     runtime.gpu_failed = false;
                     runtime.fit();
                     Ok(())
@@ -652,6 +691,9 @@ impl Editor {
                 self.refresh();
                 self.redraw();
                 self.persist();
+                if let Some(notice) = import_notice {
+                    self.warn(notice);
+                }
             }
             Err(error) => self.warn(error),
         }
@@ -659,7 +701,10 @@ impl Editor {
 }
 
 impl Runtime {
-    fn apply(&mut self, update: &CanvasUpdate) -> Result<(), String> {
+    pub fn apply(&mut self, update: &CanvasUpdate) -> Result<(), String> {
+        if update.committed && update.changed {
+            self.preview_generation += 1;
+        }
         if update.structure_changed {
             self.renderer.sync_document(&self.document)
         } else {
@@ -689,6 +734,8 @@ impl Runtime {
             .min((rect.height() - 64.0) / f64::from(page.height_px))
             .clamp(0.05, 8.0);
         self.viewport.zoom = zoom;
+        self.viewport.rotation_radians = 0.0;
+        self.viewport.mirrored_horizontal = false;
         self.viewport.pan = Point {
             x: (rect.width() - f64::from(page.width_px) * zoom) / 2.0,
             y: (rect.height() - f64::from(page.height_px) * zoom) / 2.0,
@@ -696,16 +743,38 @@ impl Runtime {
         self.viewport.revision += 1;
     }
 
-    fn zoom_at(&mut self, focus: Point, factor: f64) {
+    pub fn zoom_at(&mut self, focus: Point, factor: f64) {
         if let Some(view) = self.viewport.with_view_at(
             focus,
             (self.viewport.zoom * factor).clamp(0.1, 16.0),
-            0.0,
-            false,
+            self.viewport.rotation_radians,
+            self.viewport.mirrored_horizontal,
         ) {
             self.viewport = view;
             self.viewport.revision += 1;
         }
+    }
+}
+
+fn supported_restored_tool(document: &WebProject) -> Option<DrawingTool> {
+    document.restored_tool().filter(|tool| {
+        matches!(
+            tool,
+            DrawingTool::Move
+                | DrawingTool::Eyedropper
+                | DrawingTool::Pencil
+                | DrawingTool::Pen
+                | DrawingTool::Brush
+                | DrawingTool::Eraser
+        )
+    })
+}
+
+pub const fn canvas_input_mode(tool: DrawingTool) -> &'static str {
+    match tool {
+        DrawingTool::Move => "pan",
+        DrawingTool::Eyedropper => "pick",
+        _ => "stroke",
     }
 }
 

@@ -10,6 +10,7 @@ members = [
     "crates/diagnostics",
     "crates/document",
     "crates/editor",
+    "crates/editor-ui",
     "crates/history",
     "crates/input",
     "crates/input-queue",
@@ -19,6 +20,7 @@ members = [
     "crates/png-io",
     "crates/project",
     "crates/project-redb",
+    "crates/project-web",
     "crates/stroke",
     "crates/tiles",
     "crates/web-core",
@@ -35,6 +37,7 @@ nyatidraw-brush = { path = "crates/brush" }
 nyatidraw-diagnostics = { path = "crates/diagnostics" }
 nyatidraw-document = { path = "crates/document" }
 nyatidraw-editor = { path = "crates/editor" }
+nyatidraw-editor-ui = { path = "crates/editor-ui" }
 nyatidraw-history = { path = "crates/history" }
 nyatidraw-input = { path = "crates/input" }
 nyatidraw-input-queue = { path = "crates/input-queue" }
@@ -44,6 +47,7 @@ nyatidraw-paint-cpu = { path = "crates/paint-cpu" }
 nyatidraw-png-io = { path = "crates/png-io" }
 nyatidraw-project = { path = "crates/project" }
 nyatidraw-project-redb = { path = "crates/project-redb" }
+nyatidraw-project-web = { path = "crates/project-web" }
 nyatidraw-stroke = { path = "crates/stroke" }
 nyatidraw-tiles = { path = "crates/tiles" }
 nyatidraw-web-core = { path = "crates/web-core" }

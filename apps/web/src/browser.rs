@@ -22,6 +22,12 @@ extern "C" {
     pub fn set_modal_open(open: bool);
     #[wasm_bindgen(js_name = focusModal)]
     pub fn focus_modal();
+    #[wasm_bindgen(js_name = setCanvasTool)]
+    pub fn set_canvas_tool(tool: &str);
+    #[wasm_bindgen(catch, js_name = loadPreference)]
+    pub fn load_preference(key: &str) -> Result<Option<String>, JsValue>;
+    #[wasm_bindgen(catch, js_name = storePreference)]
+    pub fn store_preference(key: &str, value: &str) -> Result<(), JsValue>;
 }
 
 pub fn error_text(error: &JsValue) -> String {

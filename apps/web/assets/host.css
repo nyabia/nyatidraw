@@ -1,0 +1,17 @@
+.browser-editor-root { display: contents; }
+.browser-canvas-host { position: relative; flex: 1; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; }
+#drawing-canvas { display: block; width: 100%; height: 100%; touch-action: none; outline: none; }
+.browser-save-status { position: absolute; right: 10px; bottom: 10px; max-width: calc(100% - 20px); padding: 5px 8px; background: #252525d9; color: #ddd; border-radius: 3px; font-size: 11px; line-height: 1.4; text-align: right; pointer-events: none; user-select: none; }
+.browser-startup { position: absolute; inset: 20% 12% auto; padding: 24px; background: #333; border: 1px solid #666; line-height: 1.6; }
+.browser-startup button, .browser-startup a { margin: 8px; }
+.browser-modal { position: fixed; inset: 0; background: #0009; z-index: 2000; display: grid; place-items: center; padding: 20px; }
+.browser-dialog { width: min(550px, 100%); max-height: 90vh; overflow: auto; background: #333; padding: 28px; border: 1px solid #707070; border-radius: 8px; box-shadow: 0 24px 100px #0007; line-height: 1.7; color: #eee; }
+.browser-dialog h1 { font-size: 22px; margin: 0 0 15px; }
+.browser-dialog p, .browser-dialog li { font-size: 13px; }
+.browser-dialog button { min-height: 32px; padding: 6px 14px; background: #555; color: #eee; border: 1px solid #888; }
+.browser-dialog li { margin: 10px 0; }
+.browser-dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
+.browser-preset { display: block; width: 100%; text-align: left; margin: 8px 0; }
+.browser-notice { position: fixed; z-index: 1000; left: 50%; bottom: 20px; transform: translateX(-50%); width: min(720px, calc(100% - 32px)); display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; background: #333; border: 1px solid #999; color: #fff; box-shadow: 0 4px 24px #0006; }
+.browser-notice p { flex: 1; margin: 0; line-height: 1.5; overflow-wrap: anywhere; }
+.browser-notice button { min-width: 28px; min-height: 28px; padding: 0; font-size: 22px; }

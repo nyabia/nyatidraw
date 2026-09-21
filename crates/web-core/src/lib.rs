@@ -20,6 +20,8 @@ pub use nyatidraw_tiles::{TILE_BYTE_LEN, TILE_EDGE, TileKey, TileSnapshot};
 
 mod codec;
 mod drawing;
+mod interchange;
+pub use interchange::WebPreferences;
 #[cfg(test)]
 mod tests;
 
@@ -92,11 +94,14 @@ pub struct BrushSettings {
     pub hardness: f32,
     pub size_pressure: bool,
     pub opacity_pressure: bool,
+    pub size_minimum_u16: u16,
+    pub opacity_minimum_u16: u16,
     pub smoothing: u8,
 }
 
 impl BrushSettings {
     #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn for_tool(tool: WebTool) -> Self {
         let preset = tool.preset();
         Self {
@@ -105,13 +110,15 @@ impl BrushSettings {
             hardness: preset.hardness,
             size_pressure: preset.size_pressure,
             opacity_pressure: preset.opacity_pressure,
+            size_minimum_u16: (preset.size_min_ratio * f32::from(u16::MAX)).round() as u16,
+            opacity_minimum_u16: (preset.opacity_min_ratio * f32::from(u16::MAX)).round() as u16,
             smoothing: 0,
         }
     }
 
     fn validate(self) -> Result<Self, WebError> {
         if !self.size_px.is_finite()
-            || !(0.5..=200.0).contains(&self.size_px)
+            || !(0.1..=200.0).contains(&self.size_px)
             || !self.opacity.is_finite()
             || !(0.0..=1.0).contains(&self.opacity)
             || !self.hardness.is_finite()
@@ -299,6 +306,16 @@ impl WebDocument {
         self.undo.len() + self.redo.len()
     }
 
+    #[must_use]
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    #[must_use]
+    pub fn redo_len(&self) -> usize {
+        self.redo.len()
+    }
+
     /// # Errors
     /// Tool changes during a stroke are rejected; temporary host tools stay host-owned.
     pub fn select_tool(&mut self, tool: WebTool) -> Result<(), WebError> {
@@ -450,6 +467,19 @@ impl WebDocument {
     pub fn rename_layer(&mut self, layer: LayerId, name: &str) -> Result<CanvasUpdate, WebError> {
         self.edit_layers(|tree| {
             tree.rename(LayerTreeNodeId::Raster(layer), name)
+                .map(|_| ())
+        })
+    }
+
+    /// # Errors
+    /// Rejects invalid layers, positions, or a live stroke.
+    pub fn reorder_layer(
+        &mut self,
+        layer: LayerId,
+        index: usize,
+    ) -> Result<CanvasUpdate, WebError> {
+        self.edit_layers(|tree| {
+            tree.reorder(LayerTreeNodeId::Raster(layer), tree.root_id(), index)
                 .map(|_| ())
         })
     }

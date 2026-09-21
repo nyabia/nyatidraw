@@ -1,0 +1,17 @@
+[package]
+name = "nyatidraw-editor-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dioxus = { version = "=0.7.9", default-features = false, features = ["lib"] }
+nyatidraw-api.workspace = true
+nyatidraw-brush.workspace = true
+nyatidraw-input.workspace = true
+nyatidraw-paint-cpu.workspace = true
+nyatidraw-tiles.workspace = true
+nyatidraw-png-io.workspace = true
+
+[lints]
+workspace = true

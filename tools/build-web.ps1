@@ -47,6 +47,16 @@ if (Test-Path -LiteralPath $publicDirectory) {
 New-Item -ItemType Directory -Path $publicDirectory -Force | Out-Null
 
 $hadEncodedFlags = Test-Path Env:CARGO_ENCODED_RUSTFLAGS
+$previousWasmCompiler = [Environment]::GetEnvironmentVariable('CC_wasm32_unknown_unknown', 'Process')
+$wasmCompiler = $previousWasmCompiler
+if ([string]::IsNullOrWhiteSpace($wasmCompiler)) {
+    $clangCommand = Get-Command clang -ErrorAction SilentlyContinue
+    if ($clangCommand) { $wasmCompiler = $clangCommand.Source }
+    elseif ($IsWindows -and (Test-Path -LiteralPath "$env:ProgramFiles/LLVM/bin/clang.exe" -PathType Leaf)) {
+        $wasmCompiler = "$env:ProgramFiles/LLVM/bin/clang.exe"
+    }
+    else { throw 'Install LLVM Clang, or set CC_wasm32_unknown_unknown to its executable, for the shared NTDR zstd codec.' }
+}
 $previousEncodedFlags = [Environment]::GetEnvironmentVariable('CARGO_ENCODED_RUSTFLAGS', 'Process')
 $rustFlags = @()
 if ($hadEncodedFlags) {
@@ -72,12 +82,15 @@ $arguments = @('build', '--web', '--package', 'nyatidraw-web', '--locked', '--ba
 if (-not $DebugBuild) { $arguments += '--release' }
 Push-Location $repositoryRoot
 try {
+    $env:CC_wasm32_unknown_unknown = $wasmCompiler
     $env:CARGO_ENCODED_RUSTFLAGS = $rustFlags -join [char]0x1f
     Write-Host "Building web editor with $actual ($BasePath)"
     & $executable @arguments
     if ($LASTEXITCODE -ne 0) { throw "Dioxus web build failed with exit code $LASTEXITCODE" }
 }
 finally {
+    if ($null -ne $previousWasmCompiler) { $env:CC_wasm32_unknown_unknown = $previousWasmCompiler }
+    else { Remove-Item Env:CC_wasm32_unknown_unknown -ErrorAction SilentlyContinue }
     if ($hadEncodedFlags) { $env:CARGO_ENCODED_RUSTFLAGS = $previousEncodedFlags }
     else { Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue }
     Pop-Location

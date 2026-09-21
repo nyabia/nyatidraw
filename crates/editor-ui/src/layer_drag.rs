@@ -1,5 +1,5 @@
 //! `WebView` layer drag/drop sends one revision-bound semantic reorder on drop.
-use crate::live_ink::LiveInkBridge;
+use crate::UiHost;
 use dioxus::prelude::*;
 use nyatidraw_api::{
     EditorCommand, GroupId, LayerCommand, LayerProjection, LayerTreeNodeId, Revision, UiProjection,
@@ -7,8 +7,8 @@ use nyatidraw_api::{
 
 // Pointer capture does not require the composition WebView's OS/OLE drag host.
 // Only a completed, revision-bound semantic drop crosses IPC, never pointer moves.
-pub(super) fn use_layer_pointer_drag(mut error: Signal<Option<String>>) {
-    let live_ink = use_context::<LiveInkBridge>();
+pub fn use_layer_pointer_drag(mut error: Signal<Option<String>>) {
+    let live_ink = use_context::<UiHost>();
     use_effect(move || {
         let live_ink = live_ink.clone();
         spawn(async move {
@@ -46,7 +46,7 @@ pub(super) fn use_layer_pointer_drag(mut error: Signal<Option<String>>) {
                     match live_ink
                         .push_editor_command(current.revision, EditorCommand::Layer(command))
                     {
-                        Ok(_) => error.set(None),
+                        Ok(()) => error.set(None),
                         Err(reason) => {
                             error.set(Some(format!("레이어를 이동하지 못했습니다: {reason:?}")));
                         }
@@ -68,7 +68,7 @@ fn node_key(key: &str) -> Option<LayerTreeNodeId> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct LayerDrag {
+pub struct LayerDrag {
     pub node: LayerTreeNodeId,
     parent: GroupId,
     index: usize,
@@ -114,7 +114,7 @@ fn adjacent_move(projection: &UiProjection, upward: bool) -> Option<LayerCommand
 }
 
 #[component]
-pub(super) fn LayerMoveButtons(
+pub fn LayerMoveButtons(
     projection: Signal<UiProjection>,
     error: Signal<Option<String>>,
 ) -> Element {
@@ -131,7 +131,7 @@ fn LayerMoveButton(
     mut error: Signal<Option<String>>,
     upward: bool,
 ) -> Element {
-    let live_ink = use_context::<LiveInkBridge>();
+    let live_ink = use_context::<UiHost>();
     let enabled = adjacent_move(&projection.read(), upward).is_some();
     rsx! {
         button {
@@ -140,7 +140,7 @@ fn LayerMoveButton(
                 let current = projection.read();
                 if let Some(command) = adjacent_move(&current, upward) {
                     match live_ink.push_editor_command(current.revision, EditorCommand::Layer(command)) {
-                        Ok(_) => error.set(None),
+                        Ok(()) => error.set(None),
                         Err(reason) => error.set(Some(format!("레이어를 이동하지 못했습니다: {reason:?}"))),
                     }
                 }

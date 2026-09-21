@@ -8,13 +8,14 @@ use nyatidraw_paint_cpu::{CpuCanvas, PremultipliedRgba8};
 use nyatidraw_tiles::FlattenedRgba8;
 
 #[component]
-pub(crate) fn BrushStrokePreview(
+pub fn BrushStrokePreview(
     tool: DrawingTool,
     pencil_template: PencilTemplate,
     size_tenths: u16,
     opacity_u16: u16,
     settings: BrushSettings,
 ) -> Element {
+    let host = use_context::<crate::UiHost>();
     let image = use_memo(use_reactive(
         (
             &tool,
@@ -30,7 +31,7 @@ pub(crate) fn BrushStrokePreview(
             projection.brush_size_tenths = size;
             projection.brush_opacity_u16 = opacity;
             projection.brush_settings = settings;
-            render(&projection).ok()
+            render(&host, &projection).ok()
         },
     ));
     rsx! { div { class: "brush-stroke-preview", title: "현재 브러시의 필압 변화 예시 · 흑백 표시, 큰 크기는 축소 · 보정 감각은 실제 획으로 확인",
@@ -40,10 +41,10 @@ pub(crate) fn BrushStrokePreview(
     } }
 }
 
-fn render(projection: &UiProjection) -> Result<std::sync::Arc<str>, String> {
+fn render(host: &crate::UiHost, projection: &UiProjection) -> Result<std::sync::Arc<str>, String> {
     const WIDTH: u32 = 160;
     const HEIGHT: u32 = 48;
-    let mut preset = crate::native_canvas::preset_for_ui_preview(projection);
+    let mut preset = host.preview_preset(projection);
     // A display thumbnail, not a 1:1 ruler. Bound allocations and raster work.
     preset.size_px = preset.size_px.min(26.0);
     let sample = |index: u32| {

@@ -1,4 +1,5 @@
 //! Project file policy, independent of any storage backend.
+mod tool_state;
 mod wire;
 
 use std::{
@@ -12,6 +13,10 @@ use nyatidraw_document::LayerTree;
 use nyatidraw_history::{History, HistoryError};
 use nyatidraw_tiles::{ContentRoot, TileSnapshot};
 
+pub use tool_state::{
+    EDITOR_TOOL_STATE_BYTES, ProjectBrushState, ProjectToolState, decode_editor_tool_state,
+    encode_editor_tool_state,
+};
 pub use wire::*;
 
 /// Backend-neutral durable project boundary.

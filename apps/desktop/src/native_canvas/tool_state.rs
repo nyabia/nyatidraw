@@ -5,12 +5,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use nyatidraw_api::{EditSettings, EditSource, FillSettings, PencilTemplate, SelectionMode};
+use nyatidraw_project::{
+    EDITOR_TOOL_STATE_BYTES as RECORD_BYTES, ProjectBrushState, ProjectToolState,
+    decode_editor_tool_state, encode_editor_tool_state,
+};
 
-use super::{BrushSettings, DrawingConfig, DrawingTool, LiveInkBridge, ProjectDb, RememberedBrush};
+use super::{DrawingConfig, LiveInkBridge, ProjectDb, RememberedBrush};
 
-const MAGIC: &[u8; 8] = b"NYTOOL01";
-const RECORD_BYTES: usize = 85;
+#[cfg(test)]
+use nyatidraw_api::{DrawingTool, PencilTemplate};
+#[cfg(test)]
 const TOOLS: [DrawingTool; 12] = [
     DrawingTool::Move,
     DrawingTool::MoveSelection,
@@ -153,135 +157,41 @@ impl Store {
 
 pub(super) fn encode(mut drawing: DrawingConfig) -> Vec<u8> {
     drawing.remember_current();
-    let mut bytes = Vec::with_capacity(RECORD_BYTES);
-    bytes.extend_from_slice(MAGIC);
-    bytes.push(u8::try_from(TOOLS.iter().position(|tool| *tool == drawing.tool).unwrap()).unwrap());
-    bytes.push(u8::from(
-        drawing.pencil_template == PencilTemplate::Graphite2B,
-    ));
-    bytes.push(u8::try_from(drawing.last_painting_slot).unwrap());
-    bytes.extend_from_slice(&drawing.color);
-    bytes.extend_from_slice(&drawing.background_color);
-    bytes.extend_from_slice(&[
-        match drawing.edit_settings.source {
-            EditSource::ActiveLayer => 0,
-            EditSource::ReferenceLayers => 1,
-            EditSource::AllVisible => 2,
-        },
-        drawing.edit_settings.tolerance,
-        match drawing.edit_settings.selection_mode {
-            SelectionMode::Replace => 0,
-            SelectionMode::Add => 1,
-            SelectionMode::Subtract => 2,
-        },
-        drawing.edit_settings.fill.gap_close_px,
-        drawing.edit_settings.fill.expand_px,
-        u8::from(drawing.edit_settings.fill.antialias),
-    ]);
-    for brush in drawing.remembered {
-        bytes.extend_from_slice(&brush.size_tenths.to_le_bytes());
-        bytes.extend_from_slice(&brush.opacity_u16.to_le_bytes());
-        bytes.push(
-            u8::from(brush.settings.size_pressure)
-                | (u8::from(brush.settings.opacity_pressure) << 1),
-        );
-        bytes.extend_from_slice(&brush.settings.size_minimum_u16.to_le_bytes());
-        bytes.extend_from_slice(&brush.settings.opacity_minimum_u16.to_le_bytes());
-        bytes.extend_from_slice(&brush.settings.hardness_u16.to_le_bytes());
-        bytes.push(brush.settings.smoothing);
-    }
-    debug_assert_eq!(bytes.len(), RECORD_BYTES);
-    bytes
+    encode_editor_tool_state(&ProjectToolState {
+        tool: drawing.tool,
+        pencil_template: drawing.pencil_template,
+        last_painting_slot: u8::try_from(drawing.last_painting_slot).unwrap(),
+        color: drawing.color,
+        background_color: drawing.background_color,
+        edit_settings: drawing.edit_settings,
+        remembered: drawing.remembered.map(|brush| ProjectBrushState {
+            size_tenths: brush.size_tenths,
+            opacity_u16: brush.opacity_u16,
+            settings: brush.settings,
+        }),
+    })
 }
 
 pub(super) fn decode(bytes: &[u8]) -> Option<DrawingConfig> {
-    if bytes.len() != RECORD_BYTES || !bytes.starts_with(MAGIC) {
-        return None;
-    }
-    let tool = *TOOLS.get(usize::from(bytes[8]))?;
-    let pencil_template = match bytes[9] {
-        0 => PencilTemplate::Mechanical2H,
-        1 => PencilTemplate::Graphite2B,
-        _ => return None,
-    };
-    let last_painting_slot = usize::from(bytes[10]);
-    let color: [u8; 4] = bytes[11..15].try_into().ok()?;
-    let background_color: [u8; 4] = bytes[15..19].try_into().ok()?;
-    if color[3] == 0 || background_color[3] == 0 || last_painting_slot >= 5 {
-        return None;
-    }
-    let expected_slot = DrawingConfig::painting_slot(tool).map(|slot| {
-        if tool == DrawingTool::Pencil && pencil_template == PencilTemplate::Graphite2B {
-            4
-        } else {
-            slot
-        }
+    let state = decode_editor_tool_state(bytes)?;
+    let last_painting_slot = usize::from(state.last_painting_slot);
+    let remembered = state.remembered.map(|brush| RememberedBrush {
+        size_tenths: brush.size_tenths,
+        opacity_u16: brush.opacity_u16,
+        settings: brush.settings,
     });
-    if expected_slot.is_some_and(|slot| slot != last_painting_slot) {
-        return None;
-    }
-    let edit_settings = EditSettings {
-        source: match bytes[19] {
-            0 => EditSource::ActiveLayer,
-            1 => EditSource::ReferenceLayers,
-            2 => EditSource::AllVisible,
-            _ => return None,
-        },
-        tolerance: bytes[20],
-        selection_mode: match bytes[21] {
-            0 => SelectionMode::Replace,
-            1 => SelectionMode::Add,
-            2 => SelectionMode::Subtract,
-            _ => return None,
-        },
-        fill: FillSettings {
-            gap_close_px: bytes[22],
-            expand_px: bytes[23],
-            antialias: match bytes[24] {
-                0 => false,
-                1 => true,
-                _ => return None,
-            },
-        },
-    };
-    if edit_settings.fill.gap_close_px > 8 || edit_settings.fill.expand_px > 64 {
-        return None;
-    }
-    let mut remembered = [RememberedBrush::for_tool(DrawingTool::Pencil); 5];
-    for (slot, encoded) in remembered.iter_mut().zip(bytes[25..].chunks_exact(12)) {
-        let number = |index| u16::from_le_bytes([encoded[index], encoded[index + 1]]);
-        *slot = RememberedBrush {
-            size_tenths: number(0),
-            opacity_u16: number(2),
-            settings: BrushSettings {
-                size_pressure: encoded[4] & 1 != 0,
-                opacity_pressure: encoded[4] & 2 != 0,
-                size_minimum_u16: number(5),
-                opacity_minimum_u16: number(7),
-                hardness_u16: number(9),
-                smoothing: encoded[11],
-            },
-        };
-        if !(1..=2_000).contains(&slot.size_tenths)
-            || slot.opacity_u16 == 0
-            || encoded[4] > 3
-            || slot.settings.smoothing > 100
-        {
-            return None;
-        }
-    }
     let active = remembered[last_painting_slot];
     Some(DrawingConfig {
-        edit_settings,
-        tool,
-        pencil_template,
+        edit_settings: state.edit_settings,
+        tool: state.tool,
+        pencil_template: state.pencil_template,
         remembered,
         last_painting_slot,
         size_tenths: active.size_tenths,
         opacity_u16: active.opacity_u16,
         brush_settings: active.settings,
-        color,
-        background_color,
+        color: state.color,
+        background_color: state.background_color,
     })
 }
 

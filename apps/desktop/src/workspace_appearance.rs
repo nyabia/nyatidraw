@@ -68,19 +68,4 @@ impl WorkspaceAppearance {
             [self.solid_rgb; 2]
         }
     }
-
-    pub(crate) fn solid_hex(self) -> String {
-        let [red, green, blue] = self.solid_rgb;
-        format!("#{red:02x}{green:02x}{blue:02x}")
-    }
-
-    pub(crate) fn set_solid_hex(&mut self, value: &str) {
-        if value.len() == 7
-            && let Some(hex) = value.strip_prefix('#')
-            && let Ok(rgb) = u32::from_str_radix(hex, 16)
-        {
-            let [_, red, green, blue] = rgb.to_be_bytes();
-            self.solid_rgb = [red, green, blue];
-        }
-    }
 }

@@ -1,10 +1,23 @@
-use crate::live_ink::LiveInkBridge;
+use crate::UiHost;
 use dioxus::prelude::*;
 use nyatidraw_api::{EditorCommand, ToolCommand, UiProjection};
 
-#[path = "palette_preferences.rs"]
-mod preferences;
-use preferences::{CAPACITY, PalettePreferences, Pins};
+const CAPACITY: usize = 10;
+type Pins = crate::PalettePins;
+#[derive(Clone)]
+struct PalettePreferences(UiHost);
+impl PalettePreferences {
+    fn open(host: UiHost) -> (Self, Pins) {
+        let pins = host.palette_pins();
+        (Self(host), pins)
+    }
+    fn notice(&self) -> Option<String> {
+        self.0.palette_notice()
+    }
+    fn save(&self, pins: Pins) {
+        self.0.save_palette_pins(pins);
+    }
+}
 
 #[derive(Clone, Copy)]
 struct PaletteEntry {
@@ -127,8 +140,9 @@ struct PaletteContext {
 }
 
 /// Call once in the app root after creating its authoritative UI projection.
-pub(crate) fn use_palette_preferences(ui_projection: Signal<UiProjection>) {
-    let (preferences, pins) = use_hook(|| PalettePreferences::open(dioxus_core::schedule_update()));
+pub fn use_palette_preferences(ui_projection: Signal<UiProjection>) {
+    let host = use_context::<UiHost>();
+    let (preferences, pins) = use_hook(move || PalettePreferences::open(host));
     let mut context = use_context_provider(|| PaletteContext {
         state: Signal::new(Palette::new(pins)),
         preferences: preferences.clone(),
@@ -147,8 +161,8 @@ pub(crate) fn use_palette_preferences(ui_projection: Signal<UiProjection>) {
 }
 
 #[component]
-pub(crate) fn ColorPanel(ui_projection: Signal<UiProjection>) -> Element {
-    let live_ink = use_context::<LiveInkBridge>();
+pub fn ColorPanel(ui_projection: Signal<UiProjection>) -> Element {
+    let live_ink = use_context::<UiHost>();
     let current = ui_projection.read().brush_color;
     let epoch = live_ink.project_epoch();
     rsx! {
@@ -160,8 +174,8 @@ pub(crate) fn ColorPanel(ui_projection: Signal<UiProjection>) -> Element {
 }
 
 #[component]
-pub(crate) fn QuickColors(ui_projection: Signal<UiProjection>) -> Element {
-    let live_ink = use_context::<LiveInkBridge>();
+pub fn QuickColors(ui_projection: Signal<UiProjection>) -> Element {
+    let live_ink = use_context::<UiHost>();
     let error = use_signal(|| Option::<String>::None);
     let current = ui_projection.read().brush_color;
     let background = ui_projection.read().background_color;
@@ -202,7 +216,7 @@ fn PaletteRow(current: [u8; 4], compact: bool) -> Element {
 
 #[component]
 fn PaletteSwatch(index: usize, color: [u8; 4], pinned: bool, selected: bool) -> Element {
-    let live_ink = use_context::<LiveInkBridge>();
+    let live_ink = use_context::<UiHost>();
     let context = use_context::<PaletteContext>();
     let mut state = context.state;
     let preferences = context.preferences;

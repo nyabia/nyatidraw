@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::live_ink::LiveInkBridge;
+use crate::UiHost;
 use dioxus::prelude::*;
 use nyatidraw_api::{CanvasSpec, EditCommand, EditorCommand, UiProjection};
 
@@ -244,11 +244,11 @@ impl CanvasDraft {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct PagePanelOpen(pub Signal<bool>);
+pub struct PagePanelOpen(pub Signal<bool>);
 
 #[component]
-pub(crate) fn PagePanel(ui_projection: Signal<UiProjection>) -> Element {
-    let live_ink = use_context::<LiveInkBridge>();
+pub fn PagePanel(ui_projection: Signal<UiProjection>) -> Element {
+    let live_ink = use_context::<UiHost>();
     let crop_ink = live_ink.clone();
     let PagePanelOpen(mut opened) = use_context();
     let mut draft = use_signal(|| CanvasDraft::new(ui_projection.read().canvas));

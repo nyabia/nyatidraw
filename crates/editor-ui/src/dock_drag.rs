@@ -1,11 +1,11 @@
 //! WebView-owned pointer capture emits only a final semantic dock command.
-use crate::live_ink::LiveInkBridge;
+use crate::UiHost;
 use dioxus::prelude::*;
 use nyatidraw_api::{
     DockAxis, DockCommand, DockNode, DockPosition, DockTree, EditorCommand, PanelKind, Revision,
 };
 
-pub(super) fn split_key(first: &DockNode, second: &DockNode) -> String {
+pub fn split_key(first: &DockNode, second: &DockNode) -> String {
     fn anchor(node: &DockNode) -> PanelKind {
         match node {
             DockNode::Panel(panel) => *panel,
@@ -20,7 +20,7 @@ pub(super) fn split_key(first: &DockNode, second: &DockNode) -> String {
     )
 }
 
-pub(super) fn height_panel(node: &DockNode) -> PanelKind {
+pub fn height_panel(node: &DockNode) -> PanelKind {
     match node {
         DockNode::Panel(panel) => *panel,
         DockNode::Tabs { panels, .. } => panels[0],
@@ -28,7 +28,7 @@ pub(super) fn height_panel(node: &DockNode) -> PanelKind {
     }
 }
 
-pub(super) fn minimum_width(node: &DockNode) -> u16 {
+pub fn minimum_width(node: &DockNode) -> u16 {
     match node {
         DockNode::Panel(panel) => match panel {
             PanelKind::Tools => 48,
@@ -77,13 +77,12 @@ fn resize_split(node: &mut DockNode, key: &str, ratio: u16) -> bool {
 }
 
 #[allow(clippy::too_many_lines)] // One revision-checked semantic event dispatcher.
-pub(super) fn use_dock_drag(live_ink: LiveInkBridge) {
-    let mut heights =
-        use_context_provider(|| Signal::new(crate::layout_store::PanelHeights::load()));
+pub fn use_dock_drag(live_ink: UiHost) {
+    let mut heights = use_context_provider(|| Signal::new(live_ink.panel_heights()));
     use_effect(move || {
         let live_ink = live_ink.clone();
         spawn(async move {
-            let probe = cancel_probe_enabled();
+            let probe = live_ink.dock_cancel_probe();
             let script = include_str!("dock_drag.js").replace(
                 "__DOCK_CANCEL_PROBE__",
                 if probe { "true" } else { "false" },
@@ -200,21 +199,4 @@ fn panel(slug: &str) -> Option<PanelKind> {
         "quick-colors" => PanelKind::QuickColors,
         _ => return None,
     })
-}
-
-// Controlled cancellation signals supplement actual computer-use drags. They
-// are not evidence of physical capture loss or a real OS focus transition.
-fn cancel_probe_enabled() -> bool {
-    if std::env::var("NAYATI_DOCK_CANCEL_PROBE").as_deref() != Ok("sequence") {
-        return false;
-    }
-    let Some(project) = std::env::args_os().nth(1).map(std::path::PathBuf::from) else {
-        return false;
-    };
-    project
-        .file_name()
-        .is_some_and(|name| name == "edit-source-scratch.ntdr")
-        && project
-            .parent()
-            .is_some_and(|parent| parent.join(".nyatidraw-scratch-dock-probe").is_file())
 }

@@ -70,4 +70,6 @@
 
 | 상태 | 결정과 근거 |
 |---|---|
-| 제한 채택·배포 gate 진행 중 | [별도 Dioxus Web 호스트, 공용 CPU 브러시와 WebGPU 합성, bounded 로컬 복구](ADR-0059-web-editor-spike.md). Windows GPU-first 성능 동등성이나 `.ntdr` 호환성을 의미하지 않는다. |
+| 제한 채택·초기 배포 확인 | [별도 Dioxus Web 호스트, 공용 CPU 브러시와 WebGPU 합성, bounded 로컬 복구](ADR-0059-web-editor-spike.md). Windows GPU-first 성능 동등성이나 `.ntdr` 호환성을 의미하지 않는다. |
+| 공용 UI 전환·로컬 검증 중 | [데스크톱 기준 공용 Dioxus 편집 화면](ADR-0060-shared-dioxus-editor-ui.md). 축소 웹 디자인 대신 동일한 컴포넌트·스타일·도킹을 사용한다. |
+| 저장 형식 통합·로컬 검증 중 | [브라우저와 데스크톱의 NTDR 저장 형식 공유](ADR-0061-shared-ntdr-browser-storage.md). 별도 웹 파일 대신 같은 redb/레코드/타일 코덱을 사용한다. |

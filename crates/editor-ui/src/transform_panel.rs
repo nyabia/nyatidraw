@@ -1,9 +1,9 @@
-use crate::live_ink::LiveInkBridge;
+use crate::UiHost;
 use dioxus::prelude::*;
 use nyatidraw_api::{AffineTransform, EditCommand, EditorCommand, TransformCommand, UiProjection};
 
 #[derive(Clone, Copy)]
-pub(crate) struct TransformPanelOpen(pub Signal<bool>);
+pub struct TransformPanelOpen(pub Signal<bool>);
 
 #[derive(Clone)]
 struct TransformInputs {
@@ -70,7 +70,7 @@ fn number(text: &str, factor: f64, min: f64, max: f64) -> Result<i64, &'static s
 }
 
 fn send(
-    bridge: &LiveInkBridge,
+    bridge: &UiHost,
     _projection: Signal<UiProjection>,
     command: TransformCommand,
     mut error: Signal<Option<String>>,
@@ -86,8 +86,8 @@ fn send(
 }
 
 #[component]
-pub(crate) fn TransformPanel(ui_projection: Signal<UiProjection>) -> Element {
-    let bridge = use_context::<LiveInkBridge>();
+pub fn TransformPanel(ui_projection: Signal<UiProjection>) -> Element {
+    let bridge = use_context::<UiHost>();
     let begin_bridge = bridge.clone();
     let preview_bridge = bridge.clone();
     let commit_bridge = bridge.clone();

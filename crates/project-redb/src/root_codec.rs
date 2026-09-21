@@ -24,11 +24,24 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Envelope, String> {
     if !bytes.starts_with(MAGIC) {
         return Envelope::decode(bytes, RecordKind::ContentRoot).map_err(|error| error.to_string());
     }
+    decode_with_limit(bytes, MAX_DECODED_BYTES)
+}
+
+pub(super) fn decode_with_limit(bytes: &[u8], limit: usize) -> Result<Envelope, String> {
+    if !bytes.starts_with(MAGIC) {
+        if bytes.len() > limit {
+            return Err("root exceeds browser decode budget".into());
+        }
+        return Envelope::decode(bytes, RecordKind::ContentRoot).map_err(|error| error.to_string());
+    }
     let length = bytes.get(8..HEADER_BYTES).ok_or("truncated root header")?;
     let length = usize::try_from(u64::from_le_bytes(length.try_into().unwrap()))
         .map_err(|_| "root length exceeds address space")?;
     if !(112..=MAX_DECODED_BYTES).contains(&length) || bytes.len() >= length {
         return Err("invalid compressed root length".into());
+    }
+    if length > limit {
+        return Err("root exceeds browser decode budget".into());
     }
     let frame = &bytes[HEADER_BYTES..];
     if zstd::zstd_safe::find_frame_compressed_size(frame)

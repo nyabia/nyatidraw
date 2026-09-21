@@ -1,10 +1,10 @@
-use crate::live_ink::LiveInkBridge;
+use crate::UiHost;
 use dioxus::prelude::*;
 use nyatidraw_api::{EditorCommand, ToolCommand};
 
 #[component]
-pub(super) fn ColorPicker(color: [u8; 4], epoch: u64) -> Element {
-    let live_ink = use_context::<LiveInkBridge>();
+pub fn ColorPicker(color: [u8; 4], epoch: u64) -> Element {
+    let live_ink = use_context::<UiHost>();
     let rgba = format!("{},{},{},{}", color[0], color[1], color[2], color[3]);
     use_effect(move || {
         let live_ink = live_ink.clone();

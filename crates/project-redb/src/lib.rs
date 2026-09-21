@@ -8,6 +8,8 @@ mod canvas_history;
 mod editor_state;
 mod history_retention;
 mod layer_history;
+mod memory;
+pub use memory::MemoryProjectDb;
 #[cfg(feature = "legacy-migration")]
 mod migration;
 mod object_retention;
@@ -338,6 +340,22 @@ impl ProjectDb {
             .validate()
             .map_err(|error| self.io(format!("invalid canvas: {error:?}")))?;
         self.commit_structural_inner(batch, None, Some(canvas), &CommitControl::Normal)
+    }
+
+    /// Commits artwork, layers and canvas dimensions as one history transition.
+    ///
+    /// # Errors
+    /// Rejects invalid metadata, lineage or a failed storage transaction.
+    pub fn commit_structural_with_metadata(
+        &self,
+        batch: &ProjectStructuralBatch,
+        tree: &LayerTree,
+        canvas: CanvasSpec,
+    ) -> Result<(), ProjectOpenError> {
+        canvas
+            .validate()
+            .map_err(|error| self.io(format!("invalid canvas: {error:?}")))?;
+        self.commit_structural_inner(batch, Some(tree), Some(canvas), &CommitControl::Normal)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1829,6 +1847,131 @@ mod tests {
             42,
             10,
         )
+    }
+
+    #[test]
+    fn memory_project_native_roundtrip_preserves_artwork_metadata_and_history() {
+        let path = temp("memory-native-roundtrip");
+        let batch = prepared_batch();
+        let tree = LayerTree::new(GroupNode {
+            id: GroupId(1),
+            name: "Root".into(),
+            visible: true,
+            opacity_u16: u16::MAX,
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
+            children: vec![LayerTreeNode::Raster(LayerNode {
+                id: LayerId(4),
+                name: "Sketch".into(),
+                visible: true,
+                locked: false,
+                reference: false,
+                alpha_locked: false,
+                clip_to_below: false,
+                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
+                opacity_u16: u16::MAX,
+                content_root: batch.materialized.after.root().id,
+            })],
+        })
+        .unwrap();
+        let canvas = CanvasSpec {
+            width_px: 3840,
+            height_px: 2160,
+            pixels_per_inch: 144,
+        };
+        let memory = MemoryProjectDb::open(&[], 32 * 1024 * 1024).unwrap();
+        memory.db().persist_canvas_spec(canvas).unwrap();
+        memory.db().persist_layer_tree(&tree).unwrap();
+        memory
+            .db()
+            .persist_editor_tool_state(b"preserved tool state")
+            .unwrap();
+        memory.db().commit(&batch).unwrap();
+        std::fs::write(&path, memory.into_bytes().unwrap()).unwrap();
+        {
+            let native = ProjectDb::open(&path).unwrap();
+            assert_eq!(native.load_current().unwrap(), Some(batch.clone()));
+            assert_eq!(native.load_layer_tree().unwrap(), Some(tree.clone()));
+            assert_eq!(native.load_canvas_spec().unwrap(), canvas);
+        }
+        let original = std::fs::read(&path).unwrap();
+        let memory = MemoryProjectDb::open(&original, 32 * 1024 * 1024).unwrap();
+        let reopened = memory.db().load_reopened().unwrap().unwrap();
+        assert_eq!(reopened.current_tiles(), &batch.materialized.after);
+        assert_eq!(reopened.history().head(), Some(batch.history_node.id));
+        assert_eq!(memory.db().load_layer_tree().unwrap(), Some(tree));
+        assert_eq!(memory.db().load_canvas_spec().unwrap(), canvas);
+        assert_eq!(
+            memory.db().load_editor_tool_state().unwrap(),
+            Some(b"preserved tool state".to_vec())
+        );
+        let output = memory.into_bytes().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::write(&path, output).unwrap();
+        let read_only = redb::ReadOnlyDatabase::open(&path).unwrap();
+        drop(read_only);
+        let native = ProjectDb::open(&path).unwrap();
+        assert_eq!(native.load_current().unwrap(), Some(batch));
+        drop(native);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn memory_project_invalid_or_oversized_input_is_never_reinitialized() {
+        for bytes in [b"invalid non-empty artwork".as_slice(), &[0; 8192]] {
+            let original = bytes.to_vec();
+            assert!(MemoryProjectDb::open(bytes, 32 * 1024 * 1024).is_err());
+            assert_eq!(bytes, original);
+        }
+        let valid = MemoryProjectDb::open(&[], 32 * 1024 * 1024)
+            .unwrap()
+            .into_bytes()
+            .unwrap();
+        assert!(MemoryProjectDb::open(&valid, valid.len() - 1).is_err());
+        assert!(MemoryProjectDb::open(&[], 0).is_err());
+        assert!(MemoryProjectDb::open(&[], 4096).is_err());
+        let mut corrupt_geometry = valid;
+        corrupt_geometry[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        let original = corrupt_geometry.clone();
+        assert!(MemoryProjectDb::open(&corrupt_geometry, 32 * 1024 * 1024).is_err());
+        assert_eq!(corrupt_geometry, original);
+    }
+
+    #[test]
+    fn memory_project_compressed_root_cannot_exceed_decoded_tile_budget() {
+        let path = temp("memory-compressed-root-budget");
+        let object = TileObject::new(vec![64; TILE_BYTE_LEN]).unwrap();
+        let after = TileSnapshot::from_objects((0..1025).map(|x| {
+            (
+                TileKey {
+                    layer: LayerId(4),
+                    mip: 0,
+                    x,
+                    y: 0,
+                },
+                object.clone(),
+            )
+        }))
+        .unwrap();
+        let before = TileSnapshot::empty();
+        let node = HistoryNode {
+            id: HistoryNodeId(1),
+            parent: None,
+            timestamp_ns: 0,
+            operation: OperationRecord::StructuralChange,
+            before_root: before.root().id,
+            after_root: after.root().id,
+        };
+        let batch = ProjectStructuralBatch::new(SnapshotId(2), before, after, node).unwrap();
+        {
+            let native = ProjectDb::open(&path).unwrap();
+            native.commit_structural(&batch).unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let error = MemoryProjectDb::open(&bytes, 32 * 1024 * 1024).unwrap_err();
+        assert!(error.to_string().contains("root"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

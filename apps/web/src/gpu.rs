@@ -19,6 +19,9 @@ pub struct WebRenderer {
 }
 
 impl WebRenderer {
+    pub fn set_background(&mut self, colors: [[u8; 3]; 2]) {
+        self.scene.set_workspace_background(colors);
+    }
     #[allow(clippy::too_many_lines)]
     pub async fn new(canvas: HtmlCanvasElement, doc: &WebDocument) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {

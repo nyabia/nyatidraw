@@ -107,7 +107,7 @@ impl WebDocument {
         document.foreground = reader.array()?;
         document.background = reader.array()?;
         for (tool, settings) in WebTool::ALL.into_iter().zip(&mut document.settings) {
-            *settings = decode_settings(&mut reader)?;
+            *settings = decode_settings(&mut reader, tool)?;
             if matches!(tool, WebTool::Pencil2H | WebTool::Pencil2B)
                 && settings.hardness.to_bits() != 1.0_f32.to_bits()
             {
@@ -162,7 +162,7 @@ fn encode_settings(bytes: &mut Vec<u8>, settings: BrushSettings) {
     bytes.push(settings.smoothing);
 }
 
-fn decode_settings(reader: &mut Reader<'_>) -> Result<BrushSettings, WebError> {
+fn decode_settings(reader: &mut Reader<'_>, tool: WebTool) -> Result<BrushSettings, WebError> {
     BrushSettings {
         size_px: f32::from_bits(reader.u32()?),
         opacity: f32::from_bits(reader.u32()?),
@@ -170,6 +170,7 @@ fn decode_settings(reader: &mut Reader<'_>) -> Result<BrushSettings, WebError> {
         size_pressure: reader.boolean()?,
         opacity_pressure: reader.boolean()?,
         smoothing: reader.byte()?,
+        ..BrushSettings::for_tool(tool)
     }
     .validate()
     .map_err(|_| WebError::InvalidPortable)

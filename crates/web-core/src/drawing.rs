@@ -38,6 +38,8 @@ impl WebDocument {
             hardness: settings.hardness,
             size_pressure: settings.size_pressure,
             opacity_pressure: settings.opacity_pressure,
+            size_min_ratio: f32::from(settings.size_minimum_u16) / f32::from(u16::MAX),
+            opacity_min_ratio: f32::from(settings.opacity_minimum_u16) / f32::from(u16::MAX),
             ..self.tool.preset()
         }
     }

@@ -10,20 +10,7 @@ use std::{
 
 const MAGIC: &[u8; 8] = b"NYDOCK03";
 const MAX_BYTES: usize = 4096;
-const PANELS: [PanelKind; 12] = [
-    PanelKind::Canvas,
-    PanelKind::Tools,
-    PanelKind::Navigator,
-    PanelKind::Layers,
-    PanelKind::Brush,
-    PanelKind::Color,
-    PanelKind::History,
-    PanelKind::CanvasActions,
-    PanelKind::Viewport,
-    PanelKind::QuickColors,
-    PanelKind::ToolProperties,
-    PanelKind::BrushSizes,
-];
+pub(crate) use nyatidraw_editor_ui::layout_store::PANELS;
 
 pub(crate) fn settings_path() -> Option<PathBuf> {
     std::env::var_os("NAYATI_LAYOUT_PATH")

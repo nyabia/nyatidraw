@@ -60,7 +60,15 @@ export async function storeWorkspace(bytes) {
   try {
     await new Promise((resolve, reject) => {
       const tx = db.transaction("workspace", "readwrite");
-      tx.objectStore("workspace").put(bytes, "current");
+      const store = tx.objectStore("workspace");
+      const previous = store.get("current");
+      previous.onsuccess = () => {
+        const oldBytes = previous.result;
+        if (oldBytes && String.fromCharCode(...oldBytes.slice(0, 8)) === "NYWEB001") {
+          store.put(oldBytes, "legacy-before-ntdr");
+        }
+        store.put(bytes, "current");
+      };
       tx.oncomplete = resolve;
       tx.onabort = () =>
         reject(tx.error || new Error("브라우저 저장이 취소되었습니다."));
@@ -84,7 +92,7 @@ export function pickFile() {
   return new Promise((resolve, reject) => {
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = ".png,.nyatidraw-web";
+    input.accept = ".ntdr,.png,.nyatidraw-web";
     input.hidden = true;
     document.body.append(input);
     input.oncancel = () => {
@@ -98,9 +106,10 @@ export function pickFile() {
         resolve(null);
         return;
       }
-      if (file.size > 72 * 1024 * 1024) {
+      const limitMiB = file.name.toLowerCase().endsWith(".png") ? 72 : 128;
+      if (file.size > limitMiB * 1024 * 1024) {
         input.remove();
-        reject(new Error("웹판은 72 MiB 이하 파일만 열 수 있습니다."));
+        reject(new Error(`이 파일은 웹판의 ${limitMiB} MiB 한도를 넘습니다.`));
         return;
       }
       try {
@@ -117,6 +126,19 @@ export function pickFile() {
 let modalOpen = false;
 let cancelCanvasGesture;
 let previousFocus;
+let canvasTool = "stroke";
+export function setCanvasTool(tool) {
+  canvasTool = tool;
+}
+export function loadPreference(key) {
+  const value = localStorage.getItem(`nyatidraw-web-ui-v1-${key}`);
+  if (value !== null && value.length > 1024) throw new Error("저장된 화면 설정이 너무 큽니다.");
+  return value;
+}
+export function storePreference(key, value) {
+  if (value.length > 1024) throw new Error("화면 설정 크기 한도를 넘었습니다.");
+  localStorage.setItem(`nyatidraw-web-ui-v1-${key}`, value);
+}
 export function setModalOpen(open) {
   if (open && !modalOpen) previousFocus = document.activeElement;
   modalOpen = open;
@@ -198,17 +220,21 @@ export function bindCanvas(canvas, callback) {
     canvas.focus({ preventScroll: true });
     active = event.pointerId;
     mode =
-      event.button === 1 || space || event.pointerType === "touch"
+      event.button === 1 || space || event.pointerType === "touch" || canvasTool === "pan"
         ? "pan"
-        : "stroke";
+        : event.altKey || canvasTool === "pick" ? "pick" : "stroke";
     canvas.setPointerCapture(active);
-    send(mode === "pan" ? "panBegin" : "begin", event);
+    send(mode === "pan" ? "panBegin" : mode === "pick" ? "pickBegin" : "begin", event);
   });
   canvas.addEventListener("pointermove", (event) => {
     if (modalOpen || event.pointerId !== active) return;
     event.preventDefault();
     if (mode === "pan") {
       send("panMove", event);
+      return;
+    }
+    if (mode === "pick") {
+      send("pickMove", event);
       return;
     }
     const samples = event.getCoalescedEvents?.() || [];
@@ -223,7 +249,7 @@ export function bindCanvas(canvas, callback) {
   });
   canvas.addEventListener("pointerup", (event) => {
     if (modalOpen || event.pointerId !== active) return;
-    send(mode === "pan" ? "panEnd" : "end", event);
+    send(mode === "pan" ? "panEnd" : mode === "pick" ? "pickEnd" : "end", event);
     active = null;
     mode = null;
     canvas.releasePointerCapture(event.pointerId);
@@ -289,23 +315,6 @@ export function bindCanvas(canvas, callback) {
     if (key === "escape") {
       cancel();
       return;
-    }
-    if (active !== null) return;
-    const command =
-      (event.ctrlKey || event.metaKey) && key === "z"
-        ? event.shiftKey
-          ? "redo"
-          : "undo"
-        : (event.ctrlKey || event.metaKey) && key === "s"
-          ? "save"
-          : !event.ctrlKey && !event.metaKey && key === "b"
-            ? "brush"
-            : !event.ctrlKey && !event.metaKey && key === "e"
-              ? "eraser"
-              : null;
-    if (command) {
-      event.preventDefault();
-      callback(command, 0, 0, 0, 0);
     }
   });
   window.addEventListener("keyup", (event) => {

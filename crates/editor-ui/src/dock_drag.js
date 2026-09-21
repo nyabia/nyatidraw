@@ -20,6 +20,12 @@ function packet(source, target, action, revision) {
 function dockRevision() {
     return document.querySelector('[data-dock-revision]')?.dataset.dockRevision;
 }
+function canRearrange() {
+    return document.querySelector('[data-dock-rearrange]')?.dataset.dockRearrange !== 'false';
+}
+function canResize() {
+    return document.querySelector('[data-dock-resizable]')?.dataset.dockResizable !== 'false';
+}
 function resizeState(handle) {
     const first = handle.previousElementSibling;
     if (handle.dataset.resizeAxis === 'height') {
@@ -66,6 +72,7 @@ document.addEventListener('pointerdown', event => {
     if (drag || resize || !event.isPrimary || event.button !== 0) return;
     const handle = event.target.closest('[data-dock-resize]');
     if (!handle) return;
+    if (handle.dataset.resizeAxis !== 'height' && !canResize()) return;
     const state = resizeState(handle);
     if (!state?.revision) return;
     try {
@@ -106,6 +113,7 @@ document.addEventListener('keydown', event => {
     }
     const handle = event.target.closest('[data-dock-resize]');
     if (!handle || drag || resize) return;
+    if (handle.dataset.resizeAxis !== 'height' && !canResize()) return;
     const arrows = handle.dataset.resizeAxis === 'height' ? ['ArrowUp', 'ArrowDown'] : ['ArrowLeft', 'ArrowRight'];
     if (![...arrows, 'Home', 'End'].includes(event.key)) return;
     const state = resizeState(handle);
@@ -179,6 +187,7 @@ document.addEventListener('pointerdown', event => {
     if (drag || resize || !event.isPrimary || event.button !== 0) return;
     const handle = event.target.closest('[data-dock-source]');
     if (!handle) return;
+    if (!canRearrange()) return;
     const revision = document.querySelector('[data-dock-revision]')?.dataset.dockRevision;
     if (!revision) return;
     try {

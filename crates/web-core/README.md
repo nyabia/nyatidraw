@@ -4,7 +4,8 @@
 It uses the existing brush evaluator (including the real 2H/2B dry-pencil models),
 pressure mapping, smoothing, CPU dab rasterizer, linear premultiplied tiles and
 layer compositor. It has no Dioxus, wgpu, filesystem, platform-input, redb, project
-wire, Zstd, browser or WASM-bindgen dependencies. Desktop code is unchanged.
+wire, Zstd, browser or WASM-bindgen dependencies. Native project persistence is
+provided by the separate `nyatidraw-project-web` adapter.
 
 ## Host contract
 
@@ -42,7 +43,7 @@ composited artwork including outside-page pixels, never the checkerboard.
 ## Resource bounds
 
 - Page: 1..4096 pixels per axis, 1..9600 PPI; outside artwork is retained.
-- Input: finite document coordinates within ±32768, brush diameter 0.5..200 px.
+- Input: finite document coordinates within ±32768, brush diameter 0.1..200 px.
 - Current artwork: 1024 nonempty 128×128 RGBA8 tiles (64 MiB pixel allocation).
 - Layers: 32 rasters, names up to 128 characters/512 UTF-8 bytes.
 - Undo/Redo: at most 128 operations, additionally pruned to a conservative
@@ -55,11 +56,19 @@ composited artwork including outside-page pixels, never the checkerboard.
 - One update allows at most 2048 dabs and bounded raster work. A stroke allows
   65536 samples/262144 dabs. Exceeding a bound cancels atomically.
 
-## Recovery / portable bytes
+## Recovery / native project adapter
 
-`encode_portable` returns browser-specific bytes with MIME
+New browser saves and downloads use the same `.ntdr` container and record codecs
+as desktop through `nyatidraw-project-web`. Hosts must use that adapter, not the
+legacy portable encoder, for recovery and downloads. Unsupported native content
+is rejected, not flattened. See [ADR-0061](../../docs/decisions/ADR-0061-shared-ntdr-browser-storage.md).
+
+### Legacy browser format
+
+The retained legacy `encode_portable` returns browser-specific bytes with MIME
 `application/vnd.nyatidraw.web-document`. The host chooses a clearly web-only
-download extension, not `.ntdr`. `decode_portable` constructs a separate document;
+download extension, not `.ntdr`. This is no longer the host save path.
+`decode_portable` constructs a separate document;
 replace the current one only after successful decoding. IndexedDB stores these
 bytes transactionally; failed recovery must preserve the old byte record.
 

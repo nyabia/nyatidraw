@@ -33,6 +33,7 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      CC_wasm32_unknown_unknown: clang
     defaults:
       run:
         shell: pwsh
@@ -54,7 +55,7 @@ jobs:
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Browser artwork and recovery core tests
-        run: cargo test -p nyatidraw-web-core --locked
+        run: cargo test -p nyatidraw-web-core -p nyatidraw-project-web --locked
       - name: WebAssembly Clippy
         run: cargo clippy -p nyatidraw-web --target wasm32-unknown-unknown --locked -- -D warnings
       - name: Install verified Dioxus CLI

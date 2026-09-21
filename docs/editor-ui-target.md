@@ -10,7 +10,7 @@
 이 문서는 2026-09-03 현재 NyatiDraw 편집기 화면을 개발판의 시각적
 출발점으로 고정하되, 각 부분이 실제로 무엇을 의미하고 어느 상태까지 구현되어야
 하는지를 정의한다. 실제 프로그램의 `apps/desktop/src/main.rs`와
-`apps/desktop/assets/styles.css`가 현재 배치의 기준이며, `docs/mockups`는 결정 과정을
+`crates/editor-ui/assets/styles.css`가 양쪽 호스트 배치의 기준이며, `docs/mockups`는 결정 과정을
 남긴 참고 자료일 뿐 최종 권위가 아니다.
 
 ## 제품 장면

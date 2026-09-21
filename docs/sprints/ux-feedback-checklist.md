@@ -41,12 +41,12 @@ scratch 창에서 아래 조작과 저장·프로세스 종료·재열기를 확
 
 | 요청 | 구현 상태 | 현재 근거 | 검증·남은 범위 |
 |---|---|---|---|
-| SV 사각형이 색상환 안에 들어감 | 구현됨 | `apps/desktop/assets/colors.css:.compact-color-panel .sv-square` | 변 44%의 대각선 약 62.23%가 안쪽 원 지름 66%보다 작다. 기존 기본 크기 창 확인. 좁은 패널·다른 DPI 검수는 남는다. |
-| wheel 아래 최근색·기존 도크 높이 유지 | 구현됨 | `apps/desktop/src/color_panel.rs:ColorPanel·PaletteRow`, `assets/colors.css:.compact-color-panel·.wheel-wrap` | 최근색 22px 한 줄을 예약하고 wheel을 가용 크기에 맞춘다. 기존 기본 크기 확인과 모든 크기 검증은 다르다. |
+| SV 사각형이 색상환 안에 들어감 | 구현됨 | `crates/editor-ui/assets/colors.css:.compact-color-panel .sv-square` | 변 44%의 대각선 약 62.23%가 안쪽 원 지름 66%보다 작다. 기존 기본 크기 창 확인. 좁은 패널·다른 DPI 검수는 남는다. |
+| wheel 아래 최근색·기존 도크 높이 유지 | 구현됨 | `crates/editor-ui/src/color_panel.rs:ColorPanel·PaletteRow`, `assets/colors.css:.compact-color-panel·.wheel-wrap` | 최근색 22px 한 줄을 예약하고 wheel을 가용 크기에 맞춘다. 기존 기본 크기 확인과 모든 크기 검증은 다르다. |
 | HEX·기본 팔레트·중복 설명 제목 제거 | 구현됨 | `apps/desktop/src/color_picker.rs:ColorPicker`, `color_picker.js:render`, `color_panel.rs:ColorPanel` | 상시 HEX와 하드코딩된 기본색·제목 줄을 제거했다. |
-| 상단 한 줄·고정 포함 최대 10개·사이드바 공유 | 구현됨 | `apps/desktop/src/color_panel.rs:PaletteRow·Palette::observe·Palette::order_recent_slots`, `assets/colors.css:.palette-row-top` | 같은 10칸, 고정 위치 유지·비고정색 최신순. 새 창에서 색상환 선택만으로 목록이 바뀌지 않고 실제 획 뒤 양쪽에 같은 최근색이 추가됨을 확인했다. |
-| 고정 유지·가장 오래된 비고정색만 교체·모두 고정이면 유지 | 구현됨 | `apps/desktop/src/color_panel.rs:Palette::observe·toggle_pin`, `palette_preferences.rs:PalettePreferences::open·save·load·replace` | 작품 Undo와 별도 사용자 설정. 기존 pin 표시·설정 기록 확인. 재시작 pin 복원·10칸 포화·손상 설정의 전체 실사용 검수는 남는다. |
-| 전경/배경 표시와 X 교환 | 구현됨 | `apps/desktop/src/color_panel.rs:QuickColors`, `main.rs:handle_editor_shortcut` | 최근색과 별도로 현재 전경색·배경색을 유지한다. |
+| 상단 한 줄·고정 포함 최대 10개·사이드바 공유 | 구현됨 | `crates/editor-ui/src/color_panel.rs:PaletteRow·Palette::observe·Palette::order_recent_slots`, `assets/colors.css:.palette-row-top` | 같은 10칸, 고정 위치 유지·비고정색 최신순. 새 창에서 색상환 선택만으로 목록이 바뀌지 않고 실제 획 뒤 양쪽에 같은 최근색이 추가됨을 확인했다. |
+| 고정 유지·가장 오래된 비고정색만 교체·모두 고정이면 유지 | 구현됨 | `crates/editor-ui/src/color_panel.rs:Palette::observe·toggle_pin`, `palette_preferences.rs:PalettePreferences::open·save·load·replace` | 작품 Undo와 별도 사용자 설정. 기존 pin 표시·설정 기록 확인. 재시작 pin 복원·10칸 포화·손상 설정의 전체 실사용 검수는 남는다. |
+| 전경/배경 표시와 X 교환 | 구현됨 | `crates/editor-ui/src/color_panel.rs:QuickColors`, `main.rs:handle_editor_shortcut` | 최근색과 별도로 현재 전경색·배경색을 유지한다. |
 | 최근색은 실제 그리기 시작에 기록 | 구현됨 | `crates/editor/src/projection.rs:stage_drawing_controls·stage_used_brush_color`, `apps/desktop/src/native_canvas.rs:StrokeDrain::record_brush_begin·StrokePipeline::drain` | accepted painting Begin의 원본 sRGB 색만 bounded 10칸으로 기록한다. 새 창에서 색상환 선택 시 불변 → 실제 획 뒤 양쪽 같은 최근색 추가를 확인했다. C/Alt picker·지우개·Undo/Redo 제외는 코드/core 경계이며 모든 조합의 창 검수까지 완료한 것은 아니다. |
 | C/Alt press/drag 확대 픽셀·색상 버블과 End 확정 | 구현됨 | `apps/desktop/src/picker_preview.rs:PATCH_SIZE·PickerRuntime·PickerToken`, `native_canvas.rs:StrokePipeline::drain·ActiveCanvas::adopt_native_edit`, `main.rs:picker_loupe` | 13×13 patch·후보색과 End 확정, Cancel/token/viewport guard 구현·통합 시험 통과. 새 창의 C drag 뒤 빨강 확정·추가 획 없음은 확인했다. **hold/drag 중간 버블 표시는 직접 capture하지 못했고 추종 감각·Alt·취소·빠른 입력 조합은 미검수**다. |
 

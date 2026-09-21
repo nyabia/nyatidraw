@@ -838,6 +838,164 @@ pub fn decode_stroke_commit(
     Ok(commit)
 }
 
+/// Bounds replay and selection expansion before decoding an untrusted stroke.
+/// This is a conservative resource gate, not a replacement for deterministic
+/// commit validation. Native decoding remains unchanged.
+///
+/// # Errors
+/// Returns an error for malformed input or strokes exceeding the import budget.
+pub fn preflight_stroke_decode(bytes: &[u8], max_affected_tiles: usize) -> Result<(), WireError> {
+    let mut decoder = Decoder::new(bytes);
+    let _id = decoder.array::<32>()?;
+    let _parent_snapshot = decoder.u128()?;
+    let _layer = decoder.u128()?;
+    let _before_root = decode_content_root(&mut decoder)?;
+    let bounds = decode_bounds(&mut decoder)?;
+    let max_tiles = u32::try_from(max_affected_tiles)
+        .map_err(|_| WireError::InvalidData("invalid stroke import tile budget"))?;
+    let width = i64::from(bounds.max_x_exclusive) - i64::from(bounds.min_x);
+    let height = i64::from(bounds.max_y_exclusive) - i64::from(bounds.min_y);
+    if width
+        .checked_mul(height)
+        .is_none_or(|area| area > i64::from(max_tiles))
+    {
+        return Err(WireError::InvalidData("stroke bounds exceed import budget"));
+    }
+    let preset = decode_brush_preset(&mut decoder)?;
+    let mut budget = StrokeReplayBudget::new(preset, max_tiles)?;
+    let _recorded = decode_recorded_stroke(&mut decoder)?;
+    let _color = decoder.array::<4>()?;
+    let sample_count = decoder.bounded_len(
+        MAX_SAMPLES_PER_STROKE.min(decoder.remaining_len() / SAMPLE_MIN_ENCODED_LEN),
+        "sample count exceeds bounded payload",
+    )?;
+    if sample_count == 0 {
+        return Err(WireError::InvalidData("empty stroke sample stream"));
+    }
+    for _ in 0..sample_count {
+        budget.push(decode_sample(&mut decoder)?)?;
+    }
+    preflight_stroke_selection(&mut decoder, max_tiles)?;
+    decoder.finish()
+}
+
+struct StrokeReplayBudget {
+    spacing: f64,
+    radius: f64,
+    min: Point,
+    max: Point,
+    previous: Option<Point>,
+    estimated_dabs: f64,
+    max_tiles: u32,
+}
+
+impl StrokeReplayBudget {
+    fn new(preset: BrushPreset, max_tiles: u32) -> Result<Self, WireError> {
+        if !matches!(preset.engine_version, 1..=3)
+            || !preset.size_px.is_finite()
+            || !preset.spacing_ratio.is_finite()
+        {
+            return Err(WireError::InvalidData("unsupported stroke import preset"));
+        }
+        let spacing = (preset.size_px.max(0.0) * preset.spacing_ratio.clamp(0.01, 4.0)).max(0.25);
+        Ok(Self {
+            spacing: f64::from(spacing),
+            // v3 rounds both dab centers and radii to 1/16 document pixels.
+            radius: f64::from(preset.size_px.max(0.0)) * 0.5 + 0.125,
+            min: Point {
+                x: f64::INFINITY,
+                y: f64::INFINITY,
+            },
+            max: Point {
+                x: f64::NEG_INFINITY,
+                y: f64::NEG_INFINITY,
+            },
+            previous: None,
+            estimated_dabs: 1.0,
+            max_tiles,
+        })
+    }
+
+    fn push(&mut self, sample: StylusSample) -> Result<(), WireError> {
+        let point = sample.position_document;
+        if !point.x.is_finite() || !point.y.is_finite() || !sample.pressure.is_finite() {
+            return Err(WireError::InvalidData("nonfinite stroke import sample"));
+        }
+        self.min.x = self.min.x.min(point.x - self.radius);
+        self.min.y = self.min.y.min(point.y - self.radius);
+        self.max.x = self.max.x.max(point.x + self.radius);
+        self.max.y = self.max.y.max(point.y + self.radius);
+        let edge = f64::from(TILE_EDGE);
+        let tile_width = (self.max.x / edge).floor() - (self.min.x / edge).floor() + 1.0;
+        let tile_height = (self.max.y / edge).floor() - (self.min.y / edge).floor() + 1.0;
+        let tile_area = tile_width * tile_height;
+        if self.min.x < f64::from(i32::MIN)
+            || self.min.y < f64::from(i32::MIN)
+            || self.max.x > f64::from(i32::MAX)
+            || self.max.y > f64::from(i32::MAX)
+            || !tile_area.is_finite()
+            || tile_area > f64::from(self.max_tiles)
+        {
+            return Err(WireError::InvalidData(
+                "stroke samples exceed import tile budget",
+            ));
+        }
+        if let Some(previous) = self.previous {
+            let distance = (point.x - previous.x).hypot(point.y - previous.y);
+            self.estimated_dabs += (distance / self.spacing).ceil() + 1.0;
+        }
+        self.previous = Some(point);
+        let dab_edge = (self.radius * 2.0).ceil() + 2.0;
+        if self.estimated_dabs > 65_536.0
+            || self.estimated_dabs * dab_edge * dab_edge > 134_217_728.0
+            || self.estimated_dabs * tile_area > 16_777_216.0
+        {
+            return Err(WireError::InvalidData(
+                "stroke replay exceeds import work budget",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn preflight_stroke_selection(decoder: &mut Decoder<'_>, max_tiles: u32) -> Result<(), WireError> {
+    if decoder.bytes[decoder.position..].starts_with(&ALPHA_LOCK_EXTENSION) {
+        let _ = decoder.array::<8>()?;
+    }
+    if decoder.remaining_len() == 0 {
+        return Ok(());
+    }
+    match decoder.array::<8>()? {
+        SELECTION_EXTENSION => {}
+        SIGNED_SELECTION_EXTENSION => {
+            if [decoder.i32()?, decoder.i32()?] == [0, 0] {
+                return Err(WireError::InvalidData(
+                    "noncanonical signed selection origin",
+                ));
+            }
+        }
+        _ => {
+            return Err(WireError::InvalidData(
+                "unsupported stroke selection extension",
+            ));
+        }
+    }
+    let width = u64::from(decoder.u32()?);
+    let height = u64::from(decoder.u32()?);
+    let pixels = width * height;
+    let pixel_budget = u64::from(max_tiles) * u64::from(TILE_EDGE).pow(2);
+    if pixels == 0 || pixels > pixel_budget {
+        return Err(WireError::InvalidData(
+            "stroke selection exceeds import pixel budget",
+        ));
+    }
+    if u64::try_from(decoder.remaining_len()).ok() != Some(pixels.div_ceil(8)) {
+        return Err(WireError::InvalidData("invalid stroke selection coverage"));
+    }
+    decoder.position = decoder.bytes.len();
+    Ok(())
+}
+
 #[must_use]
 pub fn encode_history_node(node: &HistoryNode) -> Vec<u8> {
     let mut output = Vec::new();
@@ -1403,6 +1561,7 @@ mod project_head_compatibility_tests {
             )
             .unwrap();
             let encoded = encode_stroke_commit(&commit);
+            assert_eq!(preflight_stroke_decode(&encoded, 1_024), Ok(()));
             let reopened = decode_stroke_commit(&encoded, &before).unwrap();
             assert_eq!(reopened.brush.preset, preset);
             assert_eq!(reopened.id, commit.id);
@@ -1439,6 +1598,101 @@ mod project_head_compatibility_tests {
             decode_brush_preset(&mut Decoder::new(&pencil_bytes)).is_err(),
             "unknown paper algorithm cannot be silently substituted"
         );
+    }
+
+    #[test]
+    fn stroke_import_budget_prevents_replay_and_selection_allocation_amplification() {
+        let sample = StylusSample {
+            sequence: 1,
+            timestamp_ns: 1,
+            device_id: 1,
+            phase: PointerPhase::Begin,
+            position_document: Point { x: 4.0, y: 4.0 },
+            pressure: 1.0,
+            tilt: None,
+            twist_radians: None,
+            tangential_pressure: None,
+            buttons: PenButtons::default(),
+            eraser: false,
+            viewport_revision: 0,
+        };
+        for engine_version in [1, 2, 3] {
+            let preset = if engine_version == 3 {
+                nyatidraw_brush::pencil_preset(nyatidraw_brush::PencilKind::Mechanical2H)
+            } else {
+                BrushPreset {
+                    engine_version,
+                    schema_version: engine_version,
+                    size_px: 1.0,
+                    ..nyatidraw_brush::pencil_preset(nyatidraw_brush::PencilKind::Mechanical2H)
+                }
+            };
+            let ordinary = stroke_budget_payload(preset, &[sample]);
+            assert_eq!(preflight_stroke_decode(&ordinary, 1_024), Ok(()));
+            for x in [f64::NAN, f64::INFINITY, 1.0e30] {
+                let distant = StylusSample {
+                    position_document: Point { x, y: 4.0 },
+                    ..sample
+                };
+                let payload = stroke_budget_payload(preset, &[sample, distant]);
+                let original = payload.clone();
+                assert!(preflight_stroke_decode(&payload, 1_024).is_err());
+                assert_eq!(
+                    payload, original,
+                    "failed import must preserve source bytes"
+                );
+            }
+            let repeated: Vec<_> = (0..100)
+                .map(|index| StylusSample {
+                    position_document: Point {
+                        x: if index % 2 == 0 { -2_048.0 } else { 2_048.0 },
+                        y: 4.0,
+                    },
+                    ..sample
+                })
+                .collect();
+            assert!(
+                preflight_stroke_decode(&stroke_budget_payload(preset, &repeated), 1_024).is_err()
+            );
+            let mut huge_selection = ordinary;
+            huge_selection.extend_from_slice(&SELECTION_EXTENSION);
+            huge_selection.extend_from_slice(&u32::MAX.to_le_bytes());
+            huge_selection.extend_from_slice(&u32::MAX.to_le_bytes());
+            assert!(preflight_stroke_decode(&huge_selection, 1_024).is_err());
+        }
+    }
+
+    fn stroke_budget_payload(preset: BrushPreset, samples: &[StylusSample]) -> Vec<u8> {
+        let mut output = vec![0; 32 + 16 + 16];
+        encode_content_root(&mut output, TileSnapshot::empty().root());
+        encode_bounds(
+            &mut output,
+            TileBounds {
+                min_x: 0,
+                min_y: 0,
+                max_x_exclusive: 1,
+                max_y_exclusive: 1,
+            },
+        );
+        encode_brush_preset(&mut output, preset);
+        encode_recorded_stroke(
+            &mut output,
+            &RecordedStroke {
+                brush_engine_version: preset.engine_version,
+                preset_id: preset.id,
+                preset_schema_version: preset.schema_version,
+                random_seed: 0,
+                sample_count: samples.len() as u64,
+                first_sample_sequence: 1,
+                last_sample_sequence: 1,
+            },
+        );
+        output.extend_from_slice(&[255; 4]);
+        output.extend_from_slice(&(samples.len() as u64).to_le_bytes());
+        for sample in samples {
+            encode_sample(&mut output, sample);
+        }
+        output
     }
 
     #[test]
