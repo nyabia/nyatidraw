@@ -3884,6 +3884,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyatidraw-web-worker"
+version = "0.1.0"
+dependencies = [
+ "nyatidraw-project-web",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "objc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

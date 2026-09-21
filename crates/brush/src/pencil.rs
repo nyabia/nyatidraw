@@ -3,11 +3,20 @@
 use crate::{BrushDab, BrushPreset, BrushPresetId, pressure_factor, unit};
 use nyatidraw_input::{Point, StylusSample};
 
-pub const PENCIL_ENGINE_VERSION: u32 = 3;
+pub const PENCIL_ENGINE_VERSION: u32 = 5;
 pub const PENCIL_PRESET_SCHEMA_VERSION: u32 = 3;
-pub const PENCIL_GRAIN_VERSION: u8 = 1;
+pub const PENCIL_GRAIN_VERSION: u8 = 2;
 /// One immutable procedural paper for v3. It does not restart for each stroke.
 pub const PENCIL_PAPER_SEED: u32 = 0x4e59_4154;
+
+#[must_use]
+pub const fn pencil_grain_version(engine: u32) -> Option<u8> {
+    match engine {
+        3 => Some(1),
+        PENCIL_ENGINE_VERSION => Some(PENCIL_GRAIN_VERSION),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PencilKind {
@@ -66,6 +75,8 @@ pub struct PencilGrain {
     pub deposit: u8,
     /// Raster surface origin modulo 2^32 document pixels. Never a view origin.
     pub origin: [u32; 2],
+    /// v5 retains a one-UNORM-step graphite undercoat inside the tip footprint.
+    pub undercoat: bool,
 }
 
 pub(super) fn valid_preset(preset: &BrushPreset) -> bool {
@@ -113,6 +124,7 @@ pub(super) fn dab_for(preset: &BrushPreset, sample: StylusSample) -> BrushDab {
         grain: Some(PencilGrain {
             deposit: (minimum + range * deposit_pressure).round() as u8,
             origin: [0, 0],
+            undercoat: preset.engine_version == PENCIL_ENGINE_VERSION,
         }),
     }
 }
@@ -142,7 +154,9 @@ pub fn pencil_coverage_units(dab: BrushDab, x: u32, y: u32) -> u32 {
         x.wrapping_add(grain.origin[0]),
         y.wrapping_add(grain.origin[1]),
     );
-    let deposit = u32::from(grain.deposit).saturating_sub(tooth);
+    let deposit = u32::from(grain.deposit)
+        .saturating_sub(tooth)
+        .max(u32::from(grain.undercoat));
     if deposit == 0 {
         return 0;
     }

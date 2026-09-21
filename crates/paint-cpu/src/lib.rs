@@ -13,6 +13,8 @@ mod compositing;
 mod flat_fill;
 mod fragment;
 mod selection;
+#[cfg(test)]
+mod short_stroke_tests;
 mod transform;
 pub use affine::{AffineResult, transform_selection_affine};
 pub use affine_draft::{AffineDraft, AffineDraftError};
@@ -514,7 +516,12 @@ impl CpuCanvas {
                 composite(
                     &mut self.pixels[pixel_offset(self.width, x, y)..][..4],
                     if dab.grain.is_some() {
-                        (coverage * alpha * 255.0).round() / 255.0
+                        let minimum = if dab.grain.is_some_and(|grain| grain.undercoat) {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        (coverage * alpha * 255.0).round().max(minimum) / 255.0
                     } else {
                         coverage * alpha
                     },

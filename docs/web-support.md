@@ -1,8 +1,8 @@
 # 웹 실험판
 
-상태: 초기 웹 스파이크는 Pages에 배포했다. 현재 작업 트리는 데스크톱과 같은
-공용 Dioxus 화면으로 전환했으며, 이 UI 통합은 로컬 검증 상태이고 아직 배포하지 않았다.
-아래 초기 배포 기록과 현재 공용 UI 검증을 구분한다. 아직 정식 출시 지원 판정은 아니다.
+상태: 데스크톱과 같은 공용 Dioxus 화면과 NTDR 저장 형식을 Pages에 배포했다.
+아래 공용 UI/NTDR 배포 기록과 초기 별도 UI 스파이크 기록을 구분한다.
+같은 화면·포맷이 모든 기능의 동등성을 뜻하지 않으며, 아직 정식 출시 지원 판정은 아니다.
 
 이번 웹 스파이크는 사용자의 별도 승인을 받은 제한된 구현이다. 이전 문서의 웹 보류를
 이 범위에서만 변경한다. Windows 설치판을 교체하거나 Linux·macOS 네이티브 지원을
@@ -41,7 +41,8 @@ DOM Pointer / coalesced samples
   → browser canvas present
 
 Dioxus controls → tool/layer commands → web-core
-completed artwork + tool preferences → shared NTDR store → IndexedDB / .ntdr download
+completed tile delta + metadata → dedicated Worker (own WASM)
+  → shared NTDR compression / database → IndexedDB / .ntdr download
 ```
 
 - `crates/editor-ui`: 데스크톱을 기준으로 한 공용 Dioxus 화면. 툴바·도구·세부 도구·
@@ -53,13 +54,15 @@ completed artwork + tool preferences → shared NTDR store → IndexedDB / .ntdr
   Dioxus, wgpu, redb, Windows API, 데스크톱 프로젝트 형식에 의존하지 않는다.
 - `crates/project-web`: 웹 문서와 공용 프로젝트 저장소 사이의 어댑터.
   `project-redb::MemoryProjectDb`로 데스크톱과 같은 redb 파일·타일 압축·메타데이터를 사용한다.
+- `apps/web-worker`: 공용 NTDR 인코딩과 IndexedDB 쓰기를 실행하는 별도 WASM/JS Worker.
+  변경 타일을 전달받으며 Dioxus나 렌더러를 초기화하지 않는다.
 - `crates/paint-gpu::GpuCompositeScene`: 기존 합성기를 웹 호스트에서도 사용한다.
   새 브러시 엔진이나 Canvas 2D 그림판을 따로 만들지 않았다.
 
 획별 DOM 재렌더를 권위 상태로 사용하지 않고, 입력 콜백은 브러시 코어로 직접 전달한다.
 다만 이번 웹 구현은 **메인 WASM 스레드에서 CPU가 획을 그리고 GPU가 표시·합성하는 방식**이다.
 Windows의 GPU-first 실시간 경로와 다르며, 고해상도·큰 브러시·고주사율 성능 동등성을
-주장하지 않는다. worker/GPU 브러시 이관은 별도 측정과 설계 이후의 일이다.
+주장하지 않는다. 저장은 Worker로 분리했지만 브러시·미리보기·파일 열기는 메인에 남아 있다.
 
 한 브라우저 이벤트의 coalesced sample이 256개를 넘으면 획을 취소한다.
 pointer cancel/capture loss, 포커스 이탈, 비정상 입력과 자원 한도 초과도 부분 획을
@@ -73,10 +76,24 @@ Web Locks로 하나의 편집 탭만 허용하고, 저장 generation과 직렬 �
 미저장 상태에서는 `beforeunload` 경고를 요청하지만, 브라우저 강제 종료·탭 강제 종료·
 운영체제 종료 때 저장 완료를 보장하는 장치는 아니다.
 
+로컬 개선 빌드는 완료된 획마다 파일을 즉시 직렬화하지 않는다. 마지막 저장 요청에서
+600ms 조용한 구간을 기다려 최신 상태를 묶으며, 대기 묶음의 첫 요청에서 3초가 지나면
+획이 진행 중이지 않은 다음 기회에 저장한다. idle 실행 대기는 최대 250ms를 더 허용한다.
+이 수치는 저장 예약 정책이지 디스크 완료 시한이 아니다. 진행 중 획, 브라우저의
+백그라운드 타이머 제한, 메인 스레드 부하에 따라 더 늦어질 수 있다.
+저장 완료 확인 전에는 미저장 상태를 유지한다. 강제 종료 시 최근 묶음은 유실될 수 있다.
+명시적인 작업 파일 내려받기는 Worker 저장을 우선 예약한다. 이미 대기 중인 예약은
+다음 깨어남에서 반영하고 실행 중 작업 뒤에 직렬 처리하므로 즉시 완료를 보장하지 않는다.
+Worker 실패 후 수동 저장은 메인 인코딩으로 현재 픽셀을 구조할 수 있다. 이 비상 경로는
+처음 연 파일의 기록과 현재 상태를 보존하지만, Worker에만 있던 세션 중간 저장 기록까지
+복원하지는 않는다. 자동 저장 실패를 성공으로 표시하지 않는다.
+
 복구되는 것은 현재 픽셀·레이어 속성과 순서·페이지·도구별 설정·색상이다.
 현재 네이티브 포맷은 활성 레이어를 별도로 기록하지 않으므로 재개 시 유효한 래스터를 선택한다.
 웹 UI의 세션 Undo/Redo, 진행 중 획, 최근 색 목록은 재개 복구 대상이 아니다.
 파일에는 공용 저장소의 최대 128개 기록을 유지한다.
+연속 입력을 한 번에 저장하면 그 묶음의 최종 상태가 하나의 파일 기록이 될 수 있다.
+이는 세션 내 획별 Undo와 다르며, 모든 중간 획을 파일 히스토리로 보존한다는 뜻이 아니다.
 잘못된 복구 데이터는 자동으로 새 그림으로 덮지 않는다. 가져오기 실패 시 현재 그림도 유지한다.
 새 그림과 파일 열기는 앱 내부 확인창을 거친다. 취소·Esc는 현재 그림을 보존하며,
 GPU가 시작되지 않는 환경에서도 시작 화면의 ‘저장된 작업 내려받기’로 복구 원본을 꺼낼 수 있다.
@@ -101,6 +118,119 @@ PNG 경계는 straight sRGB8, 내부 타일은 linear premultiplied RGBA8이다.
 사이트 데이터 삭제, 비공개 모드 종료, 저장 공간 정리로 복구 데이터가 사라질 수 있다.
 중요한 작업은 작업 파일로 따로 내려받는다. 현재 기능은 그림을 서버로 업로드하지 않는다.
 
+## 저장 예약 개선의 중간 측정 기록
+
+아래는 Worker 이관 전의 중간 측정이다. 현재 결과는 다음 절을 따른다.
+
+- 획 종료 시 전체 NTDR 파일을 만들던 작업을 위의 제한된 대기/묶음 저장으로 변경했다.
+  내비게이터·레이어 미리보기 갱신도 200ms 뒤로 예약하며 진행 중 획에는 실행하지 않는다.
+- `?timings`를 붙인 개발 확인 화면에서 입력 Begin/End, 미리보기 생성, 복구 파일 인코딩의
+  동기 실행 시간만 콘솔에 기록한다. 그림 내용·경로·색상은 기록하지 않는다.
+- 환경: Ryzen 7 5800X3D, GeForce RTX 3080(드라이버 32.0.15.9621), Windows 11 Pro
+  10.0.26200, Codex 내장 Chromium 브라우저, WebGPU, DX 0.7.9 WASM release.
+  실제 선택된 GPU 어댑터와 Chromium 세부 버전은 수집하지 않았다.
+- 64×64 시험 그림, 800% 보기, 2H/2px, 약 3.2초 동안 짧은 드래그 8회씩 비교했다.
+  저장 파일 생성은 **8회 → 1회**, 미리보기 생성은 8회 → 8회였다.
+  미리보기는 획 종료 직후 대신 약 250ms 뒤에 실행됐다. 계산 자체가 빨라졌다는 주장은 아니다.
+
+| 동기 작업 | 변경 전 n / p50 / p95 / p99 (ms) | 변경 후 n / p50 / p95 / p99 (ms) |
+|---|---|---|
+| 입력 Begin | 8 / 0.4 / 1.3 / 1.3 | 8 / 0.4 / 2.3 / 2.3 |
+| 입력 End | 8 / 0.2 / 0.6 / 0.6 | 8 / 0.2 / 0.6 / 0.6 |
+| 미리보기 생성 | 8 / 2.8 / 5.2 / 5.2 | 8 / 3.8 / 4.5 / 4.5 |
+| 복구 파일 인코딩 | 8 / 5.7 / 14.9 / 14.9 | 1 / 14.3 / 14.3 / 14.3 |
+
+분위수는 nearest-rank이며 초기 열기 미리보기는 제외했다. 작은 표본이고 후속 시험에는
+앞선 획이 남아 있어 동일 데이터의 엄밀한 성능 비교가 아니다. n=1의 분위수는 단일 관찰값이다.
+입력 콜백 시간은 물리 펜 지연·GPU 완료·첫 표시 픽셀 시간이 아니다.
+확인된 개선은 파일 생성 횟수와 실행 시점이며 체감 지연 개선율은 측정하지 않았다.
+
+핵심 테스트 9개(파일 브리지 6개/웹 코어 3개), WASM 및 파일 브리지 Clippy,
+DX release 빌드가 통과했다. 새 핵심 테스트는 1획/8획 묶음 저장의 네이티브 파일 재열기와
+정확한 타일, 세션 내 마지막 획 Undo/Redo를 검사한다.
+실제 브라우저에서도 8회 Undo/Redo 후 미리보기 일치, 저장 완료 표시 뒤 탭 닫기/재개 시
+미리보기 일치와 오류 로그 부재를 확인했다. 사용자 그림과 기존 사용자 출처는 수정하지 않았다.
+전체 브라우저 프로세스 재시작, 물리 펜 및 대형 작품 장시간 시험은 미검증이다.
+
+이 중간 단계에서는 인코딩과 미리보기 모두 메인에서 실행했다. idle 예약만으로
+계산을 선점할 수 없으므로 아래 Worker 구현으로 인코딩 실행 위치를 바꿨다.
+
+## 저장 Worker와 짧은 획 수정
+
+`cargo run -p nyatidraw-paint-cpu --example short_stroke_probe --locked`는 UI·저장 없이
+공용 브러시 평가기와 CPU 래스터화만 실행하는 재현 도구다. 수정 전 결과:
+
+- 20px/간격 8% 펜, 크기 필압 활성·최소 크기 0, 필압 `0 → 1 → 0`:
+  이동 0px/1px에서 유효 픽셀 0개, 2px에서 276개. 첫 dab의 반경은 0이고
+  다음 dab 간격 1.6px를 넘지 않으면 유효 필압을 받은 자국이 생성되지 않는다.
+- 기본 2H, 정수 좌표 x/y 8..23의 256개 정지 탭:
+  필압 0.1에서 34개, 필압 0.5에서 4개가 완전히 투명하다. 필압 1에서는 0개다.
+  입자 coverage와 RGBA8 양자화가 작은 단일 자국을 없앨 수 있다.
+- 이는 결함 재현 결과이며 수정 완료나 물리 펜·GPU 결과가 아니다.
+  웹 펜 기본값은 간격 15%/최소 크기 10%로 달라 위 펜 조건을 기본 웹 설정과
+  동일시하지 않는다. 공용 연필 모델은 두 호스트에서 사용한다.
+
+수정 후 0px/1px 펜 모두 332개 픽셀이 남는다. 2H의 위 256개 정수 좌표 탭은
+필압 0/0.1/0.5/1에서 모두 완전 투명 사례가 0개다. 추가 핵심 검사에서는 1/4px
+위상까지 4096개 탭을 검사했다. 불투명도·flow 0은 여전히 그리지 않는다.
+round v4는 최초 유효 필압이 간격 안에서 도착하면 즉시 한 자국을 만들고 이후 간격을
+다시 잰다. pencil v5는 같은 시작 처리와 1/255 alpha의 미세 graphite 바탕을 사용한다.
+v1/v2/v3 재생은 보존한다. 새 의미론적 획에는 구버전 쓰기를 막는 파일 capability를 기록한다.
+자세한 계약은 [ADR-0063](decisions/ADR-0063-short-stroke-contact-and-pencil-quantization.md)을 따른다.
+
+웹 저장 Worker는 정적 배포와 충돌하지 않는다. 별도 JS/WASM 자산을 같은 출처에서
+읽고, 공유 메모리 없이 메시지/transferable buffer를 사용하는 방향이다.
+메인에서 압축한 완성 파일만 Worker에 넘기는 방식은 현재 병목을 해결하지 못한다.
+Worker가 공용 NTDR 인코딩·압축·IndexedDB 쓰기를 소유하고, 메인은 완료된 문서의
+변경 타일·메타데이터를 보낸다. 큐는 실행 중 1개/최신 대기 상태 1개로 제한하되,
+차분을 합칠 때 타일 삭제와 모든 누적 변경을 보존해야 한다. 프로젝트 epoch와 revision을
+확인한 IndexedDB 완료 응답만 저장 완료로 인정하고, 실패 시 미저장 상태와 수동 구조 경로를
+유지한다. 이 경로를 구현하고 로컬 release 브라우저에서 IndexedDB 저장까지 확인했다.
+초기 파일 바이트는 프로젝트당 한 번 보내며, 이후에는 변경 픽셀과 전체 타일 키 목록을
+보낸다. 전체 키 목록으로 삭제를 표현하여 대기 작업을 합쳐도 삭제와 누적 변경이 남는다.
+정적 빌드는 content-hash JS/WASM 및 Worker manifest를 포함한다.
+설계·실패 경계는 [ADR-0062](decisions/ADR-0062-worker-ntdr-recovery.md)에 기록한다.
+
+일반 Worker와 공유 메모리 WASM threads를 구분한다. 후자의 `SharedArrayBuffer`에는
+별도의 cross-origin isolation 요구가 있지만, 이 저장 Worker 설계에는 공유 메모리가 필요 없다.
+근거: [MDN Web Workers](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Using_web_workers),
+[MDN SharedArrayBuffer](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer).
+
+### Worker 로컬 검증 결과
+
+위와 같은 Windows/5800X3D/RTX 3080 환경, DX WASM release, 별도 localhost 출처의
+64×64 시험 그림/800% 보기/2H 2px에서 짧은 드래그 8회를 약 1.4초 동안 입력했다.
+사용자 작업 출처와 그림은 변경하지 않았다. Worker 파일 생성은 1회였다.
+
+| 구간 | n | p50 / p95 / p99 (ms) |
+|---|---:|---|
+| 메인 Begin | 8 | 0.4 / 2.3 / 2.3 |
+| 메인 End | 8 | 0.3 / 0.9 / 0.9 |
+| 메인 변경분 캡처 | 1 | 0.7 / 0.7 / 0.7 |
+| Worker 인코딩 | 1 | 42.2 / 42.2 / 42.2 |
+| Worker 인코딩+IndexedDB 완료 | 1 | 82.3 / 82.3 / 82.3 |
+
+237,568-byte 복구 파일을 저장했으며 Worker 인코딩 구간 안에서 메인 rAF 콜백이
+2회 실행됐다. 이는 별도 스레드 실행 증거이지 GPU present/실제 표시 지연 측정은 아니다.
+분위수는 nearest-rank, n=1은 단일 관찰이다. 앞선 시험 획이 누적되어 있어 인코더 자체의
+속도 비교로 사용하지 않는다. 캡처 시간은 이후 JS buffer 복사/메시지 전달 전체 비용과 다르다.
+
+8회 개별 Undo/Redo 후 각각 이전/최종 내비게이터 PNG 데이터가 같았다.
+저장 완료 뒤 탭 닫기/다시 열기에서도 최종 미리보기가 같았고 경고·오류 로그는 없었다.
+`worker_reopen_probe`는 전체/차분 저장 모두 별도 프로세스의 native/web reader에서
+동일한 타일 content root를 확인했다. 공용 테스트에는 실제 프로세스 재시작을 포함하는
+native pencil/history 검증도 있다. 전체 기능 테스트와 전체 타깃 Clippy를 통과했다.
+
+추가 출하 검증에서는 별도 Edge 프로필에서 64×64 시험 그림을 저장 버튼으로 내려받았다.
+실제 `drawing.ntdr`(143,360 bytes)를 native/web reader로 읽어 비어 있지 않은 타일과
+동일한 content root를 확인했다. 파일 열기 UI로 다시 가져온 뒤 미리보기 SHA256은
+`a45c6e066f1c799ea62316c4bef6754f711fa6dcf47d6cc6e1f3a256f4f839c3`으로 저장 전과 같았다.
+영속 시험 프로필의 브라우저 프로세스를 종료·재실행한 뒤에도 같은 미리보기가 복원됐다.
+로컬 서버의 favicon 404와 Chromium powerPreference 안내 외 앱/Worker 오류는 없었다.
+
+실물 펜과 큰 그림 장시간 시험은 아직 미검증이다. Worker 저장 분리만으로 모든 웹
+입력 지연을 해결했다고 판정하지 않는다. 공개 배포 상태와 설치본 교체는 별도로 확인한다.
+
 ## 자원 상한
 
 - 페이지는 각 축 최대 4096px, 현재 픽셀은 최대 1024개의 128×128 타일(64MiB), 래스터는 32개.
@@ -123,6 +253,7 @@ Clang이 PATH에 없으면 `CC_wasm32_unknown_unknown`으로 지정한다. Windo
 ```powershell
 rustup target add wasm32-unknown-unknown
 ./tools/setup-web-ci.ps1
+./tools/setup-worker-ci.ps1
 ./tools/build-web.ps1 -DebugBuild -BasePath /
 python -m http.server 8766 --bind 127.0.0.1 --directory target/dx/nyatidraw-web/debug/web/public
 ```
@@ -179,8 +310,25 @@ NTDR 통합의 별도 경계는 [ADR-0061](decisions/ADR-0061-shared-ntdr-browse
   산출물의 네이티브 재열기는 미검증이다. 이를 브라우저 제한이나 앱 성공으로 단정하지 않는다.
   위 핵심 파일 왕복 및 실제 IndexedDB 저장/재개와 구분한다.
 - 배포 전 workspace 기본/전체 기능 테스트, 전체 타깃·전체 기능 Clippy,
-  WASM Clippy 및 서식 검사를 수행한다. 공개 배포 결과는 별도로 기록한다.
+  WASM Clippy 및 서식 검사가 통과했다. 공개 배포 결과는 별도로 기록한다.
 - 사용자 작업 출처와 작품 파일은 건드리지 않았으며 설치본은 교체하지 않았다.
+
+## 공용 UI·NTDR 공개 배포 검증
+
+- 코드 기준 `93495bb`를 [Pages workflow](https://github.com/nyabia/nyatidraw/actions/runs/35593463022)로
+  빌드·배포했다. Linux 핵심 테스트, WASM Clippy, DX release 빌드와 개인 경로 검사가 통과했다.
+- 공용 코드의 [Windows CI](https://github.com/nyabia/nyatidraw/actions/runs/35593463046)는
+  전체 기능 테스트·전체 타깃 Clippy·DX Windows release 빌드가 통과했다.
+- [공개 편집기](https://nyabia.github.io/nyatidraw/draw/)에서 공용 패널과 WebGPU 시작,
+  첫 화면의 중앙 맞춤, 오른쪽 아래 저장 안내, 캔버스 전체 tooltip 제거를 확인했다.
+  관찰 중 콘솔 경고·오류는 없었다.
+- 홈페이지는 공용 NTDR 안내를 표시하며 Windows 설치 링크는 기존 alpha.12를 유지한다.
+  새 Windows 릴리즈 태그 발행이나 로컬 설치본 교체는 하지 않았다.
+- 실제 다운로드 파일의 네이티브 재열기와 물리 펜·전체 브라우저 프로세스 재시작은
+  위 미검증 경계를 그대로 유지한다.
+- 공개 WASM: HTTP 200, `application/wasm`, WASM 헤더 정상, 3,409,639 bytes.
+  SHA-256: `BD41EBFB7EA0704445C727B9023AC91ED1107BDAFF0E55BC6AC541B6C6C57616`.
+  공개 파일에서도 개인 홈/작업 경로 패턴이 검출되지 않았다. 이는 제한된 패턴 검사다.
 
 ## 초기 별도 UI 스파이크의 검증 기록
 
@@ -217,7 +365,7 @@ NTDR 통합의 별도 경계는 [ADR-0061](decisions/ADR-0061-shared-ntdr-browse
 비개인 checkout에서 다시 빌드한 결과만 Pages에 배포한다. 자산 데이터는 런타임에
 사용되므로 임의 바이트 치환이나 디버그 섹션 삭제로 제거된다고 가정하지 않는다.
 
-공개 WASM은 HTTP 200, `application/wasm`, 올바른 WASM 헤더와 1,297,500 bytes를
+초기 별도 UI 스파이크의 공개 WASM은 HTTP 200, `application/wasm`, 올바른 WASM 헤더와 1,297,500 bytes를
 확인했다. CI와 공개 파일 검사에서 개인 Windows/macOS/Linux 홈 경로 패턴은 검출되지 않았다.
 공개 WASM SHA-256:
 `FEEA4109A62F509C3F3808DE691262A20794666C201A77A3AE024251D2B13B6E`.

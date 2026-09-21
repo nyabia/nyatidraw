@@ -13,6 +13,8 @@ use nyatidraw_tiles::TileSnapshot;
 use nyatidraw_web_core::{WebDocument, WebPreferences};
 
 mod preferences;
+mod recovery;
+pub use recovery::{RecoveryCheckpoint, RecoveryRequest, RecoveryWriter};
 #[cfg(test)]
 mod tests;
 

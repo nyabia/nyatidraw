@@ -549,8 +549,8 @@ fn hash_legacy_commit(commit: &StrokeCommit) -> ObjectHash {
             payload.extend_from_slice(&value.to_bits().to_le_bytes());
         }
     }
-    if preset.engine_version == nyatidraw_brush::PENCIL_ENGINE_VERSION {
-        payload.push(nyatidraw_brush::PENCIL_GRAIN_VERSION);
+    if let Some(grain_version) = nyatidraw_brush::pencil_grain_version(preset.engine_version) {
+        payload.push(grain_version);
         payload.extend_from_slice(&nyatidraw_brush::PENCIL_PAPER_SEED.to_le_bytes());
     }
     payload.extend_from_slice(&commit.recorded.random_seed.to_le_bytes());

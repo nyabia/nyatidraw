@@ -28,17 +28,18 @@ use std::{
 use nyatidraw_api::{CanvasSpec, ContentRootId, HistoryNodeId, SnapshotId};
 use nyatidraw_document::LayerTree;
 use nyatidraw_history::{History, HistoryNode};
+#[cfg(test)]
+use nyatidraw_project::CONFIGURABLE_BRUSH_SCHEMA_FLAG;
 use nyatidraw_project::{
     ALPHA_LOCK_STROKE_SCHEMA_FLAG, CANVAS_HISTORY_SCHEMA_VERSION, COMPRESSED_TILE_SCHEMA_FLAG,
-    CONFIGURABLE_BRUSH_SCHEMA_FLAG, Envelope, LAYER_COMPOSITING_SCHEMA_FLAG,
-    LAYER_HISTORY_SCHEMA_VERSION, MAX_LAYER_TREE_RECORD_BYTES, OpenMode, ProjectCommitBatch,
-    ProjectHistoryCursor, ProjectOpenError, ProjectRepository, ProjectStructuralBatch, RecordKind,
-    ReopenedProject, RootManifest, SCHEMA_VERSION, SELECTION_STROKE_SCHEMA_VERSION,
-    SIGNED_SELECTION_SCHEMA_FLAG, decode_history_cursor, decode_history_node,
-    decode_initial_history_cursor, decode_layer_tree, decode_project_head, decode_root_manifest,
-    decode_stroke_commit, encode_history_cursor, encode_history_node,
-    encode_initial_history_cursor, encode_layer_tree, encode_project_head, encode_root_manifest,
-    encode_stroke_commit, open_mode,
+    Envelope, LAYER_COMPOSITING_SCHEMA_FLAG, LAYER_HISTORY_SCHEMA_VERSION,
+    MAX_LAYER_TREE_RECORD_BYTES, OpenMode, ProjectCommitBatch, ProjectHistoryCursor,
+    ProjectOpenError, ProjectRepository, ProjectStructuralBatch, RecordKind, ReopenedProject,
+    RootManifest, SCHEMA_VERSION, SELECTION_STROKE_SCHEMA_VERSION, SIGNED_SELECTION_SCHEMA_FLAG,
+    decode_history_cursor, decode_history_node, decode_initial_history_cursor, decode_layer_tree,
+    decode_project_head, decode_root_manifest, decode_stroke_commit, encode_history_cursor,
+    encode_history_node, encode_initial_history_cursor, encode_layer_tree, encode_project_head,
+    encode_root_manifest, encode_stroke_commit, open_mode,
 };
 use nyatidraw_stroke::{MaterializationStrategy, materialize_with_strategy};
 use nyatidraw_tiles::{ContentRoot, ObjectHash, TileObject, TileSnapshot};
@@ -541,16 +542,9 @@ impl ProjectDb {
                             SCHEMA_VERSION
                         },
                     ) | (current & SCHEMA_CAPABILITY_FLAGS)
-                        | if batch.stroke.brush.preset.engine_version >= 2 {
-                            CONFIGURABLE_BRUSH_SCHEMA_FLAG
-                        } else {
-                            0
-                        }
-                        | if batch.stroke.brush.preset.engine_version >= 3 {
-                            nyatidraw_project::PENCIL_BRUSH_SCHEMA_FLAG
-                        } else {
-                            0
-                        }
+                        | nyatidraw_project::brush_replay_schema_flags(
+                            batch.stroke.brush.preset.engine_version,
+                        )
                         | if batch
                             .stroke
                             .selection()
@@ -907,10 +901,10 @@ impl ProjectDb {
             if stroke.alpha_locked() && schema & ALPHA_LOCK_STROKE_SCHEMA_FLAG == 0 {
                 return Err(self.corrupt("alpha-locked stroke lacks required reader capability"));
             }
-            if stroke.brush.preset.engine_version >= 3
-                && schema & nyatidraw_project::PENCIL_BRUSH_SCHEMA_FLAG == 0
-            {
-                return Err(self.corrupt("pencil stroke lacks required reader capability"));
+            let required =
+                nyatidraw_project::brush_replay_schema_flags(stroke.brush.preset.engine_version);
+            if schema & required != required {
+                return Err(self.corrupt("brush stroke lacks required reader capability"));
             }
         }
         drop(strokes);
@@ -2443,12 +2437,19 @@ mod tests {
             CANVAS_HISTORY_SCHEMA_VERSION
                 | COMPRESSED_TILE_SCHEMA_FLAG
                 | CONFIGURABLE_BRUSH_SCHEMA_FLAG
+                | nyatidraw_project::SHORT_STROKE_BRUSH_SCHEMA_FLAG
                 | LAYER_COMPOSITING_SCHEMA_FLAG
                 | root_codec::SCHEMA_FLAG
         );
         // The original reader masked compression only; this must not resemble
         // one of its known levels 1..=4.
         assert!(!(1..=4).contains(&(marker & !COMPRESSED_TILE_SCHEMA_FLAG)));
+        let old_flags =
+            SCHEMA_CAPABILITY_FLAGS & !nyatidraw_project::SHORT_STROKE_BRUSH_SCHEMA_FLAG;
+        assert!(
+            !(1..=4).contains(&(marker & !old_flags)),
+            "v3 readers must reject the new stroke contract"
+        );
         drop(tx);
         drop(database);
         let reopened = ProjectDb::open(&path).unwrap();

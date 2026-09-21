@@ -1,4 +1,24 @@
 let unsaved = false;
+const timingEnabled = new URLSearchParams(location.search).has("timings");
+export function monotonicNow() {
+  return performance.now();
+}
+export function recordWork(kind, started) {
+  if (timingEnabled) console.debug("NyatiDraw timing " + JSON.stringify({
+    kind, ms: performance.now() - started,
+  }));
+}
+export function backgroundTurn(delay) {
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      if (document.hidden || !window.requestIdleCallback) {
+        resolve();
+      } else {
+        window.requestIdleCallback(resolve, { timeout: 250 });
+      }
+    }, delay);
+  });
+}
 window.addEventListener("beforeunload", (event) => {
   if (!unsaved) return;
   event.preventDefault();
@@ -29,54 +49,83 @@ export async function claimWorkspace() {
       .catch(reject);
   });
 }
-function database() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open("nyatidraw-web-v1", 1);
-    request.onupgradeneeded = () =>
-      request.result.createObjectStore("workspace");
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-    request.onblocked = () =>
-      reject(
-        new Error("다른 탭에서 저장소를 사용 중입니다. 해당 탭을 닫아주세요."),
-      );
-  });
+let workerAssets;
+function recoveryAssets() {
+  if (!workerAssets) workerAssets = (async () => {
+    const response = await fetch(new URL("./worker/manifest.json", document.baseURI), { cache: "no-store" });
+    if (!response.ok) throw new Error("저장 Worker 파일을 읽지 못했습니다.");
+    const manifest = await response.json();
+    if (manifest.protocol !== 1 || !/^recovery-[a-f0-9]+\.js$/.test(manifest.entry)
+        || !/^storage-[a-f0-9]+\.js$/.test(manifest.storage)) {
+      throw new Error("저장 Worker 버전이 맞지 않습니다. 새로고침해주세요.");
+    }
+    return manifest;
+  })();
+  return workerAssets;
 }
 export async function loadWorkspace() {
-  const db = await database();
-  try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction("workspace", "readonly");
-      const request = tx.objectStore("workspace").get("current");
-      request.onsuccess = () => resolve(request.result || null);
-      request.onerror = () => reject(request.error);
-    });
-  } finally {
-    db.close();
-  }
+  const assets = await recoveryAssets();
+  const storage = await import(new URL(`./worker/${assets.storage}`, document.baseURI).href);
+  return storage.loadWorkspace();
 }
-export async function storeWorkspace(bytes) {
-  const db = await database();
-  try {
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction("workspace", "readwrite");
-      const store = tx.objectStore("workspace");
-      const previous = store.get("current");
-      previous.onsuccess = () => {
-        const oldBytes = previous.result;
-        if (oldBytes && String.fromCharCode(...oldBytes.slice(0, 8)) === "NYWEB001") {
-          store.put(oldBytes, "legacy-before-ntdr");
-        }
-        store.put(bytes, "current");
-      };
-      tx.oncomplete = resolve;
-      tx.onabort = () =>
-        reject(tx.error || new Error("브라우저 저장이 취소되었습니다."));
-      tx.onerror = () => reject(tx.error);
+let recoveryWorker;
+let recoveryInFlight;
+let recoveryId = 0;
+let recoveryBroken;
+function breakRecovery(error) {
+  recoveryBroken = error;
+  recoveryWorker?.terminate();
+  recoveryInFlight?.reject(error);
+  recoveryInFlight = null;
+}
+export async function saveInWorker(packet, download) {
+  if (recoveryBroken) throw recoveryBroken;
+  if (recoveryInFlight) throw new Error("저장 요청이 이미 진행 중입니다.");
+  const assets = await recoveryAssets();
+  if (!recoveryWorker) {
+    recoveryWorker = new Worker(new URL(`./worker/${assets.entry}`, document.baseURI), {
+      type: "module", name: "NyatiDraw recovery",
     });
-  } finally {
-    db.close();
+    recoveryWorker.onerror = (event) => breakRecovery(new Error(event.message || "저장 Worker 실행 실패"));
+    recoveryWorker.onmessageerror = () => breakRecovery(new Error("저장 Worker 응답 오류"));
+    recoveryWorker.onmessage = ({ data }) => {
+      const pending = recoveryInFlight;
+      if (!pending || pending.id !== data.id) {
+        breakRecovery(new Error("저장 Worker 응답 순서 오류"));
+        return;
+      }
+      recoveryInFlight = null;
+      if (data.error) pending.reject(new Error(data.error));
+      else {
+        if (timingEnabled && data.metrics) {
+          const { encodeStart, encodeEnd, ...metrics } = data.metrics;
+          metrics.mainFramesDuringEncode = pending.frames.filter(time => time >= encodeStart && time <= encodeEnd).length;
+          console.debug("NyatiDraw worker " + JSON.stringify(metrics));
+        }
+        pending.resolve(data.bytes);
+      }
+    };
   }
+  const id = ++recoveryId;
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => breakRecovery(new Error("저장 Worker 응답 시간이 초과되었습니다. 작업 파일을 내려받아주세요.")), 120000);
+    let frame;
+    const frames = [];
+    const finish = () => { clearTimeout(timeout); if (frame) cancelAnimationFrame(frame); };
+    recoveryInFlight = { id, frames,
+      resolve: (value) => { finish(); resolve(value); },
+      reject: (error) => { finish(); reject(error); },
+    };
+    if (timingEnabled) {
+      const sampleFrame = () => {
+        frames.push(performance.timeOrigin + performance.now());
+        if (recoveryInFlight?.id === id && frames.length < 1024) frame = requestAnimationFrame(sampleFrame);
+      };
+      frame = requestAnimationFrame(sampleFrame);
+    }
+    try { recoveryWorker.postMessage({ id, packet, download, timings: timingEnabled }, [packet.buffer]); }
+    catch (error) { breakRecovery(error); }
+  });
 }
 export function downloadBytes(bytes, filename, mime) {
   const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
@@ -189,6 +238,17 @@ function containDialogFocus(event) {
   }
 }
 export function bindCanvas(canvas, callback) {
+  if (timingEnabled) {
+    const dispatch = callback;
+    callback = (...args) => {
+      const started = monotonicNow();
+      try {
+        return dispatch(...args);
+      } finally {
+        if (["begin", "end"].includes(args[0])) recordWork(args[0], started);
+      }
+    };
+  }
   let active = null;
   let mode = null;
   let space = false;

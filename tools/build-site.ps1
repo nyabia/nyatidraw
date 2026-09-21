@@ -20,6 +20,19 @@ if ($WebPublicDirectory) {
     $wasm = Get-ChildItem -LiteralPath $WebPublicDirectory -Filter '*.wasm' -Recurse -File | Select-Object -First 1
     $javascript = Get-ChildItem -LiteralPath $WebPublicDirectory -Filter '*.js' -Recurse -File | Select-Object -First 1
     if (-not $wasm -or -not $javascript) { throw 'Web editor output is incomplete: wasm and JavaScript are required.' }
+    $workerRoot = Join-Path $WebPublicDirectory 'worker'
+    $workerManifest = Get-Content -LiteralPath (Join-Path $workerRoot 'manifest.json') -Raw | ConvertFrom-Json
+    if ($workerManifest.protocol -ne 1) { throw 'Unsupported recovery Worker protocol.' }
+    foreach ($entry in @($workerManifest.entry, $workerManifest.storage)) {
+        if ($entry -notmatch '^(recovery|storage)-[a-f0-9]+\.js$' -or
+            -not (Test-Path -LiteralPath (Join-Path $workerRoot $entry) -PathType Leaf)) {
+            throw 'Recovery Worker output is incomplete.'
+        }
+    }
+    if (-not (Get-ChildItem -LiteralPath $workerRoot -Filter 'ntdr-*.wasm' -File) -or
+        -not (Get-ChildItem -LiteralPath $workerRoot -Filter 'ntdr-*.js' -File)) {
+        throw 'Recovery Worker WASM bindings are missing.'
+    }
     $header = @(Get-Content -LiteralPath $wasm.FullName -AsByteStream -TotalCount 4)
     if (($header -join ',') -ne '0,97,115,109') { throw 'Web editor output does not contain a valid WebAssembly header.' }
 }

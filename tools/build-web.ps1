@@ -87,6 +87,7 @@ try {
     Write-Host "Building web editor with $actual ($BasePath)"
     & $executable @arguments
     if ($LASTEXITCODE -ne 0) { throw "Dioxus web build failed with exit code $LASTEXITCODE" }
+    & (Join-Path $PSScriptRoot 'build-web-worker.ps1') -PublicDirectory $publicDirectory -DebugBuild:$DebugBuild
 }
 finally {
     if ($null -ne $previousWasmCompiler) { $env:CC_wasm32_unknown_unknown = $previousWasmCompiler }

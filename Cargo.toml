@@ -5,6 +5,7 @@ members = [
     "apps/cli",
     "apps/desktop",
     "apps/web",
+    "apps/web-worker",
     "crates/api",
     "crates/brush",
     "crates/diagnostics",

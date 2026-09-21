@@ -4,14 +4,20 @@ use web_sys::HtmlCanvasElement;
 
 #[wasm_bindgen(module = "/src/browser.js")]
 extern "C" {
+    #[wasm_bindgen(js_name = monotonicNow)]
+    pub fn monotonic_now() -> f64;
+    #[wasm_bindgen(js_name = recordWork)]
+    pub fn record_work(kind: &str, started: f64);
+    #[wasm_bindgen(js_name = backgroundTurn)]
+    pub fn background_turn(delay_ms: f64) -> Promise;
     #[wasm_bindgen(js_name = bindCanvas)]
     pub fn bind_canvas(canvas: &HtmlCanvasElement, callback: &Function);
     #[wasm_bindgen(js_name = claimWorkspace)]
     pub fn claim_workspace() -> Promise;
     #[wasm_bindgen(js_name = loadWorkspace)]
     pub fn load_workspace() -> Promise;
-    #[wasm_bindgen(js_name = storeWorkspace)]
-    pub fn store_workspace(bytes: &Uint8Array) -> Promise;
+    #[wasm_bindgen(js_name = saveInWorker)]
+    pub fn save_in_worker(bytes: &Uint8Array, download: bool) -> Promise;
     #[wasm_bindgen(js_name = setUnsaved)]
     pub fn set_unsaved(unsaved: bool);
     #[wasm_bindgen(js_name = downloadBytes)]

@@ -339,6 +339,64 @@ fn probe_fixtures() -> Vec<ProbeFixture> {
                 .collect(),
         });
     }
+    fixtures.extend(short_stroke_fixtures());
+    fixtures
+}
+
+fn short_stroke_fixtures() -> Vec<ProbeFixture> {
+    use nyatidraw_brush::{
+        BrushEvaluator, BrushPreset, PencilKind, RoundBrushEvaluator, begin_round_stroke,
+        pencil_preset,
+    };
+    use nyatidraw_input::{PenButtons, PointerPhase, StylusSample};
+    let mut fixtures = Vec::new();
+    for (name, engine, pressure) in [
+        ("pencil_legacy_tap", 3, 0.5),
+        ("pencil_tap_half_pressure", 5, 0.5),
+        ("pencil_tap_zero_pressure", 5, 0.0),
+        ("pencil_tap_low_pressure", 5, 0.1),
+        ("pencil_pressure_onset", 5, 0.0),
+    ] {
+        let preset = BrushPreset {
+            engine_version: engine,
+            ..pencil_preset(PencilKind::Mechanical2H)
+        };
+        let first = StylusSample {
+            sequence: 1,
+            timestamp_ns: 1,
+            device_id: 1,
+            phase: PointerPhase::Begin,
+            position_document: Point { x: 21.0, y: 12.0 },
+            pressure,
+            tilt: None,
+            twist_radians: None,
+            tangential_pressure: None,
+            buttons: PenButtons::default(),
+            eraser: false,
+            viewport_revision: 0,
+        };
+        let mut evaluator = RoundBrushEvaluator::default();
+        let mut dabs = Vec::new();
+        let mut token = begin_round_stroke(&mut evaluator, &preset, first, &mut dabs);
+        if name == "pencil_pressure_onset" {
+            evaluator.push(
+                &mut token,
+                &[StylusSample {
+                    sequence: 2,
+                    phase: PointerPhase::Move,
+                    pressure: 1.0,
+                    ..first
+                }],
+                &mut dabs,
+            );
+        }
+        evaluator.end(token, &mut dabs);
+        fixtures.push(ProbeFixture {
+            name,
+            brush_rgba8: [0, 0, 0, 255],
+            dabs,
+        });
+    }
     fixtures
 }
 

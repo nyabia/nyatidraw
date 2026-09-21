@@ -4,13 +4,17 @@ use dioxus::prelude::*;
 use js_sys::{Array, Uint8Array};
 use nyatidraw_api::DrawingTool;
 use nyatidraw_input::{Point, ViewportTransform};
-use nyatidraw_project_web::WebProject;
+use nyatidraw_project_web::{RecoveryCheckpoint, WebProject};
 use nyatidraw_web_core::{CanvasSpec, CanvasUpdate, StrokePoint, WebDocument, WebError, WebTool};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::HtmlCanvasElement;
 
 use crate::{browser, gpu::WebRenderer};
+
+const RECOVERY_QUIET_MS: f64 = 600.0;
+const RECOVERY_MAX_WAIT_MS: f64 = 3000.0;
+const PREVIEW_DELAY_MS: f64 = 200.0;
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct Runtime {
@@ -24,12 +28,19 @@ pub struct Runtime {
     pub selected_tool: DrawingTool,
     pub project_epoch: u64,
     pub preview_generation: u64,
+    preview_dirty: bool,
+    preview_running: bool,
     frame_pending: bool,
     pub gpu_failed: bool,
     pan_start: Option<(Point, Point)>,
     save_generation: u64,
     save_running: bool,
     save_pending: bool,
+    save_not_before: f64,
+    save_due_by: f64,
+    recovery_checkpoint: Option<RecoveryCheckpoint>,
+    download_pending: bool,
+    worker_failed: bool,
     pending_document: Option<WebProject>,
 }
 
@@ -149,12 +160,19 @@ impl Editor {
             selected_tool,
             project_epoch: 1,
             preview_generation: 1,
+            preview_dirty: false,
+            preview_running: false,
             frame_pending: false,
             gpu_failed: false,
             pan_start: None,
             save_generation: 0,
             save_running: false,
             save_pending: false,
+            save_not_before: 0.0,
+            save_due_by: 0.0,
+            recovery_checkpoint: None,
+            download_pending: false,
+            worker_failed: false,
             pending_document: None,
         };
         runtime.resize();
@@ -425,6 +443,7 @@ impl Editor {
     }
 
     pub fn redraw(self) {
+        self.queue_previews();
         let cell = self.runtime.peek().clone();
         {
             let mut borrow = cell.borrow_mut();
@@ -461,12 +480,56 @@ impl Editor {
         }
     }
 
+    fn queue_previews(self) {
+        let cell = self.runtime.peek().clone();
+        {
+            let mut borrow = cell.borrow_mut();
+            let Some(runtime) = borrow.as_mut() else {
+                return;
+            };
+            if !runtime.preview_dirty || runtime.preview_running || runtime.document.is_drawing() {
+                return;
+            }
+            runtime.preview_running = true;
+        }
+        spawn_local(async move {
+            let _ = JsFuture::from(browser::background_turn(PREVIEW_DELAY_MS)).await;
+            let publish = {
+                let mut borrow = cell.borrow_mut();
+                let Some(runtime) = borrow.as_mut() else {
+                    return;
+                };
+                runtime.preview_running = false;
+                if runtime.document.is_drawing() || !runtime.preview_dirty {
+                    false
+                } else {
+                    runtime.preview_dirty = false;
+                    runtime.preview_generation += 1;
+                    true
+                }
+            };
+            if publish {
+                self.refresh();
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_lines)]
     pub fn persist(self) {
         let cell = self.runtime.peek().clone();
         {
             let mut borrow = cell.borrow_mut();
             let Some(runtime) = borrow.as_mut() else {
                 return;
+            };
+            let now = browser::monotonic_now();
+            if !runtime.save_pending {
+                runtime.save_due_by = now + RECOVERY_MAX_WAIT_MS;
+            }
+            runtime.save_not_before = if runtime.download_pending {
+                now
+            } else {
+                (now + RECOVERY_QUIET_MS).min(runtime.save_due_by)
             };
             runtime.save_generation += 1;
             runtime.save_pending = true;
@@ -476,10 +539,14 @@ impl Editor {
             }
             runtime.save_running = true;
         }
-        self.report("브라우저에 저장 중…");
+        self.report("변경사항 저장 대기 중…");
         spawn_local(async move {
             loop {
-                let encoded = {
+                let delay = cell.borrow().as_ref().map_or(0.0, |runtime| {
+                    (runtime.save_not_before - browser::monotonic_now()).max(0.0)
+                });
+                let _ = JsFuture::from(browser::background_turn(delay)).await;
+                let prepared = {
                     let mut borrow = cell.borrow_mut();
                     let Some(runtime) = borrow.as_mut() else {
                         return;
@@ -488,17 +555,30 @@ impl Editor {
                         runtime.save_running = false;
                         return;
                     }
+                    if browser::monotonic_now() < runtime.save_not_before {
+                        continue;
+                    }
                     runtime.save_pending = false;
-                    runtime
+                    let started = browser::monotonic_now();
+                    let download = std::mem::take(&mut runtime.download_pending);
+                    let result = runtime
                         .document
-                        .encode_ntdr()
-                        .map(|bytes| (runtime.save_generation, bytes))
+                        .prepare_recovery(
+                            runtime.project_epoch,
+                            runtime.save_generation,
+                            runtime.recovery_checkpoint.as_ref(),
+                        )
+                        .map(|request| (runtime.save_generation, request, download));
+                    browser::record_work("recovery_capture", started);
+                    result
                 };
-                let (generation, bytes) = match encoded {
+                self.report("브라우저에 저장 중…");
+                let (generation, request, download) = match prepared {
                     Ok(value) => value,
                     Err(error) => {
                         if let Some(runtime) = cell.borrow_mut().as_mut() {
                             runtime.save_running = false;
+                            runtime.worker_failed = true;
                         }
                         self.report("브라우저 저장 실패");
                         self.warn(format!(
@@ -507,9 +587,10 @@ impl Editor {
                         return;
                     }
                 };
-                let result = JsFuture::from(browser::store_workspace(&Uint8Array::from(
-                    bytes.as_slice(),
-                )))
+                let result = JsFuture::from(browser::save_in_worker(
+                    &Uint8Array::from(request.bytes.as_slice()),
+                    download,
+                ))
                 .await;
                 let mut borrow = cell.borrow_mut();
                 let Some(runtime) = borrow.as_mut() else {
@@ -517,6 +598,7 @@ impl Editor {
                 };
                 if let Err(error) = result {
                     runtime.save_running = false;
+                    runtime.worker_failed = true;
                     drop(borrow);
                     self.report("브라우저 저장 실패");
                     self.warn(format!(
@@ -525,13 +607,21 @@ impl Editor {
                     ));
                     return;
                 }
-                if runtime.save_pending {
+                runtime.recovery_checkpoint = Some(request.checkpoint);
+                runtime.worker_failed = false;
+                let pending = runtime.save_pending;
+                runtime.save_running = pending;
+                let current = !pending
+                    && generation == runtime.save_generation
+                    && !runtime.document.is_drawing();
+                drop(borrow);
+                if download {
+                    let bytes = Uint8Array::new(&result.unwrap_or(JsValue::NULL));
+                    browser::download_bytes(&bytes, "drawing.ntdr", "application/octet-stream");
+                }
+                if pending {
                     continue;
                 }
-                runtime.save_running = false;
-                let current =
-                    generation == runtime.save_generation && !runtime.document.is_drawing();
-                drop(borrow);
                 if current {
                     browser::set_unsaved(false);
                     self.report(if self.read(|r| r.gpu_failed).unwrap_or(false) {
@@ -546,6 +636,13 @@ impl Editor {
     }
 
     pub fn download_project(self) {
+        if !self.read(|runtime| runtime.worker_failed).unwrap_or(true) {
+            if let Some(runtime) = self.runtime.peek().borrow_mut().as_mut() {
+                runtime.download_pending = true;
+            }
+            self.persist();
+            return;
+        }
         let result = {
             let cell = self.runtime.peek().clone();
             let mut borrow = cell.borrow_mut();
@@ -710,7 +807,7 @@ impl Editor {
 impl Runtime {
     pub fn apply(&mut self, update: &CanvasUpdate) -> Result<(), String> {
         if update.committed && update.changed {
-            self.preview_generation += 1;
+            self.preview_dirty = true;
         }
         if update.structure_changed {
             self.renderer.sync_document(&self.document)

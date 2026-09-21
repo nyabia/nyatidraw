@@ -891,8 +891,10 @@ struct StrokeReplayBudget {
 
 impl StrokeReplayBudget {
     fn new(preset: BrushPreset, max_tiles: u32) -> Result<Self, WireError> {
-        if !matches!(preset.engine_version, 1..=3)
-            || !preset.size_px.is_finite()
+        if !matches!(
+            preset.engine_version,
+            1..=nyatidraw_brush::PENCIL_ENGINE_VERSION
+        ) || !preset.size_px.is_finite()
             || !preset.spacing_ratio.is_finite()
         {
             return Err(WireError::InvalidData("unsupported stroke import preset"));
@@ -911,7 +913,7 @@ impl StrokeReplayBudget {
                 y: f64::NEG_INFINITY,
             },
             previous: None,
-            estimated_dabs: 1.0,
+            estimated_dabs: if preset.engine_version >= 4 { 2.0 } else { 1.0 },
             max_tiles,
         })
     }
@@ -1154,8 +1156,8 @@ fn encode_brush_preset(output: &mut Vec<u8>, preset: BrushPreset) {
             output.extend_from_slice(&value.to_bits().to_le_bytes());
         }
     }
-    if preset.engine_version == nyatidraw_brush::PENCIL_ENGINE_VERSION {
-        output.push(nyatidraw_brush::PENCIL_GRAIN_VERSION);
+    if let Some(grain_version) = nyatidraw_brush::pencil_grain_version(preset.engine_version) {
+        output.push(grain_version);
         output.extend_from_slice(&nyatidraw_brush::PENCIL_PAPER_SEED.to_le_bytes());
     }
 }
@@ -1190,9 +1192,8 @@ fn decode_brush_preset(decoder: &mut Decoder<'_>) -> Result<BrushPreset, WireErr
         preset.opacity_min_ratio = f32::from_bits(decoder.u32()?);
         preset.hardness = f32::from_bits(decoder.u32()?);
     }
-    if preset.engine_version == nyatidraw_brush::PENCIL_ENGINE_VERSION
-        && (decoder.u8()? != nyatidraw_brush::PENCIL_GRAIN_VERSION
-            || decoder.u32()? != nyatidraw_brush::PENCIL_PAPER_SEED)
+    if let Some(grain_version) = nyatidraw_brush::pencil_grain_version(preset.engine_version)
+        && (decoder.u8()? != grain_version || decoder.u32()? != nyatidraw_brush::PENCIL_PAPER_SEED)
     {
         return Err(WireError::InvalidData("unsupported pencil paper contract"));
     }
@@ -1539,6 +1540,14 @@ mod project_head_compatibility_tests {
             current,
             nyatidraw_brush::pencil_preset(nyatidraw_brush::PencilKind::Mechanical2H),
             nyatidraw_brush::pencil_preset(nyatidraw_brush::PencilKind::Graphite2B),
+            BrushPreset {
+                engine_version: 3,
+                ..nyatidraw_brush::pencil_preset(nyatidraw_brush::PencilKind::Mechanical2H)
+            },
+            BrushPreset {
+                engine_version: 4,
+                ..current
+            },
         ] {
             let mut evaluator = RoundBrushEvaluator::new(12);
             let mut dabs = Vec::new();
@@ -1616,13 +1625,16 @@ mod project_head_compatibility_tests {
             eraser: false,
             viewport_revision: 0,
         };
-        for engine_version in [1, 2, 3] {
-            let preset = if engine_version == 3 {
-                nyatidraw_brush::pencil_preset(nyatidraw_brush::PencilKind::Mechanical2H)
+        for engine_version in [1, 2, 3, 4, 5] {
+            let preset = if nyatidraw_brush::pencil_grain_version(engine_version).is_some() {
+                BrushPreset {
+                    engine_version,
+                    ..nyatidraw_brush::pencil_preset(nyatidraw_brush::PencilKind::Mechanical2H)
+                }
             } else {
                 BrushPreset {
                     engine_version,
-                    schema_version: engine_version,
+                    schema_version: engine_version.min(2),
                     size_px: 1.0,
                     ..nyatidraw_brush::pencil_preset(nyatidraw_brush::PencilKind::Mechanical2H)
                 }

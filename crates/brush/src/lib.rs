@@ -12,10 +12,10 @@ use nyatidraw_input::{Point, StylusSample};
 mod pencil;
 pub use pencil::{
     PENCIL_ENGINE_VERSION, PENCIL_GRAIN_VERSION, PENCIL_PAPER_SEED, PENCIL_PRESET_SCHEMA_VERSION,
-    PencilGrain, PencilKind, pencil_coverage_units, pencil_preset,
+    PencilGrain, PencilKind, pencil_coverage_units, pencil_grain_version, pencil_preset,
 };
 
-pub const ROUND_BRUSH_ENGINE_VERSION: u32 = 2;
+pub const ROUND_BRUSH_ENGINE_VERSION: u32 = 4;
 pub const ROUND_BRUSH_PRESET_SCHEMA_VERSION: u32 = 2;
 pub const MAX_PENCIL_DABS_PER_SEGMENT: u64 = 4_096;
 pub const MAX_PENCIL_DABS_PER_STROKE: u64 = 1_048_576;
@@ -159,6 +159,7 @@ pub struct RoundBrushStroke {
     first_sample_sequence: u64,
     emitted_dabs: u64,
     evaluation_failed: bool,
+    contact_started: bool,
 }
 
 impl RoundBrushStroke {
@@ -185,6 +186,8 @@ impl BrushEvaluator for RoundBrushEvaluator {
             first_sample_sequence: first.sequence,
             emitted_dabs: 1,
             evaluation_failed: false,
+            contact_started: first.pressure > 0.0
+                || (!preset.size_pressure && !preset.opacity_pressure),
         }
     }
 
@@ -238,10 +241,8 @@ pub fn replay_round_stroke(
     out: &mut Vec<BrushDab>,
 ) -> Result<(), RoundBrushReplayError> {
     let preset = snapshot.preset;
-    if !matches!(
-        preset.engine_version,
-        1 | ROUND_BRUSH_ENGINE_VERSION | PENCIL_ENGINE_VERSION
-    ) || recorded.brush_engine_version != preset.engine_version
+    if !matches!(preset.engine_version, 1..=PENCIL_ENGINE_VERSION)
+        || recorded.brush_engine_version != preset.engine_version
     {
         return Err(RoundBrushReplayError::UnsupportedEngineVersion(
             recorded.brush_engine_version,
@@ -284,6 +285,8 @@ pub fn replay_round_stroke(
         first_sample_sequence: first.sequence,
         emitted_dabs: 1,
         evaluation_failed: false,
+        contact_started: first.pressure > 0.0
+            || (!preset.size_pressure && !preset.opacity_pressure),
     };
     out.push(dab_for(&preset, first));
     let mut evaluator = RoundBrushEvaluator::default();
@@ -308,7 +311,7 @@ fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut 
     let dy = next.position_document.y - start.position_document.y;
     let mut remaining = dx.hypot(dy);
     if !remaining.is_finite() {
-        if token.preset.engine_version == PENCIL_ENGINE_VERSION {
+        if pencil_grain_version(token.preset.engine_version).is_some() {
             token.evaluation_failed = true;
         }
         token.last_input = next;
@@ -316,7 +319,7 @@ fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut 
     }
 
     let spacing = f64::from(spacing_px(&token.preset));
-    if token.preset.engine_version == PENCIL_ENGINE_VERSION {
+    if pencil_grain_version(token.preset.engine_version).is_some() {
         let projected = ((remaining + token.distance_since_dab) / spacing).floor();
         #[allow(clippy::cast_precision_loss)]
         let available = MAX_PENCIL_DABS_PER_STROKE
@@ -331,7 +334,7 @@ fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut 
     let mut segment_progress = 0.0_f64;
     let mut segment_dabs = 0_u64;
     while remaining + token.distance_since_dab >= spacing {
-        if token.preset.engine_version == PENCIL_ENGINE_VERSION
+        if pencil_grain_version(token.preset.engine_version).is_some()
             && (token.emitted_dabs >= MAX_PENCIL_DABS_PER_STROKE
                 || segment_dabs >= MAX_PENCIL_DABS_PER_SEGMENT)
         {
@@ -348,6 +351,7 @@ fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut 
         segment_progress += (1.0 - segment_progress) * step;
         let dab_sample = interpolate_sample(start, next, segment_progress);
         out.push(dab_for(&token.preset, dab_sample));
+        token.contact_started |= dab_sample.pressure > 0.0;
         token.emitted_dabs = token.emitted_dabs.saturating_add(1);
         segment_dabs += 1;
         remaining -= advance;
@@ -359,6 +363,22 @@ fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut 
     }
 
     token.distance_since_dab += remaining.max(0.0);
+    if token.preset.engine_version >= ROUND_BRUSH_ENGINE_VERSION
+        && !token.contact_started
+        && next.pressure > 0.0
+    {
+        if pencil_grain_version(token.preset.engine_version).is_some()
+            && token.emitted_dabs >= MAX_PENCIL_DABS_PER_STROKE
+        {
+            token.evaluation_failed = true;
+            token.last_input = next;
+            return;
+        }
+        out.push(dab_for(&token.preset, next));
+        token.emitted_dabs = token.emitted_dabs.saturating_add(1);
+        token.contact_started = true;
+        token.distance_since_dab = 0.0;
+    }
     token.last_input = next;
 }
 
@@ -372,7 +392,7 @@ fn spacing_px(preset: &BrushPreset) -> f32 {
 
 #[must_use]
 fn dab_for(preset: &BrushPreset, sample: StylusSample) -> BrushDab {
-    if preset.engine_version == PENCIL_ENGINE_VERSION {
+    if pencil_grain_version(preset.engine_version).is_some() {
         return pencil::dab_for(preset, sample);
     }
     let pressure = unit(sample.pressure);
@@ -419,7 +439,7 @@ fn pressure_factor(enabled: bool, minimum: f32, pressure: f32) -> f32 {
 }
 
 fn valid_preset(preset: &BrushPreset) -> bool {
-    if preset.engine_version == PENCIL_ENGINE_VERSION {
+    if pencil_grain_version(preset.engine_version).is_some() {
         return pencil::valid_preset(preset);
     }
     [

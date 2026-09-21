@@ -5,6 +5,7 @@ on:
     paths:
       - 'site/**'
       - 'apps/web/**'
+      - 'apps/web-worker/**'
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -12,6 +13,8 @@ on:
       - 'tools/dioxus-cli.version'
       - 'tools/build-web.ps1'
       - 'tools/setup-web-ci.ps1'
+      - 'tools/setup-worker-ci.ps1'
+      - 'tools/build-web-worker.ps1'
       - 'tools/build-site.ps1'
       - '.github/workflows/pages.yml'
   release:
@@ -55,11 +58,13 @@ jobs:
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Browser artwork and recovery core tests
-        run: cargo test -p nyatidraw-web-core -p nyatidraw-project-web --locked
+        run: cargo test -p nyatidraw-brush -p nyatidraw-paint-cpu -p nyatidraw-project -p nyatidraw-web-core -p nyatidraw-project-web --locked
       - name: WebAssembly Clippy
-        run: cargo clippy -p nyatidraw-web --target wasm32-unknown-unknown --locked -- -D warnings
+        run: cargo clippy -p nyatidraw-web -p nyatidraw-web-worker --target wasm32-unknown-unknown --locked -- -D warnings
       - name: Install verified Dioxus CLI
         run: ./tools/setup-web-ci.ps1
+      - name: Install matching Worker bindings tool
+        run: ./tools/setup-worker-ci.ps1
       - name: Build web editor
         run: ./tools/build-web.ps1
       - name: Assemble website and verified web output

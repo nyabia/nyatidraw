@@ -267,6 +267,62 @@ fn scratch_path(label: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn batched_recovery_preserves_every_stroke_pixel_and_session_undo() {
+    for count in [1, 8] {
+        let mut web = WebProject::new(CanvasSpec {
+            width_px: 64,
+            height_px: 64,
+            pixels_per_inch: 96,
+        })
+        .unwrap();
+        web.select_tool(WebTool::Pen).unwrap();
+        let mut before_last = web.snapshot().clone();
+        for index in 0..count {
+            before_last = web.snapshot().clone();
+            let point = StrokePoint {
+                x: 8.0,
+                y: 8.0 + f64::from(index) * 6.0,
+                pressure: 1.0,
+                time_ms: f64::from(index) * 10.0,
+            };
+            web.begin_stroke(point).unwrap();
+            web.end_stroke(StrokePoint {
+                x: 12.0,
+                time_ms: point.time_ms + 1.0,
+                ..point
+            })
+            .unwrap();
+        }
+        let expected = web.snapshot().clone();
+        let path = scratch_path("batched-recovery");
+        std::fs::write(&path, web.encode_ntdr().unwrap()).unwrap();
+        let native = ProjectDb::open(&path).unwrap();
+        assert_eq!(
+            native
+                .load_reopened()
+                .unwrap()
+                .unwrap()
+                .into_parts()
+                .current_tiles,
+            expected
+        );
+        drop(native);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(web.undo_len(), usize::try_from(count).unwrap());
+        web.undo().unwrap();
+        assert_eq!(web.snapshot(), &before_last);
+        web.redo().unwrap();
+        assert_eq!(web.snapshot(), &expected);
+        assert_eq!(
+            WebProject::decode_ntdr(&web.encode_ntdr().unwrap())
+                .unwrap()
+                .snapshot(),
+            &expected
+        );
+    }
+}
+
+#[test]
 fn repeated_browser_saves_keep_native_retention_and_reopen_after_128_edits() {
     let mut web = WebProject::new(CanvasSpec {
         width_px: 16,
@@ -296,4 +352,113 @@ fn repeated_browser_saves_keep_native_retention_and_reopen_after_128_edits() {
         web.layers().raster(web.active_layer()).unwrap().name,
         "Edit 129"
     );
+}
+
+#[test]
+fn worker_deltas_keep_cumulative_pixels_deletions_and_native_history() {
+    let (original, tiles, layers, _) = fixture();
+    let mut web = WebProject::decode_ntdr(&original).unwrap();
+    let mut writer = RecoveryWriter::default();
+    let initial = web.prepare_recovery(1, 1, None).unwrap();
+    writer.stage(&initial.bytes).unwrap();
+    assert!(writer.file().is_err());
+    writer.accept().unwrap();
+    let mut checkpoint = initial.checkpoint;
+    web.set_active_layer(LayerId(23)).unwrap();
+    web.select_tool(WebTool::Pen).unwrap();
+    for (revision, x) in [(2, 20.0), (3, 280.0)] {
+        let point = StrokePoint {
+            x,
+            y: 20.0,
+            pressure: 1.0,
+            time_ms: 1.0,
+        };
+        web.begin_stroke(point).unwrap();
+        web.end_stroke(StrokePoint {
+            x: x + 8.0,
+            time_ms: 2.0,
+            ..point
+        })
+        .unwrap();
+        if revision == 2 {
+            continue;
+        }
+        let request = web
+            .prepare_recovery(1, revision, Some(&checkpoint))
+            .unwrap();
+        let bytes = writer.stage(&request.bytes).unwrap();
+        assert_eq!(
+            WebProject::decode_ntdr(&bytes).unwrap().snapshot(),
+            web.snapshot()
+        );
+        writer.accept().unwrap();
+        checkpoint = request.checkpoint;
+    }
+    web.undo().unwrap();
+    web.undo().unwrap();
+    assert_eq!(web.snapshot(), &tiles);
+    let removal = web.prepare_recovery(1, 4, Some(&checkpoint)).unwrap();
+    assert!(
+        removal.bytes.len() < 1024,
+        "unchanged pixels must not cross the worker boundary again"
+    );
+    let bytes = writer.stage(&removal.bytes).unwrap();
+    writer.accept().unwrap();
+    let memory = MemoryProjectDb::open(&bytes, MAX_NTDR_BYTES).unwrap();
+    let reopened = memory.db().load_reopened().unwrap().unwrap().into_parts();
+    assert_eq!(reopened.current_tiles, tiles);
+    assert_eq!(reopened.history.node_count(), 4);
+    assert_eq!(memory.db().load_layer_tree().unwrap(), Some(layers));
+}
+
+#[test]
+fn worker_failed_stale_and_corrupt_requests_never_replace_accepted_artwork() {
+    let (original, _, _, _) = fixture();
+    let mut web = WebProject::decode_ntdr(&original).unwrap();
+    let mut writer = RecoveryWriter::default();
+    let initial = web.prepare_recovery(1, 1, None).unwrap();
+    writer.stage(&initial.bytes).unwrap();
+    writer.accept().unwrap();
+    let preserved = writer.file().unwrap().to_vec();
+    web.set_foreground([10, 20, 30, 255]);
+    let change = web
+        .prepare_recovery(1, 2, Some(&initial.checkpoint))
+        .unwrap();
+    writer.stage(&change.bytes).unwrap();
+    assert!(writer.stage(&change.bytes).is_err());
+    writer.abort();
+    assert_eq!(writer.file().unwrap(), preserved);
+    assert!(writer.accept().is_err());
+    for packet in [
+        &change.bytes[..3],
+        &change.bytes[..change.bytes.len() - 1],
+        &initial.bytes,
+    ] {
+        assert!(writer.stage(packet).is_err());
+        assert_eq!(writer.file().unwrap(), preserved);
+    }
+    writer.stage(&change.bytes).unwrap();
+    writer.accept().unwrap();
+    let accepted = writer.file().unwrap().to_vec();
+    assert!(writer.stage(&change.bytes).is_err());
+    assert_eq!(writer.file().unwrap(), accepted);
+    let replacement = WebProject::new(CanvasSpec {
+        width_px: 32,
+        height_px: 32,
+        pixels_per_inch: 96,
+    })
+    .unwrap();
+    let request = replacement
+        .prepare_recovery(2, 3, Some(&change.checkpoint))
+        .unwrap();
+    let bytes = writer.stage(&request.bytes).unwrap();
+    writer.accept().unwrap();
+    assert!(
+        WebProject::decode_ntdr(&bytes)
+            .unwrap()
+            .snapshot()
+            .is_empty()
+    );
+    assert!(writer.stage(&change.bytes).is_err());
+    assert_eq!(writer.file().unwrap(), bytes);
 }

@@ -70,8 +70,10 @@ fn paper_tooth(pixel: vec2<u32>) -> u32 {
 fn pencil_coverage(input: VertexOutput) -> f32 {
     let pixel = vec2<u32>(floor(input.position.xy));
     let tooth = paper_tooth(pixel + input.grain.yz);
-    let deposit = input.grain.x - 1u;
-    if deposit <= tooth { return 0.0; }
+    let deposit = (input.grain.x & 65535u) - 1u;
+    let undercoat = input.grain.x >> 16u;
+    let pigment = max(deposit - min(deposit, tooth), undercoat);
+    if pigment == 0u { return 0.0; }
     let center = vec2<i32>(round(input.center_px * 16.0));
     let radius = i32(round(input.radius_px * 16.0));
     var count = 0u;
@@ -81,7 +83,7 @@ fn pencil_coverage(input: VertexOutput) -> f32 {
             if delta.x * delta.x + delta.y * delta.y <= radius * radius { count += 1u; }
         }
     }
-    return f32(count * (deposit - tooth)) / 4080.0;
+    return f32(count * pigment) / 4080.0;
 }
 
 fn shade_dab(input: VertexOutput) -> vec4<f32> {
@@ -96,7 +98,8 @@ fn shade_dab(input: VertexOutput) -> vec4<f32> {
     if input.grain.x != 0u {
         let coverage = pencil_coverage(input);
         if coverage == 0.0 { discard; }
-        let dab_alpha = floor(coverage * input.opacity * 255.0 + 0.5) / 255.0;
+        let minimum = select(0.0, f32(input.grain.x >> 16u), input.opacity > 0.0);
+        let dab_alpha = max(floor(coverage * input.opacity * 255.0 + 0.5), minimum) / 255.0;
         return vec4<f32>(brush_color.rgb, brush_color.a * dab_alpha);
     }
     let pixel_origin = input.position.xy - vec2<f32>(0.5, 0.5);

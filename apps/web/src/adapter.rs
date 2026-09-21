@@ -148,6 +148,7 @@ impl WebUiBackend {
         if self.previews.borrow().0 == revision {
             return;
         }
+        let started = browser::monotonic_now();
         let Some((navigator, layers)) = self.editor.read(|runtime| {
             let document = &runtime.document;
             let frame = crate::preview::navigator(document, revision).map(Arc::new);
@@ -198,6 +199,7 @@ impl WebUiBackend {
             return;
         };
         *self.previews.borrow_mut() = (revision, navigator, layers);
+        browser::record_work("previews", started);
     }
 
     fn select_tool(&self, tool: DrawingTool) -> Result<(), String> {

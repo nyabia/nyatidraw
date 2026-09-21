@@ -313,9 +313,32 @@ pub const LAYER_COMPOSITING_SCHEMA_FLAG: u64 = 0x800;
 pub const ALPHA_LOCK_STROKE_SCHEMA_FLAG: u64 = 0x1000;
 /// Upright dry-pencil v3 requires its document-space procedural grain replay.
 pub const PENCIL_BRUSH_SCHEMA_FLAG: u64 = 0x2000;
+/// Engine v4/v5 pressure onset and graphite undercoat require version-aware replay.
+pub const SHORT_STROKE_BRUSH_SCHEMA_FLAG: u64 = 0x8000;
+
+#[must_use]
+pub const fn brush_replay_schema_flags(engine: u32) -> u64 {
+    let configurable = if engine >= 2 {
+        CONFIGURABLE_BRUSH_SCHEMA_FLAG
+    } else {
+        0
+    };
+    let pencil = if nyatidraw_brush::pencil_grain_version(engine).is_some() {
+        PENCIL_BRUSH_SCHEMA_FLAG
+    } else {
+        0
+    };
+    let onset = if engine >= 4 {
+        SHORT_STROKE_BRUSH_SCHEMA_FLAG
+    } else {
+        0
+    };
+    configurable | pencil | onset
+}
 pub const SCHEMA_CAPABILITY_FLAGS: u64 = COMPRESSED_TILE_SCHEMA_FLAG
     | CONFIGURABLE_BRUSH_SCHEMA_FLAG
     | SIGNED_SELECTION_SCHEMA_FLAG
     | LAYER_COMPOSITING_SCHEMA_FLAG
     | ALPHA_LOCK_STROKE_SCHEMA_FLAG
-    | PENCIL_BRUSH_SCHEMA_FLAG;
+    | PENCIL_BRUSH_SCHEMA_FLAG
+    | SHORT_STROKE_BRUSH_SCHEMA_FLAG;
