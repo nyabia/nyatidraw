@@ -246,6 +246,14 @@ impl DesktopCanvasHandle {
         self.activation.open_from_dialog(path)
     }
 
+    pub(crate) fn new_drawing(&self) -> Result<(), String> {
+        if self.live_ink.is_closing() || self.live_ink.is_saving_as() {
+            return Err("현재 저장 작업이 끝난 뒤 새 그림을 시작해주세요.".into());
+        }
+        let path = crate::sketchbook::reserve_new_drawing()?;
+        self.open_path(path)
+    }
+
     pub(crate) fn save_as(&self, path: std::path::PathBuf) -> Result<(), String> {
         crate::save_as::validate_target(&path)?;
         self.live_ink.queue_save_as(path)?;

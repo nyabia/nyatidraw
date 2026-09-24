@@ -53,12 +53,22 @@ impl WebDocument {
             self.cancel_stroke();
             return Err(WebError::StrokeInProgress);
         }
+        self.require_idle()?;
         let mut sample = make_sample(point, 1, PointerPhase::Begin)?;
         let layer = self
             .layers()
             .raster(self.active_layer())
             .ok_or(WebError::InvalidLayer)?;
         if !layer.visible || layer.locked || (layer.alpha_locked && self.tool == WebTool::Eraser) {
+            return Err(WebError::LayerUnavailable);
+        }
+        let visible = nyatidraw_document::composition_scope_nodes(
+            self.layers().root(),
+            nyatidraw_document::CompositionScope::Solo(self.solo.unwrap_or(
+                nyatidraw_api::LayerTreeNodeId::Group(self.layers().root_id()),
+            )),
+        );
+        if !visible.contains(&nyatidraw_api::LayerTreeNodeId::Raster(self.active_layer())) {
             return Err(WebError::LayerUnavailable);
         }
         sample.eraser = self.tool == WebTool::Eraser;
@@ -124,9 +134,13 @@ impl WebDocument {
         if f64::from(x).abs() > MAX_COORDINATE || f64::from(y).abs() > MAX_COORDINATE {
             return Err(WebError::InvalidInput);
         }
-        let pixel =
-            nyatidraw_paint_cpu::sample_display_pixel(self.snapshot(), self.layers(), [x, y], None)
-                .map_err(|_| WebError::InvalidPixels)?;
+        let pixel = nyatidraw_paint_cpu::sample_display_pixel(
+            self.snapshot(),
+            self.layers(),
+            [x, y],
+            self.solo,
+        )
+        .map_err(|_| WebError::InvalidPixels)?;
         Ok(crate::linear_premultiplied_to_srgb8(pixel).unwrap_or([0; 4]))
     }
 
@@ -245,15 +259,27 @@ impl WebDocument {
             return Ok(CanvasUpdate::default());
         }
         let mut next = self.artwork.clone();
-        next.tiles = self
-            .artwork
-            .tiles
-            .with_replacements(
-                tiles
-                    .into_iter()
-                    .map(|(key, canvas)| (key, canvas.pixels_rgba8_premultiplied().to_vec())),
-            )
-            .map_err(|_| WebError::InvalidPixels)?;
+        next.tiles =
+            self.artwork
+                .tiles
+                .with_replacements(tiles.into_iter().map(|(key, canvas)| {
+                    let mut pixels = canvas.pixels_rgba8_premultiplied().to_vec();
+                    if let Some(mask) = &self.selection {
+                        let original = self.artwork.tiles.get(key);
+                        let (ox, oy) = key.pixel_origin();
+                        for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+                            let x = ox + i64::from((index % TILE_EDGE as usize) as u32);
+                            let y = oy + i64::from((index / TILE_EDGE as usize) as u32);
+                            if !mask.contains_signed(x as i32, y as i32) {
+                                pixel.copy_from_slice(original.map_or(&[0; 4], |tile| {
+                                    &tile.pixels()[index * 4..index * 4 + 4]
+                                }));
+                            }
+                        }
+                    }
+                    (key, pixels)
+                }))
+                .map_err(|_| WebError::InvalidPixels)?;
         if next.tiles.len() > MAX_RESIDENT_TILES {
             return Err(WebError::LimitExceeded);
         }

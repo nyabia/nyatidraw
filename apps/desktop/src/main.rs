@@ -18,10 +18,14 @@ mod performance_probe;
 mod performance_workload;
 mod preview;
 #[cfg(windows)]
+mod recent_projects;
+#[cfg(windows)]
 mod render_host;
 mod save_as;
 #[cfg(windows)]
 mod single_instance;
+#[cfg(windows)]
+mod sketchbook;
 mod transform_gesture;
 mod transform_worker;
 #[cfg(windows)]
@@ -37,6 +41,9 @@ use nyatidraw_editor_ui::{EditorChrome, TransientNotice, UiIcon, UiSlots};
 use std::{sync::OnceLock, time::Instant};
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct RecentProjectList(Signal<Result<Vec<std::path::PathBuf>, String>>);
 fn main() {
     #[cfg(windows)]
     velopack::VelopackApp::build()
@@ -89,6 +96,12 @@ fn app() -> Element {
         if *update_status.peek() != current {
             update_status.set(current);
         }
+        let RecentProjectList(mut recent) =
+            use_context_provider(|| RecentProjectList(Signal::new(recent_projects::list())));
+        let current = recent_projects::list();
+        if *recent.peek() != current {
+            recent.set(current);
+        }
     }
     let ui_ink = live_ink.clone();
     let host = use_hook(move || editor_ui_host::create(ui_ink, dioxus_core::schedule_update()));
@@ -120,42 +133,7 @@ fn app() -> Element {
         }
     }
 }
-/// Read-only feedback: raw input and release/cancel remain in the native actor.
-fn picker_loupe(snapshot: native_canvas::PickerSnapshot) -> Element {
-    let [x, y] = snapshot.cursor_css;
-    let top = if y >= 190.0 { y - 180.0 } else { y + 26.0 };
-    let position = format!(
-        "left:clamp(6px,{}px,calc(100vw - 138px));top:clamp(6px,{top}px,calc(100vh - 160px))",
-        x - 66.0
-    );
-    let candidate = snapshot.frame.as_ref().and_then(|frame| frame.candidate);
-    let swatch = candidate.map_or_else(String::new, |[r, g, b, _]| {
-        format!("background:rgb({r} {g} {b})")
-    });
-    let status = if snapshot.pending {
-        "…"
-    } else if snapshot.error.is_some() && snapshot.frame.is_none() {
-        "채취 실패"
-    } else if candidate.is_none() {
-        "투명"
-    } else {
-        ""
-    };
-    rsx! {
-        aside { class: "picker-loupe", style: position, aria_label: "스포이트 확대 미리보기",
-            div { class: "picker-pixels",
-                if let Some(frame) = snapshot.frame {
-                    img { src: frame.data_uri.to_string(), alt: "커서 주변 픽셀", draggable: "false", "data-pixel-size": "{frame.size}" }
-                }
-                span { class: "picker-center" }
-            }
-            div { class: "picker-candidate",
-                span { class: "picker-swatch", style: swatch }
-                span { "{status}" }
-            }
-        }
-    }
-}
+use nyatidraw_editor_ui::picker_loupe::picker_loupe;
 
 #[component]
 fn CloseProgress(status: CloseStatus) -> Element {
@@ -247,7 +225,7 @@ fn FileButtons(#[props(default = false)] extended: bool) -> Element {
             for file_action in (0_u8..=2).filter(|action| extended || *action == 0) {
                 button {
                     class: "command", disabled: busy() || host.is_none(),
-                    title: match file_action { 1 => "새 그림의 저장 위치 선택", 2 => "현재 그림과 모든 실행 취소 기록을 다른 이름으로 저장", _ => "PNG 또는 NyatiDraw 프로젝트 열기" },
+                    title: match file_action { 1 => "저장 위치를 정하지 않고 새 그림 시작", 2 => "현재 그림과 모든 실행 취소 기록을 다른 이름으로 저장", _ => "PNG 또는 NyatiDraw 프로젝트 열기" },
                     onclick: {
                         let host = host.clone();
                         let live_ink = live_ink.clone();
@@ -258,10 +236,16 @@ fn FileButtons(#[props(default = false)] extended: bool) -> Element {
                             let window = window.clone();
                             async move {
                                 if busy() { return; }
+                                if file_action == 1 {
+                                    if let Some(host) = &host && let Err(error) = host.new_drawing() {
+                                        live_ink.publish_activation_notice(error);
+                                    }
+                                    return;
+                                }
                                 busy.set(true);
                                 let dialog = rfd::AsyncFileDialog::new().set_parent(window.as_ref());
                                 let selected = if file_action != 0 {
-                                    dialog.set_title(if file_action == 2 { "다른 이름으로 저장" } else { "새 그림 저장 위치" }).add_filter("NyatiDraw 프로젝트", &["ntdr"])
+                                    dialog.set_title("다른 이름으로 저장").add_filter("NyatiDraw 프로젝트", &["ntdr"])
                                         .set_file_name("새 그림.ntdr").save_file().await
                                 } else {
                                     dialog.set_title("그림 열기").add_filter("그림 / 프로젝트", &["png", "ntdr"])
@@ -288,10 +272,55 @@ fn FileButtons(#[props(default = false)] extended: bool) -> Element {
                     else { UiIcon { name: "folder" } span { "열기" } }
                 }
             }
+            if extended {
+                RecentProjects { disabled: busy() }
+            }
         };
     }
     #[cfg(not(windows))]
     rsx! { button { disabled: true, "열기 · Windows 전용" } }
+}
+
+#[cfg(windows)]
+#[component]
+fn RecentProjects(disabled: bool) -> Element {
+    let host = try_use_context::<desktop_canvas::DesktopCanvasHandle>();
+    let live_ink = use_context::<LiveInkBridge>();
+    let recent = use_context::<RecentProjectList>().0.read().clone();
+    let title = recent
+        .as_ref()
+        .err()
+        .map_or("최근 그림", String::as_str)
+        .to_owned();
+    let paths = recent.unwrap_or_default();
+    let entries: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let parent = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+            format!("{name} — {}", parent.display())
+        })
+        .collect();
+    rsx! {
+        select { class: "command recent-projects", style: "max-width: 180px", aria_label: "최근 그림", title, value: "",
+            disabled: disabled || host.is_none() || paths.is_empty(),
+            onchange: move |event| {
+                if let Ok(index) = event.value().parse::<usize>()
+                    && let Some(path) = paths.get(index)
+                {
+                    let result = if !path.is_file() {
+                        Err("그림 파일을 찾지 못했습니다. 이동한 파일은 열기에서 다시 선택해주세요.".into())
+                    } else if let Some(host) = &host { host.open_path(path.clone()) }
+                    else { Err("캔버스가 아직 준비되지 않았습니다.".into()) };
+                    if let Err(error) = result { live_ink.publish_activation_notice(error); }
+                }
+            },
+            option { value: "", disabled: true, "최근 그림" }
+            for (index, label) in entries.iter().enumerate() {
+                option { value: "{index}", "{label}" }
+            }
+        }
+    }
 }
 
 #[component]

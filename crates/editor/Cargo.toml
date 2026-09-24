@@ -11,6 +11,7 @@ nyatidraw-diagnostics.workspace = true
 nyatidraw-document.workspace = true
 nyatidraw-history.workspace = true
 nyatidraw-input.workspace = true
+nyatidraw-paint-cpu.workspace = true
 nyatidraw-project.workspace = true
 nyatidraw-stroke.workspace = true
 nyatidraw-tiles.workspace = true

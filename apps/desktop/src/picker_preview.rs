@@ -10,25 +10,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const INTERVAL: Duration = Duration::from_millis(33);
-const PATCH_SIZE: u16 = 13;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PickerFrame {
-    pub(crate) size: u16,
-    pub(crate) data_uri: Arc<str>,
-    /// Opaque sRGB, exactly as a successful release would set foreground RGB.
-    /// Transparent artwork has no candidate; the PNG still shows its neighbors.
-    pub(crate) candidate: Option<[u8; 4]>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct PickerSnapshot {
-    /// `WebView` client CSS pixels, including the native canvas layout origin.
-    pub(crate) cursor_css: [f64; 2],
-    pub(crate) frame: Option<Arc<PickerFrame>>,
-    pub(crate) pending: bool,
-    pub(crate) error: Option<String>,
-}
+pub(crate) use nyatidraw_editor_ui::picker_loupe::{PickerFrame, PickerSnapshot};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PickerToken {
@@ -287,42 +270,12 @@ pub(super) fn sample_patch(
     tiles: &nyatidraw_tiles::TileSnapshot,
     tree: &nyatidraw_document::LayerTree,
 ) -> Result<PickerFrame, String> {
-    let half = i32::from(PATCH_SIZE / 2);
-    let mut pixels = Vec::with_capacity(usize::from(PATCH_SIZE).pow(2) * 4);
-    let mut candidate = None;
-    for y in -half..=half {
-        for x in -half..=half {
-            let point = [
-                request.point[0].checked_add(x),
-                request.point[1].checked_add(y),
-            ];
-            let pixel = if let [Some(x), Some(y)] = point {
-                sample_picker_pixel(tiles, tree, request.target, [x, y], request.source).map_err(
-                    |error| match error {
-                        EditFailure::Rejected(error) | EditFailure::Fatal(error) => error,
-                    },
-                )?
-            } else {
-                [0; 4]
-            };
-            if x == 0 && y == 0 {
-                candidate = crate::edit_worker::picker_color(pixel);
+    nyatidraw_editor_ui::picker_loupe::sample_frame(request.point, |point| {
+        sample_picker_pixel(tiles, tree, request.target, point, request.source).map_err(|error| {
+            match error {
+                EditFailure::Rejected(message) | EditFailure::Fatal(message) => message,
             }
-            pixels.extend_from_slice(&pixel);
-        }
-    }
-    let surface = nyatidraw_tiles::FlattenedRgba8 {
-        origin_x: i64::from(request.point[0]) - i64::from(half),
-        origin_y: i64::from(request.point[1]) - i64::from(half),
-        width: u32::from(PATCH_SIZE),
-        height: u32::from(PATCH_SIZE),
-        pixels,
-    };
-    let png = nyatidraw_png_io::encode_png_bytes(&surface).map_err(|error| error.to_string())?;
-    Ok(PickerFrame {
-        size: PATCH_SIZE,
-        candidate,
-        data_uri: crate::preview::png_data_uri(&png, 4096, "picker")?,
+        })
     })
 }
 

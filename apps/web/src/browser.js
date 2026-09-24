@@ -237,6 +237,22 @@ function containDialogFocus(event) {
     first.focus();
   }
 }
+export function mountCanvas() {
+  const canvas = document.createElement("canvas");
+  canvas.id = "drawing-canvas";
+  canvas.tabIndex = 0;
+  canvas.setAttribute("aria-label", "그리기 캔버스");
+  const attach = () => {
+    const slot = document.getElementById("drawing-canvas-slot");
+    if (slot && canvas.parentElement !== slot) {
+      cancelCanvasGesture?.();
+      slot.appendChild(canvas);
+    }
+  };
+  attach();
+  new MutationObserver(attach).observe(document.body, { childList: true, subtree: true });
+}
+
 export function bindCanvas(canvas, callback) {
   if (timingEnabled) {
     const dispatch = callback;
@@ -252,6 +268,26 @@ export function bindCanvas(canvas, callback) {
   let active = null;
   let mode = null;
   let space = false;
+  let pickerEvent = null;
+  let pickerFrame = 0;
+  let pickerTime = 0;
+  const clearPicker = () => {
+    cancelAnimationFrame(pickerFrame);
+    pickerFrame = 0;
+    pickerEvent = null;
+  };
+  const flushPicker = () => {
+    pickerFrame = 0;
+    if (active === null || mode !== "pick" || !pickerEvent) return;
+    if (performance.now() - pickerTime < 33) {
+      pickerFrame = requestAnimationFrame(flushPicker);
+      return;
+    }
+    pickerTime = performance.now();
+    const event = pickerEvent;
+    pickerEvent = null;
+    send("pickMove", event);
+  };
   const local = (event) => {
     const rect = canvas.getBoundingClientRect();
     return [event.clientX - rect.left, event.clientY - rect.top];
@@ -294,7 +330,8 @@ export function bindCanvas(canvas, callback) {
       return;
     }
     if (mode === "pick") {
-      send("pickMove", event);
+      pickerEvent = event;
+      if (!pickerFrame) pickerFrame = requestAnimationFrame(flushPicker);
       return;
     }
     const samples = event.getCoalescedEvents?.() || [];
@@ -309,12 +346,14 @@ export function bindCanvas(canvas, callback) {
   });
   canvas.addEventListener("pointerup", (event) => {
     if (modalOpen || event.pointerId !== active) return;
+    clearPicker();
     send(mode === "pan" ? "panEnd" : mode === "pick" ? "pickEnd" : "end", event);
     active = null;
     mode = null;
     canvas.releasePointerCapture(event.pointerId);
   });
   const cancel = () => {
+    clearPicker();
     space = false;
     if (active === null) return;
     const captured = active;

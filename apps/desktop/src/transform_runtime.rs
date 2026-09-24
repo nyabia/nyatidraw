@@ -212,18 +212,12 @@ impl ActiveCanvas {
                 self.finish_transform_tool();
                 return;
             };
-            if !self.stroke.transform_paste && projection.transform == AffineTransform::default() {
-                TransformCommand::Cancel
-            } else if projection.can_commit {
-                TransformCommand::Commit {
-                    generation: projection.generation,
-                }
-            } else {
-                // A rejected latest request invalidates commit authorization,
-                // so explicitly regenerate the last valid displayed transform.
-                self.stroke.revalidating_transform = true;
-                TransformCommand::Preview(projection.transform)
-            }
+            let command = nyatidraw_editor::transform::tool_switch_command(
+                projection,
+                self.stroke.transform_paste,
+            );
+            self.stroke.revalidating_transform = matches!(command, TransformCommand::Preview(_));
+            command
         } else {
             return;
         };

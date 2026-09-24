@@ -15,7 +15,9 @@ pub enum GpuSelectionError {
 }
 
 impl GpuSelectionMask {
-    pub(crate) fn new(
+    /// # Errors
+    /// Rejects empty, oversized or inconsistent packed selection masks.
+    pub fn new(
         device: &wgpu::Device,
         origin: [i32; 2],
         dimensions: [u32; 2],

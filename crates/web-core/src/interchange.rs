@@ -1,10 +1,11 @@
 use crate::{
-    Artwork, BrushSettings, CanvasSpec, LayerId, LayerTree, LayerTreeNode, MAX_LAYERS,
-    MAX_RESIDENT_TILES, TileSnapshot, WebDocument, WebError, WebTool,
+    Artwork, BrushSettings, CanvasSpec, LayerId, LayerTree, MAX_LAYERS, MAX_RESIDENT_TILES,
+    TileSnapshot, WebDocument, WebError, WebTool,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WebPreferences {
+    pub edit_settings: nyatidraw_api::EditSettings,
     pub tool: WebTool,
     pub brushes: [BrushSettings; 5],
     pub foreground: [u8; 4],
@@ -14,7 +15,7 @@ pub struct WebPreferences {
 impl WebDocument {
     /// Adopts exact linear-premultiplied native pixels without flattening or cropping.
     /// # Errors
-    /// Rejects unsupported groups, missing layers, non-base tiles and browser limits.
+    /// Rejects missing layers, non-base tiles and browser limits.
     pub fn from_snapshot(
         canvas: CanvasSpec,
         tiles: TileSnapshot,
@@ -23,18 +24,13 @@ impl WebDocument {
     ) -> Result<Self, WebError> {
         let mut document = Self::new(canvas)?;
         if layers.root().children.is_empty()
-            || layers.root().children.len() > MAX_LAYERS
+            || crate::editing::node_count(&layers) > MAX_LAYERS
             || tiles.len() > MAX_RESIDENT_TILES
         {
             return Err(WebError::LimitExceeded);
         }
-        let mut next = 1;
-        for node in &layers.root().children {
-            let LayerTreeNode::Raster(layer) = node else {
-                return Err(WebError::InvalidLayer);
-            };
-            next = next.max(layer.id.0.checked_add(1).ok_or(WebError::LimitExceeded)?);
-        }
+        let next = nyatidraw_editor::layer_edit::next_layer_node_id(&layers)
+            .map_err(WebError::EditRejected)?;
         if layers.raster(active).is_none() {
             return Err(WebError::InvalidLayer);
         }
@@ -66,6 +62,7 @@ impl WebDocument {
     #[must_use]
     pub const fn preferences(&self) -> WebPreferences {
         WebPreferences {
+            edit_settings: self.edit_settings,
             tool: self.tool,
             brushes: self.settings,
             foreground: self.foreground,
@@ -81,7 +78,13 @@ impl WebDocument {
         for settings in preferences.brushes {
             settings.validate()?;
         }
+        if preferences.edit_settings.fill.gap_close_px > 8
+            || preferences.edit_settings.fill.expand_px > 64
+        {
+            return Err(WebError::InvalidInput);
+        }
         self.tool = preferences.tool;
+        self.edit_settings = preferences.edit_settings;
         self.settings = preferences.brushes;
         self.foreground = preferences.foreground;
         self.background = preferences.background;

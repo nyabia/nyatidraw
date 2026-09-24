@@ -3,10 +3,7 @@
 //! registered PNG; DIB-only producers and other platforms are explicit follow-ups.
 use nyatidraw_paint_cpu::RasterFragment;
 
-pub(crate) trait ArtworkClipboard {
-    fn write(&mut self, fragment: &RasterFragment) -> Result<(), String>;
-    fn read(&mut self) -> Result<RasterFragment, String>;
-}
+pub(crate) use nyatidraw_editor::pixel_edit::ArtworkClipboard;
 
 pub(crate) struct SystemClipboard;
 

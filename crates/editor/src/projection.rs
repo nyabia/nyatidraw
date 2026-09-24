@@ -234,7 +234,7 @@ impl Default for ProjectionState {
     }
 }
 
-fn project_children(group: &GroupNode, depth: u16, out: &mut Vec<LayerProjection>) {
+pub fn project_children(group: &GroupNode, depth: u16, out: &mut Vec<LayerProjection>) {
     // Document children are stored bottom-to-top. The UI projection is
     // top-to-bottom, but a group must still precede its own descendants so
     // collapse/indent semantics remain structurally meaningful.

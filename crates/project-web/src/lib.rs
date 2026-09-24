@@ -5,6 +5,7 @@
 use std::ops::{Deref, DerefMut};
 
 use nyatidraw_api::{CanvasSpec, DrawingTool, HistoryNodeId, SnapshotId};
+#[cfg(test)]
 use nyatidraw_document::LayerTreeNode;
 use nyatidraw_editor::HeadlessStrokeSession;
 use nyatidraw_project::{ReopenedProject, decode_editor_tool_state};
@@ -67,7 +68,7 @@ impl WebProject {
 
     /// Loads native bytes without modifying the input. Legacy NYWEB001 is import-only.
     /// # Errors
-    /// Rejects corruption, unsupported groups and resource limits before replacement.
+    /// Rejects corruption and resource limits before replacement, preserving groups.
     pub fn decode_ntdr(bytes: &[u8]) -> Result<Self, String> {
         if bytes.starts_with(b"NYWEB001") {
             return WebDocument::decode_portable(bytes)
@@ -94,23 +95,9 @@ impl WebProject {
             )
         };
         let mut document = if let Some(layers) = layers {
-            if layers
-                .root()
-                .children
-                .iter()
-                .any(|node| matches!(node, LayerTreeNode::Group(_)))
-            {
-                return Err("This project contains layer groups that the browser cannot edit yet; it was not changed. Open it in NyatiDraw Desktop.".into());
-            }
-            let active = layers
-                .root()
-                .children
-                .iter()
-                .rev()
-                .find_map(|node| match node {
-                    LayerTreeNode::Raster(layer) => Some(layer.id),
-                    LayerTreeNode::Group(_) => None,
-                })
+            let active = nyatidraw_editor::layer_edit::raster_layer_ids(&layers)
+                .first()
+                .copied()
                 .ok_or("The browser requires at least one raster layer")?;
             WebDocument::from_snapshot(canvas, tiles, layers, active).map_err(message)?
         } else if tiles.is_empty() {
@@ -123,20 +110,6 @@ impl WebProject {
         let import_notice = if state.is_some() && decoded.is_none() {
             Some(
                 "Unrecognized tool settings were preserved unchanged. Browser defaults are temporary; saving changed settings requires NyatiDraw Desktop.",
-            )
-        } else if decoded.is_some_and(|state| {
-            !matches!(
-                state.tool,
-                DrawingTool::Move
-                    | DrawingTool::Eyedropper
-                    | DrawingTool::Pencil
-                    | DrawingTool::Pen
-                    | DrawingTool::Brush
-                    | DrawingTool::Eraser
-            )
-        }) {
-            Some(
-                "The previous tool is not available in the browser. Its settings are preserved; the last painting brush is available instead.",
             )
         } else {
             None

@@ -235,3 +235,147 @@ fn bounded_history_keeps_latest_edits_and_noops_do_not_displace_undo() {
     );
     assert_eq!(document.artwork, state);
 }
+#[test]
+fn shared_selection_fill_and_transform_preserve_undo_and_cancelled_artwork() {
+    use nyatidraw_api::{AffineTransform, EditCommand as E, LayerCommand, TransformCommand as T};
+    let mut doc = WebDocument::new(CanvasSpec {
+        width_px: 32,
+        height_px: 32,
+        pixels_per_inch: 96,
+    })
+    .unwrap();
+    doc.apply_edit(E::SelectLasso {
+        vertices: vec![[2, 2], [10, 2], [10, 10], [2, 10]],
+    })
+    .unwrap();
+    doc.apply_edit(E::FillSelection {
+        color: [255, 0, 0, 255],
+    })
+    .unwrap();
+    let painted = doc.snapshot().clone();
+    assert!(!painted.is_empty());
+    doc.apply_edit(E::CopySelection).unwrap();
+    let original_tree = doc.layers().clone();
+    doc.apply_edit(E::FreeTransform(T::Paste)).unwrap();
+    assert_eq!(
+        doc.layers(),
+        &original_tree,
+        "provisional paste must not enter autosave"
+    );
+    doc.apply_edit(E::FreeTransform(T::Cancel)).unwrap();
+    assert_eq!(doc.snapshot(), &painted);
+    doc.apply_edit(E::FreeTransform(T::Begin)).unwrap();
+    let transform = AffineTransform {
+        offset_milli: [4000, 0],
+        ..Default::default()
+    };
+    doc.apply_edit(E::FreeTransform(T::Preview(transform)))
+        .unwrap();
+    let generation = doc.transform_projection().unwrap().generation;
+    assert!(
+        doc.apply_edit(E::FreeTransform(T::Commit {
+            generation: generation - 1
+        }))
+        .is_err()
+    );
+    doc.apply_edit(E::FreeTransform(T::Commit { generation }))
+        .unwrap();
+    assert_ne!(doc.snapshot(), &painted);
+    doc.undo().unwrap();
+    assert_eq!(doc.snapshot(), &painted);
+    doc.apply_layer_command(LayerCommand::DuplicateRaster(doc.active_layer()))
+        .unwrap();
+    let duplicate = doc.active_layer();
+    assert!(doc.snapshot().iter().any(|(key, _)| key.layer == duplicate));
+    doc.undo().unwrap();
+    assert_eq!(doc.snapshot(), &painted);
+}
+
+#[test]
+fn brush_cannot_change_pixels_outside_the_selection() {
+    use nyatidraw_api::EditCommand as E;
+    let mut doc = WebDocument::new(CanvasSpec {
+        width_px: 32,
+        height_px: 32,
+        pixels_per_inch: 96,
+    })
+    .unwrap();
+    doc.select_tool(WebTool::Pen).unwrap();
+    doc.apply_edit(E::SelectLasso {
+        vertices: vec![[4, 4], [8, 4], [8, 8], [4, 8]],
+    })
+    .unwrap();
+    let point = StrokePoint {
+        x: 4.0,
+        y: 4.0,
+        pressure: 1.0,
+        time_ms: 1.0,
+    };
+    doc.begin_stroke(point).unwrap();
+    doc.end_stroke(point).unwrap();
+    let pixels = doc.export_rgba8().unwrap();
+    assert!(
+        pixels
+            .chunks_exact(4)
+            .enumerate()
+            .all(|(index, pixel)| pixel[3] == 0
+                || ((4..8).contains(&(index % 32)) && (4..8).contains(&(index / 32))))
+    );
+    assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
+}
+
+#[test]
+fn switching_tools_commits_moved_or_pasted_artwork_without_recording_unchanged_drafts() {
+    use nyatidraw_api::{AffineTransform, EditCommand as E, TransformCommand as T};
+    for pasted in [false, true] {
+        for moved in [false, true] {
+            let mut document = WebDocument::import_rgba8(16, 16, &[255; 16 * 16 * 4]).unwrap();
+            let original = document.snapshot().clone();
+            let tree = document.layers().clone();
+            let history = document.history_len();
+            document.apply_edit(E::SelectAll).unwrap();
+            document.apply_edit(E::CopySelection).unwrap();
+            document
+                .apply_edit(E::FreeTransform(if pasted { T::Paste } else { T::Begin }))
+                .unwrap();
+            if moved {
+                document
+                    .apply_edit(E::FreeTransform(T::Preview(AffineTransform {
+                        offset_milli: [4000, 0],
+                        ..Default::default()
+                    })))
+                    .unwrap();
+            }
+            let preview = document.display_snapshot().clone();
+            if moved {
+                assert!(
+                    document
+                        .apply_edit(E::FreeTransform(T::Preview(AffineTransform {
+                            scale_ppm: [0, 0],
+                            ..Default::default()
+                        })))
+                        .is_err()
+                );
+                assert!(!document.transform_projection().unwrap().can_commit);
+                assert_eq!(document.display_snapshot(), &preview);
+            }
+            let update = document.finish_transform_for_tool_switch().unwrap();
+            assert!(document.transform_projection().is_none());
+            assert_eq!(update.committed, pasted || moved);
+            assert_eq!(document.snapshot(), &preview);
+            assert_eq!(
+                document.history_len(),
+                history + usize::from(pasted || moved)
+            );
+            let portable = document.encode_portable().unwrap();
+            let reopened = WebDocument::decode_portable(&portable).unwrap();
+            assert_eq!(reopened.snapshot(), document.snapshot());
+            assert_eq!(reopened.layers(), document.layers());
+            if pasted || moved {
+                document.undo().unwrap();
+                assert_eq!(document.snapshot(), &original);
+                assert_eq!(document.layers(), &tree);
+            }
+        }
+    }
+}

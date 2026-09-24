@@ -20,6 +20,7 @@ pub fn App() -> Element {
         ready: use_signal(|| false),
         modal: use_signal(|| None),
         notice: use_signal(|| None),
+        picker: use_signal(|| None),
     };
     use_context_provider(|| editor);
     let backend = use_hook(|| WebUiBackend::new(editor));
@@ -51,7 +52,7 @@ pub fn App() -> Element {
         document::Link { rel: "stylesheet", href: HOST_STYLE }
         document::Meta { name: "theme-color", content: "#242424" }
         div { class: "browser-editor-root", "inert": modal.map(|_| ""),
-            EditorChrome { ui_projection: projection, export_status: ExportStatus::Idle, overlays: rsx! { BrowserNotice {} } }
+            EditorChrome { ui_projection: projection, export_status: ExportStatus::Idle, overlays: rsx! { BrowserNotice {} BrowserPicker {} } }
         }
         BrowserDialog {}
     }
@@ -64,7 +65,7 @@ fn BrowserCanvas() -> Element {
     let save_status = (editor.status)();
     rsx! {
         div { class: "browser-canvas-host",
-            canvas { id: "drawing-canvas", tabindex: "0", aria_label: "그리기 캔버스. B 브러시 계열, E 지우개, C 스포이트, Space 또는 가운데 버튼으로 이동." }
+            div { id: "drawing-canvas-slot" }
             if ready {
                 div { class: "browser-save-status", role: "status", "{save_status}" }
             }
@@ -105,6 +106,15 @@ fn BrowserHelp() -> Element {
 }
 
 #[component]
+fn BrowserPicker() -> Element {
+    let editor = use_context::<Editor>();
+    match (editor.picker)() {
+        Some(snapshot) => nyatidraw_editor_ui::picker_loupe::picker_loupe(snapshot),
+        None => rsx! {},
+    }
+}
+
+#[component]
 fn BrowserNotice() -> Element {
     let editor = use_context::<Editor>();
     rsx! {
@@ -138,9 +148,9 @@ fn BrowserDialog() -> Element {
                         p { role: "status", "{editor.status}" }
                         ul {
                             li { "그림은 서버로 전송하지 않고 이 브라우저에 자동 복구용으로 저장합니다. 중요한 작업은 파일로 내려받아 보관하세요." }
-                            li { "작업 파일은 데스크톱과 같은 .ntdr 형식입니다. 웹에서 지원하지 않는 그룹이나 자원 한도를 넘는 파일은 내용 손실을 막기 위해 열지 않습니다. 이전 .nyatidraw-web 파일도 가져올 수 있습니다." }
+                            li { "작업 파일은 데스크톱과 같은 .ntdr 형식이며 레이어와 그룹을 유지합니다. 브라우저 자원 한도를 넘는 파일은 내용 손실을 막기 위해 열지 않습니다. 이전 .nyatidraw-web 파일도 가져올 수 있습니다." }
                             li { "최대 4096 × 4096 캔버스, 32개 레이어. 되돌리기는 메모리 한도 내 최대 128개이며 다시 열 때 복원되지 않습니다." }
-                            li { "도킹 위치 변경은 캔버스 수명 보장을 위해 현재 웹판에서 비활성화됩니다. 패널 크기 조절과 탭은 사용할 수 있습니다." }
+                            li { "패널 이동·크기 조절·탭은 데스크톱과 같은 방식으로 동작합니다. 배치는 이 브라우저에 저장합니다." }
                             li { "필압은 기기와 브라우저 지원에 따라 달라집니다. Windows 앱과 같은 성능을 검증한 상태는 아닙니다." }
                         }
                         button { "data-dialog-initial": "", onclick: move |_| editor.close_modal(), "닫기" }

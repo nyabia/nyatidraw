@@ -7,6 +7,7 @@ license.workspace = true
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 dioxus = { version = "=0.7.9", default-features = false, features = ["web", "launch", "lib"] }
 nyatidraw-api.workspace = true
+nyatidraw-editor.workspace = true
 nyatidraw-editor-ui.workspace = true
 nyatidraw-input.workspace = true
 nyatidraw-document.workspace = true

@@ -16,6 +16,8 @@ pub struct WebRenderer {
     presenter: TexturePresenter,
     failure: Arc<Mutex<Option<String>>>,
     zero_tile: Box<[u8]>,
+    selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
+    transform_guide_active: bool,
 }
 
 impl WebRenderer {
@@ -122,6 +124,8 @@ impl WebRenderer {
             presenter,
             failure,
             zero_tile: vec![0; TILE_BYTE_LEN].into_boxed_slice(),
+            selection: None,
+            transform_guide_active: false,
         };
         renderer.check_device()?;
         Ok(renderer)
@@ -132,9 +136,61 @@ impl WebRenderer {
         let size = document_size(doc);
         validate_texture_size(&self.device, size)?;
         self.scene
-            .replace_document(size, doc.layers().clone())
+            .replace_document(size, doc.display_layers().clone())
             .map_err(|error| format!("Replace canvas scene: {error:?}"))?;
-        upload_snapshot(&mut self.scene, doc)
+        upload_snapshot(&mut self.scene, doc)?;
+        self.sync_chrome(doc)
+    }
+
+    pub fn sync_chrome(&mut self, doc: &WebDocument) -> Result<(), String> {
+        self.scene
+            .set_solo(doc.solo_node())
+            .map_err(|e| format!("Solo: {e:?}"))?;
+        let unchanged = match (&self.selection, doc.selection()) {
+            (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            let mask = doc
+                .selection()
+                .map(|mask| {
+                    nyatidraw_paint_gpu::GpuSelectionMask::new(
+                        &self.device,
+                        mask.origin(),
+                        mask.dimensions(),
+                        &mask.packed_bits(),
+                    )
+                })
+                .transpose()
+                .map_err(|e| format!("Selection: {e:?}"))?;
+            self.scene.set_selection_overlay(mask.as_ref());
+            self.selection = doc.selection().cloned();
+        }
+        Ok(())
+    }
+
+    pub fn set_gesture_preview(&mut self, points: &[[i32; 2]], closed: bool) {
+        self.scene.set_gesture_preview(points, closed);
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn transform_guide(
+        &mut self,
+        transform: Option<&nyatidraw_api::TransformProjection>,
+        zoom: f64,
+    ) {
+        if let Some(transform) = transform {
+            let points: Vec<_> = nyatidraw_editor::transform_gesture::guide(transform, 7.0 / zoom)
+                .into_iter()
+                .map(|point| point.map(|v| v.round() as i32))
+                .collect();
+            self.scene.set_gesture_preview(&points, false);
+            self.transform_guide_active = true;
+        } else if self.transform_guide_active {
+            self.scene.set_gesture_preview(&[], false);
+            self.transform_guide_active = false;
+        }
     }
 
     pub fn upload_dirty(&mut self, doc: &WebDocument, keys: &[TileKey]) -> Result<(), String> {
@@ -230,7 +286,7 @@ fn validate_texture_size(device: &wgpu::Device, size: [u32; 2]) -> Result<(), St
 }
 
 fn upload_snapshot(scene: &mut GpuCompositeScene, doc: &WebDocument) -> Result<(), String> {
-    for (key, tile) in doc.snapshot().iter() {
+    for (key, tile) in doc.display_snapshot().iter() {
         scene
             .upload_closed_tile(key, tile.pixels())
             .map_err(|error| format!("Upload canvas snapshot: {error:?}"))?;

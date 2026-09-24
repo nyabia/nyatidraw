@@ -20,7 +20,9 @@ pub use nyatidraw_tiles::{TILE_BYTE_LEN, TILE_EDGE, TileKey, TileSnapshot};
 
 mod codec;
 mod drawing;
+mod editing;
 mod interchange;
+mod transform;
 pub use interchange::WebPreferences;
 #[cfg(test)]
 mod tests;
@@ -150,8 +152,9 @@ pub struct CanvasUpdate {
     pub structure_changed: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WebError {
+    EditRejected(String),
     InvalidCanvas,
     InvalidInput,
     InvalidBrush,
@@ -168,6 +171,7 @@ pub enum WebError {
 impl std::fmt::Display for WebError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::EditRejected(message) => message,
             Self::InvalidCanvas => "Canvas dimensions must be between 1 and 4096 pixels",
             Self::InvalidInput => "Invalid or out-of-range drawing input; stroke cancelled",
             Self::InvalidBrush => "Invalid brush setting",
@@ -211,6 +215,13 @@ pub struct WebDocument {
     evaluator: RoundBrushEvaluator,
     stroke: Option<drawing::ActiveStroke>,
     next_layer_id: u128,
+    selection: Option<std::sync::Arc<nyatidraw_paint_cpu::SelectionMask>>,
+    clipboard: nyatidraw_editor::pixel_edit::MemoryArtworkClipboard,
+    pub edit_settings: nyatidraw_api::EditSettings,
+    solo: Option<LayerTreeNodeId>,
+    transform: nyatidraw_editor::transform::TransformSession,
+    transform_preview: Option<nyatidraw_editor::transform::TransformOutcome>,
+    revision: u128,
 }
 
 impl Default for WebDocument {
@@ -254,6 +265,13 @@ impl WebDocument {
             evaluator: RoundBrushEvaluator::default(),
             stroke: None,
             next_layer_id: 2,
+            selection: None,
+            clipboard: nyatidraw_editor::pixel_edit::MemoryArtworkClipboard::default(),
+            edit_settings: nyatidraw_api::EditSettings::default(),
+            solo: None,
+            transform: nyatidraw_editor::transform::TransformSession::default(),
+            transform_preview: None,
+            revision: 1,
         })
     }
 
@@ -295,11 +313,11 @@ impl WebDocument {
     }
     #[must_use]
     pub fn can_undo(&self) -> bool {
-        self.stroke.is_none() && !self.undo.is_empty()
+        self.require_idle().is_ok() && !self.undo.is_empty()
     }
     #[must_use]
     pub fn can_redo(&self) -> bool {
-        self.stroke.is_none() && !self.redo.is_empty()
+        self.require_idle().is_ok() && !self.redo.is_empty()
     }
     #[must_use]
     pub fn history_len(&self) -> usize {
@@ -524,6 +542,8 @@ impl WebDocument {
     /// Undo is unavailable while a stroke is live. Empty history is a no-op.
     pub fn undo(&mut self) -> Result<CanvasUpdate, WebError> {
         self.require_idle()?;
+        self.selection = None;
+        self.solo = None;
         let Some(previous) = self.undo.pop_back() else {
             return Ok(CanvasUpdate::default());
         };
@@ -537,6 +557,8 @@ impl WebDocument {
     /// Redo is unavailable while a stroke is live. Empty history is a no-op.
     pub fn redo(&mut self) -> Result<CanvasUpdate, WebError> {
         self.require_idle()?;
+        self.selection = None;
+        self.solo = None;
         let Some(next) = self.redo.pop() else {
             return Ok(CanvasUpdate::default());
         };
@@ -628,7 +650,7 @@ impl WebDocument {
     }
 
     fn require_idle(&self) -> Result<(), WebError> {
-        if self.stroke.is_some() {
+        if self.stroke.is_some() || self.transform_preview.is_some() {
             Err(WebError::StrokeInProgress)
         } else {
             Ok(())
@@ -638,6 +660,7 @@ impl WebDocument {
     fn commit_artwork(&mut self, next: Artwork) -> CanvasUpdate {
         let update = difference(&self.artwork, &next, true);
         if update.changed {
+            self.revision = self.revision.saturating_add(1);
             self.redo.clear();
             self.undo
                 .push_back(std::mem::replace(&mut self.artwork, next));

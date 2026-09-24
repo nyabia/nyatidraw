@@ -7,6 +7,86 @@ use nyatidraw_web_core::{StrokePoint, WebTool};
 
 use super::*;
 
+#[test]
+fn browser_edits_and_group_metadata_survive_native_process_restart() {
+    use nyatidraw_api::{AffineTransform, EditCommand as E, LayerCommand, TransformCommand as T};
+    const FILE: &str = "NYATIDRAW_TEST_WEB_REOPEN_FILE";
+    const ROOT: &str = "NYATIDRAW_TEST_WEB_REOPEN_ROOT";
+    if let Some(path) = std::env::var_os(FILE) {
+        let bytes = std::fs::read(&path).unwrap();
+        let browser = WebProject::decode_ntdr(&bytes).unwrap();
+        let native = ProjectDb::open(std::path::Path::new(&path)).unwrap();
+        let reopened = native.load_reopened().unwrap().unwrap().into_parts();
+        assert_eq!(reopened.current_tiles, *browser.snapshot());
+        assert_eq!(
+            format!("{:?}", reopened.current_tiles.root()),
+            std::env::var(ROOT).unwrap()
+        );
+        assert_eq!(
+            native
+                .load_cursor_layer_tree(reopened.current_cursor)
+                .unwrap()
+                .as_ref(),
+            Some(browser.layers())
+        );
+        return;
+    }
+    let mut browser = WebProject::from_document(WebDocument::default());
+    browser
+        .apply_edit(E::SelectLasso {
+            vertices: vec![[2, 2], [20, 2], [20, 20], [2, 20]],
+        })
+        .unwrap();
+    browser
+        .apply_edit(E::FillSelection {
+            color: [120, 20, 10, 255],
+        })
+        .unwrap();
+    browser.apply_edit(E::FreeTransform(T::Begin)).unwrap();
+    browser
+        .apply_edit(E::FreeTransform(T::Preview(AffineTransform {
+            offset_milli: [7000, -3000],
+            ..Default::default()
+        })))
+        .unwrap();
+    let generation = browser.transform_projection().unwrap().generation;
+    browser
+        .apply_edit(E::FreeTransform(T::Commit { generation }))
+        .unwrap();
+    browser.apply_layer_command(LayerCommand::AddGroup).unwrap();
+    let active = browser.active_layer();
+    browser
+        .apply_layer_command(LayerCommand::DuplicateRaster(active))
+        .unwrap();
+    let bytes = browser.encode_ntdr().unwrap();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nyatidraw-web-reopen-{}-{nonce}.ntdr",
+        std::process::id()
+    ));
+    std::fs::write(&path, bytes).unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::browser_edits_and_group_metadata_survive_native_process_restart",
+            "--nocapture",
+        ])
+        .env(FILE, &path)
+        .env(ROOT, format!("{:?}", browser.snapshot().root()))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
 fn fixture() -> (Vec<u8>, TileSnapshot, LayerTree, ProjectToolState) {
     let memory = MemoryProjectDb::open(&[], MAX_NTDR_BYTES).unwrap();
     let db = memory.db();
@@ -154,7 +234,7 @@ fn editing_an_undone_native_project_preserves_redo_branch_and_exact_new_pixels()
 }
 
 #[test]
-fn unsupported_groups_corruption_and_invalid_pixels_never_replace_source_artwork() {
+fn groups_roundtrip_and_invalid_data_never_replace_source_artwork() {
     let (original, tiles, layers, _) = fixture();
     let memory = MemoryProjectDb::open(&original, MAX_NTDR_BYTES).unwrap();
     let mut root = layers.root().clone();
@@ -187,12 +267,19 @@ fn unsupported_groups_corruption_and_invalid_pixels_never_replace_source_artwork
         .unwrap();
     let grouped = memory.into_bytes().unwrap();
     let preserved = grouped.clone();
-    assert!(
-        WebProject::decode_ntdr(&grouped)
-            .err()
-            .expect("groups must be rejected")
-            .contains("groups")
-    );
+    let mut web = WebProject::decode_ntdr(&grouped).unwrap();
+    assert_eq!(web.layers(), &tree);
+    web.apply_layer_command(nyatidraw_api::LayerCommand::Reorder {
+        node: nyatidraw_api::LayerTreeNodeId::Raster(LayerId(19)),
+        new_parent: GroupId(99),
+        index: 0,
+    })
+    .unwrap();
+    let nested_tree = web.layers().clone();
+    let bytes = web.encode_ntdr().unwrap();
+    let reopened = WebProject::decode_ntdr(&bytes).unwrap();
+    assert_eq!(reopened.layers(), &nested_tree);
+    assert_eq!(reopened.snapshot(), web.snapshot());
     assert_eq!(grouped, preserved);
     assert!(WebProject::decode_ntdr(b"invalid nonempty file").is_err());
     assert_eq!(

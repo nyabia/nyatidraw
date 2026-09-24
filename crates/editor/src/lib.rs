@@ -2,9 +2,14 @@
 
 use std::collections::BTreeMap;
 
+pub mod gesture;
+pub mod layer_edit;
+pub mod pixel_edit;
 mod projection;
+pub mod transform;
+pub mod transform_gesture;
 
-pub use projection::{ProjectionError, ProjectionState};
+pub use projection::{ProjectionError, ProjectionState, project_children};
 
 use nyatidraw_api::{
     HISTORY_PROJECTION_MAX_ENTRIES, HistoryBranchProjection, HistoryEntryProjection, HistoryNodeId,

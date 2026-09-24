@@ -4,6 +4,8 @@ use web_sys::HtmlCanvasElement;
 
 #[wasm_bindgen(module = "/src/browser.js")]
 extern "C" {
+    #[wasm_bindgen(js_name = mountCanvas)]
+    pub fn mount_canvas();
     #[wasm_bindgen(js_name = monotonicNow)]
     pub fn monotonic_now() -> f64;
     #[wasm_bindgen(js_name = recordWork)]

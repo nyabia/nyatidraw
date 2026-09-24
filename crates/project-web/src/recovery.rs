@@ -5,7 +5,7 @@ use nyatidraw_web_core::{BrushSettings, MAX_RESIDENT_TILES, WebDocument, WebPref
 
 use crate::{MAX_NTDR_BYTES, WebProject, message};
 
-const MAGIC: &[u8; 8] = b"NYWORK01";
+const MAGIC: &[u8; 8] = b"NYWORK02";
 const MAX_METADATA_BYTES: usize = 128 * 1024;
 const MAX_REQUEST_BYTES: usize =
     MAX_NTDR_BYTES + MAX_RESIDENT_TILES * (TILE_BYTE_LEN + 25) + MAX_METADATA_BYTES + 512;
@@ -267,6 +267,23 @@ fn put_preferences(
     bytes.extend_from_slice(&[selected, preferences.tool as u8]);
     bytes.extend_from_slice(&preferences.foreground);
     bytes.extend_from_slice(&preferences.background);
+    let edit = preferences.edit_settings;
+    bytes.extend_from_slice(&[
+        match edit.source {
+            nyatidraw_api::EditSource::ActiveLayer => 0,
+            nyatidraw_api::EditSource::AllVisible => 1,
+            nyatidraw_api::EditSource::ReferenceLayers => 2,
+        },
+        edit.tolerance,
+        match edit.selection_mode {
+            nyatidraw_api::SelectionMode::Replace => 0,
+            nyatidraw_api::SelectionMode::Add => 1,
+            nyatidraw_api::SelectionMode::Subtract => 2,
+        },
+        edit.fill.gap_close_px,
+        edit.fill.expand_px,
+        u8::from(edit.fill.antialias),
+    ]);
     for brush in preferences.brushes {
         for value in [brush.size_px, brush.opacity, brush.hardness] {
             bytes.extend_from_slice(&value.to_le_bytes());
@@ -294,6 +311,33 @@ fn read_preferences(
         .ok_or("Invalid recovery brush")?;
     let foreground = reader.array()?;
     let background = reader.array()?;
+    let source = match reader.byte()? {
+        0 => nyatidraw_api::EditSource::ActiveLayer,
+        1 => nyatidraw_api::EditSource::AllVisible,
+        2 => nyatidraw_api::EditSource::ReferenceLayers,
+        _ => return Err("Invalid edit source".into()),
+    };
+    let tolerance = reader.byte()?;
+    let selection_mode = match reader.byte()? {
+        0 => nyatidraw_api::SelectionMode::Replace,
+        1 => nyatidraw_api::SelectionMode::Add,
+        2 => nyatidraw_api::SelectionMode::Subtract,
+        _ => return Err("Invalid selection mode".into()),
+    };
+    let fill = nyatidraw_api::FillSettings {
+        gap_close_px: reader.byte()?,
+        expand_px: reader.byte()?,
+        antialias: reader.boolean()?,
+    };
+    if fill.gap_close_px > 8 || fill.expand_px > 64 {
+        return Err("Invalid fill settings".into());
+    }
+    let edit_settings = nyatidraw_api::EditSettings {
+        source,
+        tolerance,
+        selection_mode,
+        fill,
+    };
     let mut brushes = WebTool::ALL.map(BrushSettings::for_tool);
     for brush in &mut brushes {
         *brush = BrushSettings {
@@ -309,6 +353,7 @@ fn read_preferences(
     }
     Ok((
         WebPreferences {
+            edit_settings,
             tool,
             brushes,
             foreground,

@@ -1,55 +1,59 @@
-//! Disposable transform state owned by the project worker, never by the GPU.
 use crate::artwork_clipboard::{ArtworkClipboard, SystemClipboard};
 use crate::edit_worker::EditFailure;
 use nyatidraw_api::{
-    AffineTransform, CanvasSpec, ContentRootId, HistoryNodeId, HistoryProjection, LayerId,
-    LayerTreeNodeId, SnapshotId, TransformCommand, TransformProjection,
+    CanvasSpec, HistoryNodeId, HistoryProjection, LayerId, SnapshotId, TransformCommand,
 };
-use nyatidraw_document::{LayerNode, LayerTree, LayerTreeNode};
-use nyatidraw_editor::HeadlessStrokeSession;
-use nyatidraw_paint_cpu::{AffineDraft, EditLimits, SelectionMask, paste_fragment, selection_all};
+use nyatidraw_document::LayerTree;
+use nyatidraw_editor::{
+    HeadlessStrokeSession,
+    transform::{TransformError, TransformSession, TransformStore},
+};
+use nyatidraw_paint_cpu::SelectionMask;
 use nyatidraw_project_redb::ProjectDb;
-use nyatidraw_tiles::{TILE_BYTE_LEN, TileSnapshot};
+use nyatidraw_tiles::TileSnapshot;
 use std::sync::Arc;
 
 #[derive(Default)]
-pub(crate) struct TransformWorker {
-    draft: Option<Transaction>,
-    generation: u64,
-}
-
-struct Transaction {
-    snapshot: SnapshotId,
-    original: TileSnapshot,
-    original_tree: LayerTree,
-    original_selection: Option<Arc<SelectionMask>>,
-    original_layer: LayerId,
-    canvas: CanvasSpec,
-    source: TileSnapshot,
-    tree: LayerTree,
-    layer: LayerId,
-    selection: Arc<SelectionMask>,
-    affine: AffineDraft,
-    projection: TransformProjection,
-    displayed: TileSnapshot,
-    displayed_selection: Arc<SelectionMask>,
-    retained_bytes: u64,
-}
+pub(crate) struct TransformWorker(TransformSession);
 
 pub(crate) struct TransformOutcome {
     pub(crate) tiles: TileSnapshot,
     pub(crate) tree: LayerTree,
     pub(crate) active_layer: LayerId,
     pub(crate) selection: Option<Arc<SelectionMask>>,
-    pub(crate) projection: Option<TransformProjection>,
+    pub(crate) projection: Option<nyatidraw_api::TransformProjection>,
     pub(crate) committed: bool,
     pub(crate) history: HistoryProjection,
 }
-
-fn rejected(error: impl std::fmt::Debug) -> EditFailure {
-    EditFailure::Rejected(format!("Transform: {error:?}"))
+struct DurableTransform<'a> {
+    session: &'a mut HeadlessStrokeSession,
+    db: &'a ProjectDb,
 }
-
+impl TransformStore for DurableTransform<'_> {
+    fn current_snapshot(&self) -> SnapshotId {
+        self.session.current_snapshot()
+    }
+    fn tiles(&self) -> &TileSnapshot {
+        self.session.tiles()
+    }
+    fn commit(&mut self, id: u128, tiles: TileSnapshot, tree: &LayerTree) -> Result<(), String> {
+        let batch = self
+            .session
+            .prepare_structural_change(
+                SnapshotId(id),
+                HistoryNodeId(id),
+                crate::native_canvas::system_timestamp_ns(),
+                tiles,
+            )
+            .map_err(|e| format!("transform prepare: {e:?}"))?;
+        self.db
+            .commit_structural_with_layer_tree(&batch, tree)
+            .map_err(|e| format!("transform commit: {e}"))?;
+        self.session
+            .accept_structural_change(&batch)
+            .map_err(|e| format!("transform accept: {e:?}"))
+    }
+}
 impl TransformWorker {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute(
@@ -75,12 +79,7 @@ impl TransformWorker {
             &mut SystemClipboard,
         )
     }
-
-    #[allow(
-        clippy::too_many_arguments,
-        clippy::too_many_lines,
-        clippy::needless_pass_by_value
-    )]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_with_clipboard(
         &mut self,
         command: TransformCommand,
@@ -93,276 +92,40 @@ impl TransformWorker {
         db: &ProjectDb,
         clipboard: &mut dyn ArtworkClipboard,
     ) -> Result<TransformOutcome, EditFailure> {
-        match command {
-            TransformCommand::Begin | TransformCommand::Paste => {
-                if command == TransformCommand::Begin
-                    && tree.raster(target).is_some_and(|layer| layer.alpha_locked)
-                {
-                    return Err(rejected(
-                        "투명도 잠금 중에는 변형할 수 없습니다. 잠금을 해제하세요.",
-                    ));
-                }
-                if self.draft.is_some() {
-                    return Err(rejected("먼저 현재 변형을 확정하거나 취소하세요."));
-                }
-                let generation = self.next_generation()?;
-                let mut source = session.tiles().clone();
-                let mut source_tree = tree.clone();
-                let mut layer = target;
-                let mut retained_bytes = 0;
-                let mask = if command == TransformCommand::Paste {
-                    let fragment = clipboard.read().map_err(EditFailure::Rejected)?;
-                    let id = crate::native_canvas::next_layer_node_id(tree)
-                        .map_err(EditFailure::Rejected)?
-                        .max(*next_id);
-                    id.checked_add(1)
-                        .ok_or_else(|| rejected("IdentifierExhausted"))?;
-                    layer = LayerId(id);
-                    let (parent, index) = tree
-                        .parent_and_index(LayerTreeNodeId::Raster(target))
-                        .ok_or_else(|| rejected("붙여넣기 위치 레이어가 없습니다."))?;
-                    source_tree
-                        .insert(
-                            parent,
-                            index + 1,
-                            LayerTreeNode::Raster(LayerNode {
-                                alpha_locked: false,
-                                clip_to_below: false,
-                                blend_mode: nyatidraw_api::LayerBlendMode::Normal,
-                                id: layer,
-                                name: "붙여넣기".into(),
-                                visible: true,
-                                locked: false,
-                                reference: false,
-                                opacity_u16: u16::MAX,
-                                content_root: ContentRootId(0),
-                            }),
-                        )
-                        .map_err(rejected)?;
-                    let pasted = paste_fragment(
-                        session.tiles(),
-                        &source_tree,
-                        layer,
-                        &fragment,
-                        EditLimits::default(),
-                    )
-                    .map_err(rejected)?;
-                    retained_bytes =
-                        (pasted.changed_tiles.len() as u64).saturating_mul(TILE_BYTE_LEN as u64);
-                    source = pasted.after;
-                    Arc::new(
-                        selection_all(fragment.origin(), fragment.size(), EditLimits::default())
-                            .map_err(rejected)?,
-                    )
-                } else {
-                    selection
-                        .clone()
-                        .ok_or_else(|| rejected("먼저 변형할 영역을 선택하세요."))?
-                };
-                let (origin, size) = mask
-                    .bounds_signed()
-                    .ok_or_else(|| rejected("EmptySelection"))?;
-                // The draft owns another binary source mask. Include retained
-                // source masks/provisional paste payload in the preview budget.
-                retained_bytes = retained_bytes.saturating_add(
-                    u64::from(mask.dimensions()[0]) * u64::from(mask.dimensions()[1]) * 2,
-                );
-                let mut affine = AffineDraft::new(
-                    session.current_snapshot(),
-                    &source,
-                    &source_tree,
-                    layer,
-                    &mask,
-                )
-                .map_err(rejected)?;
-                let transform = AffineTransform::default();
-                let result = affine
-                    .preview(generation, &transform, preview_limits(retained_bytes)?)
-                    .map_err(rejected)?;
-                let projection = TransformProjection {
-                    generation,
-                    transform,
-                    origin,
-                    size,
-                    corners_milli: corners_milli(result.corners),
-                    can_commit: true,
-                };
-                let displayed = result.paint.after.clone();
-                let displayed_selection = Arc::new(result.selection.clone());
-                self.draft = Some(Transaction {
-                    snapshot: session.current_snapshot(),
-                    original: session.tiles().clone(),
-                    original_tree: tree.clone(),
-                    original_selection: selection.clone(),
-                    original_layer: target,
-                    canvas,
-                    source,
-                    tree: source_tree,
-                    layer,
-                    selection: mask,
-                    affine,
-                    projection,
-                    displayed,
-                    displayed_selection,
-                    retained_bytes,
-                });
-            }
-            TransformCommand::Preview(transform) => {
-                let generation = self.next_generation()?;
-                let tx = self.draft.as_mut().ok_or_else(|| rejected("NoTransform"))?;
-                tx.projection.can_commit = false;
-                tx.guard(target, canvas, tree, selection, session)?;
-                let [width, height] = tx.displayed_selection.dimensions();
-                let retained = tx
-                    .retained_bytes
-                    .saturating_add(u64::from(width) * u64::from(height));
-                let result = tx
-                    .affine
-                    .preview(generation, &transform, preview_limits(retained)?)
-                    .map_err(rejected)?;
-                tx.projection.generation = generation;
-                tx.projection.transform = transform;
-                tx.projection.corners_milli = corners_milli(result.corners);
-                tx.projection.can_commit = true;
-                tx.displayed = result.paint.after.clone();
-                tx.displayed_selection = Arc::new(result.selection.clone());
-            }
-            TransformCommand::Commit { generation } => {
-                let tx = self.draft.as_ref().ok_or_else(|| rejected("NoTransform"))?;
-                if !tx.projection.can_commit {
-                    return Err(rejected("미리보기를 다시 갱신한 뒤 확정하세요."));
-                }
-                tx.guard(target, canvas, tree, selection, session)?;
-                let result = tx
-                    .affine
-                    .prepare_commit(
-                        generation,
-                        tx.snapshot,
-                        &tx.source,
-                        &tx.tree,
-                        tx.layer,
-                        &tx.selection,
-                    )
-                    .map_err(rejected)?;
-                let after = result.paint.after.clone();
-                let retained_selection = Arc::new(result.selection.clone());
-                let changed = after.root() != tx.original.root() || tx.tree != tx.original_tree;
-                if changed {
-                    // Reserve both provisional layer and operation identifiers
-                    // only at successful commit; Cancel consumes no document id.
-                    let id = (*next_id).max(tx.layer.0.saturating_add(1));
-                    let next = id
-                        .checked_add(1)
-                        .ok_or_else(|| rejected("IdentifierExhausted"))?;
-                    let batch = session
-                        .prepare_structural_change(
-                            SnapshotId(id),
-                            HistoryNodeId(id),
-                            crate::native_canvas::system_timestamp_ns(),
-                            after.clone(),
-                        )
-                        .map_err(|e| EditFailure::Fatal(format!("transform prepare: {e:?}")))?;
-                    db.commit_structural_with_layer_tree(&batch, &tx.tree)
-                        .map_err(|e| EditFailure::Fatal(format!("transform commit: {e}")))?;
-                    session
-                        .accept_structural_change(&batch)
-                        .map_err(|e| EditFailure::Fatal(format!("transform accept: {e:?}")))?;
-                    *next_id = next;
-                }
-                *selection = Some(retained_selection);
-                let outcome = TransformOutcome {
-                    tiles: after,
-                    tree: tx.tree.clone(),
-                    active_layer: tx.layer,
-                    selection: selection.clone(),
-                    projection: None,
-                    committed: changed,
-                    history: session.history_projection(),
-                };
-                self.draft = None;
-                return Ok(outcome);
-            }
-            TransformCommand::Cancel => {
-                let tx = self.draft.as_ref().ok_or_else(|| rejected("NoTransform"))?;
-                // A stale source may not be visually rolled back over newer
-                // artwork. Normal actor routing prevents edits during drafts.
-                tx.guard(target, canvas, tree, selection, session)?;
-                let outcome = TransformOutcome {
-                    tiles: tx.original.clone(),
-                    tree: tx.original_tree.clone(),
-                    active_layer: tx.original_layer,
-                    selection: tx.original_selection.clone(),
-                    projection: None,
-                    committed: false,
-                    history: session.history_projection(),
-                };
-                self.draft = None;
-                return Ok(outcome);
-            }
-        }
-        let tx = self.draft.as_ref().ok_or_else(|| rejected("NoTransform"))?;
+        let result = self
+            .0
+            .execute(
+                command,
+                target,
+                canvas,
+                tree,
+                selection,
+                &mut DurableTransform { session, db },
+                next_id,
+                clipboard,
+            )
+            .map_err(|error| match error {
+                TransformError::Rejected(message) => EditFailure::Rejected(message),
+                TransformError::Fatal(message) => EditFailure::Fatal(message),
+            })?;
         Ok(TransformOutcome {
-            tiles: tx.displayed.clone(),
-            tree: tx.tree.clone(),
-            active_layer: tx.layer,
-            selection: Some(tx.displayed_selection.clone()),
-            projection: Some(tx.projection.clone()),
-            committed: false,
+            tiles: result.tiles,
+            tree: result.tree,
+            active_layer: result.active_layer,
+            selection: result.selection,
+            projection: result.projection,
+            committed: result.committed,
             history: session.history_projection(),
         })
     }
-
-    fn next_generation(&mut self) -> Result<u64, EditFailure> {
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| rejected("GenerationExhausted"))?;
-        Ok(self.generation)
-    }
-}
-
-impl Transaction {
-    #[allow(clippy::ref_option)] // Equality against the pinned optional Arc is the source guard.
-    fn guard(
-        &self,
-        target: LayerId,
-        canvas: CanvasSpec,
-        tree: &LayerTree,
-        selection: &Option<Arc<SelectionMask>>,
-        session: &HeadlessStrokeSession,
-    ) -> Result<(), EditFailure> {
-        if target != self.layer
-            || canvas != self.canvas
-            || tree != &self.original_tree
-            || selection != &self.original_selection
-            || session.current_snapshot() != self.snapshot
-            || session.tiles().root() != self.original.root()
-        {
-            return Err(rejected("SourceChanged"));
-        }
-        Ok(())
-    }
-}
-
-fn preview_limits(retained_bytes: u64) -> Result<EditLimits, EditFailure> {
-    let mut limits = EditLimits::default();
-    limits.max_workspace_bytes = limits
-        .max_workspace_bytes
-        .checked_sub(retained_bytes)
-        .ok_or_else(|| rejected("LimitExceeded"))?;
-    Ok(limits)
-}
-
-#[allow(clippy::cast_possible_truncation)]
-fn corners_milli(corners: [[f64; 2]; 4]) -> [[i64; 2]; 4] {
-    // Affine preflight has already bounded finite geometry to signed pixels.
-    corners.map(|point| point.map(|value| (value * 1_000.0).round() as i64))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::artwork_clipboard::MemoryClipboard;
+    use nyatidraw_api::AffineTransform;
+    use nyatidraw_paint_cpu::{EditLimits, selection_all};
     use nyatidraw_paint_cpu::{RasterFragment, flatten_layer_tree_rgba8};
 
     #[test]

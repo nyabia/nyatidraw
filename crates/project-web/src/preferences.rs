@@ -1,6 +1,4 @@
-use nyatidraw_api::{
-    BrushSettings as NativeBrushSettings, DrawingTool, EditSettings, PencilTemplate,
-};
+use nyatidraw_api::{BrushSettings as NativeBrushSettings, DrawingTool, PencilTemplate};
 use nyatidraw_project::{ProjectBrushState, ProjectToolState};
 use nyatidraw_web_core::{BrushSettings, WebPreferences, WebTool};
 
@@ -28,6 +26,7 @@ pub(super) fn to_web(state: ProjectToolState) -> WebPreferences {
         };
     }
     WebPreferences {
+        edit_settings: state.edit_settings,
         tool: NATIVE_TO_WEB[usize::from(state.last_painting_slot)],
         brushes,
         foreground: state.color,
@@ -97,7 +96,7 @@ pub(super) fn to_native(
         last_painting_slot: slot,
         color: preferences.foreground,
         background_color: preferences.background,
-        edit_settings: original.map_or_else(EditSettings::default, |state| state.edit_settings),
+        edit_settings: preferences.edit_settings,
         remembered,
     })
 }

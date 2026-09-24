@@ -2,10 +2,9 @@ use dioxus::prelude::ReadableExt;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use nyatidraw_api::{
-    BrushSettings, DockCommand, DockTree, DrawingTool, EditCommand, EditorCommand, EditorEvent,
-    EventEnvelope, HistoryCommand, HistoryEntryProjection, HistoryOperationLabel, LayerCommand,
-    LayerProjection, LayerProjectionKind, LayerTreeNodeId, PencilTemplate, Revision, ToolCommand,
-    UiProjection, ViewportCommand, ViewportProjection, WorkspaceProjection,
+    BrushSettings, DockCommand, DockTree, DrawingTool, EditorCommand, EditorEvent, EventEnvelope,
+    HistoryCommand, HistoryEntryProjection, HistoryOperationLabel, LayerCommand, PencilTemplate,
+    Revision, ToolCommand, UiProjection, ViewportCommand, ViewportProjection, WorkspaceProjection,
 };
 use nyatidraw_editor_ui::{
     UiBackend,
@@ -14,7 +13,7 @@ use nyatidraw_editor_ui::{
     workspace_appearance::WorkspaceAppearance,
 };
 use nyatidraw_input::Point;
-use nyatidraw_web_core::{LayerTreeNode, WebDocument, WebTool};
+use nyatidraw_web_core::{WebDocument, WebTool};
 
 use crate::{browser, runtime::Editor};
 
@@ -31,7 +30,7 @@ struct Preferences {
 impl Preferences {
     fn load(editor: Editor) -> Self {
         let mut preferences = Self::default();
-        for key in ["pins", "heights", "appearance"] {
+        for key in ["pins", "heights", "appearance", "dock"] {
             match browser::load_preference(key) {
                 Ok(Some(value)) if preferences.restore(key, &value).is_none() => editor.warn(
                     "화면 설정 일부를 읽지 못해 기본값을 사용합니다. 그림 데이터는 유지됩니다.",
@@ -48,6 +47,17 @@ impl Preferences {
 
     fn restore(&mut self, key: &str, value: &str) -> Option<()> {
         match key {
+            "dock" => {
+                if value.len() > 16384 {
+                    return None;
+                }
+                let bytes = value
+                    .split(',')
+                    .map(str::parse::<u8>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
+                self.dock = nyatidraw_editor_ui::layout_codec::decode(&bytes).ok()?;
+            }
             "pins" => {
                 let entries: Vec<_> = value.split(':').collect();
                 if entries.len() != 10 {
@@ -172,17 +182,10 @@ impl WebUiBackend {
                     ]
                 }),
             };
-            let frames = document
-                .layers()
-                .root()
-                .children
-                .iter()
-                .filter_map(|node| {
-                    let LayerTreeNode::Raster(layer) = node else {
-                        return None;
-                    };
-                    crate::preview::layer_thumbnail(document, layer.id)
-                        .map(|frame| (layer.id, Arc::new(frame)))
+            let frames = nyatidraw_editor::layer_edit::raster_layer_ids(document.layers())
+                .into_iter()
+                .filter_map(|id| {
+                    crate::preview::layer_thumbnail(document, id).map(|frame| (id, Arc::new(frame)))
                 })
                 .collect();
             (
@@ -203,6 +206,14 @@ impl WebUiBackend {
     }
 
     fn select_tool(&self, tool: DrawingTool) -> Result<(), String> {
+        if self
+            .editor
+            .read(|r| r.document.transform_projection().is_some())
+            .unwrap_or(false)
+        {
+            self.editor
+                .try_edit(WebDocument::finish_transform_for_tool_switch)?;
+        }
         let web_tool = match tool {
             DrawingTool::Pencil => Some(
                 if self.preferences.borrow().pencil == PencilTemplate::Graphite2B {
@@ -241,12 +252,18 @@ impl WebUiBackend {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn tool_command(&self, command: ToolCommand) -> Result<(), String> {
         match command {
             ToolCommand::Select(tool) => self.select_tool(tool),
             ToolCommand::SelectPencilTemplate(template) => {
+                let previous = self.preferences.borrow().pencil;
                 self.preferences.borrow_mut().pencil = template;
-                self.select_tool(DrawingTool::Pencil)
+                if let Err(error) = self.select_tool(DrawingTool::Pencil) {
+                    self.preferences.borrow_mut().pencil = previous;
+                    return Err(error);
+                }
+                Ok(())
             }
             ToolCommand::CycleBrushFamily => {
                 let tool = self
@@ -259,7 +276,65 @@ impl WebUiBackend {
                     _ => DrawingTool::Pencil,
                 })
             }
-            ToolCommand::CycleSelectionFamily => self.select_tool(DrawingTool::Move),
+            ToolCommand::CycleSelectionFamily => {
+                let tool = self
+                    .editor
+                    .read(|runtime| runtime.selected_tool)
+                    .unwrap_or(DrawingTool::Move);
+                self.select_tool(match tool {
+                    DrawingTool::Move => DrawingTool::MoveSelection,
+                    DrawingTool::MoveSelection => DrawingTool::Wand,
+                    DrawingTool::Wand => DrawingTool::Lasso,
+                    DrawingTool::Lasso => DrawingTool::RectangleSelection,
+                    _ => DrawingTool::Move,
+                })
+            }
+            ToolCommand::CycleFillFamily => {
+                let tool = self
+                    .editor
+                    .read(|runtime| runtime.selected_tool)
+                    .unwrap_or(DrawingTool::Fill);
+                self.select_tool(if tool == DrawingTool::Fill {
+                    DrawingTool::Gradient
+                } else {
+                    DrawingTool::Fill
+                })
+            }
+            ToolCommand::SetSizeMinimumU16(value) => self.brush(|s| s.size_minimum_u16 = value),
+            ToolCommand::SetOpacityMinimumU16(value) => {
+                self.brush(|s| s.opacity_minimum_u16 = value)
+            }
+            ToolCommand::SetEditSource(source) => self.editor.try_preferences(|d| {
+                d.edit_settings.source = source;
+                Ok(())
+            }),
+            ToolCommand::SetEditTolerance(value) => self.editor.try_preferences(|d| {
+                d.edit_settings.tolerance = value;
+                Ok(())
+            }),
+            ToolCommand::SetSelectionMode(mode) => self.editor.try_preferences(|d| {
+                d.edit_settings.selection_mode = mode;
+                Ok(())
+            }),
+            ToolCommand::SetFillSettings(settings) => self.editor.try_preferences(|d| {
+                if settings.gap_close_px > 8 || settings.expand_px > 64 {
+                    return Err(nyatidraw_web_core::WebError::InvalidInput);
+                }
+                d.edit_settings.fill = settings;
+                Ok(())
+            }),
+            ToolCommand::SetFillGapClose(value) => self.editor.try_preferences(|d| {
+                d.edit_settings.fill.gap_close_px = value.min(8);
+                Ok(())
+            }),
+            ToolCommand::SetFillExpansion(value) => self.editor.try_preferences(|d| {
+                d.edit_settings.fill.expand_px = value.min(64);
+                Ok(())
+            }),
+            ToolCommand::SetFillAntialias(value) => self.editor.try_preferences(|d| {
+                d.edit_settings.fill.antialias = value;
+                Ok(())
+            }),
             ToolCommand::CancelGesture => {
                 self.editor.input("cancel", 0.0, 0.0, 0.0, 0.0);
                 Ok(())
@@ -295,7 +370,6 @@ impl WebUiBackend {
                 document.set_background(foreground);
                 Ok(())
             }),
-            _ => Err("이 도구 옵션은 웹판에 아직 연결되지 않았습니다.".into()),
         }
     }
 
@@ -373,61 +447,8 @@ impl WebUiBackend {
     }
 
     fn layer_command(&self, command: LayerCommand) -> Result<(), String> {
-        match command {
-            LayerCommand::AddRaster => self.editor.try_edit(|document| {
-                document.add_layer(&format!(
-                    "Layer {}",
-                    document.layers().root().children.len() + 1
-                ))
-            }),
-            LayerCommand::SetActive(layer) => self
-                .editor
-                .try_preferences(|document| document.set_active_layer(layer)),
-            LayerCommand::SetLocked { layer, locked } => self
-                .editor
-                .try_edit(|document| document.set_layer_locked(layer, locked)),
-            LayerCommand::SetAlphaLocked {
-                layer,
-                alpha_locked,
-            } => self
-                .editor
-                .try_edit(|document| document.set_layer_alpha_locked(layer, alpha_locked)),
-            LayerCommand::SetVisibility {
-                node: LayerTreeNodeId::Raster(layer),
-                visible,
-            } => self
-                .editor
-                .try_edit(|document| document.set_layer_visible(layer, visible)),
-            LayerCommand::SetOpacity {
-                node: LayerTreeNodeId::Raster(layer),
-                opacity_u16,
-            } => self.editor.try_edit(|document| {
-                document.set_layer_opacity(layer, f32::from(opacity_u16) / 65535.0)
-            }),
-            LayerCommand::SetBlendMode {
-                node: LayerTreeNodeId::Raster(layer),
-                blend_mode,
-            } => self
-                .editor
-                .try_edit(|document| document.set_layer_blend_mode(layer, blend_mode)),
-            LayerCommand::Rename {
-                node: LayerTreeNodeId::Raster(layer),
-                name,
-            } => self
-                .editor
-                .try_edit(|document| document.rename_layer(layer, &name)),
-            LayerCommand::Delete(LayerTreeNodeId::Raster(layer)) => self
-                .editor
-                .try_edit(|document| document.delete_layer(layer)),
-            LayerCommand::Reorder {
-                node: LayerTreeNodeId::Raster(layer),
-                index,
-                ..
-            } => self
-                .editor
-                .try_edit(|document| document.reorder_layer(layer, index)),
-            _ => Err("이 레이어 명령은 웹판에 아직 연결되지 않았습니다.".into()),
-        }
+        self.editor
+            .try_edit(|document| document.apply_layer_command(command))
     }
 }
 
@@ -446,7 +467,7 @@ impl UiBackend for WebUiBackend {
             let preset = document.brush_preset();
             projection.workspace = WorkspaceProjection::Ready;
             projection.canvas = document.canvas();
-            projection.active_layer = Some(document.active_layer());
+            projection.active_layer = Some(document.display_active_layer());
             projection.drawing_tool = runtime.selected_tool;
             projection.brush_size_tenths = ratio_u16(settings.size_px * 10.0);
             projection.brush_opacity_u16 = ratio_u16(settings.opacity * 65535.0);
@@ -464,35 +485,22 @@ impl UiBackend for WebUiBackend {
             projection
                 .recent_brush_sizes
                 .clone_from(&runtime.recent_sizes);
-            projection.edit.can_cancel = document.is_drawing();
-            projection.layers = document
-                .layers()
-                .root()
-                .children
-                .iter()
-                .enumerate()
-                .rev()
-                .filter_map(|(index, node)| {
-                    let LayerTreeNode::Raster(layer) = node else {
-                        return None;
-                    };
-                    Some(LayerProjection {
-                        alpha_locked: layer.alpha_locked,
-                        clip_to_below: layer.clip_to_below,
-                        blend_mode: layer.blend_mode,
-                        id: LayerTreeNodeId::Raster(layer.id),
-                        parent: document.layers().root_id(),
-                        index,
-                        depth: 1,
-                        kind: LayerProjectionKind::Raster,
-                        name: layer.name.clone(),
-                        visible: layer.visible,
-                        locked: layer.locked,
-                        reference: layer.reference,
-                        opacity_u16: layer.opacity_u16,
-                    })
-                })
-                .collect();
+            projection.edit.can_cancel = document.is_drawing()
+                || document.selection().is_some()
+                || runtime.gesture.is_some()
+                || document.transform_projection().is_some();
+            projection.edit.transform = document.transform_projection().cloned();
+            projection.edit.has_selection = document.selection().is_some();
+            projection.edit.selected_pixels = document
+                .selection()
+                .map_or(0, |mask| mask.selected_pixels());
+            projection.edit_settings = document.edit_settings;
+            projection.solo_node = document.solo_node();
+            nyatidraw_editor::project_children(
+                document.display_layers().root(),
+                1,
+                &mut projection.layers,
+            );
             projection.history.entries = (0..document.undo_len())
                 .map(|_| HistoryEntryProjection {
                     operation: HistoryOperationLabel::Structural,
@@ -529,69 +537,10 @@ impl UiBackend for WebUiBackend {
             C::History(HistoryCommand::Redo) => {
                 self.editor.read(|r| r.document.can_redo()).unwrap_or(false)
             }
-            C::Project(_)
-            | C::Viewport(_)
-            | C::Edit(EditCommand::ClearActiveLayer | EditCommand::ResizePage { .. })
-            | C::Dock(DockCommand::ActivatePanel(_) | DockCommand::ResetToSafeDefault) => true,
-            C::Tool(tool) => match tool {
-                ToolCommand::Select(value) => matches!(
-                    value,
-                    DrawingTool::Move
-                        | DrawingTool::Pencil
-                        | DrawingTool::Pen
-                        | DrawingTool::Brush
-                        | DrawingTool::Eraser
-                        | DrawingTool::Eyedropper
-                ),
-                ToolCommand::CancelGesture
-                | ToolCommand::CycleBrushFamily
-                | ToolCommand::CycleSelectionFamily
-                | ToolCommand::SelectPencilTemplate(_)
-                | ToolCommand::SetSizeTenths(_)
-                | ToolCommand::AdjustSizeSteps { .. }
-                | ToolCommand::SetOpacityU16(_)
-                | ToolCommand::SetSizePressure(_)
-                | ToolCommand::SetOpacityPressure(_)
-                | ToolCommand::SetHardnessU16(_)
-                | ToolCommand::SetSmoothing(_)
-                | ToolCommand::SetColor(_)
-                | ToolCommand::SwapColors => true,
-                _ => false,
-            },
-            C::Layer(layer) => matches!(
-                layer,
-                LayerCommand::AddRaster
-                    | LayerCommand::SetActive(_)
-                    | LayerCommand::SetLocked { .. }
-                    | LayerCommand::SetAlphaLocked { .. }
-                    | LayerCommand::SetVisibility {
-                        node: LayerTreeNodeId::Raster(_),
-                        ..
-                    }
-                    | LayerCommand::SetOpacity {
-                        node: LayerTreeNodeId::Raster(_),
-                        ..
-                    }
-                    | LayerCommand::SetBlendMode {
-                        node: LayerTreeNodeId::Raster(_),
-                        ..
-                    }
-                    | LayerCommand::Rename {
-                        node: LayerTreeNodeId::Raster(_),
-                        ..
-                    }
-                    | LayerCommand::Delete(LayerTreeNodeId::Raster(_))
-                    | LayerCommand::Reorder {
-                        node: LayerTreeNodeId::Raster(_),
-                        new_parent: nyatidraw_api::GroupId(0),
-                        ..
-                    }
-            ),
-            C::Dock(DockCommand::Replace(dock)) => {
-                same_topology(self.preferences.borrow().dock.root(), dock.root())
-                    && self.preferences.borrow().dock.top() == dock.top()
+            C::Project(_) | C::Viewport(_) | C::Tool(_) | C::Layer(_) | C::Dock(_) | C::Edit(_) => {
+                true
             }
-            _ => false,
+            C::History(_) => false,
         }
     }
 
@@ -621,6 +570,7 @@ impl UiBackend for WebUiBackend {
         {
             return Err("먼저 현재 획을 마쳐주세요.".into());
         }
+        let save_dock = matches!(command, EditorCommand::Dock(_));
         match command {
             EditorCommand::Project(_) => self.editor.download_project(),
             EditorCommand::Tool(command) => return self.tool_command(command),
@@ -632,19 +582,10 @@ impl UiBackend for WebUiBackend {
             EditorCommand::History(HistoryCommand::Redo) => {
                 return self.editor.try_edit(WebDocument::redo);
             }
-            EditorCommand::Edit(EditCommand::ClearActiveLayer) => {
-                return self.editor.try_edit(WebDocument::clear_active_layer);
-            }
-            EditorCommand::Edit(EditCommand::ResizePage {
-                size: [width_px, height_px],
-            }) => {
-                return self.editor.try_edit(|document| {
-                    document.set_canvas(nyatidraw_api::CanvasSpec {
-                        width_px,
-                        height_px,
-                        pixels_per_inch: document.canvas().pixels_per_inch,
-                    })
-                });
+            EditorCommand::Edit(command) => {
+                return self
+                    .editor
+                    .try_edit(|document| document.apply_edit(command));
             }
             EditorCommand::Dock(DockCommand::ActivatePanel(panel)) => {
                 self.preferences.borrow_mut().dock.activate_panel(panel);
@@ -658,7 +599,39 @@ impl UiBackend for WebUiBackend {
                 self.preferences.borrow_mut().dock = dock;
                 self.editor.refresh();
             }
+            EditorCommand::Dock(DockCommand::MovePanel {
+                panel,
+                target,
+                position,
+            }) => {
+                self.preferences
+                    .borrow_mut()
+                    .dock
+                    .dock_panel(panel, target, position)
+                    .map_err(|e| format!("{e:?}"))?;
+                self.editor.refresh();
+            }
+            EditorCommand::Dock(DockCommand::MoveToolbarToTop { panel, before }) => {
+                self.preferences
+                    .borrow_mut()
+                    .dock
+                    .dock_toolbar_top(panel, before)
+                    .map_err(|e| format!("{e:?}"))?;
+                self.editor.refresh();
+            }
             _ => return Err("이 기능은 웹판에 아직 연결되지 않았습니다.".into()),
+        }
+        if save_dock {
+            let encoded =
+                nyatidraw_editor_ui::layout_codec::encode(&self.preferences.borrow().dock);
+            self.save_preference(
+                "dock",
+                &encoded
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
         Ok(())
     }
@@ -769,38 +742,6 @@ pub fn drawing_tool(tool: WebTool) -> DrawingTool {
         WebTool::Pen => DrawingTool::Pen,
         WebTool::SoftBrush => DrawingTool::Brush,
         WebTool::Eraser => DrawingTool::Eraser,
-    }
-}
-
-fn same_topology(left: &nyatidraw_api::DockNode, right: &nyatidraw_api::DockNode) -> bool {
-    use nyatidraw_api::DockNode;
-    match (left, right) {
-        (DockNode::Panel(left), DockNode::Panel(right)) => left == right,
-        (
-            DockNode::Tabs {
-                active: la,
-                panels: lp,
-            },
-            DockNode::Tabs {
-                active: ra,
-                panels: rp,
-            },
-        ) => la == ra && lp == rp,
-        (
-            DockNode::Split {
-                axis: la,
-                first: lf,
-                second: ls,
-                ..
-            },
-            DockNode::Split {
-                axis: ra,
-                first: rf,
-                second: rs,
-                ..
-            },
-        ) => la == ra && same_topology(lf, rf) && same_topology(ls, rs),
-        _ => false,
     }
 }
 

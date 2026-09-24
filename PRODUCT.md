@@ -4,8 +4,10 @@
 
 ## Platform
 
-Windows-first desktop. macOS, Wayland and web remain later ports behind the same
-document/input/repository boundaries.
+Windows-first desktop, with a separately bounded browser edition using the same
+Dioxus editor UI, editing core and `.ntdr` format. Native macOS and Linux remain
+deferred. See [current priorities](docs/sprints/current-priorities.md) and
+[web support boundaries](docs/web-support.md).
 
 ## Stack
 
@@ -17,7 +19,10 @@ brush, history, and project layers do not depend on the UI framework.
 
 Primary user: a digital artist who wants to open a PNG beside a Godot project through the Windows image-opening workflow, draw immediately with a pressure-sensitive pen, and save both the paired editable source and a game-ready export without manual synchronization.
 
-Secondary future users include pixel/2D game artists who need vector layers, animation, timelapse, or a web viewer/editor. A publicly distributed standalone drawing application is a distant product goal, not the current milestone.
+The active workflow also covers illustration practice: rough sketch, shape
+correction, linework, flat color and shading. A public Windows alpha and a web
+experimental edition exist; publication is not a claim of production readiness.
+Vector layers, animation and timelapse remain later work.
 
 ## Product Purpose
 
@@ -39,7 +44,9 @@ The differentiator is one continuous native workflow from pen sample to GPU-visi
 
 ## Capabilities and Constraints
 
-- Raster-first; vector, animation, image editing, web embedding, and canonical Git export are later layers.
+- Raster-first; vector, animation, advanced image editing, embedded-web integrations, and canonical Git export are later layers.
+- Starting a desktop drawing does not require choosing a save location. Local
+  Sketchbook storage supplies recovery; Save As assigns a user-chosen destination.
 - Pressure support is mandatory. Tilt, twist, eraser, and barrel buttons are capability-detected.
 - Native desktop on Windows, macOS, and Linux is the product target; backend coverage may ship in stages.
 - Fast launch, responsive drawing, and bounded shutdown outrank Git-friendly storage.
@@ -50,11 +57,14 @@ The differentiator is one continuous native workflow from pen sample to GPU-visi
 
 ## Evidence on Hand
 
-The Windows vertical slice includes bounded native input, WGPU live ink and
-compositing, immutable signed tiles, redb reopen/history, and an explicit CLI
-export path. The current UI still contains decorative controls and the desktop
-automatic PNG/install workflow is not complete. Target latency and platform
-coverage must not be presented as measured results until their gates pass.
+The Windows alpha includes bounded native input, WGPU live ink and compositing,
+immutable signed tiles, redb reopen/history, paired PNG export, file associations,
+and an installer/update feed. Basic selection, affine transform, fill, gradient,
+layer groups, alpha lock and clipping are implemented. Desktop and web share
+editor commands; browser clipboard, history navigation and file access retain
+explicit host limitations. [Release evidence](docs/releasing.md) and
+[workflow gates](docs/illustration-workflow.md) distinguish implementation,
+local acceptance, public deployment and unverified hardware behavior.
 
 ## Product Principles
 
@@ -68,5 +78,6 @@ coverage must not be presented as measured results until their gates pass.
 
 - The product name is `NyatiDraw` and its editable project extension is `.ntdr`.
 - Dependency versions are locked by `Cargo.lock`; Vello remains a later adapter decision.
-- The first supported Linux display backend and the release threshold for macOS pressure support remain Sprint 0 decisions.
-- Working color space, first-project bit depth, and default tile edge require benchmarks and format review.
+- Linux/macOS input and window adapters remain deferred, not implicitly supported.
+- Current raster storage is 128px RGBA8 tiles. Wider gamut, higher bit depth and
+  advanced color management require separate format and rendering decisions.

@@ -26,6 +26,8 @@ pub struct Runtime {
     pub recent_colors: Vec<[u8; 4]>,
     pub recent_sizes: Vec<u16>,
     pub selected_tool: DrawingTool,
+    pub gesture: Option<nyatidraw_editor::gesture::EditGesture>,
+    transform_drag: Option<(nyatidraw_editor::transform_gesture::TransformGesture, u64)>,
     pub project_epoch: u64,
     pub preview_generation: u64,
     preview_dirty: bool,
@@ -59,6 +61,7 @@ pub struct Editor {
     pub ready: Signal<bool>,
     pub modal: Signal<Option<EditorModal>>,
     pub notice: Signal<Option<String>>,
+    pub picker: Signal<Option<nyatidraw_editor_ui::picker_loupe::PickerSnapshot>>,
 }
 
 impl Editor {
@@ -84,6 +87,7 @@ impl Editor {
     }
 
     pub fn show_modal(mut self, modal: EditorModal) {
+        self.picker.set(None);
         browser::set_modal_open(true);
         self.modal.set(Some(modal));
     }
@@ -129,6 +133,7 @@ impl Editor {
         } else {
             WebProject::from_document(WebDocument::default())
         };
+        browser::mount_canvas();
         let canvas = web_sys::window()
             .and_then(|w| w.document())
             .and_then(|d| d.get_element_by_id("drawing-canvas"))
@@ -158,6 +163,8 @@ impl Editor {
             fit_to_canvas: true,
             recent_sizes: Vec::new(),
             selected_tool,
+            gesture: None,
+            transform_drag: None,
             project_epoch: 1,
             preview_generation: 1,
             preview_dirty: false,
@@ -277,7 +284,10 @@ impl Editor {
         clippy::cast_sign_loss,
         clippy::too_many_lines
     )]
-    pub fn input(self, phase: &str, x: f64, y: f64, pressure: f64, time_ms: f64) {
+    pub fn input(mut self, phase: &str, x: f64, y: f64, pressure: f64, time_ms: f64) {
+        if matches!(phase, "resize" | "cancel" | "overflow" | "begin") {
+            self.picker.set(None);
+        }
         if phase == "dismissModal" {
             self.close_modal();
             return;
@@ -311,6 +321,9 @@ impl Editor {
             let point = Point { x, y };
             match phase {
                 "resize" => {
+                    runtime.transform_drag = None;
+                    runtime.gesture = None;
+                    runtime.renderer.set_gesture_preview(&[], false);
                     save = runtime.document.is_drawing() || runtime.save_pending;
                     let update = runtime.document.cancel_stroke();
                     runtime.apply(&update)?;
@@ -348,8 +361,26 @@ impl Editor {
                     return Ok(());
                 }
                 "cancel" | "overflow" => {
+                    runtime.transform_drag = None;
                     runtime.pan_start = None;
-                    let update = runtime.document.cancel_stroke();
+                    let update = if runtime.document.transform_projection().is_some() {
+                        runtime
+                            .document
+                            .apply_edit(nyatidraw_api::EditCommand::FreeTransform(
+                                nyatidraw_api::TransformCommand::Cancel,
+                            ))
+                            .map_err(|e| e.to_string())?
+                    } else if runtime.gesture.take().is_some() {
+                        CanvasUpdate::default()
+                    } else if runtime.document.is_drawing() {
+                        runtime.document.cancel_stroke()
+                    } else {
+                        runtime
+                            .document
+                            .apply_edit(nyatidraw_api::EditCommand::ClearSelection)
+                            .map_err(|e| e.to_string())?
+                    };
+                    runtime.renderer.set_gesture_preview(&[], false);
                     refresh = true;
                     save = true;
                     runtime.apply(&update)?;
@@ -375,18 +406,156 @@ impl Editor {
                 pressure: pressure as f32,
                 time_ms,
             };
-            if phase == "pickEnd" {
-                let color = runtime
-                    .document
-                    .sample_rgba8(position.x.floor() as i32, position.y.floor() as i32)
-                    .map_err(|error| error.to_string())?;
-                if color[3] == 0 {
-                    return Ok(());
+            if matches!(phase, "pickBegin" | "pickMove" | "pickEnd") {
+                use nyatidraw_editor::pixel_edit::{
+                    PickerSource, picker_color, sample_picker_pixel,
+                };
+                use nyatidraw_editor_ui::picker_loupe::{PickerSnapshot, sample_frame};
+                if runtime.document.transform_projection().is_some() {
+                    return Err("현재 변형을 확정하거나 취소하세요.".into());
                 }
-                runtime.document.set_foreground(color);
-                save = true;
-                refresh = true;
+                let document = &runtime.document;
+                let source = if runtime.selected_tool == DrawingTool::Eyedropper {
+                    PickerSource::Artwork(document.edit_settings.source)
+                } else {
+                    PickerSource::Display(document.solo_node())
+                };
+                let point = [position.x.floor() as i32, position.y.floor() as i32];
+                let sample = |point| {
+                    sample_picker_pixel(
+                        document.snapshot(),
+                        document.layers(),
+                        document.active_layer(),
+                        point,
+                        source,
+                    )
+                    .map_err(|error| error.0)
+                };
+                if phase == "pickEnd" {
+                    self.picker.set(None);
+                    if let Some(color) = picker_color(sample(point)?) {
+                        runtime.document.set_foreground(color);
+                        save = true;
+                        refresh = true;
+                    }
+                } else {
+                    let frame = sample_frame(point, sample)?;
+                    let rect = runtime.canvas.get_bounding_client_rect();
+                    self.picker.set(Some(PickerSnapshot {
+                        cursor_css: [rect.x() + x, rect.y() + y],
+                        frame: Some(std::sync::Arc::new(frame)),
+                        pending: false,
+                        error: None,
+                    }));
+                }
                 return Ok(());
+            }
+            if phase == "begin"
+                && runtime.selected_tool == DrawingTool::MoveSelection
+                && runtime.document.transform_projection().is_none()
+            {
+                let update = runtime
+                    .document
+                    .apply_edit(nyatidraw_api::EditCommand::FreeTransform(
+                        nyatidraw_api::TransformCommand::Begin,
+                    ))
+                    .map_err(|e| e.to_string())?;
+                runtime.apply(&update)?;
+                refresh = true;
+            }
+            if let Some(projection) = runtime.document.transform_projection().cloned()
+                && matches!(phase, "begin" | "move" | "end")
+            {
+                if phase == "begin" {
+                    runtime.transform_drag =
+                        nyatidraw_editor::transform_gesture::TransformGesture::begin(
+                            &projection,
+                            [position.x, position.y],
+                            7.0 / runtime.viewport.zoom,
+                        )
+                        .map(|gesture| (gesture, runtime.viewport.revision));
+                } else if let Some((gesture, revision)) = &runtime.transform_drag {
+                    if *revision != runtime.viewport.revision {
+                        runtime.transform_drag = None;
+                        return Err("화면 이동으로 변형 드래그를 취소했습니다.".into());
+                    }
+                    let candidate = gesture.update([position.x, position.y])?;
+                    let update = runtime
+                        .document
+                        .apply_edit(nyatidraw_api::EditCommand::FreeTransform(
+                            nyatidraw_api::TransformCommand::Preview(candidate),
+                        ))
+                        .map_err(|e| e.to_string())?;
+                    runtime.apply(&update)?;
+                    refresh = true;
+                }
+                if phase == "end" {
+                    runtime.transform_drag = None;
+                }
+                return Ok(());
+            }
+            if runtime.selected_tool.is_edit() && matches!(phase, "begin" | "move" | "end") {
+                let sample = nyatidraw_input::StylusSample {
+                    sequence: 1,
+                    timestamp_ns: (time_ms.max(0.0) * 1_000_000.0) as u64,
+                    device_id: 1,
+                    position_document: position,
+                    pressure: pressure as f32,
+                    phase: match phase {
+                        "begin" => nyatidraw_input::PointerPhase::Begin,
+                        "end" => nyatidraw_input::PointerPhase::End,
+                        _ => nyatidraw_input::PointerPhase::Move,
+                    },
+                    tilt: None,
+                    twist_radians: None,
+                    tangential_pressure: None,
+                    buttons: nyatidraw_input::PenButtons::default(),
+                    eraser: false,
+                    viewport_revision: runtime.viewport.revision,
+                };
+                match phase {
+                    "begin" => {
+                        if runtime.document.transform_projection().is_some() {
+                            return Err("현재 변형을 확정하거나 취소하세요.".into());
+                        }
+                        runtime.gesture = Some(nyatidraw_editor::gesture::EditGesture::begin(
+                            runtime.selected_tool,
+                            runtime.document.edit_settings,
+                            nyatidraw_tiles::color::srgb8_to_linear_premultiplied(
+                                runtime.document.foreground(),
+                            ),
+                            runtime.document.selection().is_some(),
+                            sample,
+                        ));
+                    }
+                    "move" => {
+                        if let Some(gesture) = &mut runtime.gesture {
+                            gesture.push(sample);
+                        }
+                    }
+                    "end" => {
+                        if let Some(gesture) = runtime.gesture.take() {
+                            runtime.renderer.set_gesture_preview(&[], false);
+                            let command = gesture.finish(sample)?;
+                            let update = runtime
+                                .document
+                                .apply_edit(command)
+                                .map_err(|e| e.to_string())?;
+                            save = update.committed;
+                            runtime.apply(&update)?;
+                            refresh = true;
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(gesture) = &runtime.gesture {
+                    let (points, closed) = gesture.preview();
+                    runtime.renderer.set_gesture_preview(points, closed);
+                }
+                return Ok(());
+            }
+            if runtime.document.transform_projection().is_some() && phase == "begin" {
+                return Err("현재 변형을 확정하거나 취소하세요.".into());
             }
             let update = match phase {
                 "begin" => runtime.document.begin_stroke(sample),
@@ -431,6 +600,9 @@ impl Editor {
             Ok(())
         })();
         if let Err(error) = result {
+            if matches!(phase, "pickBegin" | "pickMove" | "pickEnd") {
+                self.picker.set(None);
+            }
             self.warn(error);
         }
         if refresh {
@@ -462,6 +634,10 @@ impl Editor {
                     return;
                 };
                 runtime.frame_pending = false;
+                runtime.renderer.transform_guide(
+                    runtime.document.transform_projection(),
+                    runtime.viewport.zoom,
+                );
                 let result = runtime.renderer.render(runtime.viewport);
                 if result.is_err() {
                     runtime.gpu_failed = true;
@@ -772,6 +948,9 @@ impl Editor {
                     runtime.selected_tool = supported_restored_tool(&document)
                         .unwrap_or_else(|| crate::adapter::drawing_tool(document.tool()));
                     runtime.document = document;
+                    runtime.gesture = None;
+                    runtime.transform_drag = None;
+                    runtime.renderer.set_gesture_preview(&[], false);
                     runtime.project_epoch += 1;
                     runtime.preview_generation += 1;
                     browser::set_canvas_tool(canvas_input_mode(runtime.selected_tool));
@@ -813,7 +992,8 @@ impl Runtime {
             self.renderer.sync_document(&self.document)
         } else {
             self.renderer
-                .upload_dirty(&self.document, &update.dirty_tiles)
+                .upload_dirty(&self.document, &update.dirty_tiles)?;
+            self.renderer.sync_chrome(&self.document)
         }
     }
 
@@ -863,17 +1043,7 @@ impl Runtime {
 }
 
 fn supported_restored_tool(document: &WebProject) -> Option<DrawingTool> {
-    document.restored_tool().filter(|tool| {
-        matches!(
-            tool,
-            DrawingTool::Move
-                | DrawingTool::Eyedropper
-                | DrawingTool::Pencil
-                | DrawingTool::Pen
-                | DrawingTool::Brush
-                | DrawingTool::Eraser
-        )
-    })
+    document.restored_tool()
 }
 
 pub const fn canvas_input_mode(tool: DrawingTool) -> &'static str {
