@@ -3,14 +3,31 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
-## alpha.14 배포 진행
+## alpha.14 배포 확인
 
-[현재 우선순위](sprints/current-priorities.md)의 공용 웹 편집 연결, 변형 도구 전환,
-저장 위치 없는 새 그림·최근 그림/재개를 로컬 검증했다. Windows·웹·Worker release 빌드와
-workspace 테스트/Clippy가 통과했다. 사용자의 배포 승인에 따라 `v0.1.0-alpha.14`를
-현재 시각으로 커밋·태그·공개한다. CI·공개 파일·Pages 확인은 완료 뒤 아래에 기록한다.
-[릴리즈 노트](releases/0.1.0-alpha.14.md)에 설치·하드웨어·정상 종료 등 미검증 경계를 명시했다.
-로컬 설치본은 이번 배포에서 교체하지 않는다.
+- 소스 `a871c3a`, 태그 `v0.1.0-alpha.14`.
+  [Windows CI](https://github.com/nyabia/nyatidraw/actions/runs/35979492861)의
+  테스트·Clippy·release 빌드가 성공했다.
+  [릴리즈 작업](https://github.com/nyabia/nyatidraw/actions/runs/35979493070)의
+  검증·release 빌드·패키징·사전 릴리즈 공개도 통과했다.
+- [공개 릴리즈](https://github.com/nyabia/nyatidraw/releases/tag/v0.1.0-alpha.14)의
+  7개 자산을 내려받아 GitHub SHA256 digest 7/7과 `SHA256SUMS.txt`의 6개 항목을 확인했다.
+- 설치 파일은 14,132,192 bytes,
+  SHA256 `58107836cc4ff54f6cbb362df9f3566aa944d351faa68a2451cf227d64d983ca`.
+  전체 업데이트 패키지는 9,650,656 bytes,
+  SHA256 `8bf6b21437b3da4733823ac0d0a3290c5a447e5c6ea85ff0d0b107357906f4fe`.
+- 피드의 패키지 SHA1/SHA256·길이와 실제 파일이 일치했다. 피드와 포터블의
+  `current/sq.version`은 `PackageId=NyatiDraw`, `Version=0.1.0-alpha.14`,
+  채널 `nyatidraw-alpha`, 실행 파일 `nyatidraw.exe`다. 포터블의 실행 파일·라이선스·
+  타사 고지도 확인했다. 설치/업데이트 설치는 실행하지 않았고 로컬 설치본은 그대로다.
+- [공용 웹 편집 공개 검증](web-support.md#alpha14-공용-편집-공개-검증)에서 변형 후 도구 전환,
+  실제 NTDR 다운로드·native/web 타일 일치·별도 브라우저 프로세스 복구를 확인했다.
+  공개 웹 본체·Worker WASM의 해시도 Pages CI 산출물과 일치했다.
+- [릴리즈 노트](releases/0.1.0-alpha.14.md)에 실제 펜·정상 종료·설치 업데이트 등
+  미검증 항목을 명시했다. 공개 확인을 하드웨어 검수로 확대하지 않는다.
+- 릴리즈 workflow의 Pages 빌드·게시도 성공했으며 산출물의 `release.json`은 alpha.14다.
+  최초 공개 URL 조회는 이전 alpha.13을 반환해, 검증 기록 커밋 후 홈페이지를 별도로
+  다시 게시한다. 기존 태그·릴리즈 파일은 이동하거나 교체하지 않는다.
 
 ## alpha.13 배포 확인
 

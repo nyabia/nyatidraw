@@ -1,8 +1,8 @@
 # 웹 실험판
 
 상태: 데스크톱과 같은 공용 Dioxus 화면과 NTDR 저장 형식을 Pages에 배포했다.
-이후 선택·채우기·변형·그룹·도킹을 공용 편집 코어에 연결한 로컬 빌드를 검증했다.
-이번 확장은 아직 공개 Pages/설치판에 배포하지 않았다. 아래 현재 소스 범위와 과거
+이후 선택·채우기·변형·그룹·도킹을 공용 편집 코어에 연결한 확장도 Pages에 배포했다.
+Windows alpha.14의 패키징·공개 결과는 [배포 기록](releasing.md)에서 확인한다. 아래 현재 소스 범위와 과거
 공용 UI/NTDR 배포 기록, 초기 별도 UI 스파이크 기록을 구분한다.
 같은 화면·포맷이 모든 기능의 동등성을 뜻하지 않으며, 아직 정식 출시 지원 판정은 아니다.
 
@@ -317,6 +317,29 @@ python -m http.server 8766 --bind 127.0.0.1 --directory target/dx/nyatidraw-web/
 웹 산출물을 포함한 사이트를 조립하며, `.github/workflows/pages.yml`은 Linux에서 코어 테스트,
 WASM Clippy, 검증된 DX 설치, 웹 빌드와 Pages 배포를 이어서 수행하도록 구성했다.
 실제 CI 성공·공개 페이지 실행은 아래 검증 근거에 별도로 기록한다.
+
+## alpha.14 공용 편집 공개 검증
+
+- 소스 `a871c3a`의 [Pages 작업](https://github.com/nyabia/nyatidraw/actions/runs/35979492601)이
+  Linux 핵심 테스트·WASM Clippy·release 빌드·개인 경로 검사·게시까지 통과했다.
+- 공개 `/nyatidraw/draw/`를 격리된 Edge 프로필로 열어 WebGPU 표시와 펜 도구의
+  마우스 드로잉을 확인했다. 전체 선택→X 100px 수치 입력→미리보기→연필 도구 전환으로
+  변형을 확정했다. 수치 입력만으로는 미리보기를 실행하지 않는 기존 UI 동작을 유지한다.
+- NTDR 다운로드와 별도 브라우저 프로세스 재시작 후 복구를 확인했다. 변형 후와
+  재시작 후 레이어 미리보기 데이터 SHA256은 모두
+  `e133169d0ba74962119c5b01057846ac3dcbd3167c1a700cf1b04973228ce04a`였다.
+- 공개 웹에서 받은 208,896-byte NTDR를 별도 native `worker_reopen_probe --verify-file`로
+  열어 실제 타일이 존재하고 native/web의 전체 타일 상태가 일치하는지 확인했다.
+  content root는 `d36d945fedfe73513e4103f16f6c259a5853b5c561276676339934210985ed41`이다.
+- 공개 웹 본체와 저장 Worker WASM은 모두 HTTP 200/`application/wasm`이며 해당 Pages
+  CI 산출물과 SHA256이 일치했다. 본체 3,582,474 bytes:
+  `bd855c08343af57c34c5e3bae19bfa6347bd2f4f8f43fb746b79f170a08dc744`,
+  Worker 2,139,195 bytes:
+  `18f1606fe3f401c139ab418a729823245b99ea6ef18961865ed574324571a89a`.
+- 콘솔에는 사이트 루트 `favicon.ico`의 404와 Windows의 WebGPU `powerPreference`
+  경고만 관찰됐다. 검증 프로필은 닫았으며 사용자 브라우저·작품·설치본은 변경하지 않았다.
+- 마우스 조작과 시험 파일 한 개의 재열기는 물리 펜·대형 작품·모든 브라우저의
+  성능/호환성 증거가 아니다. Windows 설치/업데이트 검수도 별개다.
 
 ## 공용 UI 통합 로컬 검증
 
