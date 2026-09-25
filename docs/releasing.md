@@ -3,6 +3,34 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
+## alpha.15 배포 확인
+
+- 소스 `c909455`, 태그 `v0.1.0-alpha.15`.
+  [Windows CI](https://github.com/nyabia/nyatidraw/actions/runs/36097401451)가 성공했다.
+  [릴리즈 작업](https://github.com/nyabia/nyatidraw/actions/runs/36097401374)의
+  검증·release 빌드·패키징·사전 릴리즈 공개가 성공했다.
+- [공개 릴리즈](https://github.com/nyabia/nyatidraw/releases/tag/v0.1.0-alpha.15)의
+  자산 7개를 내려받아 GitHub SHA256 digest와 크기 7/7, `SHA256SUMS.txt`의 6개 항목을
+  확인했다. 설치 파일은 14,132,538 bytes,
+  SHA256 `00f8cb27b0ee2ee94d1dfc1967bba5e7bea2fa0a5bfaea293eedcb1013f50f98`다.
+  전체 업데이트 패키지는 9,651,002 bytes,
+  SHA256 `ddd83eba45021484ea0c3d9fe7ac808c78d06e3f58216f9eb60719240493d25c`다.
+  피드의 제품 ID·버전·크기·SHA1/SHA256과 실제 파일이 일치했고, 포터블 manifest의
+  `NyatiDraw` / `0.1.0-alpha.15` / `nyatidraw.exe` 및 라이선스·타사 고지도 확인했다.
+- 릴리즈 workflow의 Pages 게시까지 성공했고 산출물의 `release.json`은 alpha.15다.
+  최초 공개 URL과 실제 브라우저의 설치 버튼은 이전 alpha.14를 반환하여 홈페이지만
+  별도로 재게시한다. 기존 태그 및 릴리즈 자산은 교체하지 않는다.
+- [웹 게시](https://github.com/nyabia/nyatidraw/actions/runs/36097401358)가 성공했다.
+  공개 웹 본체 WASM SHA256은
+  `94ead639da565388799116e618936f234063b1b2f0b73db6094b8bf6794a21b0`,
+  Worker는 `a6f0711b5d9bf29381f37b3db4a7a7bccd80221ce045fbeab6086f36ff90672b`로
+  각각 Pages CI 산출물과 일치했다.
+- 격리 Edge에서 선택 기본 차단/입력란 허용, 2B/17px/63% 설정 후 펜 전환과
+  프로세스 재시작, 연필 복귀 시 값 복원을 확인했다. 공개 웹에서 획을 만든 `.ntdr`을
+  실제 내려받아 별도 native probe로 열었고 native/web artwork root가 일치했다.
+- [릴리즈 노트](releases/0.1.0-alpha.15.md)에 실제 iPad Safari·물리 펜·desktop 창의
+  Save/Save As 재시험·설치 업데이트는 미검증으로 명시했다. 사용자 작품과 설치본은 변경하지 않았다.
+
 ## alpha.14 배포 확인
 
 - 소스 `a871c3a`, 태그 `v0.1.0-alpha.14`.
