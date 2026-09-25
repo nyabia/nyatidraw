@@ -70,7 +70,8 @@ Worker 내부 전달 형식 `NYWORK03`은 비연필 도구를 선택한 경우�
   읽기 전용일 때 선택 차단, 이름 수정 중에는 전체 선택 가능함을 확인했다.
 - 위 브라우저 검증은 Windows Edge이며 실제 iPad Safari 길게 누르기·물리 펜 검증을 뜻하지
   않는다. 공용 CSS에 `-webkit-user-select`와 `-webkit-touch-callout`을 적용했다.
-- 공개 배포 및 설치본 교체는 하지 않았다. 이번 desktop 변경은 핵심 검사/컴파일로 검증했으며
+- 이후 alpha.15 공개 배포와 공개 웹 검증을 완료했다([배포 기록](releasing.md#alpha15-배포-확인)).
+  로컬 설치본은 교체하지 않았다. 이번 desktop 변경은 핵심 검사/컴파일로 검증했으며
   desktop 창에서 Save/Save As를 재시험하지는 않았다.
 
 ## 이전 데스크톱 검증 기록

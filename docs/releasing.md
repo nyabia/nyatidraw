@@ -18,8 +18,11 @@
   피드의 제품 ID·버전·크기·SHA1/SHA256과 실제 파일이 일치했고, 포터블 manifest의
   `NyatiDraw` / `0.1.0-alpha.15` / `nyatidraw.exe` 및 라이선스·타사 고지도 확인했다.
 - 릴리즈 workflow의 Pages 게시까지 성공했고 산출물의 `release.json`은 alpha.15다.
-  최초 공개 URL과 실제 브라우저의 설치 버튼은 이전 alpha.14를 반환하여 홈페이지만
-  별도로 재게시한다. 기존 태그 및 릴리즈 자산은 교체하지 않는다.
+  최초 공개 URL과 실제 브라우저의 설치 버튼은 이전 alpha.14를 반환했다.
+  검증 기록 커밋 `4ab032f`의
+  [홈페이지 재게시](https://github.com/nyabia/nyatidraw/actions/runs/36098865106) 성공 후
+  기본 `release.json` URL과 실제 Edge의 설치 버튼에서 alpha.15 설치 링크를 확인했다.
+  기존 태그 및 릴리즈 자산은 교체하지 않았다.
 - [웹 게시](https://github.com/nyabia/nyatidraw/actions/runs/36097401358)가 성공했다.
   공개 웹 본체 WASM SHA256은
   `94ead639da565388799116e618936f234063b1b2f0b73db6094b8bf6794a21b0`,
