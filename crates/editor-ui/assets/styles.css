@@ -1,4 +1,5 @@
-* { box-sizing: border-box; }
+* { box-sizing: border-box; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+:where(input:not([type]), input:is([type="text"], [type="search"], [type="email"], [type="url"], [type="tel"], [type="password"], [type="number"]), textarea):not([readonly]):not([disabled]), [contenteditable="true"], [contenteditable="plaintext-only"], [contenteditable="true"] *, [contenteditable="plaintext-only"] * { -webkit-user-select: text; user-select: text; -webkit-touch-callout: initial; }
 html, body, #main, main { width: 100%; height: 100%; margin: 0; overflow: hidden; font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; }
 body { background: #181818; color: #fff; font-size: 12px; user-select: none; }
 button { margin: 0; padding: 0; border: 0; color: inherit; background: transparent; font: inherit; cursor: pointer; }

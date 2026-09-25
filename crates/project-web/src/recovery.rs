@@ -5,7 +5,7 @@ use nyatidraw_web_core::{BrushSettings, MAX_RESIDENT_TILES, WebDocument, WebPref
 
 use crate::{MAX_NTDR_BYTES, WebProject, message};
 
-const MAGIC: &[u8; 8] = b"NYWORK02";
+const MAGIC: &[u8; 8] = b"NYWORK03";
 const MAX_METADATA_BYTES: usize = 128 * 1024;
 const MAX_REQUEST_BYTES: usize =
     MAX_NTDR_BYTES + MAX_RESIDENT_TILES * (TILE_BYTE_LEN + 25) + MAX_METADATA_BYTES + 512;
@@ -71,6 +71,10 @@ impl WebProject {
         )?;
         bytes.extend_from_slice(&self.active_layer().0.to_le_bytes());
         put_preferences(&mut bytes, self.preferences(), self.selected_tool)?;
+        bytes.push(match self.pencil_template {
+            nyatidraw_api::PencilTemplate::Mechanical2H => 0,
+            nyatidraw_api::PencilTemplate::Graphite2B => 1,
+        });
         let count = u32::try_from(self.snapshot().len()).map_err(message)?;
         bytes.extend_from_slice(&count.to_le_bytes());
         for (key, tile) in self.snapshot().iter() {
@@ -195,6 +199,11 @@ fn read_request(
     let layers = decode_layer_tree(reader.blob(MAX_METADATA_BYTES)?).map_err(message)?;
     let active = LayerId(u128::from_le_bytes(reader.array()?));
     let (preferences, selected) = read_preferences(&mut reader)?;
+    let pencil_template = match reader.byte()? {
+        0 => nyatidraw_api::PencilTemplate::Mechanical2H,
+        1 => nyatidraw_api::PencilTemplate::Graphite2B,
+        _ => return Err("Invalid recovery pencil template".into()),
+    };
     let count = usize::try_from(reader.u32()?).map_err(message)?;
     if count > MAX_RESIDENT_TILES {
         return Err("Too many recovery tiles".into());
@@ -231,8 +240,10 @@ fn read_request(
         project.backing.clone_from(&previous.backing);
         project.saved_preferences = previous.saved_preferences;
         project.saved_selected_tool = previous.saved_selected_tool;
+        project.saved_pencil_template = previous.saved_pencil_template;
     }
     project.selected_tool = selected;
+    project.pencil_template = pencil_template;
     Ok(StoredRecovery {
         epoch,
         revision,

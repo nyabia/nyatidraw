@@ -132,9 +132,9 @@ impl WebUiBackend {
     }
 
     fn restore_project_tool(&self) {
-        let Some((epoch, tool)) = self
+        let Some((epoch, pencil_template)) = self
             .editor
-            .read(|runtime| (runtime.project_epoch, runtime.document.tool()))
+            .read(|runtime| (runtime.project_epoch, runtime.document.pencil_template()))
         else {
             return;
         };
@@ -143,11 +143,7 @@ impl WebUiBackend {
             return;
         }
         preferences.project_epoch = epoch;
-        preferences.pencil = if tool == WebTool::Pencil2B {
-            PencilTemplate::Graphite2B
-        } else {
-            PencilTemplate::Mechanical2H
-        };
+        preferences.pencil = pencil_template;
     }
 
     fn update_previews(&self) {

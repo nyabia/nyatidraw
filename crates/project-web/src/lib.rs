@@ -4,7 +4,7 @@
 
 use std::ops::{Deref, DerefMut};
 
-use nyatidraw_api::{CanvasSpec, DrawingTool, HistoryNodeId, SnapshotId};
+use nyatidraw_api::{CanvasSpec, DrawingTool, HistoryNodeId, PencilTemplate, SnapshotId};
 #[cfg(test)]
 use nyatidraw_document::LayerTreeNode;
 use nyatidraw_editor::HeadlessStrokeSession;
@@ -27,6 +27,8 @@ pub struct WebProject {
     saved_preferences: WebPreferences,
     selected_tool: Option<DrawingTool>,
     saved_selected_tool: Option<DrawingTool>,
+    pencil_template: PencilTemplate,
+    saved_pencil_template: PencilTemplate,
     import_notice: Option<&'static str>,
 }
 
@@ -56,12 +58,19 @@ impl WebProject {
     #[must_use]
     pub fn from_document(document: WebDocument) -> Self {
         let saved_preferences = document.preferences();
+        let pencil_template = if document.tool() == nyatidraw_web_core::WebTool::Pencil2B {
+            PencilTemplate::Graphite2B
+        } else {
+            PencilTemplate::Mechanical2H
+        };
         Self {
             document,
             backing: Vec::new(),
             saved_preferences,
             selected_tool: None,
             saved_selected_tool: None,
+            pencil_template,
+            saved_pencil_template: pencil_template,
             import_notice: None,
         }
     }
@@ -71,9 +80,18 @@ impl WebProject {
     /// Rejects corruption and resource limits before replacement, preserving groups.
     pub fn decode_ntdr(bytes: &[u8]) -> Result<Self, String> {
         if bytes.starts_with(b"NYWEB001") {
-            return WebDocument::decode_portable(bytes)
-                .map(Self::from_document)
-                .map_err(message);
+            let mut project =
+                Self::from_document(WebDocument::decode_portable(bytes).map_err(message)?);
+            project.selected_tool = Some(match project.document.tool() {
+                nyatidraw_web_core::WebTool::Pencil2H | nyatidraw_web_core::WebTool::Pencil2B => {
+                    DrawingTool::Pencil
+                }
+                nyatidraw_web_core::WebTool::Pen => DrawingTool::Pen,
+                nyatidraw_web_core::WebTool::SoftBrush => DrawingTool::Brush,
+                nyatidraw_web_core::WebTool::Eraser => DrawingTool::Eraser,
+            });
+            project.saved_selected_tool = project.selected_tool;
+            return Ok(project);
         }
         let memory = MemoryProjectDb::open(bytes, MAX_NTDR_BYTES).map_err(message)?;
         let db = memory.db();
@@ -120,6 +138,8 @@ impl WebProject {
                 .map_err(message)?;
         }
         let selected_tool = decoded.map(|state| state.tool);
+        let pencil_template =
+            decoded.map_or(PencilTemplate::Mechanical2H, |state| state.pencil_template);
         let saved_preferences = document.preferences();
         drop(memory);
         Ok(Self {
@@ -128,6 +148,8 @@ impl WebProject {
             saved_preferences,
             selected_tool,
             saved_selected_tool: selected_tool,
+            pencil_template,
+            saved_pencil_template: pencil_template,
             import_notice,
         })
     }
@@ -144,6 +166,48 @@ impl WebProject {
 
     pub fn set_project_tool(&mut self, tool: DrawingTool) {
         self.selected_tool = Some(tool);
+        if tool == DrawingTool::Pencil {
+            self.pencil_template = if self.document.tool() == nyatidraw_web_core::WebTool::Pencil2B
+            {
+                PencilTemplate::Graphite2B
+            } else {
+                PencilTemplate::Mechanical2H
+            };
+        }
+    }
+
+    #[must_use]
+    pub const fn pencil_template(&self) -> PencilTemplate {
+        self.pencil_template
+    }
+
+    /// # Errors
+    /// Rejects settings that cannot be represented by the shared tool record.
+    pub fn encode_tool_preferences(&self) -> Result<Vec<u8>, String> {
+        let mut state = preferences::to_native(self.preferences(), self.selected_tool, None)?;
+        if state.tool != DrawingTool::Pencil {
+            state.pencil_template = self.pencil_template;
+        }
+        Ok(nyatidraw_project::encode_editor_tool_state(&state))
+    }
+
+    #[must_use]
+    pub fn valid_tool_preferences(bytes: &[u8]) -> bool {
+        decode_editor_tool_state(bytes).is_some()
+    }
+
+    /// # Errors
+    /// Rejects invalid fallback settings without modifying artwork or history.
+    pub fn restore_fallback_tool_preferences(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let state = decode_editor_tool_state(bytes).ok_or("Invalid app tool preferences")?;
+        if self.selected_tool.is_none() && self.import_notice.is_none() {
+            self.document
+                .restore_preferences(preferences::to_web(state))
+                .map_err(message)?;
+            self.selected_tool = Some(state.tool);
+            self.pencil_template = state.pencil_template;
+        }
+        Ok(())
     }
 
     /// Commits an exact structural edit into a copy of the native database.
@@ -202,16 +266,21 @@ impl WebProject {
             .map_err(message)?;
         }
         let current_preferences = self.document.preferences();
-        if self.backing.is_empty()
+        let original = db.load_editor_tool_state().map_err(message)?;
+        if original.is_none()
             || self.saved_preferences != current_preferences
             || self.selected_tool != self.saved_selected_tool
+            || self.pencil_template != self.saved_pencil_template
         {
-            let original = db.load_editor_tool_state().map_err(message)?;
             let decoded = original.as_deref().and_then(decode_editor_tool_state);
             if original.is_some() && decoded.is_none() {
                 return Err("This project has unrecognized tool settings. They were preserved; change them in NyatiDraw Desktop before saving new browser settings.".into());
             }
-            let state = preferences::to_native(current_preferences, self.selected_tool, decoded)?;
+            let mut state =
+                preferences::to_native(current_preferences, self.selected_tool, decoded)?;
+            if state.tool != DrawingTool::Pencil {
+                state.pencil_template = self.pencil_template;
+            }
             db.persist_editor_tool_state(&nyatidraw_project::encode_editor_tool_state(&state))
                 .map_err(message)?;
         }
@@ -219,6 +288,7 @@ impl WebProject {
         self.backing.clone_from(&bytes);
         self.saved_preferences = current_preferences;
         self.saved_selected_tool = self.selected_tool;
+        self.saved_pencil_template = self.pencil_template;
         Ok(bytes)
     }
 }

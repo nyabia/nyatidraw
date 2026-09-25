@@ -9,6 +9,8 @@ mod preview;
 #[cfg(target_arch = "wasm32")]
 mod runtime;
 #[cfg(target_arch = "wasm32")]
+mod tool_preferences;
+#[cfg(target_arch = "wasm32")]
 mod ui;
 
 #[cfg(target_arch = "wasm32")]

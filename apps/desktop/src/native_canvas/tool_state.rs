@@ -73,7 +73,14 @@ fn global_settings_path() -> Option<PathBuf> {
 
 impl Store {
     pub(super) fn load(db: &ProjectDb, live_ink: &LiveInkBridge) -> (Self, Option<DrawingConfig>) {
-        let global_path = global_settings_path();
+        Self::load_with_global_path(db, live_ink, global_settings_path())
+    }
+
+    fn load_with_global_path(
+        db: &ProjectDb,
+        live_ink: &LiveInkBridge,
+        global_path: Option<PathBuf>,
+    ) -> (Self, Option<DrawingConfig>) {
         let global = global_path.as_ref().map_or(Ok(None), |path| {
             let file = match File::open(path) {
                 Ok(file) => file,
@@ -253,6 +260,48 @@ mod tests {
         let mut unsupported = valid;
         unsupported.push(0);
         assert!(decode(&unsupported).is_none());
+    }
+
+    #[test]
+    fn project_brush_state_wins_and_saving_refreshes_both_stores_without_artwork_changes() {
+        let path = std::env::temp_dir().join(format!(
+            "nyatidraw-tool-priority-{}-{}.ntdr",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let global = path.with_extension("tools");
+        let drawing = DrawingConfig::from_projection(&nyatidraw_api::UiProjection::empty());
+        let other = DrawingConfig {
+            size_tenths: 170,
+            color: [123, 45, 67, 255],
+            ..drawing
+        };
+        std::fs::write(&global, encode(other)).unwrap();
+        let bridge = LiveInkBridge::with_capacity(16, nyatidraw_api::LayerId(1));
+        let db = ProjectDb::open(&path).unwrap();
+        assert_eq!(
+            Store::load_with_global_path(&db, &bridge, Some(global.clone())).1,
+            decode(&encode(other))
+        );
+        db.persist_editor_tool_state(&encode(drawing)).unwrap();
+        let (mut store, loaded) = Store::load_with_global_path(&db, &bridge, Some(global.clone()));
+        assert_eq!(loaded, Some(drawing));
+        assert_eq!(std::fs::read(&global).unwrap(), encode(other));
+        store.persist(&db, drawing, &bridge);
+        drop(db);
+        let db = ProjectDb::open(&path).unwrap();
+        assert_eq!(
+            db.load_editor_tool_state().unwrap().unwrap(),
+            encode(drawing)
+        );
+        assert_eq!(std::fs::read(&global).unwrap(), encode(drawing));
+        assert!(db.load_reopened().unwrap().is_none());
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(global).unwrap();
     }
 
     #[test]

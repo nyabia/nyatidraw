@@ -19,6 +19,7 @@ const PREVIEW_DELAY_MS: f64 = 200.0;
 #[allow(clippy::struct_excessive_bools)]
 pub struct Runtime {
     pub document: WebProject,
+    tool_preferences: crate::tool_preferences::AppToolPreferences,
     pub renderer: WebRenderer,
     pub canvas: HtmlCanvasElement,
     pub viewport: ViewportTransform,
@@ -126,13 +127,15 @@ impl Editor {
             .await
             .map_err(|e| browser::error_text(&e))?;
         let restored = !saved.is_null();
-        let document = if restored {
+        let mut document = if restored {
             WebProject::decode_ntdr(&Uint8Array::new(&saved).to_vec()).map_err(|e| {
                 format!("저장된 작업을 열지 못했습니다. 원본 복구 데이터는 유지됩니다: {e}")
             })?
         } else {
             WebProject::from_document(WebDocument::default())
         };
+        let (tool_preferences, tool_notice) = crate::tool_preferences::AppToolPreferences::load();
+        tool_preferences.restore_fallback(&mut document)?;
         browser::mount_canvas();
         let canvas = web_sys::window()
             .and_then(|w| w.document())
@@ -147,6 +150,7 @@ impl Editor {
             .unwrap_or_else(|| crate::adapter::drawing_tool(document_tool));
         let mut runtime = Runtime {
             document,
+            tool_preferences,
             renderer,
             canvas: canvas.clone(),
             viewport: ViewportTransform {
@@ -200,6 +204,9 @@ impl Editor {
         self.refresh();
         self.redraw();
         if let Some(notice) = import_notice {
+            self.warn(notice);
+        }
+        if let Some(notice) = tool_notice {
             self.warn(notice);
         }
         Ok(())
@@ -690,14 +697,23 @@ impl Editor {
         });
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn persist(self) {
+        self.persist_recovery(true);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn persist_recovery(self, save_app_preferences: bool) {
         let cell = self.runtime.peek().clone();
         {
             let mut borrow = cell.borrow_mut();
             let Some(runtime) = borrow.as_mut() else {
                 return;
             };
+            if save_app_preferences
+                && let Err(error) = runtime.tool_preferences.save(&runtime.document)
+            {
+                self.warn(error);
+            }
             let now = browser::monotonic_now();
             if !runtime.save_pending {
                 runtime.save_due_by = now + RECOVERY_MAX_WAIT_MS;
@@ -812,6 +828,11 @@ impl Editor {
     }
 
     pub fn download_project(self) {
+        if let Some(runtime) = self.runtime.peek().borrow_mut().as_mut()
+            && let Err(error) = runtime.tool_preferences.save(&runtime.document)
+        {
+            self.warn(error);
+        }
         if !self.read(|runtime| runtime.worker_failed).unwrap_or(true) {
             if let Some(runtime) = self.runtime.peek().borrow_mut().as_mut() {
                 runtime.download_pending = true;
@@ -932,7 +953,7 @@ impl Editor {
         self.show_modal(EditorModal::ReplaceDocument);
     }
 
-    fn replace(self, document: WebProject) {
+    fn replace(self, mut document: WebProject) {
         let import_notice = document.import_notice();
         let cell = self.runtime.peek().clone();
         let result = {
@@ -942,6 +963,9 @@ impl Editor {
             };
             if runtime.document.is_drawing() {
                 return;
+            }
+            if let Err(error) = runtime.tool_preferences.restore_fallback(&mut document) {
+                return self.warn(error);
             }
             match runtime.renderer.sync_document(&document) {
                 Ok(()) => {
@@ -973,7 +997,7 @@ impl Editor {
             Ok(()) => {
                 self.refresh();
                 self.redraw();
-                self.persist();
+                self.persist_recovery(false);
                 if let Some(notice) = import_notice {
                     self.warn(notice);
                 }

@@ -8,6 +8,57 @@ use nyatidraw_web_core::{StrokePoint, WebTool};
 use super::*;
 
 #[test]
+fn file_first_tool_fallback_and_worker_save_preserve_brush_state_without_changing_artwork() {
+    let legacy = MemoryProjectDb::open(&[], MAX_NTDR_BYTES)
+        .unwrap()
+        .into_bytes()
+        .unwrap();
+    let mut without_settings = WebProject::decode_ntdr(&legacy).unwrap();
+    let saved_defaults = without_settings.encode_ntdr().unwrap();
+    assert!(
+        WebProject::decode_ntdr(&saved_defaults)
+            .unwrap()
+            .restored_tool()
+            .is_some()
+    );
+    let (original, tiles, _, _) = fixture();
+    let mut recent = WebProject::from_document(WebDocument::default());
+    recent.select_tool(WebTool::Pencil2B).unwrap();
+    recent.set_project_tool(DrawingTool::Pencil);
+    let mut settings = recent.brush_settings();
+    settings.size_px = 17.0;
+    settings.opacity = 0.63;
+    recent.set_brush_settings(settings).unwrap();
+    recent.set_foreground([12, 34, 56, 255]);
+    recent.select_tool(WebTool::Pen).unwrap();
+    recent.set_project_tool(DrawingTool::Pen);
+    let fallback = recent.encode_tool_preferences().unwrap();
+    let mut existing = WebProject::decode_ntdr(&original).unwrap();
+    let file_settings = existing.encode_tool_preferences().unwrap();
+    existing
+        .restore_fallback_tool_preferences(&fallback)
+        .unwrap();
+    assert_eq!(existing.encode_tool_preferences().unwrap(), file_settings);
+    assert_eq!(existing.snapshot(), &tiles);
+
+    let mut blank = WebProject::from_document(WebDocument::default());
+    blank.restore_fallback_tool_preferences(&fallback).unwrap();
+    assert_eq!(blank.encode_tool_preferences().unwrap(), fallback);
+    assert!(blank.snapshot().is_empty());
+    let request = blank.prepare_recovery(1, 1, None).unwrap();
+    let bytes = RecoveryWriter::default().stage(&request.bytes).unwrap();
+    let reopened = WebProject::decode_ntdr(&bytes).unwrap();
+    assert_eq!(reopened.encode_tool_preferences().unwrap(), fallback);
+    assert_eq!(reopened.pencil_template(), PencilTemplate::Graphite2B);
+    let native = MemoryProjectDb::open(&bytes, MAX_NTDR_BYTES).unwrap();
+    assert_eq!(
+        native.db().load_editor_tool_state().unwrap().unwrap(),
+        fallback
+    );
+    assert!(reopened.snapshot().is_empty());
+}
+
+#[test]
 fn browser_edits_and_group_metadata_survive_native_process_restart() {
     use nyatidraw_api::{AffineTransform, EditCommand as E, LayerCommand, TransformCommand as T};
     const FILE: &str = "NYATIDRAW_TEST_WEB_REOPEN_FILE";

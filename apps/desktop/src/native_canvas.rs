@@ -780,6 +780,10 @@ impl SharedGpuCanvas {
         {
             return Err("변형을 확정하거나 취소한 뒤 저장하세요.".into());
         }
+        canvas
+            .stroke
+            .materializer
+            .persist_tool_state(canvas.drawing);
         let state = std::mem::replace(&mut self.state, CanvasState::Suspended);
         self.performance_probe.take();
         let source = match &self.project_location {
@@ -3068,6 +3072,7 @@ impl ActiveCanvas {
         let Some(path) = self.project_export_path.clone() else {
             return;
         };
+        self.stroke.materializer.persist_tool_state(self.drawing);
         match self
             .stroke
             .materializer
