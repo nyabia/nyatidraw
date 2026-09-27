@@ -26,6 +26,7 @@ GM storage/menu는 fixture가 제공했다. 실제 Tampermonkey/Greasemonkey 설
 - 원본/복사본 RGBA SHA256 모두
   `e1ed32b51c802545f783a39b373a588f4ecd6937a685f1c62248e7a542d1a446`.
 - 작성 중이던 fixture 텍스트는 변경되지 않았다.
+- PNG 다운로드 성공, 사이트 설정 해제 시 저장 규칙과 추가 버튼 제거 확인.
 
 로컬 화면과 일회성 probe는 무시되는 `output/playwright/docs28-*`에 있다.
 실제 사이트의 로그인·첨부·업로드·게시, 확장 관리자 sandbox, Firefox/iPad/물리 펜은 미검증이다.
@@ -35,3 +36,7 @@ GM storage/menu는 fixture가 제공했다. 실제 Tampermonkey/Greasemonkey 설
 
 Website workflow와 공개 URL 확인 결과는 배포 후 여기에 기록한다.
 Windows 버전은 alpha.17을 유지하며 이번 작업으로 앱 태그를 추가하지 않는다.
+
+첫 Website 실행은 Windows에서 생성한 npm 잠금 파일의 선택 의존성 두 항목 누락으로
+설치 단계에서 중단됐다. 기존 node_modules가 없는 디렉터리에서 CI와 같은 npm 11.19.0으로
+잠금 파일을 재생성했다. 이미 공개된 사이트는 이 실패로 교체되지 않았다.
