@@ -18,7 +18,10 @@
   내보내기 픽셀 일치, NTDR의 별도 프로세스 native/web 재열기를 확인했다.
   웹 본체·Worker·연동 가이드 해시도 Pages 산출물과 일치했다.
 - 최초 공개 `release.json`은 릴리즈 workflow 완료 뒤에도 alpha.16을 반환했다.
-  릴리즈 Pages 산출물에는 alpha.17이 들어 있어 공개 기본 URL의 후속 확인이 필요하다.
+  릴리즈 Pages 산출물에는 alpha.17이 들어 있었다.
+  검증 기록 커밋 `79b7c18`의 [홈페이지 재게시](https://github.com/nyabia/nyatidraw/actions/runs/36298678140)
+  성공 후 기본 `release.json` URL과 실제 Edge 다운로드 버튼에서 alpha.17 설치 링크를 확인했다.
+  기존 태그와 릴리즈 자산은 교체하지 않았다.
 - 사용자 작품과 설치본은 변경하지 않았다. 실제 펜·터치·iPad Safari·Misskey 서버 첨부·
   설치 업데이트는 미검증이다. [릴리즈 노트](releases/0.1.0-alpha.17.md)의 제한을 유지한다.
 
