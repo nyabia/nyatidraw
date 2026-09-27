@@ -3,6 +3,14 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
+## 문서 사이트·작성창 유저스크립트 게시
+
+Astro/Starlight 사용자 문서와 범용 유저스크립트는 Windows 버전과 별도로 Website workflow로 배포한다.
+소스 `796b015`의 [Pages 게시](https://github.com/nyabia/nyatidraw/actions/runs/36338004353)와
+[공개 URL·파일 해시 검증](measurements/docs-userscript.md)이 완료됐다.
+홈페이지의 문서 메뉴는 `/nyatidraw/docs/`로 연결되며 기존 guide URL도 유지한다.
+앱 태그와 설치본은 alpha.17 그대로다. 확장 관리자·사이트별 실제 첨부는 아직 미검증이다.
+
 ## alpha.17 배포 확인
 
 - 소스 `8825105`, 태그 `v0.1.0-alpha.17`.

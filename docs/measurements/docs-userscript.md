@@ -34,8 +34,21 @@ GM storage/menu는 fixture가 제공했다. 실제 Tampermonkey/Greasemonkey 설
 
 ## 공개 배포
 
-Website workflow와 공개 URL 확인 결과는 배포 후 여기에 기록한다.
-Windows 버전은 alpha.17을 유지하며 이번 작업으로 앱 태그를 추가하지 않는다.
+소스 `796b015`의 [Website workflow](https://github.com/nyabia/nyatidraw/actions/runs/36338004353)가
+검증·웹 빌드·문서와 유저스크립트 조립·개인 경로 검사·Pages 배포에 성공했다.
+공개 홈페이지, 문서 6개 페이지, 설치용 userscript 총 8개 URL에서 HTTP 200을 확인했다.
+실제 Edge에서 홈페이지 문서 메뉴→문서 안내, PNG 검색→저장 문서,
+기존 guide URL→저장 문서 이동을 확인했다. 공개 문서의 모바일 화면도 확인했다.
+
+CI Pages artifact와 기본 공개 URL에서 내려받은 파일의 SHA256이 각각 일치했다.
+
+- `draw/integration/nyatidraw.user.js`:
+  `185ae40a32bce8eb84df24160607af3900296fc0d6b7bd6d89207a7e41bd2368`
+- `docs/index.html`:
+  `ba7cce5fbda13df95556ff9300c95380b3f960cbaf4013a9be1880af3656a37c`
+
+`release.json`은 alpha.17의 기존 Windows 설치 링크를 유지한다.
+이번 작업으로 앱 태그·Windows 릴리즈를 추가하거나 사용자 설치본을 갱신하지 않았다.
 
 첫 Website 실행은 Windows에서 생성한 npm 잠금 파일의 선택 의존성 두 항목 누락으로
 설치 단계에서 중단됐다. 기존 node_modules가 없는 디렉터리에서 CI와 같은 npm 11.19.0으로
