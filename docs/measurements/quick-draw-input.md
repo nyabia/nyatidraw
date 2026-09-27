@@ -36,3 +36,17 @@ OS의 실제 팜 분류·캡처 동작을 검증한 것은 아니다. Windows PT
 Misskey 위젯 예제는 링크를 여는 용도다. 인증, 자동 첨부, 자동 게시 기능은 없다.
 일반 웹판은 기존 브라우저 작업을 복원하므로 새 그림은 사용자가 직접 시작한다.
 기존 SDK의 iframe/popup 반환 기능은 유지한다. 이 문서는 공개 배포 완료 선언이 아니다.
+
+## alpha.17 공개 웹 확인
+
+- 소스 `8825105`의 [Website 실행](https://github.com/nyabia/nyatidraw/actions/runs/36297742043)이 성공했다.
+- 공개 HTTPS 편집기에서 실제 PNG 복사 후 다른 로컬 페이지에 붙여넣었다.
+  1280×720, 비투명 픽셀 2,226개였으며 공개판 PNG 내보내기와 RGBA 차이는 0개였다.
+- 공개판에서 실제로 저장한 NTDR을 별도 프로세스로 열어 native/web artwork root 일치를 확인했다.
+- 본체 WASM SHA256 `26b6a24ed22ab599083dea17f6e2d45f6ec9be9fb2078ceca6caf1c2bc023222`,
+  Worker `c88ceffe30a2ef99af5c551a6452c22281fce0aa929fec4f611cda505d1dc3f6`,
+  연동 가이드 `8382a401ab13e882ae0f92b68bb97f0bed834c9d01e77d4652b58e2edef63267`이
+  CI Pages 산출물과 실제 기본 URL에서 일치했다.
+- Windows RTX 3080/Vulkan/debug에서 기존 native transform actor의 도구 전환,
+  GPU/CPU 비교, 저장·자식 프로세스 재열기 회귀 검사도 통과했다.
+  이것은 MoveArtwork 전용 GPU 성능 측정이나 실제 펜/화면 표시 지연 증거가 아니다.

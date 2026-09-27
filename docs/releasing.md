@@ -3,6 +3,25 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
+## alpha.17 배포 확인
+
+- 소스 `8825105`, 태그 `v0.1.0-alpha.17`.
+  [Windows CI](https://github.com/nyabia/nyatidraw/actions/runs/36297741991)와
+  [릴리즈 작업](https://github.com/nyabia/nyatidraw/actions/runs/36297742146)의
+  검증·release 빌드·패키징·사전 릴리즈 공개·Pages 게시가 성공했다.
+- 공개 자산 7개를 내려받아 크기와 GitHub SHA256 digest를 대조했고,
+  `SHA256SUMS.txt` 6개 항목과 업데이트 피드의 제품 ID·버전·크기·SHA1/SHA256이 일치했다.
+  설치 파일은 14,149,145 bytes,
+  SHA256 `841f2160e099c1d2173ab3435d9122ed1e524b2a7154f423be20d7e87d2d1fa7`다.
+  포터블 manifest의 `NyatiDraw` / `0.1.0-alpha.17` / `nyatidraw.exe`, 라이선스·Lucide 고지도 확인했다.
+- [공개 웹 검증](measurements/quick-draw-input.md#alpha17-공개-웹-확인)에서 실제 PNG 복사·붙여넣기,
+  내보내기 픽셀 일치, NTDR의 별도 프로세스 native/web 재열기를 확인했다.
+  웹 본체·Worker·연동 가이드 해시도 Pages 산출물과 일치했다.
+- 최초 공개 `release.json`은 릴리즈 workflow 완료 뒤에도 alpha.16을 반환했다.
+  릴리즈 Pages 산출물에는 alpha.17이 들어 있어 공개 기본 URL의 후속 확인이 필요하다.
+- 사용자 작품과 설치본은 변경하지 않았다. 실제 펜·터치·iPad Safari·Misskey 서버 첨부·
+  설치 업데이트는 미검증이다. [릴리즈 노트](releases/0.1.0-alpha.17.md)의 제한을 유지한다.
+
 ## alpha.16 배포 확인
 
 - 소스 `60b89e7`, 태그 `v0.1.0-alpha.16`.
