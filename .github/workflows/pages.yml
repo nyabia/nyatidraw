@@ -4,6 +4,7 @@ on:
     branches: [main]
     paths:
       - 'site/**'
+      - 'site-docs/**'
       - 'apps/web/**'
       - 'apps/web-worker/**'
       - 'web-integration/**'
@@ -18,6 +19,7 @@ on:
       - 'tools/setup-worker-ci.ps1'
       - 'tools/build-web-worker.ps1'
       - 'tools/build-site.ps1'
+      - 'tools/build-docs.ps1'
       - '.github/workflows/pages.yml'
   release:
     types: [published, unpublished, deleted, edited]
@@ -36,6 +38,7 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: '0'
+      ASTRO_TELEMETRY_DISABLED: '1'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CC_wasm32_unknown_unknown: clang
@@ -47,6 +50,14 @@ jobs:
         with:
           persist-credentials: false
           ref: main
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: site-docs/package-lock.json
+      - name: Install documentation dependencies
+        working-directory: site-docs
+        run: npm ci --no-fund
       - name: Install project Rust and WebAssembly target
         run: |
           $version = (Select-String '^channel = "([^"]+)"' rust-toolchain.toml).Matches.Groups[1].Value

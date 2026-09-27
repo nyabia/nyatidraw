@@ -68,6 +68,8 @@
 
 ## 웹 실험판
 
+문서·외부 작성창 연결: [ADR-0065 Starlight 문서와 범용 유저스크립트](ADR-0065-starlight-docs-and-composer-userscript.md).
+
 | 상태 | 결정과 근거 |
 |---|---|
 | 제한 채택·초기 배포 확인 | [별도 Dioxus Web 호스트, 공용 CPU 브러시와 WebGPU 합성, bounded 로컬 복구](ADR-0059-web-editor-spike.md). Windows GPU-first 성능 동등성이나 `.ntdr` 호환성을 의미하지 않는다. |

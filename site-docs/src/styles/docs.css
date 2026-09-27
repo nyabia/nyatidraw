@@ -1,0 +1,13 @@
+:root {
+  --sl-font: 'Segoe UI', 'Malgun Gothic', system-ui, sans-serif;
+  --sl-color-accent-low: #192d37;
+  --sl-color-accent: #81b4c7;
+  --sl-color-accent-high: #c4e3ed;
+}
+:root[data-theme='light'] {
+  --sl-color-accent-low: #e1eef0;
+  --sl-color-accent: #356677;
+  --sl-color-accent-high: #244854;
+}
+.sl-markdown-content { word-break: keep-all; overflow-wrap: anywhere; }
+.site-title img { width: 1.8rem; height: 1.8rem; }

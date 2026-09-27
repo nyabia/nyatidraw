@@ -490,6 +490,20 @@ h3 {
   grid-column: 2;
   color: var(--muted);
 }
+.doc-links {
+  border-top: 1px solid var(--line);
+}
+.doc-links > a {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr) auto;
+  gap: 20px;
+  align-items: center;
+  padding: 20px 0;
+  border-bottom: 1px solid var(--line);
+  text-decoration: none;
+}
+.doc-links > a:hover strong { text-decoration: underline; }
+.doc-links > a > span { color: var(--muted); font-size: 13px; }
 .development {
   display: grid;
   grid-template-columns: 0.85fr 1.5fr;
@@ -578,6 +592,9 @@ footer nav {
   }
 }
 @media (max-width: 760px) {
+  .doc-links > a { grid-template-columns: 1fr auto; gap: 4px 16px; }
+  .doc-links > a > span:not(:last-child) { grid-row: 2; }
+  .doc-links > a > span:last-child { grid-column: 2; grid-row: 1 / 3; }
   .masthead {
     min-height: 70px;
   }

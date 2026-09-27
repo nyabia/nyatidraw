@@ -1,0 +1,18 @@
+// ==UserScript==
+// @name         NyatiDraw 작성창 바로가기
+// @namespace    https://github.com/nyabia/nyatidraw
+// @version      0.1.0
+// @description  직접 설정한 HTTPS 사이트의 작성창에서 NyatiDraw를 열고 PNG를 복사하거나 다운로드합니다.
+// @downloadURL  https://nyabia.github.io/nyatidraw/draw/integration/nyatidraw.user.js
+// @updateURL    https://nyabia.github.io/nyatidraw/draw/integration/nyatidraw.user.js
+// @license      MIT
+// @match        https://*/*
+// @run-at       document-idle
+// @noframes
+// @grant        GM.getValue
+// @grant        GM.setValue
+// @grant        GM.registerMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// ==/UserScript==

@@ -4,6 +4,9 @@
 
 ## 문서 지도
 
+사용자용 안내는 [공개 문서 사이트](https://nyabia.github.io/nyatidraw/docs/)에 있다.
+원본은 `site-docs/src/content/docs/`의 Markdown/MDX이며, 이 폴더는 개발 설계·검증 기록을 유지한다.
+
 | 문서 | 답하는 질문 |
 |---|---|
 | [현재 우선순위](sprints/current-priorities.md) | 웹 편집 연결·새 그림/최근 그림 다음에 무엇을 결정하며, 아직 무엇을 시작하지 않는가? |
@@ -33,7 +36,7 @@
 | [플랫폼 지원](platform-support.md) | 어떤 플랫폼이 구현·검증·보류 상태인가? |
 | [웹 실험판](web-support.md) | 브라우저판은 어떤 엔진·저장 형식을 쓰며, 어떻게 실행하고 어디까지 검증했는가? |
 | [웹 임베딩 SDK](web-embedding.md) | iframe 또는 새 창에서 편집하고 호출 페이지에 PNG를 어떻게 반환하는가? |
-| [Misskey 간편 연결](research/misskey-integration.md) | 위젯 바로가기와 PNG 복사·붙여넣기로 추가 인증 없이 어떻게 사용하는가? |
+| [문서 사이트 운영](../site-docs/README.md) | Markdown 문서·검색·범용 유저스크립트를 어떻게 빌드하고 배포하는가? |
 | [웹 연동 검증](measurements/web-integration.md) | 저장 격리·호출 검증·실패 복구를 실제 브라우저에서 어디까지 확인했는가? |
 | [공용 편집 실행](decisions/ADR-0064-shared-editor-commands.md) | 웹의 빠진 기능을 복제 없이 어떻게 연결하며, 데스크톱에서 저장 위치 없이 새 그림을 어떻게 시작하는가? |
 

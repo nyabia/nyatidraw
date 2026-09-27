@@ -4,6 +4,8 @@
 /.codex-remote-attachments/
 /output/
 /vendor/
+/site-docs/node_modules/
+/site-docs/.astro/
 
 # Local editor and environment state
 /.idea/

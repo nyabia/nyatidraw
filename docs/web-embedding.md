@@ -7,8 +7,9 @@ NyatiDraw Web은 새 빈 그림을 iframe 또는 별도 창에서 열고, 사용
 ## 빠른 통합
 
 일반 SNS 작성창에 그림을 보내는 것만 필요하면 SDK 대신 일반 웹판의 **PNG 복사**를
-사용한다. [연동 가이드](../web-integration/guide.html)에 Misskey 위젯 바로가기와
+사용한다. [사용 문서](https://nyabia.github.io/nyatidraw/docs/guide/save/)에
 복사·붙여넣기 흐름을 정리했다. 사용자가 직접 누를 때만 복사하며 자동 첨부하지 않는다.
+사이트별 작성창 버튼은 [범용 유저스크립트](https://nyabia.github.io/nyatidraw/docs/integration/userscript/)를 사용한다.
 
 SDK와 편집기 파일을 함께 제공하면 SDK의 기본 `editorUrl`은 모듈 위치의 한 단계 위다. 다른 위치의 편집기를 쓰면 `editorUrl`을 명시한다. 둘 다 HTTPS 또는 localhost 개발 URL이어야 한다.
 

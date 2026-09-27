@@ -7,6 +7,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+& (Join-Path $PSScriptRoot 'build-docs.ps1')
 $destination = Join-Path $repositoryRoot 'target/site'
 if (-not $WebPublicDirectory) {
     $candidate = Join-Path $repositoryRoot 'target/dx/nyatidraw-web/release/web/public'
@@ -63,10 +64,17 @@ if (Test-Path -LiteralPath $destination) {
 }
 New-Item -ItemType Directory -Force $destination | Out-Null
 Copy-Item (Join-Path $repositoryRoot 'site/*') $destination -Recurse -Force
+$docsDestination = Join-Path $destination 'docs'
+New-Item -ItemType Directory -Force $docsDestination | Out-Null
+Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'target/site-docs') -Force | Copy-Item -Destination $docsDestination -Recurse -Force
 if ($WebPublicDirectory) {
     $drawDestination = Join-Path $destination 'draw'
     New-Item -ItemType Directory -Force $drawDestination | Out-Null
     Get-ChildItem -LiteralPath $WebPublicDirectory -Force | Copy-Item -Destination $drawDestination -Recurse -Force
+    $integrationDestination = Join-Path $drawDestination 'integration'
+    New-Item -ItemType Directory -Force $integrationDestination | Out-Null
+    Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'web-integration') -File | Copy-Item -Destination $integrationDestination -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'target/userscript/nyatidraw.user.js') -Destination $integrationDestination -Force
 }
 New-Item -ItemType File -Path (Join-Path $destination '.nojekyll') -Force | Out-Null
 # Never retain a stale download when the published release has been withdrawn.
