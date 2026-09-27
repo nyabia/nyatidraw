@@ -32,6 +32,21 @@
 - 로컬 증거는 무시되는 `output/playwright/embed-*`, `output/embed-*.log`에 있다.
   사용자 작품과 설치본은 변경하지 않았다. 이 기록은 릴리스/배포 완료 선언이 아니다.
 
+## alpha.16 공개 웹 확인
+
+- 소스 `60b89e7`의 [Website 실행](https://github.com/nyabia/nyatidraw/actions/runs/36291316963)이 성공했다.
+- 공개 HTTPS 예제에서 640×480 iframe 그림을 반환했다. PNG는 7,833 bytes,
+  비투명 픽셀 1,715개였다. 팝업은 숨김 옵션과 무관하게 전체 속성 패널을 표시했고,
+  그림 PNG 8,116 bytes를 반환한 뒤 정상 닫혔다.
+- 공개판의 NTDR을 별도 native/web verifier로 열어 실제 타일 존재와 artwork root 일치를 확인했다.
+- 공개 본체 WASM `147763eb3d75c1615dc38df7dc25251c9aa8684163726fe92a65ef90df0e0718`,
+  Worker `09f1f3dd89f982247d4bb7b208d69bef5e257780acd1dba282ee85f035e03847`,
+  SDK `4c5befbda823feb002079c1a5e799a515351a3fe62aba8f9ac9e88ae25012575`의 SHA-256이
+  Pages CI 산출물과 일치했다. 실제 펜·SNS 업로드·설치판 검증으로 확대하지 않는다.
+- 공개 웹의 상단 `흰 배경 추가`를 실행해 `White` 래스터가 기존 레이어 아래에 생성됨을
+  확인했다. 640×480 PNG를 반환받아 모든 채널 값이 255임을 확인했다.
+  특수 배경 레이어나 임의 색상 배경 속성이 아니라 일반 흰색 래스터 추가 기능이다.
+
 ## 경계
 
 - iframe UI 설정은 배치/표시 옵션이며 기능 권한을 제한하는 보안 샌드박스가 아니다.

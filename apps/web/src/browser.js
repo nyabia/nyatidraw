@@ -399,6 +399,9 @@ export function bindCanvas(canvas, callback) {
     };
   }
   let active = null;
+  let activePointerType = null;
+  let lastPenActivity = -Infinity;
+  const penTouchGuardMs = 700;
   let mode = null;
   let space = false;
   let pickerEvent = null;
@@ -436,8 +439,25 @@ export function bindCanvas(canvas, callback) {
       event.pointerType === "pen",
     );
   };
+  const releaseTouchPan = () => {
+    const captured = active;
+    active = null;
+    activePointerType = null;
+    mode = null;
+    callback("panEnd", 0, 0, 0, 0, false);
+    if (canvas.hasPointerCapture(captured)) canvas.releasePointerCapture(captured);
+  };
   canvas.addEventListener("contextmenu", (event) => event.preventDefault());
   canvas.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "pen") {
+      lastPenActivity = performance.now();
+      if (activePointerType === "touch") releaseTouchPan();
+    }
+    if (event.pointerType === "touch" &&
+        performance.now() - lastPenActivity < penTouchGuardMs) {
+      event.preventDefault();
+      return;
+    }
     if (
       modalOpen ||
       active !== null ||
@@ -449,6 +469,7 @@ export function bindCanvas(canvas, callback) {
     document.activeElement?.blur();
     canvas.focus({ preventScroll: true });
     active = event.pointerId;
+    activePointerType = event.pointerType;
     mode =
       event.button === 1 || space || event.pointerType === "touch" || canvasTool === "pan"
         ? "pan"
@@ -457,6 +478,7 @@ export function bindCanvas(canvas, callback) {
     send(mode === "pan" ? "panBegin" : mode === "pick" ? "pickBegin" : "begin", event);
   });
   canvas.addEventListener("pointermove", (event) => {
+    if (event.pointerType === "pen") lastPenActivity = performance.now();
     if (modalOpen || event.pointerId !== active) return;
     event.preventDefault();
     if (mode === "pan") {
@@ -472,6 +494,7 @@ export function bindCanvas(canvas, callback) {
     if (samples.length > 256) {
       callback("overflow", 0, 0, 0, event.timeStamp, false);
       active = null;
+      activePointerType = null;
       mode = null;
       return;
     }
@@ -479,10 +502,12 @@ export function bindCanvas(canvas, callback) {
       send("move", sample);
   });
   canvas.addEventListener("pointerup", (event) => {
+    if (event.pointerType === "pen") lastPenActivity = performance.now();
     if (modalOpen || event.pointerId !== active) return;
     clearPicker();
     send(mode === "pan" ? "panEnd" : mode === "pick" ? "pickEnd" : "end", event);
     active = null;
+    activePointerType = null;
     mode = null;
     canvas.releasePointerCapture(event.pointerId);
   });
@@ -492,14 +517,20 @@ export function bindCanvas(canvas, callback) {
     if (active === null) return;
     const captured = active;
     active = null;
+    activePointerType = null;
     mode = null;
     callback("cancel", 0, 0, 0, 0, false);
     if (canvas.hasPointerCapture(captured))
       canvas.releasePointerCapture(captured);
   };
   cancelCanvasGesture = cancel;
-  canvas.addEventListener("pointercancel", cancel);
-  canvas.addEventListener("lostpointercapture", cancel);
+  const cancelActivePointer = (event) => {
+    if (event.pointerId !== active) return;
+    if (activePointerType === "touch") releaseTouchPan();
+    else cancel();
+  };
+  canvas.addEventListener("pointercancel", cancelActivePointer);
+  canvas.addEventListener("lostpointercapture", cancelActivePointer);
   window.addEventListener("blur", () => {
     cancel();
     space = false;
