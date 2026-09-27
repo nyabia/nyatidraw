@@ -105,6 +105,33 @@ fn source_bounds(
     Ok(bounds)
 }
 
+/// Occupied bounds of the movable source, including signed off-page pixels.
+pub struct MovableBounds {
+    pub origin: [i32; 2],
+    pub size: [u32; 2],
+}
+
+/// # Errors
+/// Rejects unsupported tiles and work outside the edit budget.
+pub fn movable_bounds(
+    snapshot: &TileSnapshot,
+    target: LayerId,
+    mask: Option<&SelectionMask>,
+    limits: EditLimits,
+) -> Result<Option<MovableBounds>, EditError> {
+    source_bounds(snapshot, target, mask, limits.bounded())?
+        .map(|bounds| {
+            Ok(MovableBounds {
+                origin: [
+                    i32::try_from(bounds.min[0]).map_err(|_| EditError::CoordinateOutOfRange)?,
+                    i32::try_from(bounds.min[1]).map_err(|_| EditError::CoordinateOutOfRange)?,
+                ],
+                size: bounds.size(limits.bounded())?,
+            })
+        })
+        .transpose()
+}
+
 pub(crate) struct Replacements<'a> {
     pub(crate) before: &'a TileSnapshot,
     pub(crate) tiles: BTreeMap<TileKey, Vec<u8>>,
@@ -276,13 +303,51 @@ pub fn transform_raster(
     transform: RasterTransform,
     limits: EditLimits,
 ) -> Result<SelectionPaintResult, EditError> {
+    transform_raster_inner(snapshot, tree, target, mask, transform, limits, false)
+}
+
+/// Translation preserves alpha-locked pixels exactly while respecting the
+/// edit lock and every signed source/destination bound.
+/// # Errors
+/// Rejects invalid source, destination or resource use before mutation.
+pub fn move_raster(
+    snapshot: &TileSnapshot,
+    tree: &LayerTree,
+    target: LayerId,
+    mask: Option<&SelectionMask>,
+    offset: [i32; 2],
+    limits: EditLimits,
+) -> Result<SelectionPaintResult, EditError> {
+    transform_raster_inner(
+        snapshot,
+        tree,
+        target,
+        mask,
+        RasterTransform {
+            offset,
+            ..RasterTransform::default()
+        },
+        limits,
+        true,
+    )
+}
+
+fn transform_raster_inner(
+    snapshot: &TileSnapshot,
+    tree: &LayerTree,
+    target: LayerId,
+    mask: Option<&SelectionMask>,
+    transform: RasterTransform,
+    limits: EditLimits,
+    allow_alpha_lock: bool,
+) -> Result<SelectionPaintResult, EditError> {
     let limits = limits.bounded();
     let layer =
         crate::selection::find_raster(tree.root(), target).ok_or(EditError::UnknownLayer)?;
     if layer.locked {
         return Err(EditError::LockedLayer);
     }
-    if layer.alpha_locked {
+    if layer.alpha_locked && !allow_alpha_lock {
         return Err(EditError::AlphaLockedLayer);
     }
     if transform.quarter_turns > 3 || transform.size.is_some_and(|size| size.contains(&0)) {

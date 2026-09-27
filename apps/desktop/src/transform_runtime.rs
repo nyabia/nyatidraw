@@ -17,11 +17,12 @@ pub(super) fn selected_tool(current: DrawingTool, command: ToolCommand) -> Optio
             _ => DrawingTool::Pencil,
         },
         ToolCommand::CycleSelectionFamily => match current {
+            DrawingTool::MoveArtwork => DrawingTool::Move,
             DrawingTool::Move => DrawingTool::MoveSelection,
             DrawingTool::MoveSelection => DrawingTool::Wand,
             DrawingTool::Wand => DrawingTool::Lasso,
             DrawingTool::Lasso => DrawingTool::RectangleSelection,
-            _ => DrawingTool::Move,
+            _ => DrawingTool::MoveArtwork,
         },
         ToolCommand::CycleFillFamily => {
             if current == DrawingTool::Fill {

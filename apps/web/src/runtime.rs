@@ -997,6 +997,38 @@ impl Editor {
         }
     }
 
+    pub fn copy_png(self) {
+        let Some(result) = self.read(|runtime| {
+            if runtime.gesture.is_some()
+                || runtime.transform_drag.is_some()
+                || runtime.document.transform_projection().is_some()
+            {
+                return Err("진행 중인 선택 또는 변형을 완료한 뒤 복사해주세요.".to_owned());
+            }
+            encode_png(&runtime.document)
+        }) else {
+            return;
+        };
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.warn(error);
+                return;
+            }
+        };
+
+        let write = browser::write_png_clipboard(&Uint8Array::from(bytes.as_slice()));
+        spawn_local(async move {
+            match JsFuture::from(write).await {
+                Ok(_) => self.report("PNG를 복사했습니다. 돌아가서 붙여넣으세요."),
+                Err(error) => self.warn(format!(
+                    "PNG 복사에 실패했습니다. 브라우저 권한을 확인하거나 PNG 내려받기를 이용해주세요: {}",
+                    browser::error_text(&error)
+                )),
+            }
+        });
+    }
+
     pub fn complete_integration(mut self) {
         if !browser::is_hosted() || (self.integration_busy)() || (self.integration_closed)() {
             return;
@@ -1304,6 +1336,7 @@ fn supported_restored_tool(document: &WebProject) -> Option<DrawingTool> {
 pub const fn canvas_input_mode(tool: DrawingTool) -> &'static str {
     match tool {
         DrawingTool::Move => "pan",
+        DrawingTool::MoveArtwork => "edit",
         DrawingTool::Eyedropper => "pick",
         _ => "stroke",
     }

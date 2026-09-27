@@ -15,7 +15,7 @@ use super::{DrawingConfig, LiveInkBridge, ProjectDb, RememberedBrush};
 #[cfg(test)]
 use nyatidraw_api::{DrawingTool, PencilTemplate};
 #[cfg(test)]
-const TOOLS: [DrawingTool; 12] = [
+const TOOLS: [DrawingTool; 13] = [
     DrawingTool::Move,
     DrawingTool::MoveSelection,
     DrawingTool::Pencil,
@@ -28,6 +28,7 @@ const TOOLS: [DrawingTool; 12] = [
     DrawingTool::Eyedropper,
     DrawingTool::Fill,
     DrawingTool::Gradient,
+    DrawingTool::MoveArtwork,
 ];
 
 pub(super) struct Store {

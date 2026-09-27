@@ -292,6 +292,68 @@ fn shared_selection_fill_and_transform_preserve_undo_and_cancelled_artwork() {
 }
 
 #[test]
+fn direct_artwork_move_preserves_off_page_pixels_and_undo_as_one_edit() {
+    use nyatidraw_api::EditCommand as E;
+    let mut doc = WebDocument::new(CanvasSpec {
+        width_px: 16,
+        height_px: 16,
+        pixels_per_inch: 96,
+    })
+    .unwrap();
+    for (left, top) in [(-3, 2), (4, 5)] {
+        doc.apply_edit(E::SelectLasso {
+            vertices: vec![
+                [left, top],
+                [left + 1, top],
+                [left + 1, top + 1],
+                [left, top + 1],
+            ],
+        })
+        .unwrap();
+        doc.apply_edit(E::FillSelection {
+            color: [255, 0, 0, 255],
+        })
+        .unwrap();
+    }
+    doc.apply_edit(E::ClearSelection).unwrap();
+    let original = doc.snapshot().clone();
+    let before = doc.history_len();
+    doc.apply_edit(E::MoveArtwork { offset: [6, -4] }).unwrap();
+    assert_eq!(doc.history_len(), before + 1);
+    assert_ne!(doc.snapshot(), &original);
+    let moved = doc.snapshot().clone();
+    doc.undo().unwrap();
+    assert_eq!(doc.snapshot(), &original);
+    doc.redo().unwrap();
+    assert_eq!(doc.snapshot(), &moved);
+    doc.apply_edit(E::CenterArtwork {
+        horizontal: true,
+        vertical: true,
+    })
+    .unwrap();
+    assert_ne!(doc.snapshot(), &moved);
+    doc.undo().unwrap();
+    assert_eq!(doc.snapshot(), &moved);
+    doc.apply_edit(E::SelectLasso {
+        vertices: vec![[10, 1], [11, 1], [11, 2], [10, 2]],
+    })
+    .unwrap();
+    let selected = doc.selection().unwrap().bounds_signed();
+    let before_selected_move = doc.snapshot().clone();
+    doc.apply_edit(E::MoveArtwork { offset: [2, 3] }).unwrap();
+    assert_eq!(
+        doc.selection().unwrap().bounds_signed(),
+        selected.map(|(origin, size)| ([origin[0] + 2, origin[1] + 3], size))
+    );
+    assert_ne!(doc.snapshot(), &before_selected_move);
+    doc.undo().unwrap();
+    assert_eq!(doc.snapshot(), &before_selected_move);
+    let bytes = doc.encode_portable().unwrap();
+    let reopened = WebDocument::decode_portable(&bytes).unwrap();
+    assert_eq!(reopened.snapshot(), &moved);
+}
+
+#[test]
 fn brush_cannot_change_pixels_outside_the_selection() {
     use nyatidraw_api::EditCommand as E;
     let mut doc = WebDocument::new(CanvasSpec {

@@ -9,7 +9,7 @@ const MAGIC: &[u8; 8] = b"NYWORK03";
 const MAX_METADATA_BYTES: usize = 128 * 1024;
 const MAX_REQUEST_BYTES: usize =
     MAX_NTDR_BYTES + MAX_RESIDENT_TILES * (TILE_BYTE_LEN + 25) + MAX_METADATA_BYTES + 512;
-const TOOLS: [DrawingTool; 12] = [
+const TOOLS: [DrawingTool; 13] = [
     DrawingTool::Move,
     DrawingTool::MoveSelection,
     DrawingTool::Wand,
@@ -22,6 +22,7 @@ const TOOLS: [DrawingTool; 12] = [
     DrawingTool::Fill,
     DrawingTool::Gradient,
     DrawingTool::Eyedropper,
+    DrawingTool::MoveArtwork,
 ];
 
 pub struct RecoveryCheckpoint {

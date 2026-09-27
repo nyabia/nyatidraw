@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod canvas_mode;
 mod smoothing;
 
+pub use canvas_mode::CanvasInputMode;
 pub use smoothing::{SmoothingError, StrokeSmoother};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

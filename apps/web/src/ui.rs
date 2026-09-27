@@ -80,6 +80,7 @@ pub fn App() -> Element {
                 span { "NyatiDraw" }
                 button { disabled: !((editor.ready)()) || (editor.integration_busy)() || (editor.integration_closed)(), onclick: move |_| editor.download_project(), "작업 파일" }
                 button { disabled: !((editor.ready)()) || (editor.integration_busy)() || (editor.integration_closed)(), onclick: move |_| editor.download_png(), "PNG 내려받기" }
+                button { disabled: !((editor.ready)()) || (editor.integration_busy)() || (editor.integration_closed)(), onclick: move |_| editor.copy_png(), "PNG 복사" }
                 button { disabled: !((editor.ready)()) || (editor.integration_busy)() || (editor.integration_closed)(), onclick: move |_| editor.show_modal(EditorModal::CancelIntegration), "취소" }
                 button { disabled: !((editor.ready)()) || (editor.integration_busy)() || (editor.integration_closed)(), onclick: move |_| editor.show_modal(EditorModal::CancelIntegration), "닫기" }
                 button { class: "browser-integration-done", disabled: !((editor.ready)()) || (editor.integration_busy)() || (editor.integration_closed)(), onclick: move |_| editor.complete_integration(), "완료" }
@@ -125,6 +126,7 @@ fn BrowserFileButtons(extended: bool) -> Element {
             button { class: "command", disabled: !ready, onclick: move |_| editor.show_modal(EditorModal::NewDocument), "새 그림" }
             button { class: "command", disabled: !ready, onclick: move |_| editor.download_project(), "작업 파일 저장" }
             button { class: "command", disabled: !ready, onclick: move |_| editor.download_png(), "PNG 내보내기" }
+            button { class: "command", disabled: !ready, onclick: move |_| editor.copy_png(), "PNG 복사" }
         }
     }
 }

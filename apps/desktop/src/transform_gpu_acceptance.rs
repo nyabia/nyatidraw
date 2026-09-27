@@ -209,6 +209,7 @@ fn actor_preview_cancel_commit_matches_gpu_and_durable_artwork() {
         DrawingTool::Wand,
         DrawingTool::Lasso,
         DrawingTool::RectangleSelection,
+        DrawingTool::MoveArtwork,
         DrawingTool::Move,
     ] {
         canvas

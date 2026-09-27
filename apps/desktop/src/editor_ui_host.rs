@@ -25,6 +25,13 @@ pub(crate) fn create(live_ink: LiveInkBridge, notify: Arc<dyn Fn() + Send + Sync
 }
 
 impl UiBackend for DesktopUiBackend {
+    fn canvas_input_mode(&self) -> nyatidraw_input::CanvasInputMode {
+        self.live_ink.canvas_input_mode()
+    }
+
+    fn set_canvas_input_mode(&self, mode: nyatidraw_input::CanvasInputMode) -> Result<(), String> {
+        self.live_ink.set_canvas_input_mode(mode)
+    }
     fn pressure_preset(&self) -> nyatidraw_input::PressurePreset {
         self.live_ink.pressure_preset()
     }

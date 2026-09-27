@@ -12,13 +12,15 @@ use nyatidraw_editor_ui::{
     preview::{LayerThumbnailSnapshot, NavigatorSnapshot, NavigatorViewport},
     workspace_appearance::WorkspaceAppearance,
 };
-use nyatidraw_input::{Point, PressurePreset};
+use nyatidraw_input::{CanvasInputMode, Point, PressurePreset};
 use nyatidraw_web_core::{WebDocument, WebTool};
 
 use crate::{browser, runtime::Editor};
 
 #[derive(Default)]
 struct Preferences {
+    canvas_input_mode: CanvasInputMode,
+    input_mode_writable: bool,
     pressure_preset: PressurePreset,
     pressure_writable: bool,
     dock: DockTree,
@@ -33,11 +35,22 @@ impl Preferences {
     fn load(editor: &Editor) -> Self {
         let mut preferences = Self {
             pressure_writable: true,
+            input_mode_writable: true,
             ..Self::default()
         };
-        for key in ["pins", "heights", "appearance", "dock", "pen-pressure"] {
+        for key in [
+            "pins",
+            "heights",
+            "appearance",
+            "dock",
+            "pen-pressure",
+            "input-mode",
+        ] {
             match browser::load_preference(key) {
                 Ok(Some(value)) if preferences.restore(key, &value).is_none() => {
+                    if key == "input-mode" {
+                        preferences.input_mode_writable = false;
+                    }
                     if key == "pen-pressure" {
                         preferences.pressure_writable = false;
                     }
@@ -46,6 +59,9 @@ impl Preferences {
                     );
                 }
                 Err(error) => {
+                    if key == "input-mode" {
+                        preferences.input_mode_writable = false;
+                    }
                     if key == "pen-pressure" {
                         preferences.pressure_writable = false;
                     }
@@ -57,11 +73,13 @@ impl Preferences {
                 _ => {}
             }
         }
+        browser::set_canvas_input_mode(preferences.canvas_input_mode.storage_value());
         preferences
     }
 
     fn restore(&mut self, key: &str, value: &str) -> Option<()> {
         match key {
+            "input-mode" => self.canvas_input_mode = CanvasInputMode::from_storage(value)?,
             "pen-pressure" => {
                 self.pressure_preset = PressurePreset::from_storage(value)?;
             }
@@ -306,11 +324,12 @@ impl WebUiBackend {
                     .read(|runtime| runtime.selected_tool)
                     .unwrap_or(DrawingTool::Move);
                 self.select_tool(match tool {
+                    DrawingTool::MoveArtwork => DrawingTool::Move,
                     DrawingTool::Move => DrawingTool::MoveSelection,
                     DrawingTool::MoveSelection => DrawingTool::Wand,
                     DrawingTool::Wand => DrawingTool::Lasso,
                     DrawingTool::Lasso => DrawingTool::RectangleSelection,
-                    _ => DrawingTool::Move,
+                    _ => DrawingTool::MoveArtwork,
                 })
             }
             ToolCommand::CycleFillFamily => {
@@ -477,6 +496,21 @@ impl WebUiBackend {
 }
 
 impl UiBackend for WebUiBackend {
+    fn canvas_input_mode(&self) -> CanvasInputMode {
+        self.preferences.borrow().canvas_input_mode
+    }
+
+    fn set_canvas_input_mode(&self, mode: CanvasInputMode) -> Result<(), String> {
+        if !self.preferences.borrow().input_mode_writable {
+            return Err("저장된 입력 설정을 읽지 못해 원본을 보존합니다".into());
+        }
+        browser::store_preference("input-mode", mode.storage_value())
+            .map_err(|error| browser::error_text(&error))?;
+        browser::set_canvas_input_mode(mode.storage_value());
+        self.preferences.borrow_mut().canvas_input_mode = mode;
+        self.editor.refresh();
+        Ok(())
+    }
     fn pressure_preset(&self) -> PressurePreset {
         self.preferences.borrow().pressure_preset
     }

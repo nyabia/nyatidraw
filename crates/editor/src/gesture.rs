@@ -36,7 +36,9 @@ impl EditGesture {
             vertices: match tool {
                 DrawingTool::Lasso => vec![start],
                 DrawingTool::RectangleSelection => rectangle_vertices(start, start),
-                DrawingTool::Gradient | DrawingTool::MoveSelection => vec![start, start],
+                DrawingTool::Gradient | DrawingTool::MoveSelection | DrawingTool::MoveArtwork => {
+                    vec![start, start]
+                }
                 _ => Vec::new(),
             },
             error: point
@@ -69,7 +71,7 @@ impl EditGesture {
         }
         if matches!(
             self.tool,
-            DrawingTool::Gradient | DrawingTool::MoveSelection
+            DrawingTool::Gradient | DrawingTool::MoveSelection | DrawingTool::MoveArtwork
         ) {
             self.vertices[1] = point;
         }
@@ -131,8 +133,8 @@ impl EditGesture {
                     }
                 }
             }
-            DrawingTool::MoveSelection => {
-                if !self.has_selection {
+            DrawingTool::MoveArtwork | DrawingTool::MoveSelection => {
+                if self.tool == DrawingTool::MoveSelection && !self.has_selection {
                     return Err("먼저 이동할 영역을 선택하세요.".into());
                 }
                 let offset = [
@@ -145,10 +147,14 @@ impl EditGesture {
                 if x == 0 && y == 0 {
                     return Err("이동하지 않았습니다. 선택 영역을 유지합니다.".into());
                 }
-                EditCommand::Transform(RasterTransform {
-                    offset: [x, y],
-                    ..RasterTransform::default()
-                })
+                if self.tool == DrawingTool::MoveArtwork {
+                    EditCommand::MoveArtwork { offset: [x, y] }
+                } else {
+                    EditCommand::Transform(RasterTransform {
+                        offset: [x, y],
+                        ..RasterTransform::default()
+                    })
+                }
             }
             DrawingTool::Fill => EditCommand::FloodFillAdvanced {
                 seed: self.start,

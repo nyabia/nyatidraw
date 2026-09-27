@@ -1,4 +1,4 @@
-use nyatidraw_api::CanvasSpec;
+use nyatidraw_api::{CanvasSpec, EditCommand};
 use nyatidraw_input::PressurePreset;
 use nyatidraw_project_redb::ProjectDb;
 use nyatidraw_project_web::{RecoveryWriter, WebProject};
@@ -76,6 +76,9 @@ fn main() -> Result<()> {
             ..first
         })
         .map_err(|error| format!("{error:?}"))?;
+        if revision == 2 {
+            verify_off_page_move(&mut web)?;
+        }
         assert!(!web.snapshot().is_empty());
         let expected = format!("{:?}", web.snapshot().root().hash);
         let request = web.prepare_recovery(1, revision, checkpoint.as_ref())?;
@@ -100,5 +103,20 @@ fn main() -> Result<()> {
     }
     std::fs::remove_file(&scratch)?;
     println!("Worker full snapshot and delta: save/restart/reopen passed");
+    Ok(())
+}
+
+fn verify_off_page_move(web: &mut WebProject) -> Result<()> {
+    let before_move = web.snapshot().clone();
+    let history_before = web.history_len();
+    web.apply_edit(EditCommand::MoveArtwork { offset: [-32, -20] })
+        .map_err(|error| format!("{error:?}"))?;
+    assert_eq!(web.history_len(), history_before + 1);
+    assert!(web.snapshot().iter().any(|(key, _)| key.x < 0 || key.y < 0));
+    let moved = web.snapshot().clone();
+    web.undo().map_err(|error| format!("{error:?}"))?;
+    assert_eq!(*web.snapshot(), before_move);
+    web.redo().map_err(|error| format!("{error:?}"))?;
+    assert_eq!(*web.snapshot(), moved);
     Ok(())
 }

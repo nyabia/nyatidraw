@@ -65,6 +65,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node --check apps/web/src/browser.js
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check apps/web/src/clipboard.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Browser artwork and recovery core tests
         run: cargo test -p nyatidraw-brush -p nyatidraw-paint-cpu -p nyatidraw-project -p nyatidraw-web-core -p nyatidraw-project-web --locked
       - name: WebAssembly Clippy

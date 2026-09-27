@@ -69,6 +69,15 @@ pub enum EditCommand {
     /// Cut the selection (or whole active raster when absent), then transform
     /// and composite it back. Successful completion clears the selection.
     Transform(RasterTransform),
+    /// Move selected pixels, or all occupied pixels of the active raster.
+    MoveArtwork {
+        offset: [i32; 2],
+    },
+    /// Center selected pixels, or the active raster, on the output page.
+    CenterArtwork {
+        horizontal: bool,
+        vertical: bool,
+    },
     /// Provisional free transform; only explicit Commit creates history.
     FreeTransform(TransformCommand),
     SelectWand {
@@ -195,6 +204,7 @@ pub struct EditProjection {
 pub enum DrawingTool {
     /// Viewport navigation only; never moves artwork.
     Move,
+    MoveArtwork,
     MoveSelection,
     Pencil,
     Pen,
@@ -217,6 +227,7 @@ impl DrawingTool {
                 | Self::Lasso
                 | Self::RectangleSelection
                 | Self::MoveSelection
+                | Self::MoveArtwork
                 | Self::Eyedropper
                 | Self::Fill
                 | Self::Gradient

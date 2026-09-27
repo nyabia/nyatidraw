@@ -5,7 +5,7 @@ use nyatidraw_api::{
 
 const MAGIC: &[u8; 8] = b"NYTOOL01";
 pub const EDITOR_TOOL_STATE_BYTES: usize = 85;
-const TOOLS: [DrawingTool; 12] = [
+const TOOLS: [DrawingTool; 13] = [
     DrawingTool::Move,
     DrawingTool::MoveSelection,
     DrawingTool::Pencil,
@@ -18,6 +18,7 @@ const TOOLS: [DrawingTool; 12] = [
     DrawingTool::Eyedropper,
     DrawingTool::Fill,
     DrawingTool::Gradient,
+    DrawingTool::MoveArtwork,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +57,7 @@ pub fn encode_editor_tool_state(state: &ProjectToolState) -> Vec<u8> {
         DrawingTool::Eyedropper => 9,
         DrawingTool::Fill => 10,
         DrawingTool::Gradient => 11,
+        DrawingTool::MoveArtwork => 12,
     });
     bytes.push(u8::from(
         state.pencil_template == PencilTemplate::Graphite2B,

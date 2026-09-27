@@ -33,6 +33,7 @@ mod updates;
 mod workspace_appearance;
 
 mod editor_ui_host;
+mod input_preferences;
 mod palette_preferences;
 mod pressure_preferences;
 

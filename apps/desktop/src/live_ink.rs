@@ -160,6 +160,8 @@ pub(crate) struct LiveInkBridge {
 }
 
 struct LiveInkInner {
+    canvas_input_mode: AtomicU8,
+    canvas_input_mode_writable: bool,
     pressure_preset: AtomicU8,
     pressure_preset_writable: bool,
     layout: OnceLock<crate::layout_store::LayoutStore>,
@@ -378,8 +380,11 @@ impl LiveInkBridge {
 
     pub(crate) fn with_capacity(capacity: usize, initial_layer: LayerId) -> Self {
         let (pressure_preset, pressure_preset_writable) = crate::pressure_preferences::load();
+        let (canvas_input_mode, canvas_input_mode_writable) = crate::input_preferences::load();
         Self {
             inner: Arc::new(LiveInkInner {
+                canvas_input_mode: AtomicU8::new(canvas_input_mode as u8),
+                canvas_input_mode_writable,
                 pressure_preset: AtomicU8::new(pressure_preset as u8),
                 pressure_preset_writable,
                 layout: OnceLock::new(),
@@ -445,6 +450,30 @@ impl LiveInkBridge {
             2 => PressurePreset::Softer,
             _ => PressurePreset::Soft,
         }
+    }
+
+    pub(crate) fn canvas_input_mode(&self) -> nyatidraw_input::CanvasInputMode {
+        use nyatidraw_input::CanvasInputMode;
+        match self.inner.canvas_input_mode.load(Ordering::Relaxed) {
+            1 => CanvasInputMode::Pen,
+            2 => CanvasInputMode::Finger,
+            _ => CanvasInputMode::Auto,
+        }
+    }
+
+    pub(crate) fn set_canvas_input_mode(
+        &self,
+        mode: nyatidraw_input::CanvasInputMode,
+    ) -> Result<(), String> {
+        if !self.inner.canvas_input_mode_writable {
+            return Err("저장된 입력 설정을 읽지 못해 원본을 보존합니다".into());
+        }
+        crate::input_preferences::save(mode)?;
+        self.inner
+            .canvas_input_mode
+            .store(mode as u8, Ordering::Relaxed);
+        self.notify_ui();
+        Ok(())
     }
 
     pub(crate) fn set_pressure_preset(&self, preset: PressurePreset) -> Result<(), String> {

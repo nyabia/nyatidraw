@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>연동 가이드 · NyatiDraw</title>
+  <style>
+    :root { color-scheme: light dark; font: 17px/1.7 system-ui, sans-serif; }
+    body { max-width: 760px; margin: auto; padding: 32px 20px 64px; }
+    h1 { font-size: 2rem; } h2 { margin-top: 2.4rem; font-size: 1.35rem; }
+    a { color: light-dark(#225baa, #99bfff); }
+    pre { padding: 16px; overflow-x: auto; background: light-dark(#f0f0f0, #292929); border-radius: 6px; font-size: .85rem; }
+    li { margin-block: 8px; } .note { color: light-dark(#555, #bbb); }
+  </style>
+</head>
+<body>
+  <nav><a href="../">NyatiDraw 열기</a></nav>
+  <h1>그림을 다른 곳으로</h1>
+  <h2>복사해서 붙여넣기</h2>
+  <ol>
+    <li><a href="../" target="_blank" rel="noopener">NyatiDraw를 새 탭에서 열고</a> 그림을 그립니다.</li>
+    <li>메뉴에서 <strong>PNG 복사</strong>를 누르고 복사 완료 안내를 기다립니다.</li>
+    <li>원래 SNS·메신저로 돌아가 작성창에 붙여넣습니다. PC는 Ctrl+V, 모바일은 붙여넣기를 사용합니다.</li>
+  </ol>
+  <p>투명도를 유지한 출력 캔버스만 복사합니다. 체크무늬와 바깥쪽 스케치는 포함하지 않습니다.
+  복사할 수 없는 브라우저에서는 PNG 내보내기로 파일을 받아 첨부하세요.</p>
+  <p class="note">일반 웹판은 마지막 브라우저 작업을 복원합니다. 새 그림은 직접 시작하세요.
+  복사는 원본 저장이 아닙니다. 중요한 그림은 작업 파일(.ntdr)로 보관하세요.
+  이미지 붙여넣기 지원과 권한은 브라우저 및 받는 앱에 따라 다릅니다.</p>
+  <h2>Misskey 위젯에 바로가기 두기</h2>
+  <p>AiScript App 위젯에 다음 링크 예제를 넣습니다. 별도 인증이나 업로드 서버는 필요하지 않습니다.
+  자동 첨부는 하지 않으며, 사용자가 그림을 복사하고 작성창에 붙여넣습니다.</p>
+  <pre><code>Ui:render([
+  Ui:C:mfm({ text: "[그림 그리기 ↗](https://nyabia.github.io/nyatidraw/draw/)" })
+])</code></pre>
+  <p class="note">서버 버전과 포크별 위젯 동작은 별도 확인이 필요합니다.</p>
+  <h2>웹사이트에 편집기 넣기</h2>
+  <p>직접 만드는 사이트라면 iframe 또는 팝업에서 PNG를 돌려받는 JavaScript SDK를 사용할 수 있습니다.
+  iframe은 표시할 패널과 초기값을 지정할 수 있고, 팝업은 전체 UI를 유지합니다.</p>
+  <p><a href="demo.html">SDK 동작 예제</a> · <a href="https://github.com/nyabia/nyatidraw/blob/main/docs/web-embedding.md">개발 문서</a></p>
+</body>
+</html>

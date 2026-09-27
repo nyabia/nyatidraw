@@ -20,7 +20,7 @@ use nyatidraw_api::{
     LayerProjection, LayerProjectionKind, LayerTreeNodeId, PanelKind, ProjectCommand, ToolCommand,
     UiProjection, ViewportCommand, WorkspaceProjection,
 };
-use nyatidraw_input::PressurePreset;
+use nyatidraw_input::{CanvasInputMode, PressurePreset};
 use preview::LayerThumbnailFrame;
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -221,6 +221,7 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
     let live_ink = use_context::<UiHost>();
     let reset_layout_ink = live_ink.clone();
     let mut menu_open = use_signal(|| false);
+    let mut menu_settings = use_signal(|| false);
     let save_ink = live_ink.clone();
     let retry_ink = live_ink.clone();
     let undo_ink = live_ink.clone();
@@ -231,7 +232,7 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
     rsx! {
         nav { class: "commandbar", aria_label: "주요 명령",
             button { class: "command hamburger-button", title: "메뉴", aria_label: "메뉴", aria_expanded: "{menu_open}",
-                onclick: move |_| menu_open.toggle(),
+                onclick: move |_| { menu_settings.set(false); menu_open.toggle(); },
                 span { class: "hamburger", i {}, i {}, i {} }
             }
             FileButtons {}
@@ -283,15 +284,31 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
                     button { class: "command hamburger-button", autofocus: true, title: "메뉴 닫기", aria_label: "메뉴 닫기",
                         onclick: move |_| menu_open.set(false), "×"
                     }
-                    FileButtons { extended: true }
-                    span { class: "divider" }
-                    ClipboardActions { ui_projection }
-                    span { class: "divider" }
-                    button { class: "command", onclick: move |_| {
-                        send_dock_command(&reset_layout_ink, DockCommand::ResetToSafeDefault);
-                        menu_open.set(false);
-                    }, "기본 화면 배치" }
-                    div { class: "pressure-preset-menu", role: "group", aria_label: "펜 필압 감도",
+                    if !menu_settings() {
+                        FileButtons { extended: true }
+                        span { class: "divider" }
+                        ClipboardActions { ui_projection }
+                        span { class: "divider" }
+                        button { class: "command", onclick: move |_| menu_settings.set(true), "환경설정" }
+                        div { class: "menu-line-spacer" }
+                        UpdateControl {}
+                    } else {
+                        button { class: "command", onclick: move |_| menu_settings.set(false), "← 작업 메뉴" }
+                        div { class: "pressure-preset-menu", role: "group", aria_label: "입력 모드",
+                            span { "입력" }
+                            for (mode, label) in [(CanvasInputMode::Auto, "자동"), (CanvasInputMode::Pen, "펜"), (CanvasInputMode::Finger, "손가락")] {
+                                button { class: "command", aria_pressed: live_ink.canvas_input_mode() == mode,
+                                    title: match mode { CanvasInputMode::Auto => "펜 우선 · 마지막 펜 입력 700ms 뒤 새 터치 허용", CanvasInputMode::Pen => "캔버스에서 손가락 입력 끄기", CanvasInputMode::Finger => "손가락으로 현재 도구 사용 · 펜도 사용 가능" },
+                                    onclick: {
+                                        let ink = live_ink.clone();
+                                        move |_| {
+                                            if let Err(message) = ink.set_canvas_input_mode(mode) { error.set(Some(message)); }
+                                        }
+                                    }, "{label}"
+                                }
+                            }
+                        }
+                        div { class: "pressure-preset-menu", role: "group", aria_label: "펜 필압 감도",
                         span { "펜 필압" }
                         for (preset, label) in [(PressurePreset::Linear, "직선"), (PressurePreset::Soft, "부드럽게"), (PressurePreset::Softer, "더 부드럽게")] {
                             button { class: "command", aria_pressed: live_ink.pressure_preset() == preset,
@@ -299,14 +316,17 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
                                     let ink = live_ink.clone();
                                     move |_| {
                                         if let Err(message) = ink.set_pressure_preset(preset) { error.set(Some(message)); }
-                                        else { menu_open.set(false); }
                                     }
                                 }, "{label}"
                             }
                         }
+                        }
+                        span { class: "divider" }
+                        button { class: "command", onclick: move |_| {
+                            send_dock_command(&reset_layout_ink, DockCommand::ResetToSafeDefault);
+                            menu_open.set(false);
+                        }, "기본 화면 배치" }
                     }
-                    div { class: "menu-line-spacer" }
-                    UpdateControl {}
                 }
             }
         }
@@ -813,6 +833,7 @@ fn ToolsPanel(ui_projection: Signal<UiProjection>) -> Element {
     let active = ui_projection.read().drawing_tool;
     rsx! {
         nav { class: "tool-list", aria_label: "도구",
+            ToolButton { label: "그림 이동", icon: "move-artwork", shortcut: "g", tool: Some(DrawingTool::MoveArtwork), active: active == DrawingTool::MoveArtwork }
             ToolButton { label: "화면 이동", icon: "hand", shortcut: "g", tool: Some(DrawingTool::Move), active: active == DrawingTool::Move }
             ToolButton { label: "변형", icon: "transform", shortcut: "g", tool: Some(DrawingTool::MoveSelection), active: active == DrawingTool::MoveSelection }
             ToolButton { label: "마법봉", icon: "wand", shortcut: "g", tool: Some(DrawingTool::Wand), active: active == DrawingTool::Wand }
@@ -873,6 +894,7 @@ fn BrushPanel(ui_projection: Signal<UiProjection>) -> Element {
         DrawingTool::Eraser => "기본 지우개",
         DrawingTool::MoveSelection => "자유 변형",
         DrawingTool::Move => "화면 이동",
+        DrawingTool::MoveArtwork => "그림 이동",
         DrawingTool::Wand => "마법봉",
         DrawingTool::Lasso => "올가미",
         DrawingTool::RectangleSelection => "사각형 선택",
@@ -910,6 +932,9 @@ fn ToolPropertiesPanel(ui_projection: Signal<UiProjection>) -> Element {
     {
         return rsx! { transform_panel::TransformPanel { ui_projection } };
     }
+    if ui_projection.read().drawing_tool == DrawingTool::MoveArtwork {
+        return rsx! { MoveArtworkPanel { ui_projection } };
+    }
     if ui_projection.read().drawing_tool.is_edit() {
         return rsx! { EditToolPanel { ui_projection } };
     }
@@ -932,6 +957,24 @@ fn ToolPropertiesPanel(ui_projection: Signal<UiProjection>) -> Element {
                 BrushPressureControl { size_axis: true, enabled: settings.size_pressure, minimum_u16: settings.size_minimum_u16 }
                 BrushPressureControl { size_axis: false, enabled: settings.opacity_pressure, minimum_u16: settings.opacity_minimum_u16 }
             }
+        }
+    }
+}
+
+#[component]
+fn MoveArtworkPanel(ui_projection: Signal<UiProjection>) -> Element {
+    let ink = use_context::<UiHost>();
+    let error = use_signal(|| Option::<String>::None);
+    let has_selection = ui_projection.read().edit.has_selection;
+    let busy = ui_projection.read().edit.busy;
+    rsx! {
+        div { class: "edit-tool-properties",
+            p { if has_selection { "선택한 그림을 끌어 이동합니다. 손을 떼면 확정됩니다." } else { "현재 레이어의 그림을 끌어 이동합니다. 페이지 밖 그림도 함께 이동합니다." } }
+            div { class: "selection-morph-actions", role: "group", aria_label: "캔버스 중앙 정렬",
+                button { disabled: busy, onclick: { let ink = ink.clone(); move |_| send_editor_command(&ink, EditorCommand::Edit(nyatidraw_api::EditCommand::CenterArtwork { horizontal: true, vertical: false }), error) }, "가로 중앙" }
+                button { disabled: busy, onclick: move |_| send_editor_command(&ink, EditorCommand::Edit(nyatidraw_api::EditCommand::CenterArtwork { horizontal: false, vertical: true }), error), "세로 중앙" }
+            }
+            if let Some(message) = error.read().as_ref() { div { class: "command-error", role: "alert", "{message}" } }
         }
     }
 }
@@ -1974,6 +2017,17 @@ pub fn UiIcon(name: &'static str) -> Element {
             "M8 12V6a2 2 0 0 1 4 0v5",
             "M12 9V4a2 2 0 0 1 4 0v7",
             "M16 8a2 2 0 0 1 4 0v8c0 4-3 6-6 6h-2c-2 0-4-1-5-3l-4-6a2 2 0 0 1 3-2l2 2",
+        ],
+        "move-artwork" => &[
+            "M7 7h10v10H7z",
+            "M12 2v4",
+            "m10 4 2-2 2 2",
+            "M12 22v-4",
+            "m10 20 2 2 2-2",
+            "M2 12h4",
+            "m4 10-2 2 2 2",
+            "M22 12h-4",
+            "m20 10 2 2-2 2",
         ],
         "rectangle-selection" => &[
             "M3 7V3h4",

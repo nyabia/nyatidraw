@@ -27,7 +27,9 @@ pub use selection::{
     rectangle_selection_signed, sample_artwork_pixel, sample_display_pixel, select_layer_alpha,
     selection_all, shrink_selection, wand_selection,
 };
-pub use transform::{transform_raster, translate_artwork};
+pub use transform::{
+    MovableBounds, movable_bounds, move_raster, transform_raster, translate_artwork,
+};
 
 use nyatidraw_brush::BrushDab;
 use nyatidraw_document::{GroupNode, LayerTree};

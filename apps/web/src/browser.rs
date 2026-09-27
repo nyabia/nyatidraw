@@ -44,6 +44,9 @@ extern "C" {
     pub fn set_modal_open(open: bool);
     #[wasm_bindgen(js_name = focusModal)]
     pub fn focus_modal();
+    #[wasm_bindgen(js_name = setCanvasInputMode)]
+    pub fn set_canvas_input_mode(mode: &str);
+
     #[wasm_bindgen(js_name = setCanvasTool)]
     pub fn set_canvas_tool(tool: &str);
     #[wasm_bindgen(catch, js_name = loadPreference)]
@@ -54,4 +57,10 @@ extern "C" {
 
 pub fn error_text(error: &JsValue) -> String {
     error.as_string().unwrap_or_else(|| format!("{error:?}"))
+}
+
+#[wasm_bindgen(module = "/src/clipboard.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = writePngClipboard)]
+    pub fn write_png_clipboard(bytes: &Uint8Array) -> Promise;
 }

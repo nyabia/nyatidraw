@@ -307,6 +307,12 @@ let modalOpen = false;
 let cancelCanvasGesture;
 let previousFocus;
 let canvasTool = "stroke";
+let canvasInputMode = "auto";
+export function setCanvasInputMode(mode) {
+  if (!["auto", "pen", "finger"].includes(mode) || mode === canvasInputMode) return;
+  cancelCanvasGesture?.();
+  canvasInputMode = mode;
+}
 export function setCanvasTool(tool) {
   canvasTool = tool;
 }
@@ -401,6 +407,7 @@ export function bindCanvas(canvas, callback) {
   let active = null;
   let activePointerType = null;
   let lastPenActivity = -Infinity;
+  let penContact = false;
   const penTouchGuardMs = 700;
   let mode = null;
   let space = false;
@@ -434,27 +441,39 @@ export function bindCanvas(canvas, callback) {
       phase,
       x,
       y,
-      event.pointerType === "mouse" ? 1 : event.pressure,
+      event.pointerType === "pen" ? event.pressure : 1,
       event.timeStamp,
       event.pointerType === "pen",
     );
   };
-  const releaseTouchPan = () => {
+  const releaseActivePointer = () => {
+    clearPicker();
     const captured = active;
+    const phase = mode === "pan" ? "panEnd" : "cancel";
     active = null;
     activePointerType = null;
     mode = null;
-    callback("panEnd", 0, 0, 0, 0, false);
+    callback(phase, 0, 0, 0, 0, false);
     if (canvas.hasPointerCapture(captured)) canvas.releasePointerCapture(captured);
   };
   canvas.addEventListener("contextmenu", (event) => event.preventDefault());
-  canvas.addEventListener("pointerdown", (event) => {
-    if (event.pointerType === "pen") {
-      lastPenActivity = performance.now();
-      if (activePointerType === "touch") releaseTouchPan();
+  const observePen = (event) => {
+    if (event.pointerType !== "pen") return;
+    lastPenActivity = performance.now();
+    if (canvasInputMode === "auto" && activePointerType === "touch") releaseActivePointer();
+    if (event.type === "pointerdown") {
+      penContact = true;
+      if (activePointerType === "touch") releaseActivePointer();
+    } else if (["pointerup", "pointercancel"].includes(event.type)) {
+      penContact = false;
     }
+  };
+  for (const phase of ["pointerdown", "pointermove", "pointerup", "pointercancel"])
+    document.addEventListener(phase, observePen, true);
+  canvas.addEventListener("pointerdown", (event) => {
     if (event.pointerType === "touch" &&
-        performance.now() - lastPenActivity < penTouchGuardMs) {
+        (penContact || canvasInputMode === "pen" ||
+         (canvasInputMode === "auto" && performance.now() - lastPenActivity < penTouchGuardMs))) {
       event.preventDefault();
       return;
     }
@@ -471,7 +490,7 @@ export function bindCanvas(canvas, callback) {
     active = event.pointerId;
     activePointerType = event.pointerType;
     mode =
-      event.button === 1 || space || event.pointerType === "touch" || canvasTool === "pan"
+      event.button === 1 || space || canvasTool === "pan"
         ? "pan"
         : event.altKey || canvasTool === "pick" ? "pick" : "stroke";
     canvas.setPointerCapture(active);
@@ -512,27 +531,20 @@ export function bindCanvas(canvas, callback) {
     canvas.releasePointerCapture(event.pointerId);
   });
   const cancel = () => {
-    clearPicker();
     space = false;
     if (active === null) return;
-    const captured = active;
-    active = null;
-    activePointerType = null;
-    mode = null;
-    callback("cancel", 0, 0, 0, 0, false);
-    if (canvas.hasPointerCapture(captured))
-      canvas.releasePointerCapture(captured);
+    releaseActivePointer();
   };
   cancelCanvasGesture = cancel;
   const cancelActivePointer = (event) => {
     if (event.pointerId !== active) return;
-    if (activePointerType === "touch") releaseTouchPan();
-    else cancel();
+    cancel();
   };
   canvas.addEventListener("pointercancel", cancelActivePointer);
   canvas.addEventListener("lostpointercapture", cancelActivePointer);
   window.addEventListener("blur", () => {
     cancel();
+    penContact = false;
     space = false;
   });
   document.addEventListener("visibilitychange", () => {

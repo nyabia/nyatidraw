@@ -23,21 +23,23 @@ use windows::{
             GetCapture, GetKeyState, ReleaseCapture, SetCapture, VK_SPACE,
         },
         UI::Input::Pointer::{
-            GetPointerPenInfo, POINTER_FLAG_CANCELED, POINTER_FLAG_INCONTACT,
-            POINTER_FLAG_SECONDBUTTON, POINTER_FLAG_THIRDBUTTON, POINTER_PEN_INFO,
+            GetPointerInfo, GetPointerPenInfo, GetPointerType, POINTER_FLAG_CANCELED,
+            POINTER_FLAG_INCONTACT, POINTER_FLAG_SECONDBUTTON, POINTER_FLAG_THIRDBUTTON,
+            POINTER_INFO, POINTER_PEN_INFO,
         },
         UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         UI::WindowsAndMessaging::{
             CREATESTRUCTW, CS_HREDRAW, CS_OWNDC, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-            DestroyWindow, GWLP_USERDATA, GetClientRect, GetMessagePos, GetMessageTime, GetParent,
-            GetWindowLongPtrW, HWND_BOTTOM, IDC_ARROW, LoadCursorW, MSG, PEN_FLAG_BARREL,
-            PostMessageW, RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer,
-            SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP,
-            WM_CAPTURECHANGED, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
-            WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-            WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_POINTERCAPTURECHANGED,
-            WM_POINTERDOWN, WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE, WM_SIZE, WM_TIMER,
-            WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+            DestroyWindow, GWLP_USERDATA, GetClientRect, GetMessageExtraInfo, GetMessagePos,
+            GetMessageTime, GetParent, GetWindowLongPtrW, HWND_BOTTOM, IDC_ARROW, LoadCursorW, MSG,
+            PEN_FLAG_BARREL, POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, PostMessageW, RegisterClassW,
+            SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer, SetWindowLongPtrW, SetWindowPos,
+            ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE,
+            WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+            WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
+            WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERLEAVE, WM_POINTERUP,
+            WM_POINTERUPDATE, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
+            WS_CLIPSIBLINGS, WS_VISIBLE,
         },
     },
     core::w,
@@ -417,6 +419,10 @@ struct CanvasWindowState {
     activation: ActivationInbox,
     viewport: WindowsViewportInput,
     mouse: WindowsMouseInput,
+    touch: WindowsMouseInput,
+    touch_pointer: Option<u32>,
+    pen_contact: Option<u32>,
+    last_pen_activity_ms: Option<u32>,
     pen: WindowsPenInput,
     host: Option<RenderHost>,
     reopening: bool,
@@ -428,6 +434,10 @@ impl CanvasWindowState {
         Self {
             viewport: WindowsViewportInput::new(live_ink.clone()),
             mouse: WindowsMouseInput::new(live_ink.clone()),
+            touch: WindowsMouseInput::new_touch(live_ink.clone()),
+            touch_pointer: None,
+            pen_contact: None,
+            last_pen_activity_ms: None,
             pen: WindowsPenInput::new(live_ink.clone()),
             live_ink,
             _instance: instance,
@@ -549,6 +559,99 @@ impl CanvasWindowState {
         }
     }
 
+    fn cancel_touch(&mut self, timestamp_ms: u32) -> bool {
+        self.touch_pointer = None;
+        let was_dragging = self.viewport.touch_drag();
+        if was_dragging {
+            self.viewport.drag = None;
+        }
+        self.touch.cancel(timestamp_ms) || was_dragging
+    }
+
+    fn observe_touch(&mut self, hwnd: HWND, message: &MSG) -> bool {
+        let pointer = pointer_id(message.wParam);
+        if message.message == WM_POINTERDOWN {
+            if self.touch_pointer.is_some() {
+                return true;
+            }
+            let elapsed = self
+                .last_pen_activity_ms
+                .map(|last| u64::from(message.time.wrapping_sub(last)));
+            if !self
+                .live_ink
+                .canvas_input_mode()
+                .allows_touch_begin(self.pen_contact.is_some(), elapsed)
+                || self.pen.active_pointer.is_some()
+                || self.mouse.active.is_some()
+                || self.viewport.drag.is_some()
+            {
+                return true;
+            }
+            self.touch_pointer = Some(pointer);
+        } else if self.touch_pointer != Some(pointer) {
+            return true;
+        }
+
+        if self.live_ink.canvas_input_mode() == nyatidraw_input::CanvasInputMode::Pen
+            || self.pen_contact.is_some()
+            || self.pen.active_pointer.is_some()
+        {
+            let _ = self.cancel_touch(message.time);
+            return true;
+        }
+
+        let mut info = POINTER_INFO::default();
+        // SAFETY: this message supplies a live pointer id and writable metadata.
+        if unsafe { GetPointerInfo(pointer, &raw mut info) }.is_err() {
+            let _ = self.cancel_touch(message.time);
+            return true;
+        }
+        let cancelled = info.pointerFlags.contains(POINTER_FLAG_CANCELED);
+        let mut client = info.ptPixelLocation;
+        // SAFETY: `client` is owned writable storage and `hwnd` is this canvas.
+        if !unsafe { ScreenToClient(hwnd, &raw mut client) }.as_bool() {
+            let _ = self.cancel_touch(message.time);
+            return true;
+        }
+        let point = [client.x, client.y];
+        if cancelled
+            || (message.message != WM_POINTERUP
+                && !info.pointerFlags.contains(POINTER_FLAG_INCONTACT))
+            || matches!(message.message, WM_POINTERCAPTURECHANGED | WM_POINTERLEAVE)
+        {
+            let _ = self.cancel_touch(message.time);
+            return true;
+        }
+        if self
+            .viewport
+            .observe_touch(hwnd, message.message, pointer, point)
+        {
+            if message.message == WM_POINTERUP {
+                self.touch_pointer = None;
+            }
+            return true;
+        }
+        let kind = match message.message {
+            WM_POINTERDOWN => nyatidraw_input_platform::WindowsMouseMessage::Down,
+            WM_POINTERUPDATE => nyatidraw_input_platform::WindowsMouseMessage::Move,
+            WM_POINTERUP => nyatidraw_input_platform::WindowsMouseMessage::Up,
+            _ => return true,
+        };
+        let event = nyatidraw_input_platform::WindowsMouseEvent {
+            message: kind,
+            timestamp_ms: info.dwTime,
+            position_client_px: nyatidraw_input::Point {
+                x: f64::from(point[0]),
+                y: f64::from(point[1]),
+            },
+        };
+        let _ = self.touch.admit(event);
+        if message.message == WM_POINTERUP {
+            self.touch_pointer = None;
+        }
+        true
+    }
+
     fn observe_viewport(
         &mut self,
         hwnd: HWND,
@@ -637,11 +740,19 @@ unsafe extern "system" fn canvas_wnd_proc(
                 let timestamp = current_message(hwnd, message, wparam, lparam).time;
                 state.viewport.drag = None;
                 state.mouse.capture_lost(timestamp);
+                state.cancel_touch(timestamp);
                 state.pen.cancel_active(timestamp);
+                state.pen_contact = None;
                 state.live_ink.request_redraw();
                 return LRESULT(0);
             }
             WM_NAYATI_CLOSE => {
+                let timestamp = current_message(hwnd, message, wparam, lparam).time;
+                state.viewport.drag = None;
+                state.mouse.capture_lost(timestamp);
+                state.cancel_touch(timestamp);
+                state.pen.cancel_active(timestamp);
+                state.pen_contact = None;
                 state.begin_close(hwnd);
                 return LRESULT(0);
             }
@@ -706,6 +817,63 @@ unsafe extern "system" fn canvas_wnd_proc(
                     return LRESULT(0);
                 }
                 let msg = current_message(hwnd, message, wparam, lparam);
+                if matches!(
+                    message,
+                    WM_LBUTTONDOWN
+                        | WM_LBUTTONUP
+                        | WM_MBUTTONDOWN
+                        | WM_MBUTTONUP
+                        | WM_MOUSEMOVE
+                        | WM_MOUSEWHEEL
+                        | WM_MOUSEHWHEEL
+                ) && (state.touch_pointer.is_some() || is_promoted_pointer_mouse())
+                {
+                    return LRESULT(0);
+                }
+                if matches!(
+                    message,
+                    WM_POINTERDOWN
+                        | WM_POINTERUPDATE
+                        | WM_POINTERUP
+                        | WM_POINTERCAPTURECHANGED
+                        | WM_POINTERLEAVE
+                ) {
+                    match pointer_type(wparam, state) {
+                        Some(PT_TOUCH) => {
+                            state.observe_touch(hwnd, &msg);
+                            state.live_ink.request_redraw();
+                            return LRESULT(0);
+                        }
+                        Some(PT_PEN) => {
+                            state.last_pen_activity_ms = Some(msg.time);
+                            if state.live_ink.canvas_input_mode()
+                                == nyatidraw_input::CanvasInputMode::Auto
+                            {
+                                state.cancel_touch(msg.time);
+                            }
+                            if message == WM_POINTERDOWN {
+                                state.pen_contact = Some(pointer_id(wparam));
+                                state.cancel_touch(msg.time);
+                            } else if message == WM_POINTERUPDATE {
+                                if pen_controls(wparam)
+                                    .is_some_and(|controls| controls.contact && !controls.cancelled)
+                                {
+                                    state.pen_contact = Some(pointer_id(wparam));
+                                    state.cancel_touch(msg.time);
+                                } else if state.pen_contact == Some(pointer_id(wparam)) {
+                                    state.pen_contact = None;
+                                }
+                            } else if matches!(
+                                message,
+                                WM_POINTERUP | WM_POINTERCAPTURECHANGED | WM_POINTERLEAVE
+                            ) && state.pen_contact == Some(pointer_id(wparam))
+                            {
+                                state.pen_contact = None;
+                            }
+                        }
+                        _ => return LRESULT(0),
+                    }
+                }
                 let controls = matches!(message, WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP)
                     .then(|| pen_controls(wparam))
                     .flatten();
@@ -772,6 +940,7 @@ enum ViewportDragSource {
     MouseMiddle,
     PenContact(u32),
     PenButton(u32),
+    TouchContact(u32),
 }
 
 struct WindowsViewportInput {
@@ -809,6 +978,38 @@ impl WindowsViewportInput {
         self.drag.is_some_and(|drag| {
             matches!(drag.source, ViewportDragSource::PenContact(id) | ViewportDragSource::PenButton(id) if id == pointer)
         })
+    }
+
+    fn touch_drag(&self) -> bool {
+        self.drag
+            .is_some_and(|drag| matches!(drag.source, ViewportDragSource::TouchContact(_)))
+    }
+
+    fn observe_touch(&mut self, hwnd: HWND, message: u32, pointer: u32, point: [i32; 2]) -> bool {
+        if message == WM_POINTERDOWN
+            && (space_is_down() || (self.live_ink.navigation_tool() && !alt_is_down()))
+        {
+            if self.drag.is_none() {
+                self.drag = Some(ViewportDrag {
+                    last_client_px: point,
+                    source: ViewportDragSource::TouchContact(pointer),
+                });
+            }
+            return true;
+        }
+        if self
+            .drag
+            .is_some_and(|drag| drag.source == ViewportDragSource::TouchContact(pointer))
+        {
+            if matches!(message, WM_POINTERUPDATE | WM_POINTERUP) {
+                self.move_drag(hwnd, point);
+            }
+            if message == WM_POINTERUP {
+                self.drag = None;
+            }
+            return true;
+        }
+        false
     }
 
     fn observe_pen(&mut self, hwnd: HWND, message: &MSG, controls: Option<PenControls>) -> bool {
@@ -1173,6 +1374,32 @@ fn pen_controls(wparam: WPARAM) -> Option<PenControls> {
         contact: flags.contains(POINTER_FLAG_INCONTACT),
         cancelled: flags.contains(POINTER_FLAG_CANCELED),
     })
+}
+
+fn pointer_id(wparam: WPARAM) -> u32 {
+    u32::try_from(wparam.0 & 0xffff).expect("pointer id is 16-bit")
+}
+
+fn pointer_type(wparam: WPARAM, state: &CanvasWindowState) -> Option<POINTER_INPUT_TYPE> {
+    let pointer = pointer_id(wparam);
+    let mut kind = POINTER_INPUT_TYPE::default();
+    // SAFETY: Windows writes the pointer type into owned stack storage.
+    if unsafe { GetPointerType(pointer, &raw mut kind) }.is_ok() {
+        Some(kind)
+    } else if state.touch_pointer == Some(pointer) {
+        Some(PT_TOUCH)
+    } else if state.pen.active_pointer == Some(pointer) || state.pen_contact == Some(pointer) {
+        Some(PT_PEN)
+    } else {
+        None
+    }
+}
+
+fn is_promoted_pointer_mouse() -> bool {
+    // Windows marks pen/touch compatibility mouse messages in the extra info.
+    // Keep those messages out of both viewport navigation and mouse drawing.
+    let extra = unsafe { GetMessageExtraInfo() }.0.cast_unsigned();
+    extra & 0xffff_ff00 == 0xff51_5700
 }
 
 fn screen_message_point(hwnd: HWND, lparam: LPARAM) -> [i32; 2] {
@@ -1649,6 +1876,7 @@ struct WindowsMouseInput {
     policy: nyatidraw_input::InStrokeViewportPolicy,
     live_ink: LiveInkBridge,
     active: Option<MouseStroke>,
+    device_id: u64,
     next_sequence: u64,
     timestamp_epoch_ms: u64,
     last_timestamp_ms: Option<u32>,
@@ -1661,10 +1889,18 @@ impl WindowsMouseInput {
             policy: nyatidraw_input::InStrokeViewportPolicy::default(),
             live_ink,
             active: None,
+            device_id: u64::MAX,
             next_sequence: 1_u64 << 63,
             timestamp_epoch_ms: 0,
             last_timestamp_ms: None,
         }
+    }
+
+    fn new_touch(live_ink: LiveInkBridge) -> Self {
+        let mut input = Self::new(live_ink);
+        input.device_id = u64::MAX - 1;
+        input.next_sequence = 1_u64 << 62;
+        input
     }
 
     fn observe(&mut self, message: &MSG) -> bool {
@@ -1811,7 +2047,7 @@ impl WindowsMouseInput {
                 .timestamp_epoch_ms
                 .saturating_add(u64::from(timestamp_ms))
                 .saturating_mul(1_000_000),
-            device_id: u64::MAX,
+            device_id: self.device_id,
             phase,
             position_document,
             pressure: 1.0,

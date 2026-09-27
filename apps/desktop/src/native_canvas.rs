@@ -2372,11 +2372,12 @@ impl ActiveCanvas {
                         }
                         ToolCommand::CycleSelectionFamily => {
                             let tool = match self.drawing.tool {
+                                DrawingTool::MoveArtwork => DrawingTool::Move,
                                 DrawingTool::Move => DrawingTool::MoveSelection,
                                 DrawingTool::MoveSelection => DrawingTool::Wand,
                                 DrawingTool::Wand => DrawingTool::Lasso,
                                 DrawingTool::Lasso => DrawingTool::RectangleSelection,
-                                _ => DrawingTool::Move,
+                                _ => DrawingTool::MoveArtwork,
                             };
                             self.drawing.select_tool(tool);
                             self.stroke

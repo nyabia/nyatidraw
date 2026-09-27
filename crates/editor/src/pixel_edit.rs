@@ -2,8 +2,8 @@ use nyatidraw_api::{CanvasSpec, EditCommand, EditSource, LayerId};
 use nyatidraw_document::LayerTree;
 use nyatidraw_paint_cpu::{
     EditLimits, PremultipliedRgba8, RasterFragment, SelectionMask, SelectionPaint, SelectionSource,
-    WandRequest, lasso_selection_signed, paint_selection, transform_raster, translate_artwork,
-    wand_selection,
+    WandRequest, lasso_selection_signed, movable_bounds, move_raster, paint_selection,
+    transform_raster, translate_artwork, wand_selection,
 };
 use nyatidraw_tiles::TileSnapshot;
 use std::sync::Arc;
@@ -122,6 +122,8 @@ pub fn execute_pixel_edit(
             | EditCommand::DeleteSelectedPixels
             | EditCommand::CutSelection
             | EditCommand::Transform(_)
+            | EditCommand::MoveArtwork { .. }
+            | EditCommand::CenterArtwork { .. }
             | EditCommand::FillSelection { .. }
             | EditCommand::FloodFill { .. }
             | EditCommand::FloodFillAdvanced { .. }
@@ -317,6 +319,49 @@ pub fn execute_pixel_edit(
             );
             None
         }
+        EditCommand::MoveArtwork { offset } => {
+            if offset != [0, 0] {
+                let moved_selection = translated_selection(selection.as_deref(), offset)?;
+                transformed = Some(
+                    move_raster(tiles, tree, target, selection.as_deref(), offset, limits)
+                        .map_err(reject)?,
+                );
+                *selection = moved_selection;
+            }
+            None
+        }
+        EditCommand::CenterArtwork {
+            horizontal,
+            vertical,
+        } => {
+            if (horizontal || vertical)
+                && let Some(bounds) =
+                    movable_bounds(tiles, target, selection.as_deref(), limits).map_err(reject)?
+            {
+                let axes = [horizontal, vertical];
+                let page = [canvas.width_px, canvas.height_px];
+                let mut offset = [0; 2];
+                for axis in 0..2 {
+                    if axes[axis] {
+                        let centered =
+                            (i64::from(page[axis]) - i64::from(bounds.size[axis])).div_euclid(2);
+                        offset[axis] = i32::try_from(centered - i64::from(bounds.origin[axis]))
+                            .map_err(|_| {
+                                PixelEditError("중앙 이동 좌표가 허용 범위를 벗어났습니다.".into())
+                            })?;
+                    }
+                }
+                if offset != [0, 0] {
+                    let moved_selection = translated_selection(selection.as_deref(), offset)?;
+                    transformed = Some(
+                        move_raster(tiles, tree, target, selection.as_deref(), offset, limits)
+                            .map_err(reject)?,
+                    );
+                    *selection = moved_selection;
+                }
+            }
+            None
+        }
         EditCommand::SelectWand {
             seed,
             tolerance,
@@ -479,6 +524,25 @@ pub fn execute_pixel_edit(
         canvas: changed_canvas,
         selection: candidate_selection,
     })
+}
+
+fn translated_selection(
+    selection: Option<&SelectionMask>,
+    offset: [i32; 2],
+) -> Result<Option<Arc<SelectionMask>>, PixelEditError> {
+    selection
+        .map(|mask| {
+            let origin = [0, 1].map(|axis| mask.origin()[axis].checked_add(offset[axis]));
+            let [Some(x), Some(y)] = origin else {
+                return Err(PixelEditError(
+                    "선택 영역 이동 좌표가 허용 범위를 벗어났습니다.".into(),
+                ));
+            };
+            SelectionMask::from_packed_bits_at([x, y], mask.dimensions(), &mask.packed_bits())
+                .map(Arc::new)
+                .map_err(|error| PixelEditError(format!("{error:?}")))
+        })
+        .transpose()
 }
 
 // All/invert have an explicit finite document domain, not the current viewport.

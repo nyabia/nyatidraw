@@ -5,7 +5,7 @@ use crate::{
 };
 use dioxus::prelude::*;
 use nyatidraw_api::{EditorCommand, EventEnvelope, Revision, UiProjection};
-use nyatidraw_input::PressurePreset;
+use nyatidraw_input::{CanvasInputMode, PressurePreset};
 use std::{ops::Deref, rc::Rc};
 
 pub type PalettePins = [Option<[u8; 4]>; 10];
@@ -46,6 +46,14 @@ pub trait UiBackend {
     fn set_workspace_appearance(&self, _appearance: WorkspaceAppearance) {}
     fn pressure_preset(&self) -> PressurePreset {
         PressurePreset::default()
+    }
+    fn canvas_input_mode(&self) -> CanvasInputMode {
+        CanvasInputMode::default()
+    }
+    /// # Errors
+    /// Returns an error when the app preference cannot be safely stored.
+    fn set_canvas_input_mode(&self, _mode: CanvasInputMode) -> Result<(), String> {
+        Ok(())
     }
     /// # Errors
     /// Returns an error when the app preference cannot be safely stored.
