@@ -17,8 +17,10 @@
 - [공개 웹 검증](measurements/web-integration.md)에서 iframe·popup PNG 반환과
   실제 다운로드 NTDR의 별도 프로세스 재열기, native/web artwork root 일치를 확인했다.
   공개 웹 본체·Worker·SDK의 SHA256도 Pages 산출물과 일치했다.
-- 최초 공개 `release.json`은 alpha.15를 반환하여 홈페이지 재게시를 요청했다.
-  최종 공개 다운로드 링크 확인은 별도 기록한다.
+- 최초 공개 `release.json`은 alpha.15를 반환했다.
+  [홈페이지 재게시](https://github.com/nyabia/nyatidraw/actions/runs/36292354433) 성공 후
+  기본 `release.json` URL과 실제 Edge의 다운로드 버튼에서 alpha.16 설치 링크를 확인했다.
+  기존 태그와 릴리즈 자산은 교체하지 않았다.
 - 사용자 작품과 설치본은 변경하지 않았다. 실제 iPad Safari·물리 펜·설치 업데이트는
   미검증이며, [릴리즈 노트](releases/0.1.0-alpha.16.md)의 제한을 유지한다.
 
