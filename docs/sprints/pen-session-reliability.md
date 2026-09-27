@@ -93,6 +93,11 @@ alpha.16 태그 이후의 웹 보수다. 데스크톱 입력 어댑터는 변경
   마우스 유지, 보호 시간 후 터치 복귀, 터치 취소 시 선택 보존.
   캡처 메서드는 시험용으로 대체했다. 실제 브라우저 캡처·OS 손바닥 판별·iPad Safari·
   물리 펜의 사용감은 미검증이다. `node --check apps/web/src/browser.js`도 통과했다.
+- DX debug Web/Worker 빌드와 [후속 웹 CI·게시](https://github.com/nyabia/nyatidraw/actions/runs/36292514138)가
+  통과했다. 공개 편집기 JS의 SHA256은
+  `0cad241395f17ea9ed65a307b80437ae99078bce1adf685d4f6d898579b6af63`으로
+  소스 `3211723`의 Pages 산출물과 일치한다. alpha.16 설치 파일에 이 웹 전용 후속 변경이
+  포함됐다는 뜻은 아니며, 기존 태그·설치 파일은 변경하지 않았다.
 
 ## 파일 크기 후속
 
