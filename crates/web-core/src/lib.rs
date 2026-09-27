@@ -39,9 +39,9 @@ const MAX_COORDINATE: f64 = 32768.0;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
 pub enum WebTool {
-    #[default]
     Pencil2H,
     Pencil2B,
+    #[default]
     Pen,
     SoftBrush,
     Eraser,
@@ -107,13 +107,17 @@ impl BrushSettings {
     pub fn for_tool(tool: WebTool) -> Self {
         let preset = tool.preset();
         Self {
-            size_px: preset.size_px,
+            size_px: if tool == WebTool::Pen {
+                10.0
+            } else {
+                preset.size_px
+            },
             opacity: preset.opacity,
             hardness: preset.hardness,
             size_pressure: preset.size_pressure,
             opacity_pressure: preset.opacity_pressure,
-            size_minimum_u16: (preset.size_min_ratio * f32::from(u16::MAX)).round() as u16,
-            opacity_minimum_u16: (preset.opacity_min_ratio * f32::from(u16::MAX)).round() as u16,
+            size_minimum_u16: 0,
+            opacity_minimum_u16: 0,
             smoothing: 0,
         }
     }

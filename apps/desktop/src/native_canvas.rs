@@ -210,7 +210,11 @@ struct RememberedBrush {
 impl RememberedBrush {
     const fn for_tool(tool: DrawingTool) -> Self {
         Self {
-            size_tenths: 50,
+            size_tenths: if matches!(tool, DrawingTool::Pen) {
+                100
+            } else {
+                50
+            },
             opacity_u16: u16::MAX,
             settings: BrushSettings::for_tool(tool),
         }

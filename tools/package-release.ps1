@@ -29,6 +29,7 @@ Copy-Item (Join-Path $source '*') $stage -Recurse
 Rename-Item -LiteralPath (Join-Path $stage 'nyatidraw-desktop.exe') -NewName 'nyatidraw.exe'
 $notices = [Text.StringBuilder]::new()
 [void]$notices.AppendLine('NyatiDraw — third-party notices')
+[void]$notices.AppendLine([IO.File]::ReadAllText((Join-Path $repositoryRoot 'THIRD-PARTY-ASSETS.txt')))
 Push-Location $repositoryRoot
 try {
     $metadata = (& cargo metadata --format-version 1 --locked --filter-platform x86_64-pc-windows-msvc) | ConvertFrom-Json

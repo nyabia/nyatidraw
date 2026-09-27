@@ -25,6 +25,13 @@ pub(crate) fn create(live_ink: LiveInkBridge, notify: Arc<dyn Fn() + Send + Sync
 }
 
 impl UiBackend for DesktopUiBackend {
+    fn pressure_preset(&self) -> nyatidraw_input::PressurePreset {
+        self.live_ink.pressure_preset()
+    }
+
+    fn set_pressure_preset(&self, preset: nyatidraw_input::PressurePreset) -> Result<(), String> {
+        self.live_ink.set_pressure_preset(preset)
+    }
     fn protocol_snapshot(&self) -> (UiProjection, Option<EventEnvelope>) {
         self.live_ink.protocol_snapshot()
     }

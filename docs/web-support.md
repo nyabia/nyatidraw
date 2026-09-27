@@ -1,5 +1,8 @@
 # 웹 실험판
 
+새 창·iframe 연동의 API와 일반 작업 저장소로부터의 격리는 [웹 임베딩](web-embedding.md),
+현재 작업 트리의 실제 확인 범위는 [연동 검증](measurements/web-integration.md)을 참고한다.
+
 상태: 데스크톱과 같은 공용 Dioxus 화면과 NTDR 저장 형식을 Pages에 배포했다.
 이후 선택·채우기·변형·그룹·도킹을 공용 편집 코어에 연결한 확장도 Pages에 배포했다.
 Windows alpha.14의 패키징·공개 결과는 [배포 기록](releasing.md)에서 확인한다. 아래 현재 소스 범위와 과거

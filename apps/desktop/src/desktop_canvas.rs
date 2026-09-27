@@ -1847,6 +1847,7 @@ struct WindowsPenInput {
     active_pointer: Option<u32>,
     temporary_picker: bool,
     barrel_picker: bool,
+    pressure_mapper: nyatidraw_input::LivePressureMapper,
 }
 
 impl WindowsPenInput {
@@ -1861,6 +1862,7 @@ impl WindowsPenInput {
             active_pointer: None,
             temporary_picker: false,
             barrel_picker: false,
+            pressure_mapper: nyatidraw_input::LivePressureMapper::default(),
         }
     }
 
@@ -1963,9 +1965,16 @@ impl WindowsPenInput {
         {
             return false;
         }
+        let mut sample = recorded.sample;
+        sample.pressure = self.pressure_mapper.process(
+            sample.phase,
+            sample.pressure,
+            true,
+            self.live_ink.pressure_preset(),
+        );
         self.live_ink
             .push_with_temporary_picker(
-                recorded.sample,
+                sample,
                 recorded.sample.phase == nyatidraw_input::PointerPhase::Begin
                     && self.temporary_picker,
             )

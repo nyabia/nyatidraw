@@ -12,13 +12,15 @@ use nyatidraw_editor_ui::{
     preview::{LayerThumbnailSnapshot, NavigatorSnapshot, NavigatorViewport},
     workspace_appearance::WorkspaceAppearance,
 };
-use nyatidraw_input::Point;
+use nyatidraw_input::{Point, PressurePreset};
 use nyatidraw_web_core::{WebDocument, WebTool};
 
 use crate::{browser, runtime::Editor};
 
 #[derive(Default)]
 struct Preferences {
+    pressure_preset: PressurePreset,
+    pressure_writable: bool,
     dock: DockTree,
     heights: PanelHeights,
     appearance: WorkspaceAppearance,
@@ -28,17 +30,30 @@ struct Preferences {
 }
 
 impl Preferences {
-    fn load(editor: Editor) -> Self {
-        let mut preferences = Self::default();
-        for key in ["pins", "heights", "appearance", "dock"] {
+    fn load(editor: &Editor) -> Self {
+        let mut preferences = Self {
+            pressure_writable: true,
+            ..Self::default()
+        };
+        for key in ["pins", "heights", "appearance", "dock", "pen-pressure"] {
             match browser::load_preference(key) {
-                Ok(Some(value)) if preferences.restore(key, &value).is_none() => editor.warn(
-                    "화면 설정 일부를 읽지 못해 기본값을 사용합니다. 그림 데이터는 유지됩니다.",
-                ),
-                Err(error) => editor.warn(format!(
-                    "화면 설정을 읽지 못했습니다: {}",
-                    browser::error_text(&error)
-                )),
+                Ok(Some(value)) if preferences.restore(key, &value).is_none() => {
+                    if key == "pen-pressure" {
+                        preferences.pressure_writable = false;
+                    }
+                    editor.warn(
+                        "화면 설정 일부를 읽지 못해 기본값을 사용합니다. 그림 데이터는 유지됩니다.",
+                    );
+                }
+                Err(error) => {
+                    if key == "pen-pressure" {
+                        preferences.pressure_writable = false;
+                    }
+                    editor.warn(format!(
+                        "화면 설정을 읽지 못했습니다: {}",
+                        browser::error_text(&error)
+                    ));
+                }
                 _ => {}
             }
         }
@@ -47,6 +62,9 @@ impl Preferences {
 
     fn restore(&mut self, key: &str, value: &str) -> Option<()> {
         match key {
+            "pen-pressure" => {
+                self.pressure_preset = PressurePreset::from_storage(value)?;
+            }
             "dock" => {
                 if value.len() > 16384 {
                     return None;
@@ -110,9 +128,9 @@ pub struct WebUiBackend {
 }
 
 impl WebUiBackend {
-    pub fn new(editor: Editor) -> Rc<Self> {
+    pub fn new(editor: &Editor) -> Rc<Self> {
         Rc::new(Self {
-            editor,
+            editor: *editor,
             preferences: RefCell::new(Preferences::load(editor)),
             previews: RefCell::new((
                 u64::MAX,
@@ -120,6 +138,16 @@ impl WebUiBackend {
                 LayerThumbnailSnapshot::default(),
             )),
         })
+    }
+
+    pub fn configure_embed_panels(&self) {
+        if browser::embed_prefers_history() {
+            self.preferences
+                .borrow_mut()
+                .dock
+                .activate_panel(nyatidraw_api::PanelKind::History);
+            self.editor.refresh();
+        }
     }
 
     fn save_preference(&self, key: &str, value: &str) {
@@ -332,7 +360,7 @@ impl WebUiBackend {
                 Ok(())
             }),
             ToolCommand::CancelGesture => {
-                self.editor.input("cancel", 0.0, 0.0, 0.0, 0.0);
+                self.editor.input("cancel", 0.0, 0.0, 0.0, 0.0, false);
                 Ok(())
             }
             ToolCommand::SetSizeTenths(value) => {
@@ -449,6 +477,23 @@ impl WebUiBackend {
 }
 
 impl UiBackend for WebUiBackend {
+    fn pressure_preset(&self) -> PressurePreset {
+        self.preferences.borrow().pressure_preset
+    }
+
+    fn set_pressure_preset(&self, preset: PressurePreset) -> Result<(), String> {
+        if !self.preferences.borrow().pressure_writable {
+            return Err("저장된 펜 필압 설정을 읽지 못해 원본을 보존합니다".into());
+        }
+        browser::store_preference("pen-pressure", preset.storage_value())
+            .map_err(|error| browser::error_text(&error))?;
+        self.preferences.borrow_mut().pressure_preset = preset;
+        if let Some(runtime) = self.editor.runtime.peek().borrow_mut().as_mut() {
+            runtime.pressure_preset = preset;
+        }
+        self.editor.refresh();
+        Ok(())
+    }
     fn protocol_snapshot(&self) -> (UiProjection, Option<EventEnvelope>) {
         self.restore_project_tool();
         let mut projection = UiProjection::empty();
@@ -545,6 +590,9 @@ impl UiBackend for WebUiBackend {
         based_on: Revision,
         command: EditorCommand,
     ) -> Result<(), String> {
+        if (self.editor.integration_busy)() || (self.editor.integration_closed)() {
+            return Err("호스트 응답을 기다리는 중입니다.".into());
+        }
         self.restore_project_tool();
         if based_on != Revision(*self.editor.revision.peek()) {
             return Err("화면 상태가 바뀌었습니다. 다시 시도해주세요.".into());

@@ -206,6 +206,8 @@ fn fixture() -> (Vec<u8>, TileSnapshot, LayerTree, ProjectToolState) {
 #[test]
 fn native_web_native_roundtrip_preserves_artwork_metadata_preferences_and_history() {
     let (original, tiles, layers, mut state) = fixture();
+    state.tool = DrawingTool::Pencil;
+    state.last_painting_slot = 0;
     state.remembered[0].size_tenths = 1;
     state.remembered[0].settings.size_minimum_u16 = 42_000;
     state.remembered[4].settings.opacity_minimum_u16 = 15_000;

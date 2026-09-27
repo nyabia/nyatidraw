@@ -1,4 +1,5 @@
 use nyatidraw_api::CanvasSpec;
+use nyatidraw_input::PressurePreset;
 use nyatidraw_project_redb::ProjectDb;
 use nyatidraw_project_web::{RecoveryWriter, WebProject};
 use nyatidraw_web_core::{StrokePoint, WebTool};
@@ -63,14 +64,14 @@ fn main() -> Result<()> {
         let first = StrokePoint {
             x: 21.0,
             y: 12.0,
-            pressure: 0.0,
+            pressure: PressurePreset::Soft.map(0.0),
             time_ms: 1.0,
         };
         web.begin_stroke(first)
             .map_err(|error| format!("{error:?}"))?;
         web.end_stroke(StrokePoint {
             x: 22.0,
-            pressure: 0.5,
+            pressure: PressurePreset::Soft.map(0.5),
             time_ms: 2.0,
             ..first
         })

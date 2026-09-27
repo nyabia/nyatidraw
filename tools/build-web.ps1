@@ -100,3 +100,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $publicDirectory 'index.html') -Path
     throw "Web build output not found: $publicDirectory"
 }
 Write-Output "Web editor ready: $publicDirectory"
+Copy-Item -LiteralPath (Join-Path $repositoryRoot 'THIRD-PARTY-ASSETS.txt') -Destination $publicDirectory
+$integrationDirectory = Join-Path $publicDirectory 'integration'
+New-Item -ItemType Directory -Path $integrationDirectory -Force | Out-Null
+Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'web-integration') -File |
+    Where-Object { $_.Extension -in '.js', '.html', '.css' } |
+    Copy-Item -Destination $integrationDirectory

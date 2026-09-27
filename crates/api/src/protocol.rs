@@ -302,15 +302,12 @@ impl BrushSettings {
     }
 
     #[must_use]
-    pub const fn for_pencil_template(template: PencilTemplate) -> Self {
+    pub const fn for_pencil_template(_template: PencilTemplate) -> Self {
         Self {
             size_pressure: true,
             opacity_pressure: true,
-            size_minimum_u16: match template {
-                PencilTemplate::Mechanical2H => 53_739,
-                PencilTemplate::Graphite2B => 22_937,
-            },
-            opacity_minimum_u16: 3_277,
+            size_minimum_u16: 0,
+            opacity_minimum_u16: 0,
             hardness_u16: u16::MAX,
             smoothing: 0,
         }
@@ -690,12 +687,12 @@ impl UiProjection {
                 zoom_ppm: 1_000_000,
                 ..ViewportProjection::default()
             },
-            drawing_tool: DrawingTool::Pencil,
+            drawing_tool: DrawingTool::Pen,
             pencil_template: PencilTemplate::Mechanical2H,
-            brush_size_tenths: 50,
+            brush_size_tenths: 100,
             recent_brush_sizes: Vec::new(),
             brush_opacity_u16: u16::MAX,
-            brush_settings: BrushSettings::for_tool(DrawingTool::Pencil),
+            brush_settings: BrushSettings::for_tool(DrawingTool::Pen),
             brush_color: [0, 0, 0, 255],
             background_color: [255; 4],
             recent_colors: Vec::new(),

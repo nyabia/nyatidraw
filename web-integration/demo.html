@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NyatiDraw embedding demo</title>
+  <style>
+    :root { color-scheme: dark; font: 15px/1.5 system-ui, sans-serif; background: #11161d; color: #e9edf3; }
+    * { box-sizing: border-box; }
+    body { max-width: 1440px; margin: auto; padding: clamp(16px, 3vw, 36px); }
+    h1 { margin: 0 0 6px; font-size: clamp(26px, 4vw, 38px); }
+    p { margin: 0 0 20px; color: #aeb8c5; }
+    .layout { display: grid; grid-template-columns: minmax(240px, 300px) minmax(0, 1fr); gap: 18px; }
+    .card { background: #1c2430; border: 1px solid #344151; border-radius: 12px; padding: 18px; }
+    .settings { display: grid; gap: 12px; align-content: start; }
+    label { display: grid; gap: 4px; font-weight: 600; }
+    input, select, button, a.download { font: inherit; }
+    input:not([type="checkbox"]), select { width: 100%; min-height: 36px; padding: 5px 8px; background: #111923; color: #fff; border: 1px solid #576779; border-radius: 6px; }
+    input[type="color"] { padding: 2px; }
+    .checks { display: grid; grid-template-columns: repeat(2, 1fr); gap: 5px 10px; }
+    .checks label { display: flex; align-items: center; gap: 6px; font-weight: 400; }
+    .actions { display: flex; flex-wrap: wrap; gap: 9px; }
+    button, a.download { min-height: 38px; padding: 7px 12px; border-radius: 6px; border: 1px solid #759cbb; background: #294762; color: white; cursor: pointer; text-decoration: none; }
+    button.secondary { background: transparent; border-color: #6b7785; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .stage { min-width: 0; }
+    #frame { height: min(70vh, 750px); min-height: 480px; background: #0e1219; border: 1px solid #344151; border-radius: 8px; overflow: hidden; }
+    #frame:empty { display: grid; place-items: center; color: #8796a8; }
+    #frame:empty::before { content: "Open the iframe editor to begin"; }
+    #status { min-height: 24px; margin: 12px 0; color: #cbd4de; }
+    #preview { max-width: 100%; max-height: 380px; background: #fff; border-radius: 6px; }
+    .result { display: flex; align-items: start; gap: 16px; flex-wrap: wrap; }
+    [hidden] { display: none !important; }
+    @media (max-width: 760px) { .layout { grid-template-columns: 1fr; } #frame { min-height: 520px; } }
+  </style>
+</head>
+<body>
+  <h1>NyatiDraw embedding demo</h1>
+  <p>Configure a fresh canvas, then open a compact iframe or the full editor in a popup. Done returns PNG bytes to this page; this demo keeps them only in memory until you download them.</p>
+  <div class="layout">
+    <section class="card settings" aria-label="Editor configuration">
+      <label>Editor URL <input id="editor-url" type="url" spellcheck="false" aria-describedby="editor-url-help"></label>
+      <small id="editor-url-help">Use the built editor URL. You can point this demo at a different localhost port to check cross-origin messaging.</small>
+      <label>Canvas width <input id="width" type="number" min="1" max="4096" value="1024"></label>
+      <label>Canvas height <input id="height" type="number" min="1" max="4096" value="768"></label>
+      <label>Initial tool
+        <select id="tool"><option value="pen">Pen</option><option value="pencil2h">2H pencil</option><option value="pencil2b">2B pencil</option><option value="brush">Brush</option><option value="eraser">Eraser</option></select>
+      </label>
+      <label>Brush size <input id="size" type="number" min="0.1" max="200" step="0.1" value="10"></label>
+      <label>Color <input id="color" type="color" value="#000000"></label>
+      <label>Opacity <input id="opacity" type="number" min="0.01" max="1" step="0.05" value="1"></label>
+      <div>Iframe controls</div>
+      <div class="checks" id="checks">
+        <label><input type="checkbox" name="toolbar" checked> Toolbar</label>
+        <label><input type="checkbox" name="tools" checked> Tools</label>
+        <label><input type="checkbox" name="brush" checked> Brush</label>
+        <label><input type="checkbox" name="colors" checked> Colors</label>
+        <label><input type="checkbox" name="layers" checked> Layers</label>
+        <label><input type="checkbox" name="history" checked> History</label>
+        <label><input type="checkbox" name="navigator" checked> Navigator</label>
+      </div>
+      <div class="actions">
+        <button id="open-iframe">Open iframe</button>
+        <button id="open-popup">Open popup</button>
+        <button id="discard" class="secondary" disabled>Discard open session</button>
+      </div>
+      <small>Popup opening must happen directly from the click. Popup blockers and Cross-Origin-Opener-Policy can prevent the return channel.</small>
+    </section>
+    <main class="stage">
+      <div id="frame" aria-label="Embedded editor"></div>
+      <div id="status" role="status" aria-live="polite">Ready to open an editor.</div>
+      <section class="card" id="result" hidden>
+        <h2>Returned PNG</h2>
+        <div class="result"><img id="preview" alt="Completed drawing preview"><div><p id="details"></p><a class="download" id="download">Download PNG</a></div></div>
+      </section>
+    </main>
+  </div>
+  <script type="module">
+    import { mountNyatiIframe, openNyatiPopup } from "./nyatidraw.js";
+
+    const $ = id => document.getElementById(id);
+    $("editor-url").value = new URL("../", import.meta.url).href;
+    let active;
+    let previewUrl;
+    let resultUrl;
+
+    function config() {
+      return {
+        canvas: { width: Number($("width").value), height: Number($("height").value) },
+        tool: $("tool").value,
+        size: Number($("size").value),
+        color: $("color").value,
+        opacity: Number($("opacity").value),
+        ui: Object.fromEntries([...$("checks").querySelectorAll("input")].map(input => [input.name, input.checked])),
+      };
+    }
+
+    function status(message) { $("status").textContent = message; }
+
+    const callbacks = {
+      onComplete(result) {
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        if (resultUrl) URL.revokeObjectURL(resultUrl);
+        previewUrl = URL.createObjectURL(result.blob);
+        resultUrl = URL.createObjectURL(result.blob);
+        $("preview").src = previewUrl;
+        $("download").href = resultUrl;
+        $("download").download = "nyatidraw.png";
+        $("details").textContent = `${result.width} × ${result.height} · ${result.bytes.byteLength.toLocaleString()} bytes`;
+        $("result").hidden = false;
+        status("PNG accepted by the demo. Use Download PNG to save it.");
+      },
+      onCancel() { status("Drawing was cancelled in the editor."); },
+      onError(error) { status(error.message); },
+      onClose({ reason }) {
+        active = null;
+        $("discard").disabled = true;
+        if (reason === "window-closed") status("Popup closed before the editor could finish. No PNG was returned.");
+      },
+    };
+
+    function start(kind) {
+      if (active) { status("Finish or explicitly discard the open editor first."); return; }
+      try {
+        const options = { editorUrl: $("editor-url").value, config: config(), ...callbacks };
+        active = kind === "iframe" ? mountNyatiIframe($("frame"), options) : openNyatiPopup(options);
+        $("discard").disabled = false;
+        status("Opening editor…");
+        active.ready.then(() => status("Editor ready. Draw, then use Done or Cancel inside it."), error => status(error.message));
+      } catch (error) { status(error.message); }
+    }
+
+    $("open-iframe").addEventListener("click", () => start("iframe"));
+    $("open-popup").addEventListener("click", () => start("popup"));
+    $("discard").addEventListener("click", () => {
+      if (!active || !confirm("Discard this editor session? Unsaved artwork in it will be lost.")) return;
+      active.dispose();
+      status("Editor session discarded.");
+    });
+    window.addEventListener("pagehide", () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      if (resultUrl) URL.revokeObjectURL(resultUrl);
+    });
+  </script>
+</body>
+</html>

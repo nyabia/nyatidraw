@@ -20,6 +20,7 @@ use nyatidraw_api::{
     LayerProjection, LayerProjectionKind, LayerTreeNodeId, PanelKind, ProjectCommand, ToolCommand,
     UiProjection, ViewportCommand, WorkspaceProjection,
 };
+use nyatidraw_input::PressurePreset;
 use preview::LayerThumbnailFrame;
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -224,7 +225,7 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
     let retry_ink = live_ink.clone();
     let undo_ink = live_ink.clone();
     let redo_ink = live_ink.clone();
-    let error = use_signal(|| Option::<String>::None);
+    let mut error = use_signal(|| Option::<String>::None);
     let top = ui_projection.read().dock.top().to_vec();
 
     rsx! {
@@ -290,6 +291,20 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
                         send_dock_command(&reset_layout_ink, DockCommand::ResetToSafeDefault);
                         menu_open.set(false);
                     }, "기본 화면 배치" }
+                    div { class: "pressure-preset-menu", role: "group", aria_label: "펜 필압 감도",
+                        span { "펜 필압" }
+                        for (preset, label) in [(PressurePreset::Linear, "직선"), (PressurePreset::Soft, "부드럽게"), (PressurePreset::Softer, "더 부드럽게")] {
+                            button { class: "command", aria_pressed: live_ink.pressure_preset() == preset,
+                                onclick: {
+                                    let ink = live_ink.clone();
+                                    move |_| {
+                                        if let Err(message) = ink.set_pressure_preset(preset) { error.set(Some(message)); }
+                                        else { menu_open.set(false); }
+                                    }
+                                }, "{label}"
+                            }
+                        }
+                    }
                     div { class: "menu-line-spacer" }
                     UpdateControl {}
                 }
@@ -1791,7 +1806,7 @@ fn LayerRow(
                 class: "layer-delete", title: "삭제 (Undo로 복원)", aria_label: "{layer.name} 삭제",
                 disabled: layer.locked,
                 onclick: move |_| send_editor_command(&delete_ink, EditorCommand::Layer(LayerCommand::Delete(id)), error),
-                "×"
+                UiIcon { name: "trash" }
             }
         }
     }
@@ -2012,11 +2027,11 @@ pub fn UiIcon(name: &'static str) -> Element {
         "layer" => &["m4 8 8-4 8 4-8 4z", "m4 4 8 4 8-4", "m4 4 8 4 8-4"],
         "reference" => &["M4 4h16v16H4z", "M8 8h8v8H8z", "m4-4 4 4"],
         "trash" => &[
-            "M5 7h14",
-            "M9 7V4h6v3",
-            "m-8 0 1 14h10l1-14",
             "M10 11v6",
             "M14 11v6",
+            "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6",
+            "M3 6h18",
+            "M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2",
         ],
         "eye" => &[
             "M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12",

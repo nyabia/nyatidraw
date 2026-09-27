@@ -14,6 +14,20 @@ extern "C" {
     pub fn background_turn(delay_ms: f64) -> Promise;
     #[wasm_bindgen(js_name = bindCanvas)]
     pub fn bind_canvas(canvas: &HtmlCanvasElement, callback: &Function);
+    #[wasm_bindgen(js_name = isHosted)]
+    pub fn is_hosted() -> bool;
+    #[wasm_bindgen(js_name = embedPrefersHistory)]
+    pub fn embed_prefers_history() -> bool;
+    #[wasm_bindgen(js_name = canStartStandalone)]
+    pub fn can_start_standalone() -> bool;
+    #[wasm_bindgen(js_name = beginIntegration)]
+    pub fn begin_integration() -> Promise;
+    #[wasm_bindgen(js_name = integrationInitialized)]
+    pub fn integration_initialized();
+    #[wasm_bindgen(js_name = integrationError)]
+    pub fn integration_error(message: &str);
+    #[wasm_bindgen(js_name = integrationSend)]
+    pub fn integration_send(kind: &str, bytes: &Uint8Array, width: u32, height: u32) -> Promise;
     #[wasm_bindgen(js_name = claimWorkspace)]
     pub fn claim_workspace() -> Promise;
     #[wasm_bindgen(js_name = loadWorkspace)]

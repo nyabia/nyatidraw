@@ -15,6 +15,10 @@ button:focus, [tabindex="0"]:focus { outline: 2px solid #9ee8ff; outline-offset:
 .commandbar { position: relative; display: flex; align-items: center; min-width: 0; padding: 3px 7px; overflow: hidden; background: #898989; border-bottom: 1px solid #515151; }
 .menu-line-overlay { position: absolute; inset: 0; z-index: 95; display: flex; align-items: center; gap: 3px; padding: 3px 7px; overflow-x: auto; background: #444; border-bottom: 1px solid #aaa; }
 .menu-line-spacer { flex: 1; }
+.pressure-preset-menu { display: inline-flex; align-items: center; gap: 2px; flex: none; white-space: nowrap; }
+.pressure-preset-menu > span { margin: 0 3px; font-size: 11px; }
+.pressure-preset-menu .command { padding-inline: 6px; }
+.pressure-preset-menu .command[aria-pressed="true"] { background: #454545; box-shadow: inset 0 0 0 1px #eee; }
 .menu-dismiss-scrim { position: fixed; inset: 45px 0 0; z-index: 94; background: transparent; }
 .page-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: #0008; }
 .page-dialog { width: min(400px,90vw); max-height: 80vh; padding: 18px !important; color: #fff; background: #707070; border: 1px solid #aaa; box-shadow: 0 10px 45px #0009; }
@@ -196,7 +200,8 @@ html.dock-resizing-height, html.dock-resizing-height * { cursor: row-resize !imp
 .eye-mark.hidden { opacity: .25; }
 .layer-solo { font-size: 12px; font-weight: 700; }
 .layer-solo.active { background: #3b7fa0; color: #fff; }
-.layer-delete { width: 22px; height: 28px; font-size: 17px; }
+.layer-delete { display: grid; width: 22px; height: 28px; place-items: center; }
+.layer-delete .icon { width: 17px; height: 17px; }
 .layer-tree { width: 17px; font-size: 16px; }
 .layer-tree .icon { width: 15px; height: 15px; }
 .layer-thumb { display: grid; width: 50px; height: 56px; place-items: center; overflow: hidden; border: 1px solid #4b4b4b; background: #fff; }

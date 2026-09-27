@@ -34,6 +34,7 @@ mod workspace_appearance;
 
 mod editor_ui_host;
 mod palette_preferences;
+mod pressure_preferences;
 
 use dioxus::prelude::*;
 use live_ink::{CloseStatus, LiveInkBridge};

@@ -3823,6 +3823,7 @@ dependencies = [
  "nyatidraw-api",
  "nyatidraw-document",
  "nyatidraw-editor",
+ "nyatidraw-input",
  "nyatidraw-project",
  "nyatidraw-project-redb",
  "nyatidraw-tiles",

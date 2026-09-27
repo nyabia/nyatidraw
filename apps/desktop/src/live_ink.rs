@@ -1,14 +1,14 @@
 use std::collections::VecDeque;
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 
 use nyatidraw_api::{
     CommandEnvelope, CommandId, EditorCommand, EditorEvent, EventEnvelope, LayerId, Revision,
     UiProjection, WorkspaceProjection,
 };
-use nyatidraw_input::{Point, PointerPhase, StylusSample, ViewportTransform};
+use nyatidraw_input::{Point, PointerPhase, PressurePreset, StylusSample, ViewportTransform};
 use nyatidraw_input_queue::{InputQueue, PushError, QueuedSample};
 
 use crate::native_canvas::PickerSnapshot;
@@ -160,6 +160,8 @@ pub(crate) struct LiveInkBridge {
 }
 
 struct LiveInkInner {
+    pressure_preset: AtomicU8,
+    pressure_preset_writable: bool,
     layout: OnceLock<crate::layout_store::LayoutStore>,
     workspace_appearance: Mutex<crate::workspace_appearance::WorkspaceAppearance>,
     raw_input: Mutex<RawInputState>,
@@ -375,8 +377,11 @@ impl LiveInkBridge {
     }
 
     pub(crate) fn with_capacity(capacity: usize, initial_layer: LayerId) -> Self {
+        let (pressure_preset, pressure_preset_writable) = crate::pressure_preferences::load();
         Self {
             inner: Arc::new(LiveInkInner {
+                pressure_preset: AtomicU8::new(pressure_preset as u8),
+                pressure_preset_writable,
                 layout: OnceLock::new(),
                 workspace_appearance: Mutex::new(
                     crate::workspace_appearance::WorkspaceAppearance::default(),
@@ -432,6 +437,26 @@ impl LiveInkBridge {
     /// Enqueues one sample and reports whether the event loop needs one wake-up.
     pub(crate) fn push(&self, sample: StylusSample) -> Result<bool, PushError> {
         self.push_with_temporary_picker(sample, false)
+    }
+
+    pub(crate) fn pressure_preset(&self) -> PressurePreset {
+        match self.inner.pressure_preset.load(Ordering::Relaxed) {
+            0 => PressurePreset::Linear,
+            2 => PressurePreset::Softer,
+            _ => PressurePreset::Soft,
+        }
+    }
+
+    pub(crate) fn set_pressure_preset(&self, preset: PressurePreset) -> Result<(), String> {
+        if !self.inner.pressure_preset_writable {
+            return Err("저장된 펜 필압 설정을 읽지 못해 원본을 보존합니다".into());
+        }
+        crate::pressure_preferences::save(preset)?;
+        self.inner
+            .pressure_preset
+            .store(preset as u8, Ordering::Relaxed);
+        self.notify_ui();
+        Ok(())
     }
 
     /// Native adapters sample their modifier state at Begin. Later modifier

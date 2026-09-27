@@ -3,7 +3,7 @@ use std::{cell::RefCell, io::Cursor, rc::Rc};
 use dioxus::prelude::*;
 use js_sys::{Array, Uint8Array};
 use nyatidraw_api::DrawingTool;
-use nyatidraw_input::{Point, ViewportTransform};
+use nyatidraw_input::{LivePressureMapper, Point, PointerPhase, PressurePreset, ViewportTransform};
 use nyatidraw_project_web::{RecoveryCheckpoint, WebProject};
 use nyatidraw_web_core::{CanvasSpec, CanvasUpdate, StrokePoint, WebDocument, WebError, WebTool};
 use wasm_bindgen::{JsCast, prelude::*};
@@ -16,8 +16,71 @@ const RECOVERY_QUIET_MS: f64 = 600.0;
 const RECOVERY_MAX_WAIT_MS: f64 = 3000.0;
 const PREVIEW_DELAY_MS: f64 = 200.0;
 
+fn hosted_project(config: &Array) -> Result<WebProject, String> {
+    let width = config
+        .get(0)
+        .as_string()
+        .ok_or("캔버스 너비 오류")?
+        .parse::<u32>()
+        .map_err(|e| e.to_string())?;
+    let height = config
+        .get(1)
+        .as_string()
+        .ok_or("캔버스 높이 오류")?
+        .parse::<u32>()
+        .map_err(|e| e.to_string())?;
+    let tool = match config.get(2).as_string().as_deref() {
+        Some("pencil2h") => WebTool::Pencil2H,
+        Some("pencil2b") => WebTool::Pencil2B,
+        Some("brush") => WebTool::SoftBrush,
+        Some("eraser") => WebTool::Eraser,
+        Some("pen") => WebTool::Pen,
+        _ => return Err("도구 설정 오류".into()),
+    };
+    let mut project = WebProject::new(CanvasSpec {
+        width_px: width,
+        height_px: height,
+        pixels_per_inch: 96,
+    })?;
+    project.select_tool(tool).map_err(|e| e.to_string())?;
+    let mut settings = project.brush_settings();
+    settings.size_px = config
+        .get(3)
+        .as_string()
+        .ok_or("브러시 크기 오류")?
+        .parse::<f32>()
+        .map_err(|e| e.to_string())?;
+    settings.opacity = config
+        .get(5)
+        .as_string()
+        .ok_or("불투명도 오류")?
+        .parse::<f32>()
+        .map_err(|e| e.to_string())?;
+    project
+        .set_brush_settings(settings)
+        .map_err(|e| e.to_string())?;
+    let color = config.get(4).as_string().ok_or("색상 오류")?;
+    let [_, red, green, blue] = u32::from_str_radix(&color[1..], 16)
+        .map_err(|e| e.to_string())?
+        .to_be_bytes();
+    project.set_foreground([red, green, blue, 255]);
+    project.set_project_tool(crate::adapter::drawing_tool(tool));
+    Ok(project)
+}
+
+fn app_pressure_preset() -> PressurePreset {
+    browser::load_preference("pen-pressure")
+        .ok()
+        .flatten()
+        .as_deref()
+        .and_then(PressurePreset::from_storage)
+        .unwrap_or_default()
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct Runtime {
+    pub pressure_preset: PressurePreset,
+    pressure_mapper: LivePressureMapper,
     pub document: WebProject,
     tool_preferences: crate::tool_preferences::AppToolPreferences,
     pub renderer: WebRenderer,
@@ -52,6 +115,7 @@ pub enum EditorModal {
     Help,
     NewDocument,
     ReplaceDocument,
+    CancelIntegration,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -63,6 +127,8 @@ pub struct Editor {
     pub modal: Signal<Option<EditorModal>>,
     pub notice: Signal<Option<String>>,
     pub picker: Signal<Option<nyatidraw_editor_ui::picker_loupe::PickerSnapshot>>,
+    pub integration_busy: Signal<bool>,
+    pub integration_closed: Signal<bool>,
 }
 
 impl Editor {
@@ -115,22 +181,41 @@ impl Editor {
     }
 
     pub async fn initialize(mut self) -> Result<(), String> {
-        if !JsFuture::from(browser::claim_workspace())
-            .await
-            .map_err(|e| browser::error_text(&e))?
-            .as_bool()
-            .unwrap_or(false)
+        let hosted = browser::is_hosted();
+        if !hosted && !browser::can_start_standalone() {
+            return Err("이 페이지는 호스트 연결 없이 프레임에서 열 수 없습니다.".into());
+        }
+        let config = if hosted {
+            let value = JsFuture::from(browser::begin_integration())
+                .await
+                .map_err(|e| browser::error_text(&e))?;
+            Some(Array::from(&value))
+        } else {
+            None
+        };
+        if !hosted
+            && !JsFuture::from(browser::claim_workspace())
+                .await
+                .map_err(|e| browser::error_text(&e))?
+                .as_bool()
+                .unwrap_or(false)
         {
             return Err("다른 탭에 NyatiDraw가 열려 있습니다. 그림을 보호하기 위해 그 탭을 닫은 후 새로고침해주세요.".into());
         }
-        let saved = JsFuture::from(browser::load_workspace())
-            .await
-            .map_err(|e| browser::error_text(&e))?;
+        let saved = if hosted {
+            JsValue::NULL
+        } else {
+            JsFuture::from(browser::load_workspace())
+                .await
+                .map_err(|e| browser::error_text(&e))?
+        };
         let restored = !saved.is_null();
         let mut document = if restored {
             WebProject::decode_ntdr(&Uint8Array::new(&saved).to_vec()).map_err(|e| {
                 format!("저장된 작업을 열지 못했습니다. 원본 복구 데이터는 유지됩니다: {e}")
             })?
+        } else if let Some(config) = config.as_ref() {
+            hosted_project(config)?
         } else {
             WebProject::from_document(WebDocument::default())
         };
@@ -144,59 +229,31 @@ impl Editor {
             .dyn_into::<HtmlCanvasElement>()
             .map_err(|_| "캔버스 초기화 실패")?;
         let renderer = WebRenderer::new(canvas.clone(), &document).await?;
-        let document_tool = document.tool();
         let import_notice = document.import_notice();
         let selected_tool = supported_restored_tool(&document)
-            .unwrap_or_else(|| crate::adapter::drawing_tool(document_tool));
-        let mut runtime = Runtime {
+            .unwrap_or_else(|| crate::adapter::drawing_tool(document.tool()));
+        let mut runtime = Runtime::new(
             document,
             tool_preferences,
             renderer,
-            canvas: canvas.clone(),
-            viewport: ViewportTransform {
-                revision: 1,
-                window_origin_physical: Point::default(),
-                physical_size: [1, 1],
-                dpi_scale: 1.0,
-                pan: Point::default(),
-                zoom: 1.0,
-                rotation_radians: 0.0,
-                mirrored_horizontal: false,
-            },
-            recent_colors: Vec::new(),
-            fit_to_canvas: true,
-            recent_sizes: Vec::new(),
+            canvas.clone(),
             selected_tool,
-            gesture: None,
-            transform_drag: None,
-            project_epoch: 1,
-            preview_generation: 1,
-            preview_dirty: false,
-            preview_running: false,
-            frame_pending: false,
-            gpu_failed: false,
-            pan_start: None,
-            save_generation: 0,
-            save_running: false,
-            save_pending: false,
-            save_not_before: 0.0,
-            save_due_by: 0.0,
-            recovery_checkpoint: None,
-            download_pending: false,
-            worker_failed: false,
-            pending_document: None,
-        };
+        );
         runtime.resize();
         runtime.fit();
         *self.runtime.peek().borrow_mut() = Some(runtime);
-        let callback = Closure::<dyn FnMut(String, f64, f64, f64, f64)>::new(
-            move |phase: String, x, y, pressure, time| self.input(&phase, x, y, pressure, time),
+        let callback = Closure::<dyn FnMut(String, f64, f64, f64, f64, bool)>::new(
+            move |phase: String, x, y, pressure, time, is_pen| {
+                self.input(&phase, x, y, pressure, time, is_pen);
+            },
         );
         browser::bind_canvas(&canvas, callback.as_ref().unchecked_ref());
         browser::set_canvas_tool(canvas_input_mode(selected_tool));
         callback.forget();
         self.ready.set(true);
-        self.report(if restored {
+        self.report(if hosted {
+            "호스트 연결됨 · 완료를 눌러 PNG를 전달하세요"
+        } else if restored {
             "작업 복구 완료 · 이 브라우저에 저장됨"
         } else {
             "WebGPU · 그림은 이 기기에만 저장됩니다"
@@ -222,7 +279,7 @@ impl Editor {
         self,
         operation: impl FnOnce(&mut WebDocument) -> Result<CanvasUpdate, WebError>,
     ) -> Result<(), String> {
-        if self.modal.peek().is_some() {
+        if self.modal.peek().is_some() || (self.integration_busy)() || (self.integration_closed)() {
             return Err("열려 있는 대화상자를 먼저 닫아주세요.".into());
         }
         let cell = self.runtime.peek().clone();
@@ -291,7 +348,10 @@ impl Editor {
         clippy::cast_sign_loss,
         clippy::too_many_lines
     )]
-    pub fn input(mut self, phase: &str, x: f64, y: f64, pressure: f64, time_ms: f64) {
+    pub fn input(mut self, phase: &str, x: f64, y: f64, pressure: f64, time_ms: f64, is_pen: bool) {
+        if (self.integration_busy)() || (self.integration_closed)() {
+            return;
+        }
         if matches!(phase, "resize" | "cancel" | "overflow" | "begin") {
             self.picker.set(None);
         }
@@ -328,6 +388,7 @@ impl Editor {
             let point = Point { x, y };
             match phase {
                 "resize" => {
+                    runtime.pressure_mapper.clear();
                     runtime.transform_drag = None;
                     runtime.gesture = None;
                     runtime.renderer.set_gesture_preview(&[], false);
@@ -368,6 +429,7 @@ impl Editor {
                     return Ok(());
                 }
                 "cancel" | "overflow" => {
+                    runtime.pressure_mapper.clear();
                     runtime.transform_drag = None;
                     runtime.pan_start = None;
                     let update = if runtime.document.transform_projection().is_some() {
@@ -407,7 +469,7 @@ impl Editor {
                 .viewport
                 .logical_to_document(point)
                 .ok_or("입력 좌표 오류")?;
-            let sample = StrokePoint {
+            let mut sample = StrokePoint {
                 x: position.x,
                 y: position.y,
                 pressure: pressure as f32,
@@ -564,6 +626,16 @@ impl Editor {
             if runtime.document.transform_projection().is_some() && phase == "begin" {
                 return Err("현재 변형을 확정하거나 취소하세요.".into());
             }
+            sample.pressure = runtime.pressure_mapper.process(
+                match phase {
+                    "begin" => PointerPhase::Begin,
+                    "end" => PointerPhase::End,
+                    _ => PointerPhase::Move,
+                },
+                sample.pressure,
+                is_pen,
+                runtime.pressure_preset,
+            );
             let update = match phase {
                 "begin" => runtime.document.begin_stroke(sample),
                 "move" if runtime.document.is_drawing() => runtime.document.move_stroke(sample),
@@ -574,6 +646,7 @@ impl Editor {
                 Ok(update) => update,
                 Err(error) => {
                     runtime.document.cancel_stroke();
+                    runtime.pressure_mapper.clear();
                     save = true;
                     refresh = true;
                     if let Err(gpu_error) = runtime.renderer.sync_document(&runtime.document) {
@@ -698,6 +771,10 @@ impl Editor {
     }
 
     pub fn persist(self) {
+        if browser::is_hosted() {
+            browser::set_unsaved(true);
+            return;
+        }
         self.persist_recovery(true);
     }
 
@@ -828,6 +905,25 @@ impl Editor {
     }
 
     pub fn download_project(self) {
+        if browser::is_hosted() {
+            let result = {
+                let cell = self.runtime.peek().clone();
+                let mut borrow = cell.borrow_mut();
+                let Some(runtime) = borrow.as_mut() else {
+                    return;
+                };
+                runtime.document.encode_ntdr()
+            };
+            match result {
+                Ok(bytes) => browser::download_bytes(
+                    &Uint8Array::from(bytes.as_slice()),
+                    "drawing.ntdr",
+                    "application/octet-stream",
+                ),
+                Err(error) => self.warn(error),
+            }
+            return;
+        }
         if let Some(runtime) = self.runtime.peek().borrow_mut().as_mut()
             && let Err(error) = runtime.tool_preferences.save(&runtime.document)
         {
@@ -859,6 +955,10 @@ impl Editor {
     }
 
     pub fn download_recovery(self) {
+        if !browser::can_start_standalone() {
+            self.warn("연결된 편집 세션에는 브라우저 자동 복구 파일이 없습니다.");
+            return;
+        }
         spawn_local(async move {
             match JsFuture::from(browser::load_workspace()).await {
                 Ok(saved) if saved.is_null() => self.warn("이 브라우저에 저장된 작업이 없습니다."),
@@ -895,6 +995,88 @@ impl Editor {
             ),
             Err(error) => self.warn(error),
         }
+    }
+
+    pub fn complete_integration(mut self) {
+        if !browser::is_hosted() || (self.integration_busy)() || (self.integration_closed)() {
+            return;
+        }
+        let Some(result) = self.read(|runtime| {
+            if runtime.document.is_drawing()
+                || runtime.gesture.is_some()
+                || runtime.transform_drag.is_some()
+                || runtime.document.transform_projection().is_some()
+            {
+                return Err("진행 중인 획 또는 변형을 완료한 뒤 다시 시도해주세요.".to_owned());
+            }
+            let canvas = runtime.document.canvas();
+            encode_png(&runtime.document).map(|bytes| (bytes, canvas.width_px, canvas.height_px))
+        }) else {
+            return;
+        };
+        let (bytes, width, height) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.warn(error);
+                return;
+            }
+        };
+        self.integration_busy.set(true);
+        browser::set_modal_open(true);
+        self.report("호스트에 PNG 전달 중…");
+        spawn_local(async move {
+            let result = JsFuture::from(browser::integration_send(
+                "complete",
+                &Uint8Array::from(bytes.as_slice()),
+                width,
+                height,
+            ))
+            .await;
+            browser::set_modal_open(false);
+            self.integration_busy.set(false);
+            match result {
+                Ok(_) => {
+                    browser::set_unsaved(false);
+                    self.integration_closed.set(true);
+                    self.report("완료 · 호스트에 PNG를 전달했습니다");
+                }
+                Err(error) => self.warn(format!(
+                    "호스트 전달 실패 · 다시 완료를 누르거나 PNG를 내려받아주세요: {}",
+                    browser::error_text(&error)
+                )),
+            }
+        });
+    }
+
+    pub fn cancel_integration(mut self) {
+        if !browser::is_hosted() || (self.integration_busy)() || (self.integration_closed)() {
+            return;
+        }
+        self.close_modal();
+        self.integration_busy.set(true);
+        browser::set_modal_open(true);
+        spawn_local(async move {
+            let result = JsFuture::from(browser::integration_send(
+                "cancel",
+                &Uint8Array::new_with_length(0),
+                0,
+                0,
+            ))
+            .await;
+            browser::set_modal_open(false);
+            self.integration_busy.set(false);
+            match result {
+                Ok(_) => {
+                    browser::set_unsaved(false);
+                    self.integration_closed.set(true);
+                    self.report("취소됨");
+                }
+                Err(error) => self.warn(format!(
+                    "호스트가 취소를 확인하지 않았습니다. 다시 시도할 수 있습니다: {}",
+                    browser::error_text(&error)
+                )),
+            }
+        });
     }
 
     pub fn new_document(self, width: u32, height: u32) {
@@ -1008,6 +1190,55 @@ impl Editor {
 }
 
 impl Runtime {
+    fn new(
+        document: WebProject,
+        tool_preferences: crate::tool_preferences::AppToolPreferences,
+        renderer: WebRenderer,
+        canvas: HtmlCanvasElement,
+        selected_tool: DrawingTool,
+    ) -> Self {
+        Self {
+            pressure_preset: app_pressure_preset(),
+            pressure_mapper: LivePressureMapper::default(),
+            document,
+            tool_preferences,
+            renderer,
+            canvas,
+            viewport: ViewportTransform {
+                revision: 1,
+                window_origin_physical: Point::default(),
+                physical_size: [1, 1],
+                dpi_scale: 1.0,
+                pan: Point::default(),
+                zoom: 1.0,
+                rotation_radians: 0.0,
+                mirrored_horizontal: false,
+            },
+            recent_colors: Vec::new(),
+            fit_to_canvas: true,
+            recent_sizes: Vec::new(),
+            selected_tool,
+            gesture: None,
+            transform_drag: None,
+            project_epoch: 1,
+            preview_generation: 1,
+            preview_dirty: false,
+            preview_running: false,
+            frame_pending: false,
+            gpu_failed: false,
+            pan_start: None,
+            save_generation: 0,
+            save_running: false,
+            save_pending: false,
+            save_not_before: 0.0,
+            save_due_by: 0.0,
+            recovery_checkpoint: None,
+            download_pending: false,
+            worker_failed: false,
+            pending_document: None,
+        }
+    }
+
     pub fn apply(&mut self, update: &CanvasUpdate) -> Result<(), String> {
         if update.committed && update.changed {
             self.preview_dirty = true;

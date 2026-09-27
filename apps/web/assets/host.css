@@ -16,3 +16,30 @@
 .browser-notice { position: fixed; z-index: 1000; left: 50%; bottom: 20px; transform: translateX(-50%); width: min(720px, calc(100% - 32px)); display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; background: #333; border: 1px solid #999; color: #fff; box-shadow: 0 4px 24px #0006; }
 .browser-notice p { flex: 1; margin: 0; line-height: 1.5; overflow-wrap: anywhere; }
 .browser-notice button { min-width: 28px; min-height: 28px; padding: 0; font-size: 22px; }
+.browser-integration-bar { position: fixed; z-index: 90; bottom: 0; left: 0; right: 0; min-height: 48px; display: flex; align-items: center; gap: 8px; padding: 6px 12px; background: #303030; border-top: 1px solid #777; }
+.browser-integration-bar span { margin-right: auto; }
+.browser-integration-bar button { min-height: 32px; padding: 5px 10px; border: 1px solid #888; border-radius: 3px; background: #535353; }
+.browser-integration-bar .browser-integration-done { background: #276383; border-color: #78b9dc; }
+html:has(.browser-integration-bar) .app-shell { height: calc(100% - 48px); }
+html.nyati-embed .app-shell { min-width: 0; min-height: 0; }
+html.nyati-embed[data-nyati-toolbar="false"] .commandbar { display: none; }
+html.nyati-embed[data-nyati-toolbar="false"] .app-shell { grid-template-rows: minmax(0, 1fr); }
+html.nyati-embed[data-nyati-colors="false"] .toolbar-dock[data-dock-top="quick-colors"] { display: none; }
+html.nyati-embed[data-nyati-tools="false"] .dock-child:has(> .panel-tools),
+html.nyati-embed[data-nyati-brush="false"] .dock-child:has(.panel-brush):not(:has(.panel-canvas)),
+html.nyati-embed[data-nyati-colors="false"] .dock-child:has(> .panel-color),
+html.nyati-embed[data-nyati-navigator="false"] .dock-child:has(> .panel-navigator),
+html.nyati-embed[data-nyati-layers="false"][data-nyati-history="false"] .dock-child:has(> .dock-tabs),
+html.nyati-embed[data-nyati-navigator="false"][data-nyati-colors="false"][data-nyati-layers="false"][data-nyati-history="false"] .dock-child:has(.panel-navigator):not(:has(.panel-canvas)),
+html.nyati-embed[data-nyati-layers="false"] .panel-layers,
+html.nyati-embed[data-nyati-history="false"] .panel-history,
+html.nyati-embed[data-nyati-layers="false"] .dock-tab[data-dock-source="layers"],
+html.nyati-embed[data-nyati-history="false"] .dock-tab[data-dock-source="history"] { display: none; }
+html.nyati-embed[data-nyati-tools="false"] .dock-child:has(> .panel-tools) + .dock-resizer,
+html.nyati-embed[data-nyati-brush="false"] .dock-child:has(.panel-brush):not(:has(.panel-canvas)) + .dock-resizer,
+html.nyati-embed[data-nyati-navigator="false"] .dock-child:has(> .panel-navigator) + .dock-resizer,
+html.nyati-embed[data-nyati-colors="false"] .dock-child:has(> .panel-color) + .dock-resizer,
+html.nyati-embed[data-nyati-layers="false"][data-nyati-history="false"] .dock-resizer:has(+ .dock-child:has(> .dock-tabs)),
+html.nyati-embed[data-nyati-navigator="false"][data-nyati-colors="false"][data-nyati-layers="false"][data-nyati-history="false"] .dock-resizer:has(+ .dock-child:has(.panel-navigator):not(:has(.panel-canvas))) { display: none; }
+html.nyati-embed[data-nyati-tools="false"][data-nyati-brush="false"][data-nyati-colors="false"][data-nyati-navigator="false"][data-nyati-layers="false"][data-nyati-history="false"] .dock-child:has(.panel-canvas) { min-width: 0 !important; flex: 1 1 0 !important; }
+html.nyati-embed[data-nyati-tools="false"][data-nyati-brush="false"][data-nyati-colors="false"][data-nyati-navigator="false"][data-nyati-layers="false"][data-nyati-history="false"] .dock-resizer { display: none; }

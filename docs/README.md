@@ -32,6 +32,8 @@
 | [결정 기록](decisions/README.md) | 무엇을 확정했고 무엇을 기술 스파이크에 남겼는가? |
 | [플랫폼 지원](platform-support.md) | 어떤 플랫폼이 구현·검증·보류 상태인가? |
 | [웹 실험판](web-support.md) | 브라우저판은 어떤 엔진·저장 형식을 쓰며, 어떻게 실행하고 어디까지 검증했는가? |
+| [웹 임베딩 SDK](web-embedding.md) | iframe 또는 새 창에서 편집하고 호출 페이지에 PNG를 어떻게 반환하는가? |
+| [웹 연동 검증](measurements/web-integration.md) | 저장 격리·호출 검증·실패 복구를 실제 브라우저에서 어디까지 확인했는가? |
 | [공용 편집 실행](decisions/ADR-0064-shared-editor-commands.md) | 웹의 빠진 기능을 복제 없이 어떻게 연결하며, 데스크톱에서 저장 위치 없이 새 그림을 어떻게 시작하는가? |
 
 ## 읽는 순서

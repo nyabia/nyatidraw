@@ -205,6 +205,78 @@ pub enum PointerPhase {
     Cancel,
 }
 
+/// App preference applied to live pen samples before brush evaluation and recording.
+/// Stored stroke samples already contain effective pressure and must not be mapped again.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PressurePreset {
+    Linear,
+    #[default]
+    Soft,
+    Softer,
+}
+
+impl PressurePreset {
+    #[must_use]
+    pub const fn storage_value(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::Soft => "soft",
+            Self::Softer => "softer",
+        }
+    }
+
+    #[must_use]
+    pub fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "linear" => Some(Self::Linear),
+            "soft" => Some(Self::Soft),
+            "softer" => Some(Self::Softer),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn map(self, pressure: f32) -> f32 {
+        let p = pressure.clamp(0.0, 1.0);
+        let k = match self {
+            Self::Linear => 0.0,
+            Self::Soft => 0.35,
+            Self::Softer => 0.7,
+        };
+        p + k * p * (1.0 - p)
+    }
+}
+
+/// Maps only live pen samples. The caller records the returned effective pressure.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LivePressureMapper {
+    active: Option<PressurePreset>,
+}
+
+impl LivePressureMapper {
+    #[must_use]
+    pub fn process(
+        &mut self,
+        phase: PointerPhase,
+        pressure: f32,
+        is_pen: bool,
+        selected: PressurePreset,
+    ) -> f32 {
+        if phase == PointerPhase::Begin {
+            self.active = is_pen.then_some(selected);
+        }
+        let effective = self.active.map_or(pressure, |preset| preset.map(pressure));
+        if matches!(phase, PointerPhase::End | PointerPhase::Cancel) {
+            self.active = None;
+        }
+        effective
+    }
+
+    pub fn clear(&mut self) {
+        self.active = None;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PenButtons(pub u32);
 
@@ -236,6 +308,53 @@ impl StylusSample {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn pressure_presets_preserve_contact_endpoints_and_monotonic_order() {
+        for preset in [
+            PressurePreset::Linear,
+            PressurePreset::Soft,
+            PressurePreset::Softer,
+        ] {
+            assert_eq!(preset.map(0.0), 0.0);
+            assert_eq!(preset.map(1.0), 1.0);
+            let values: Vec<_> = (0_u16..=100)
+                .map(|step| preset.map(f32::from(step) / 100.0))
+                .collect();
+            assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+        assert!(PressurePreset::Soft.map(0.5) > 0.5);
+        assert!(PressurePreset::Softer.map(0.5) > PressurePreset::Soft.map(0.5));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn live_pen_mapping_freezes_at_begin_and_leaves_mouse_unchanged() {
+        let mut mapper = LivePressureMapper::default();
+        let begin = mapper.process(PointerPhase::Begin, 0.0, true, PressurePreset::Soft);
+        let move_pressure = mapper.process(PointerPhase::Move, 0.5, true, PressurePreset::Softer);
+        let end = mapper.process(PointerPhase::End, 1.0, true, PressurePreset::Softer);
+        assert_eq!(begin, 0.0);
+        assert_eq!(move_pressure, PressurePreset::Soft.map(0.5));
+        assert_eq!(end, 1.0);
+        assert_eq!(
+            mapper.process(PointerPhase::Begin, 1.0, false, PressurePreset::Softer),
+            1.0
+        );
+        assert_eq!(
+            mapper.process(PointerPhase::End, 1.0, false, PressurePreset::Softer),
+            1.0
+        );
+        assert_eq!(
+            mapper.process(PointerPhase::Cancel, 0.0, true, PressurePreset::Softer),
+            0.0
+        );
+        assert_eq!(
+            mapper.process(PointerPhase::Begin, 0.5, true, PressurePreset::Softer),
+            PressurePreset::Softer.map(0.5)
+        );
+    }
 
     #[test]
     fn normalizes_pressure_axes() {
