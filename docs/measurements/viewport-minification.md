@@ -78,4 +78,19 @@ fmt 검사와 웹·Windows release 빌드가 성공했다. 테스트 집계의 �
 `output/playwright/minification-before-ui.png`, `minification-after-ui.png`,
 `minification-after-stroke.png`, `minification-after-rotated.png`에 로컬 화면 증거를 남겼다.
 로컬 favicon 404와 WebGPU adapter 선호도 경고 외 앱·셰이더 오류는 관찰하지 않았다.
-Windows 설치본은 교체하거나 실행하지 않았다. 공개 배포 결과는 완료 후 별도로 기록한다.
+Windows 설치본은 교체하거나 실행하지 않았다.
+
+## 공개 웹 확인
+
+소스 `6a13692`의 [Website 작업](https://github.com/nyabia/nyatidraw/actions/runs/38408316557)이
+성공했다. 공개 `/nyatidraw/draw/`를 새 Edge 프로필에서 열고 같은 4095×2305 PNG의
+22% 표시를 확인했다. 실제 PNG 복사의 디코딩 픽셀 해시는 수정 전·로컬 수정본과 같았다.
+`output/playwright/minification-public-ui.png`에 화면을 남겼다.
+
+공개 파일의 원시 바이트 SHA-256은 CI Pages 산출물과 각각 일치했다.
+
+- 본체 WASM: `a97ceab6f4db45d57e7eae4403de0dc42720ee3f9fa67b5491deb4ea247dcf9d`
+- Worker WASM: `52a9a7384ee553263e554a5aadfb33e6dc76423c6f76d328ea69cbfe5cb78c75`
+- 복구 Worker JS: `65c7d22a87599cd99723899756d80562ef97d5e3c3ad1054cd4cb0a15418ada9`
+
+공개 실행에서도 favicon 404·WebGPU adapter 선호도 경고 외 앱·셰이더 오류는 관찰하지 않았다.

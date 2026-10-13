@@ -3,7 +3,7 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
-## alpha.19 배포 준비
+## alpha.19 배포 검증
 
 사용자가 큰 그림의 축소 표시 수정과 배포를 승인했다. 웹과 Windows의 공용 GPU 표시
 경로를 개선하며 원본 픽셀·Undo·NTDR·PNG는 변경하지 않는다.
@@ -16,8 +16,25 @@
 - 물리 펜·iPad Safari·설치 업데이트·지연 수치는 이번 검증에 포함하지 않는다.
   내비게이터·레이어 썸네일과 픽셀 변형 축소는 별도 경로이며 이번 변경 대상이 아니다.
 
+- 소스 `6a13692`, 태그 `v0.1.0-alpha.19`의
+  [Windows CI](https://github.com/nyabia/nyatidraw/actions/runs/38408316729)가 성공했다.
+  [릴리즈 작업](https://github.com/nyabia/nyatidraw/actions/runs/38408323668)의 source 검사·
+  Windows release 빌드·패키징·사전 릴리즈 공개·Pages 게시가 성공했다.
+- [공개 릴리즈](https://github.com/nyabia/nyatidraw/releases/tag/v0.1.0-alpha.19)의 자산 7개를
+  내려받아 GitHub 크기·SHA256 digest 7/7, `SHA256SUMS.txt`의 6개 항목을 확인했다.
+  JSON·legacy 업데이트 피드의 제품 ID·버전·Full 타입·크기·SHA1/SHA256이 일치했다.
+  포터블 manifest의 `NyatiDraw` / `0.1.0-alpha.19` / `nyatidraw.exe` /
+  `nyatidraw-alpha` / `win-x64`, MIT·Apache 라이선스 원문·Lucide 고지도 확인했다.
+  설치 파일은 14,334,434 bytes,
+  SHA256 `5b1bbf24c4db615470ea8c57223e5e34b4dad4aa68a2138b2c107c01d89b7af4`다.
+- [Website 게시](https://github.com/nyabia/nyatidraw/actions/runs/38408316557)가 성공했고,
+  [공개 웹 확인](measurements/viewport-minification.md#공개-웹-확인)에서 실제 축소 표시와
+  PNG 픽셀 보존을 확인했다. 공개 본체·Worker 파일 해시는 Pages CI 산출물과 일치했다.
+
 [변경 내용](releases/0.1.0-alpha.19.md), [축소 표시 검증](measurements/viewport-minification.md).
-태그 릴리즈·공개 자산·실제 공개 웹 확인은 완료 후 기록한다.
+릴리즈 Pages 산출물의 `release.json`은 alpha.19였지만, 완료 직후 기본 공개 URL과
+실제 Edge 다운로드 버튼은 alpha.18을 반환했다. Windows 태그와 자산은 그대로 두고
+홈페이지만 다시 게시해 다운로드 대상 전환을 확인한다.
 
 ## alpha.18 배포 검증
 
