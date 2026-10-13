@@ -16,6 +16,7 @@ use nyatidraw_input::{Point, ViewportTransform, ViewportValidationError};
 use nyatidraw_tiles::{CompositeCache, TILE_BYTE_LEN, TILE_EDGE, TileKey};
 use wgpu::util::DeviceExt;
 
+use crate::presentation::{self, AreaReducer};
 use crate::{
     GpuRoundDabPainter, GpuWorkingTile, PaintSubmission, RGBA8_BYTES_PER_PIXEL,
     WORKING_TEXTURE_FORMAT,
@@ -31,6 +32,7 @@ const COMPOSITE_FIXED_BYTES: u64 = COMPOSITE_SCRATCH_BYTES
     + (nyatidraw_tiles::color::LAYER_COLOR_TRANSFER_ENTRIES * size_of::<u32>()) as u64;
 /// Explicit cap for the temporary full-document Sprint 3 texture strategy.
 pub const MAX_PERSISTENT_SCENE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PRESENTATION_MIP_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayerUploadError {
@@ -131,6 +133,7 @@ pub struct CompositeRenderStats {
 struct CompositeSurface {
     tile: GpuWorkingTile,
     source_bind_group: wgpu::BindGroup,
+    presentation_bind_group: wgpu::BindGroup,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -144,6 +147,7 @@ struct SparseAtlasSurface {
     key: SparseSurfaceKey,
     tile: GpuWorkingTile,
     source_bind_group: wgpu::BindGroup,
+    presentation_bind_group: wgpu::BindGroup,
     last_used: u64,
 }
 
@@ -163,7 +167,7 @@ impl SparseAtlas {
                 height: TILE_EDGE,
                 depth_or_array_layers: slot_count,
             },
-            mip_level_count: 1,
+            mip_level_count: presentation::SPARSE_MIP_LEVELS,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: WORKING_TEXTURE_FORMAT,
@@ -244,6 +248,12 @@ impl SparseAtlas {
         self.clock = self.clock.saturating_add(1);
         self.slots[slot] = Some(SparseAtlasSurface {
             key,
+            presentation_bind_group: presentation::source_binding(
+                device,
+                source_layout,
+                &self.texture,
+                array_layer,
+            ),
             tile,
             source_bind_group,
             last_used: self.clock,
@@ -268,6 +278,12 @@ impl CompositeSurface {
             }],
         });
         Self {
+            presentation_bind_group: presentation::source_binding(
+                device,
+                source_layout,
+                &tile.texture,
+                tile.copy_origin.z,
+            ),
             tile,
             source_bind_group,
         }
@@ -508,6 +524,10 @@ pub struct GpuCompositeScene {
     viewport_uniform: wgpu::Buffer,
     workspace_background: [[f32; 3]; 2],
     workspace_pipeline: wgpu::RenderPipeline,
+    workspace_resolve_pipeline: wgpu::RenderPipeline,
+    workspace_accumulation: Option<CompositeSurface>,
+    area_reducer: AreaReducer,
+    page_mips_dirty: bool,
     workspace_params: DynamicWorkspaceParams,
     sparse_atlas: SparseAtlas,
     sparse_closed_tiles: BTreeMap<TileKey, Box<[u8]>>,
@@ -567,13 +587,15 @@ impl GpuCompositeScene {
                 surfaces,
             });
         }
-        Ok(self.sparse_atlas.slots.len().min(
+        let slots = self.sparse_atlas.slots.len().min(
             usize::try_from(
                 (MAX_PERSISTENT_SCENE_BYTES - page_bytes - COMPOSITE_FIXED_BYTES)
                     / TILE_BYTE_LEN as u64,
             )
             .unwrap_or(usize::MAX),
-        ))
+        );
+        validate_presentation_mips(size, slots)?;
+        Ok(slots)
     }
 
     /// Preflights a page/history replacement against texture and scene budgets.
@@ -652,11 +674,12 @@ impl GpuCompositeScene {
         for id in groups {
             self.groups.entry(id).or_insert_with(|| {
                 CompositeSurface::new(
-                    create_document_texture(
+                    create_group_texture(
                         &self.device,
                         &self.queue,
                         self.document_size,
                         "nayati-restored-group",
+                        id == tree.root_id(),
                     ),
                     &self.device,
                     &self.source_layout,
@@ -671,6 +694,7 @@ impl GpuCompositeScene {
             self.solo_node = None;
         }
         self.page_cache.clear();
+        self.page_mips_dirty = true;
         self.sparse_cache.clear();
         self.sparse_atlas.key_to_slot.clear();
         self.sparse_atlas
@@ -739,6 +763,7 @@ impl GpuCompositeScene {
                 surfaces: surface_count.saturating_add(1),
             });
         }
+        validate_presentation_mips(document_size, atlas_slots as usize)?;
         let source_layout = create_source_layout(device);
         let opacity_layout = create_opacity_layout(device);
         let (color_transfer_layout, color_transfer_bind_group) =
@@ -783,8 +808,33 @@ impl GpuCompositeScene {
             include_str!("selection_overlay.wgsl"),
         );
         let workspace_params = DynamicWorkspaceParams::new(device);
-        let workspace_pipeline =
-            create_workspace_pipeline(device, &source_layout, &workspace_params.layout);
+        let workspace_pipeline = create_workspace_pipeline(
+            device,
+            &source_layout,
+            &workspace_params.layout,
+            include_str!("workspace_tiles.wgsl"),
+            presentation::ACCUMULATION_FORMAT,
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+        );
+        let workspace_resolve_pipeline = create_workspace_pipeline(
+            device,
+            &source_layout,
+            &viewport_layout,
+            include_str!("workspace_resolve.wgsl"),
+            WORKING_TEXTURE_FORMAT,
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        );
         let opacity =
             DynamicOpacityBuffer::new(device, &opacity_layout, INITIAL_COMPOSITE_CHILD_CAPACITY);
 
@@ -797,12 +847,18 @@ impl GpuCompositeScene {
         }
         let mut groups = BTreeMap::new();
         for id in group_ids {
-            let tile =
-                create_document_texture(device, queue, document_size, "nayati-group-composite");
+            let tile = create_group_texture(
+                device,
+                queue,
+                document_size,
+                "nayati-group-composite",
+                id == tree.root_id(),
+            );
             groups.insert(id, CompositeSurface::new(tile, device, &source_layout));
         }
         let live_backup =
             create_document_texture(device, queue, document_size, "nayati-live-stroke-backup");
+        let area_reducer = AreaReducer::new(device, &source_layout);
 
         Ok(Self {
             device: device.clone(),
@@ -829,6 +885,10 @@ impl GpuCompositeScene {
             viewport_uniform,
             workspace_background: [[0.035; 3]; 2],
             workspace_pipeline,
+            workspace_resolve_pipeline,
+            workspace_accumulation: None,
+            area_reducer,
+            page_mips_dirty: true,
             workspace_params,
             sparse_atlas,
             sparse_closed_tiles: BTreeMap::new(),
@@ -2030,6 +2090,19 @@ impl GpuCompositeScene {
         self.handle_sparse_eviction(evicted)
             .map_err(|()| CompositeRenderError::SparseAtlasExhausted)?;
         self.composite_stack_tile(&group, coordinate, true)?;
+        if group_id == self.tree.root_id() {
+            let slot = self
+                .sparse_atlas
+                .slot(SparseSurfaceKey::Group(key))
+                .ok_or(CompositeRenderError::SparseAtlasExhausted)?;
+            self.area_reducer.rebuild(
+                &self.device,
+                &self.queue,
+                &self.source_layout,
+                &self.sparse_atlas.texture,
+                slot,
+            );
+        }
         self.sparse_cache.insert(key, ());
         Ok(rebuilt)
     }
@@ -2110,9 +2183,9 @@ impl GpuCompositeScene {
                 .ensure_capacity(&self.device, batch.len());
             self.workspace_params.write(&self.queue, affine, batch);
             let display = self
-                .display
+                .workspace_accumulation
                 .as_ref()
-                .expect("display ensured before sparse rendering");
+                .expect("accumulation ensured before sparse rendering");
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2122,7 +2195,7 @@ impl GpuCompositeScene {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("nayati-workspace-tile-display-pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &display.view,
+                        view: &display.tile.view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Load,
@@ -2143,7 +2216,7 @@ impl GpuCompositeScene {
                             tile: coordinate,
                         }))
                         .ok_or(CompositeRenderError::SparseAtlasExhausted)?;
-                    pass.set_bind_group(0, &root.source_bind_group, &[]);
+                    pass.set_bind_group(0, &root.presentation_bind_group, &[]);
                     pass.set_bind_group(
                         1,
                         &self.workspace_params.bind_group,
@@ -2160,8 +2233,8 @@ impl GpuCompositeScene {
         Ok(())
     }
 
-    /// Rebuilds only missing visible group/tile cache entries, then samples the
-    /// root composite through the supplied affine into the display texture.
+    /// Reuses group/tile caches, then projects the final root into the viewport.
+    /// Minification first completes the page root and refreshes dirty display mips.
     ///
     /// # Errors
     ///
@@ -2185,7 +2258,13 @@ impl GpuCompositeScene {
             .solo_node
             .map(|node| composition_scope_nodes(self.tree.root(), CompositionScope::Solo(node)));
         let mut stats = CompositeRenderStats::default();
-        for coordinate in visible_tile_coordinates(viewport, self.document_size) {
+        let minifying = viewport.zoom * viewport.dpi_scale < 1.0;
+        let page_coordinates = if minifying {
+            page_tile_coordinates(self.document_size)
+        } else {
+            visible_tile_coordinates(viewport, self.document_size)
+        };
+        for coordinate in page_coordinates {
             stats.group_tiles_rebuilt = stats
                 .group_tiles_rebuilt
                 .saturating_add(self.ensure_group_tile(self.tree.root_id(), coordinate)?);
@@ -2199,6 +2278,16 @@ impl GpuCompositeScene {
             .groups
             .get(&self.tree.root_id())
             .ok_or(CompositeRenderError::UnknownGroup(self.tree.root_id()))?;
+        if minifying && self.page_mips_dirty {
+            self.area_reducer.rebuild(
+                &self.device,
+                &self.queue,
+                &self.source_layout,
+                &root.tile.texture,
+                0,
+            );
+            self.page_mips_dirty = false;
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2221,12 +2310,16 @@ impl GpuCompositeScene {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.viewport_pipeline);
-            pass.set_bind_group(0, &root.source_bind_group, &[]);
+            pass.set_bind_group(0, &root.presentation_bind_group, &[]);
             pass.set_bind_group(1, &self.viewport_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([encoder.finish()]);
-        self.render_sparse_workspace(viewport, &sparse_coordinates, &mut stats)?;
+        if !sparse_coordinates.is_empty() {
+            self.clear_workspace_accumulation();
+            self.render_sparse_workspace(viewport, &sparse_coordinates, &mut stats)?;
+            self.resolve_workspace();
+        }
         let display = self.display.as_ref().expect("display ensured above");
         let mut encoder = self
             .device
@@ -2296,7 +2389,88 @@ impl GpuCompositeScene {
                 size,
                 "nayati-viewport-display",
             ));
+            self.workspace_accumulation = None;
         }
+    }
+
+    fn clear_workspace_accumulation(&mut self) {
+        if self.workspace_accumulation.is_none() {
+            let Some(display) = &self.display else {
+                return;
+            };
+            self.workspace_accumulation = Some(CompositeSurface::new(
+                create_presentation_texture(
+                    &self.device,
+                    &self.queue,
+                    [display.width(), display.height()],
+                    "nyatidraw-workspace-accumulation",
+                    1,
+                    presentation::ACCUMULATION_FORMAT,
+                ),
+                &self.device,
+                &self.source_layout,
+            ));
+        }
+        let Some(surface) = &self.workspace_accumulation else {
+            return;
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("nyatidraw-workspace-accumulation-clear"),
+            });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("nyatidraw-workspace-accumulation-clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &surface.tile.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+        self.queue.submit([encoder.finish()]);
+    }
+
+    fn resolve_workspace(&self) {
+        let (Some(display), Some(accumulation)) = (&self.display, &self.workspace_accumulation)
+        else {
+            return;
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("nyatidraw-workspace-accumulation-resolve"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("nyatidraw-workspace-accumulation-resolve"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &display.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.workspace_resolve_pipeline);
+            pass.set_bind_group(0, &accumulation.source_bind_group, &[]);
+            pass.set_bind_group(1, &self.viewport_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit([encoder.finish()]);
     }
 
     fn ensure_group_tile(
@@ -2328,6 +2502,9 @@ impl GpuCompositeScene {
             }
         }
         self.composite_stack_tile(&group, coordinate, false)?;
+        if group_id == self.tree.root_id() {
+            self.page_mips_dirty = true;
+        }
         self.page_cache.insert(key, ());
         Ok(rebuilt)
     }
@@ -2742,8 +2919,8 @@ fn create_viewport_binding(
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("nayati-viewport-sampler"),
         mag_filter: wgpu::FilterMode::Nearest,
-        min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Linear,
         address_mode_u: wgpu::AddressMode::ClampToEdge,
         address_mode_v: wgpu::AddressMode::ClampToEdge,
         ..Default::default()
@@ -2811,10 +2988,13 @@ fn create_workspace_pipeline(
     device: &wgpu::Device,
     source_layout: &wgpu::BindGroupLayout,
     workspace_layout: &wgpu::BindGroupLayout,
+    shader_source: &str,
+    format: wgpu::TextureFormat,
+    blend: wgpu::BlendState,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("nayati-workspace-tile-shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("workspace_tiles.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(shader_source.into()),
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("nayati-workspace-tile-pipeline-layout"),
@@ -2838,19 +3018,8 @@ fn create_workspace_pipeline(
             entry_point: Some("fragment_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: WORKING_TEXTURE_FORMAT,
-                blend: Some(wgpu::BlendState {
-                    color: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                    alpha: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                }),
+                format,
+                blend: Some(blend),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -2865,6 +3034,38 @@ fn create_document_texture(
     size: [u32; 2],
     label: &'static str,
 ) -> GpuWorkingTile {
+    create_presentation_texture(device, queue, size, label, 1, WORKING_TEXTURE_FORMAT)
+}
+
+fn create_group_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    size: [u32; 2],
+    label: &'static str,
+    root: bool,
+) -> GpuWorkingTile {
+    create_presentation_texture(
+        device,
+        queue,
+        size,
+        label,
+        if root {
+            presentation::mip_levels(size)
+        } else {
+            1
+        },
+        WORKING_TEXTURE_FORMAT,
+    )
+}
+
+fn create_presentation_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    size: [u32; 2],
+    label: &'static str,
+    mip_level_count: u32,
+    format: wgpu::TextureFormat,
+) -> GpuWorkingTile {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -2872,17 +3073,20 @@ fn create_document_texture(
             height: size[1],
             depth_or_array_layers: 1,
         },
-        mip_level_count: 1,
+        mip_level_count,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: WORKING_TEXTURE_FORMAT,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_DST
             | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        mip_level_count: Some(1),
+        ..Default::default()
+    });
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("nayati-document-texture-init"),
     });
@@ -3008,6 +3212,33 @@ fn tile_region(
             TILE_EDGE.min(document_size[1] - y),
         ],
     ))
+}
+
+fn validate_presentation_mips(size: [u32; 2], slots: usize) -> Result<(), CompositeRenderError> {
+    let required_bytes = presentation::mip_bytes(size).saturating_add(
+        presentation::mip_bytes([TILE_EDGE; 2])
+            .saturating_mul(u64::try_from(slots).unwrap_or(u64::MAX)),
+    );
+    if required_bytes > MAX_PRESENTATION_MIP_BYTES {
+        return Err(CompositeRenderError::AllocationBudgetExceeded {
+            required_bytes,
+            max_bytes: MAX_PRESENTATION_MIP_BYTES,
+            surfaces: slots.saturating_add(1),
+        });
+    }
+    Ok(())
+}
+
+fn page_tile_coordinates(size: [u32; 2]) -> Vec<TileCoordinate> {
+    (0..size[1].div_ceil(TILE_EDGE))
+        .flat_map(|y| {
+            (0..size[0].div_ceil(TILE_EDGE)).map(move |x| TileCoordinate {
+                mip: 0,
+                x: i32::try_from(x).expect("document tile x fits i32"),
+                y: i32::try_from(y).expect("document tile y fits i32"),
+            })
+        })
+        .collect()
 }
 
 fn visible_tile_coordinates(
@@ -3137,10 +3368,16 @@ fn visible_sparse_coordinates(
         .iter()
         .map(|point| point.y)
         .fold(f64::NEG_INFINITY, f64::max);
-    let min_tile_x = tile_coordinate_from_document(min_x);
-    let min_tile_y = tile_coordinate_from_document(min_y);
-    let max_tile_x = tile_coordinate_from_document(max_x - f64::EPSILON);
-    let max_tile_y = tile_coordinate_from_document(max_y - f64::EPSILON);
+    let footprint = 1.0 / (viewport.zoom * viewport.dpi_scale);
+    let halo = if footprint > 1.0 {
+        2.0_f64.powf(footprint.log2().ceil()) * 1.5
+    } else {
+        0.0
+    };
+    let min_tile_x = tile_coordinate_from_document(min_x - halo);
+    let min_tile_y = tile_coordinate_from_document(min_y - halo);
+    let max_tile_x = tile_coordinate_from_document(max_x + halo - f64::EPSILON);
+    let max_tile_y = tile_coordinate_from_document(max_y + halo - f64::EPSILON);
     coordinates
         .into_iter()
         .filter(|coordinate| {

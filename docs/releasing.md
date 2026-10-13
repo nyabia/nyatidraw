@@ -3,6 +3,22 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
+## alpha.19 배포 준비
+
+사용자가 큰 그림의 축소 표시 수정과 배포를 승인했다. 웹과 Windows의 공용 GPU 표시
+경로를 개선하며 원본 픽셀·Undo·NTDR·PNG는 변경하지 않는다.
+
+- 실제 GPU 축소 패턴 24개 조건, 원본 보존·1:1/확대·반투명 경계·비가시 갱신·홀수 크기 검사 통과.
+- 기존 레이어 GPU 회귀 검사, workspace 핵심 테스트·Clippy·fmt,
+  WASM UI/Worker Clippy, 웹·Windows release 빌드 통과.
+- 격리 Edge에서 화면 맞춤·축소 획·Undo·보기 회전·별도 프로세스 복구를 확인했다.
+  PNG 복사의 디코딩 픽셀은 수정 전과 같은 SHA-256이었다.
+- 물리 펜·iPad Safari·설치 업데이트·지연 수치는 이번 검증에 포함하지 않는다.
+  내비게이터·레이어 썸네일과 픽셀 변형 축소는 별도 경로이며 이번 변경 대상이 아니다.
+
+[변경 내용](releases/0.1.0-alpha.19.md), [축소 표시 검증](measurements/viewport-minification.md).
+태그 릴리즈·공개 자산·실제 공개 웹 확인은 완료 후 기록한다.
+
 ## alpha.18 배포 검증
 
 무파일 낙서·PNG 복사 요청과 함께 사용자가 게시를 승인했다. 이 버전에는 앞선 로컬

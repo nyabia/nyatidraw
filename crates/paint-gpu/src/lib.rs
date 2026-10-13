@@ -7,6 +7,7 @@
 
 mod compositor;
 mod gesture_preview;
+mod presentation;
 mod selection;
 pub use selection::{GpuSelectionError, GpuSelectionMask};
 
@@ -152,6 +153,7 @@ impl GpuWorkingTile {
             dimension: Some(wgpu::TextureViewDimension::D2),
             base_array_layer: array_layer,
             array_layer_count: Some(1),
+            mip_level_count: Some(1),
             ..Default::default()
         });
         Self {

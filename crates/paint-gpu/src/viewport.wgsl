@@ -61,6 +61,12 @@ fn fragment_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
     let checker_value = select(0.58, 0.72, checker == 0);
     let checkerboard = vec3<f32>(checker_value);
     let uv = document / params.document_size.xy;
-    let artwork = textureSampleLevel(source_texture, source_sampler, uv, 0.0);
+    let footprint = max(length(params.document_x.xy), length(params.document_y.xy));
+    var artwork: vec4<f32>;
+    if footprint <= 1.00001 {
+        artwork = textureLoad(source_texture, vec2<i32>(floor(document)), 0);
+    } else {
+        artwork = textureSampleLevel(source_texture, source_sampler, uv, log2(footprint));
+    }
     return vec4<f32>(artwork.rgb + checkerboard * (1.0 - artwork.a), 1.0);
 }

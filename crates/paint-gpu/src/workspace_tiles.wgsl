@@ -11,6 +11,31 @@ var source_texture: texture_2d<f32>;
 @group(1) @binding(0)
 var<uniform> params: WorkspaceTileParams;
 
+fn load_or_transparent(pixel: vec2<i32>, level: i32) -> vec4<f32> {
+    let size = vec2<i32>(textureDimensions(source_texture, level));
+    if any(pixel < vec2(0)) || any(pixel >= size) { return vec4(0.0); }
+    return textureLoad(source_texture, pixel, level);
+}
+
+fn filtered_level(document: vec2<f32>, local: vec2<f32>, level: i32) -> vec4<f32> {
+    let scale = exp2(f32(level));
+    if level > 7 {
+        // Each 128px tile contributes its area to the same globally aligned coarse grid.
+        let cell = floor(params.tile_origin.xy / scale);
+        let weight = max(vec2(0.0), vec2(1.0) - abs(document / scale - vec2(0.5) - cell));
+        let area = 128.0 / scale;
+        return textureLoad(source_texture, vec2(0), 7) * area * area * weight.x * weight.y;
+    }
+    let pixel = local / scale - vec2(0.5);
+    let low = vec2<i32>(floor(pixel));
+    let weight = fract(pixel);
+    return mix(
+        mix(load_or_transparent(low, level), load_or_transparent(low + vec2(1, 0), level), weight.x),
+        mix(load_or_transparent(low + vec2(0, 1), level), load_or_transparent(low + vec2(1, 1), level), weight.x),
+        weight.y,
+    );
+}
+
 @vertex
 fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
     let positions = array<vec2<f32>, 3>(
@@ -52,10 +77,23 @@ fn fragment_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
     }
 
     let local = document - params.tile_origin.xy;
-    if local.x < 0.0 || local.y < 0.0 || local.x >= 128.0 || local.y >= 128.0 {
-        discard;
+    let footprint = max(length(params.document_x.xy), length(params.document_y.xy));
+    var artwork: vec4<f32>;
+    if footprint <= 1.00001 {
+        if any(local < vec2(0.0)) || any(local >= vec2(128.0)) { discard; }
+        artwork = textureLoad(source_texture, vec2<i32>(floor(local)), 0);
+    } else {
+        let lod = log2(footprint);
+        let low = i32(floor(lod));
+        let support = exp2(ceil(lod));
+        let cell_origin = floor(params.tile_origin.xy / support) * support;
+        let cell_size = max(128.0, support);
+        if any(document < cell_origin - vec2(support * 0.5))
+            || any(document >= cell_origin + vec2(cell_size + support * 0.5)) {
+            discard;
+        }
+        artwork = mix(filtered_level(document, local, low), filtered_level(document, local, low + 1), fract(lod));
     }
-    let artwork = textureLoad(source_texture, vec2<i32>(floor(local)), 0);
     if artwork.a <= 0.0 {
         discard;
     }
