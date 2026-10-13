@@ -31,8 +31,11 @@
 - [공개 웹 확인](measurements/unsaved-drawing.md#공개-웹-확인)에서 저장 파일 없이 그린 후
   실제 PNG 복사·붙여넣기를 확인했다. 본체·복구 Worker·문서 파일이 Pages CI 산출물과 일치했다.
 - 최초 릴리즈 Pages 완료 후 공개 `release.json`과 Edge 다운로드 버튼은 alpha.17이었다.
-  릴리즈 Pages 산출물의 `release.json`은 alpha.18이므로 홈페이지만 별도 재게시한다.
-  기존 태그·Windows 릴리즈 자산은 교체하지 않는다.
+  릴리즈 Pages 산출물의 `release.json`은 alpha.18이었다.
+  검증 기록 커밋 `7af368d`의
+  [홈페이지 재게시](https://github.com/nyabia/nyatidraw/actions/runs/38356076893)가 성공한 뒤
+  기본 `release.json` URL과 실제 Edge 다운로드 버튼에서 alpha.18 설치 링크를 확인했다.
+  기존 태그·Windows 릴리즈 자산은 교체하지 않았다.
 
 [변경 내용](releases/0.1.0-alpha.18.md), [무파일 낙서 검증](measurements/unsaved-drawing.md),
 [앞선 통합 검증](core-workflow-completion.md)에 실제 입력·설치 등 검증하지 않은 경계를 유지한다.
