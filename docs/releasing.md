@@ -33,8 +33,10 @@
 
 [변경 내용](releases/0.1.0-alpha.19.md), [축소 표시 검증](measurements/viewport-minification.md).
 릴리즈 Pages 산출물의 `release.json`은 alpha.19였지만, 완료 직후 기본 공개 URL과
-실제 Edge 다운로드 버튼은 alpha.18을 반환했다. Windows 태그와 자산은 그대로 두고
-홈페이지만 다시 게시해 다운로드 대상 전환을 확인한다.
+실제 Edge 다운로드 버튼은 alpha.18을 반환했다. 검증 기록 커밋 `946ecf8`의
+[홈페이지 재게시](https://github.com/nyabia/nyatidraw/actions/runs/38411329665) 성공 후
+기본 `release.json` URL과 실제 Edge 다운로드 버튼에서 alpha.19 설치 링크를 확인했다.
+Windows 태그와 릴리즈 자산은 교체하지 않았다.
 
 ## alpha.18 배포 검증
 
