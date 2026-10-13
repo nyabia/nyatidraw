@@ -27,6 +27,9 @@ impl WebDocument {
     /// # Errors
     /// Rejects invalid edits and browser resource limits before replacing artwork.
     pub fn apply_edit(&mut self, command: EditCommand) -> Result<CanvasUpdate, WebError> {
+        if let EditCommand::ColorAdjustment(command) = command {
+            return self.apply_color_adjustment(command);
+        }
         if command == EditCommand::PasteSelection {
             return self.apply_transform(nyatidraw_api::TransformCommand::Paste);
         }

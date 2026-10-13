@@ -993,6 +993,7 @@ mod tests {
             reference,
             opacity_u16: u16::MAX,
             content_root: ContentRootId(0),
+            color_effect: None,
         })
     }
     fn tree(locked: bool) -> LayerTree {

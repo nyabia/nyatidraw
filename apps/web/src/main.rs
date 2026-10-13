@@ -7,6 +7,8 @@ mod gpu;
 #[cfg(target_arch = "wasm32")]
 mod preview;
 #[cfg(target_arch = "wasm32")]
+mod reference_image;
+#[cfg(target_arch = "wasm32")]
 mod runtime;
 #[cfg(target_arch = "wasm32")]
 mod tool_preferences;

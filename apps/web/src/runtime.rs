@@ -99,6 +99,7 @@ pub struct Runtime {
     frame_pending: bool,
     pub gpu_failed: bool,
     pan_start: Option<(Point, Point)>,
+    rotation_start: Option<(nyatidraw_input::ViewportRotationDrag, ViewportTransform)>,
     save_generation: u64,
     save_running: bool,
     save_pending: bool,
@@ -129,6 +130,7 @@ pub struct Editor {
     pub picker: Signal<Option<nyatidraw_editor_ui::picker_loupe::PickerSnapshot>>,
     pub integration_busy: Signal<bool>,
     pub integration_closed: Signal<bool>,
+    pub copying_png: Signal<bool>,
 }
 
 impl Editor {
@@ -256,7 +258,7 @@ impl Editor {
         } else if restored {
             "작업 복구 완료 · 이 브라우저에 저장됨"
         } else {
-            "WebGPU · 그림은 이 기기에만 저장됩니다"
+            "바로 그리세요 · 파일 없이 자동 복구 · PNG 복사로 붙여넣기"
         });
         self.refresh();
         self.redraw();
@@ -283,6 +285,7 @@ impl Editor {
             return Err("열려 있는 대화상자를 먼저 닫아주세요.".into());
         }
         let cell = self.runtime.peek().clone();
+        let mut persist_edit = true;
         let result = {
             let mut borrow = cell.borrow_mut();
             let Some(runtime) = borrow.as_mut() else {
@@ -294,26 +297,33 @@ impl Editor {
             if runtime.gpu_failed {
                 return Err("화면이 중단되었습니다. 작업 저장 후 새로고침해주세요.".into());
             }
-            operation(&mut runtime.document)
-                .map_err(|e| e.to_string())
-                .and_then(|update| {
-                    let result = runtime.apply(&update);
-                    if result.is_err() {
-                        runtime.gpu_failed = true;
-                    }
-                    result
-                })
+            let correction_before = runtime.document.color_adjustment_projection().is_some();
+            let edited = operation(&mut runtime.document);
+            if correction_before || runtime.document.color_adjustment_projection().is_some() {
+                persist_edit = edited.as_ref().is_ok_and(|update| update.committed);
+            }
+            edited.map_err(|e| e.to_string()).and_then(|update| {
+                let result = runtime.apply(&update);
+                if result.is_err() {
+                    runtime.gpu_failed = true;
+                }
+                result
+            })
         };
         match result {
             Ok(()) => {
                 self.refresh();
                 self.redraw();
-                self.persist();
+                if persist_edit {
+                    self.persist();
+                }
                 Ok(())
             }
             Err(error) => {
                 self.refresh();
-                self.persist();
+                if persist_edit {
+                    self.persist();
+                }
                 Err(error)
             }
         }
@@ -388,6 +398,8 @@ impl Editor {
             let point = Point { x, y };
             match phase {
                 "resize" => {
+                    runtime.pan_start = None;
+                    runtime.rotation_start = None;
                     runtime.pressure_mapper.clear();
                     runtime.transform_drag = None;
                     runtime.gesture = None;
@@ -405,6 +417,44 @@ impl Editor {
                 "panBegin" => {
                     runtime.fit_to_canvas = false;
                     runtime.pan_start = Some((point, runtime.viewport.pan));
+                    return Ok(());
+                }
+                "rotateBegin" => {
+                    runtime.fit_to_canvas = false;
+                    runtime.rotation_start = nyatidraw_input::ViewportRotationDrag::new(
+                        x,
+                        runtime.viewport.rotation_radians,
+                    )
+                    .map(|drag| (drag, runtime.viewport));
+                    return Ok(());
+                }
+                "rotateMove" | "rotateEnd" => {
+                    if let Some((drag, start)) = runtime.rotation_start {
+                        let rect = runtime.canvas.get_bounding_client_rect();
+                        let center = Point {
+                            x: rect.width() * 0.5,
+                            y: rect.height() * 0.5,
+                        };
+                        if let Some(angle) = drag.millidegrees_at(x)
+                            && let Some(mut view) = start.with_view_at(
+                                center,
+                                start.zoom,
+                                (f64::from(angle) / 1_000.0).to_radians(),
+                                start.mirrored_horizontal,
+                            )
+                        {
+                            view.revision = runtime.viewport.revision + 1;
+                            runtime.viewport = view;
+                            refresh = true;
+                        }
+                    }
+                    if phase == "rotateEnd" {
+                        runtime.rotation_start = None;
+                    }
+                    return Ok(());
+                }
+                "rotateCancel" => {
+                    runtime.rotation_start = None;
                     return Ok(());
                 }
                 "panMove" => {
@@ -429,10 +479,18 @@ impl Editor {
                     return Ok(());
                 }
                 "cancel" | "overflow" => {
+                    runtime.rotation_start = None;
                     runtime.pressure_mapper.clear();
                     runtime.transform_drag = None;
                     runtime.pan_start = None;
-                    let update = if runtime.document.transform_projection().is_some() {
+                    let update = if runtime.document.color_adjustment_projection().is_some() {
+                        runtime
+                            .document
+                            .apply_edit(nyatidraw_api::EditCommand::ColorAdjustment(
+                                nyatidraw_api::ColorAdjustmentCommand::Cancel,
+                            ))
+                            .map_err(|e| e.to_string())?
+                    } else if runtime.document.transform_projection().is_some() {
                         runtime
                             .document
                             .apply_edit(nyatidraw_api::EditCommand::FreeTransform(
@@ -464,6 +522,9 @@ impl Editor {
             }
             if runtime.gpu_failed {
                 return Err("화면 표시가 중단되었습니다. 작업 저장 후 새로고침해주세요.".into());
+            }
+            if runtime.document.color_adjustment_projection().is_some() {
+                return Err("색 보정을 확정하거나 취소하세요.".into());
             }
             let position = runtime
                 .viewport
@@ -587,15 +648,21 @@ impl Editor {
                         if runtime.document.transform_projection().is_some() {
                             return Err("현재 변형을 확정하거나 취소하세요.".into());
                         }
-                        runtime.gesture = Some(nyatidraw_editor::gesture::EditGesture::begin(
-                            runtime.selected_tool,
-                            runtime.document.edit_settings,
-                            nyatidraw_tiles::color::srgb8_to_linear_premultiplied(
-                                runtime.document.foreground(),
-                            ),
-                            runtime.document.selection().is_some(),
-                            sample,
-                        ));
+                        runtime.gesture =
+                            Some(nyatidraw_editor::gesture::EditGesture::begin_with_colors(
+                                runtime.selected_tool,
+                                runtime.document.edit_settings,
+                                [
+                                    nyatidraw_tiles::color::srgb8_to_linear_premultiplied(
+                                        runtime.document.foreground(),
+                                    ),
+                                    nyatidraw_tiles::color::srgb8_to_linear_premultiplied(
+                                        runtime.document.background(),
+                                    ),
+                                ],
+                                runtime.document.selection().is_some(),
+                                sample,
+                            ));
                     }
                     "move" => {
                         if let Some(gesture) = &mut runtime.gesture {
@@ -964,7 +1031,8 @@ impl Editor {
                 Ok(saved) if saved.is_null() => self.warn("이 브라우저에 저장된 작업이 없습니다."),
                 Ok(saved) => {
                     let bytes = Uint8Array::new(&saved);
-                    let legacy = bytes.subarray(0, 8).to_vec() == b"NYWEB001";
+                    let header = bytes.subarray(0, 8).to_vec();
+                    let legacy = header == b"NYWEB001" || header == b"NYWEB002";
                     browser::download_bytes(
                         &bytes,
                         if legacy {
@@ -997,30 +1065,44 @@ impl Editor {
         }
     }
 
-    pub fn copy_png(self) {
+    pub fn copy_png(mut self) {
+        if (self.copying_png)() {
+            self.warn("PNG 복사가 진행 중입니다. 잠시 기다려주세요.");
+            return;
+        }
         let Some(result) = self.read(|runtime| {
             if runtime.gesture.is_some()
                 || runtime.transform_drag.is_some()
                 || runtime.document.transform_projection().is_some()
+                || runtime.document.color_adjustment_projection().is_some()
             {
-                return Err("진행 중인 선택 또는 변형을 완료한 뒤 복사해주세요.".to_owned());
+                return Err(
+                    "진행 중인 선택·변형·색 보정을 확정하거나 취소한 뒤 복사해주세요.".to_owned(),
+                );
             }
-            encode_png(&runtime.document)
+            encode_png(&runtime.document).map(|bytes| (runtime.project_epoch, bytes))
         }) else {
             return;
         };
-        let bytes = match result {
-            Ok(bytes) => bytes,
+        let (epoch, bytes) = match result {
+            Ok(value) => value,
             Err(error) => {
                 self.warn(error);
                 return;
             }
         };
 
+        self.copying_png.set(true);
         let write = browser::write_png_clipboard(&Uint8Array::from(bytes.as_slice()));
         spawn_local(async move {
-            match JsFuture::from(write).await {
-                Ok(_) => self.report("PNG를 복사했습니다. 돌아가서 붙여넣으세요."),
+            let result = JsFuture::from(write).await;
+            self.copying_png.set(false);
+            match result {
+                Ok(_) => self.report(if self.read(|runtime| runtime.project_epoch) == Some(epoch) {
+                    "PNG를 복사했습니다. 돌아가서 붙여넣으세요."
+                } else {
+                    "이전 그림의 PNG를 복사했습니다. 돌아가서 붙여넣으세요."
+                }),
                 Err(error) => self.warn(format!(
                     "PNG 복사에 실패했습니다. 브라우저 권한을 확인하거나 PNG 내려받기를 이용해주세요: {}",
                     browser::error_text(&error)
@@ -1127,7 +1209,7 @@ impl Editor {
             return;
         }
         spawn_local(async move {
-            let file = match JsFuture::from(browser::pick_file()).await {
+            let file = match JsFuture::from(browser::pick_file(false)).await {
                 Ok(file) if file.is_null() => return,
                 Ok(file) => Array::from(&file),
                 Err(error) => {
@@ -1149,6 +1231,56 @@ impl Editor {
                 }
             }
         });
+    }
+
+    pub async fn import_png_layer(self) {
+        let Some(epoch) = self.read(|runtime| runtime.project_epoch) else {
+            return;
+        };
+        let result = async {
+            let file = JsFuture::from(browser::pick_file(true))
+                .await
+                .map_err(|error| browser::error_text(&error))?;
+            if file.is_null() {
+                return Ok(());
+            }
+            if self.read(|runtime| runtime.project_epoch) != Some(epoch) {
+                return Err("그림이 바뀌어 이미지 가져오기를 취소했습니다.".to_owned());
+            }
+            let file = Array::from(&file);
+            let name = file.get(0).as_string().unwrap_or_default();
+            let bytes = Uint8Array::new(&file.get(1)).to_vec();
+            let (size, mut pixels) = decode_png_pixels(&bytes)?;
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&nyatidraw_tiles::color::srgb8_to_linear_premultiplied([
+                    pixel[0], pixel[1], pixel[2], pixel[3],
+                ]));
+            }
+            let import = nyatidraw_api::RasterImport {
+                project_epoch: epoch,
+                name: name.strip_suffix(".png").unwrap_or(&name).to_owned(),
+                size,
+                pixels: pixels.into(),
+            };
+            self.try_edit(|document| {
+                document.apply_edit(nyatidraw_api::EditCommand::FreeTransform(
+                    nyatidraw_api::TransformCommand::ImportRaster(import),
+                ))
+            })?;
+            if let Some(runtime) = self.runtime.peek().borrow_mut().as_mut() {
+                runtime.selected_tool = DrawingTool::MoveSelection;
+                runtime
+                    .document
+                    .set_project_tool(DrawingTool::MoveSelection);
+            }
+            browser::set_canvas_tool(canvas_input_mode(DrawingTool::MoveSelection));
+            self.refresh();
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(error) = result {
+            self.warn(error);
+        }
     }
 
     fn stage_replacement(self, document: WebProject) {
@@ -1259,6 +1391,7 @@ impl Runtime {
             frame_pending: false,
             gpu_failed: false,
             pan_start: None,
+            rotation_start: None,
             save_generation: 0,
             save_running: false,
             save_pending: false,
@@ -1363,6 +1496,11 @@ fn encode_png(document: &WebDocument) -> Result<Vec<u8>, String> {
 }
 
 fn decode_png(bytes: &[u8]) -> Result<WebDocument, String> {
+    let (size, rgba) = decode_png_pixels(bytes)?;
+    WebDocument::import_rgba8(size[0], size[1], &rgba).map_err(|e| e.to_string())
+}
+
+fn decode_png_pixels(bytes: &[u8]) -> Result<([u32; 2], Vec<u8>), String> {
     let mut decoder = png::Decoder::new(Cursor::new(bytes));
     decoder.set_limits(png::Limits {
         bytes: 72 * 1024 * 1024,
@@ -1396,5 +1534,5 @@ fn decode_png(bytes: &[u8]) -> Result<WebDocument, String> {
         }
         png::ColorType::Indexed => return Err("PNG 색상 변환에 실패했습니다.".into()),
     }
-    WebDocument::import_rgba8(info.width, info.height, &rgba).map_err(|e| e.to_string())
+    Ok(([info.width, info.height], rgba))
 }

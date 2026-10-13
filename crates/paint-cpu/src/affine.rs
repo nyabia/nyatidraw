@@ -156,7 +156,8 @@ impl Region {
 /// filter support, independently of whether selected artwork is transparent.
 /// Positive rotation is clockwise in document coordinates (Y points down).
 /// Bilinear minification is not an area filter: a shape shrunk between all
-/// pixel centers is rejected, rather than committing an empty cut result.
+/// pixel centers, or whose ink rounds entirely to zero, is rejected rather
+/// than committing an empty cut result.
 ///
 /// # Errors
 /// Rejects invalid, empty, locked, out-of-range or over-budget requests before
@@ -237,9 +238,10 @@ pub fn transform_selection_affine(
         baseline_bytes: baseline,
         limits,
     };
-    cut_source(&mut replacements, source, target, mask)?;
+    let source_has_ink = cut_source(&mut replacements, source, target, mask)?;
     let pixel_count = usize::try_from(output.pixels()).map_err(|_| EditError::LimitExceeded)?;
     let mut packed = vec![0_u8; pixel_count.div_ceil(8)];
+    let mut output_has_ink = false;
     for y in 0..output.size[1] {
         for x in 0..output.size[0] {
             let point = output.point(x, y);
@@ -251,6 +253,7 @@ pub fn transform_selection_affine(
                 packed[index / 8] |= 1 << (index % 8);
             }
             if color[3] != 0 {
+                output_has_ink = true;
                 let (key, offset) = pixel_address(target, point);
                 composite_surface(
                     &mut replacements.tile(key)?[offset..offset + 4],
@@ -261,9 +264,8 @@ pub fn transform_selection_affine(
         }
     }
     let selection = SelectionMask::from_packed_bits_at(output.origin, output.size, &packed)?;
-    // Extreme minification of a thin shape can miss all pixel centers. Never
-    // publish the cut if no editable transformed selection remains.
-    if selection.selected_pixels() == 0 {
+    // Transparent selected pixels cannot make an empty cut result safe.
+    if selection.selected_pixels() == 0 || (source_has_ink && !output_has_ink) {
         return Err(EditError::InvalidTransform);
     }
     Ok(AffineResult {
@@ -278,24 +280,24 @@ fn cut_source(
     source: Region,
     target: LayerId,
     mask: &SelectionMask,
-) -> Result<(), EditError> {
+) -> Result<bool, EditError> {
+    let mut has_ink = false;
     for y in 0..source.size[1] {
         for x in 0..source.size[0] {
             let point = source.point(x, y);
             let [px, py] = point.map(|p| i32::try_from(p).expect("checked source"));
             if mask.contains_signed(px, py) {
                 let (key, offset) = pixel_address(target, point);
-                if replacements
-                    .before
-                    .get(key)
-                    .is_some_and(|t| t.pixels()[offset..offset + 4] != [0; 4])
+                if let Some(tile) = replacements.before.get(key)
+                    && tile.pixels()[offset..offset + 4] != [0; 4]
                 {
+                    has_ink |= tile.pixels()[offset + 3] != 0;
                     replacements.tile(key)?[offset..offset + 4].fill(0);
                 }
             }
         }
     }
-    Ok(())
+    Ok(has_ink)
 }
 
 fn bilinear(
@@ -371,6 +373,7 @@ mod tests {
                         reference: false,
                         opacity_u16: u16::MAX,
                         content_root: ContentRootId(0),
+                        color_effect: None,
                     })
                 })
                 .into(),
@@ -552,6 +555,62 @@ mod tests {
                 }
             }
             assert!(partial);
+        }
+    }
+
+    #[test]
+    fn resampling_cannot_erase_all_selected_ink_behind_nonempty_selection_coverage() {
+        let layer = LayerId(1);
+        let tree = tree();
+        for (size, bits, alpha, transform) in [
+            (
+                [5, 1],
+                0b1_1111,
+                128,
+                AffineTransform {
+                    scale_ppm: [200_000, 1_000_000],
+                    ..AffineTransform::default()
+                },
+            ),
+            (
+                [1, 1],
+                1,
+                1,
+                AffineTransform {
+                    offset_milli: [500, 500],
+                    ..AffineTransform::default()
+                },
+            ),
+        ] {
+            let mask = SelectionMask::from_packed_bits_at([-4, -1], size, &[bits]).unwrap();
+            let before = fixture(&[
+                (layer, [-4, -1], [alpha, 0, 0, alpha]),
+                (layer, [100, 10], [0, 64, 0, 64]),
+            ]);
+            assert!(matches!(
+                transform_selection_affine(
+                    &before,
+                    &tree,
+                    layer,
+                    &mask,
+                    &transform,
+                    EditLimits::default(),
+                ),
+                Err(EditError::InvalidTransform)
+            ));
+            assert_eq!(pixel(&before, layer, [-4, -1]), [alpha, 0, 0, alpha]);
+            let empty = fixture(&[(layer, [100, 10], [0, 64, 0, 64])]);
+            let result = transform_selection_affine(
+                &empty,
+                &tree,
+                layer,
+                &mask,
+                &transform,
+                EditLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(result.paint.after, empty);
+            assert!(result.selection.selected_pixels() > 0);
         }
     }
 

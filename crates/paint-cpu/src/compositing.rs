@@ -61,7 +61,10 @@ pub(crate) fn group_pixel(
     scope: Option<&BTreeSet<LayerTreeNodeId>>,
 ) -> [u8; 4] {
     let raw = |node: &LayerTreeNode| match node {
-        LayerTreeNode::Raster(layer) => crate::selection::raster_pixel(snapshot, layer.id, point),
+        LayerTreeNode::Raster(layer) => nyatidraw_tiles::color::apply_layer_color_effect(
+            crate::selection::raster_pixel(snapshot, layer.id, point),
+            layer.color_effect,
+        ),
         LayerTreeNode::Group(group) => group_pixel(snapshot, group, point, scope),
     };
     let mut output = [0; 4];
@@ -84,14 +87,26 @@ pub(crate) fn group_pixel(
 
 fn raw_tile(snapshot: &TileSnapshot, node: &LayerTreeNode, coordinate: TileCoordinate) -> Vec<u8> {
     match node {
-        LayerTreeNode::Raster(layer) => snapshot
-            .get(TileKey {
-                layer: layer.id,
-                mip: 0,
-                x: coordinate.x,
-                y: coordinate.y,
-            })
-            .map_or_else(|| vec![0; TILE_BYTE_LEN], |tile| tile.pixels().to_vec()),
+        LayerTreeNode::Raster(layer) => {
+            let mut pixels = snapshot
+                .get(TileKey {
+                    layer: layer.id,
+                    mip: 0,
+                    x: coordinate.x,
+                    y: coordinate.y,
+                })
+                .map_or_else(|| vec![0; TILE_BYTE_LEN], |tile| tile.pixels().to_vec());
+            if layer.color_effect.is_some_and(|effect| effect.enabled) {
+                for pixel in pixels.chunks_exact_mut(4) {
+                    let mapped = nyatidraw_tiles::color::apply_layer_color_effect(
+                        [pixel[0], pixel[1], pixel[2], pixel[3]],
+                        layer.color_effect,
+                    );
+                    pixel.copy_from_slice(&mapped);
+                }
+            }
+            pixels
+        }
         LayerTreeNode::Group(group) => group_tile(snapshot, group, coordinate),
     }
 }

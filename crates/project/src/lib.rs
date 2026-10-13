@@ -315,6 +315,8 @@ pub const ALPHA_LOCK_STROKE_SCHEMA_FLAG: u64 = 0x1000;
 pub const PENCIL_BRUSH_SCHEMA_FLAG: u64 = 0x2000;
 /// Engine v4/v5 pressure onset and graphite undercoat require version-aware replay.
 pub const SHORT_STROKE_BRUSH_SCHEMA_FLAG: u64 = 0x8000;
+/// Layer-tree v4 display colors require readers that preserve the effect.
+pub const LAYER_COLOR_EFFECT_SCHEMA_FLAG: u64 = 0x1_0000;
 
 #[must_use]
 pub const fn brush_replay_schema_flags(engine: u32) -> u64 {
@@ -341,4 +343,5 @@ pub const SCHEMA_CAPABILITY_FLAGS: u64 = COMPRESSED_TILE_SCHEMA_FLAG
     | LAYER_COMPOSITING_SCHEMA_FLAG
     | ALPHA_LOCK_STROKE_SCHEMA_FLAG
     | PENCIL_BRUSH_SCHEMA_FLAG
-    | SHORT_STROKE_BRUSH_SCHEMA_FLAG;
+    | SHORT_STROKE_BRUSH_SCHEMA_FLAG
+    | LAYER_COLOR_EFFECT_SCHEMA_FLAG;

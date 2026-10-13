@@ -25,6 +25,7 @@ fn tree() -> LayerTree {
             .map(|id| {
                 LayerTreeNode::Raster(LayerNode {
                     alpha_locked: false,
+                    color_effect: None,
                     clip_to_below: false,
                     blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                     id: LayerId(id),

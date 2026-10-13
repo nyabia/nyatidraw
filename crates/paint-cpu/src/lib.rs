@@ -9,6 +9,7 @@
 
 mod affine;
 mod affine_draft;
+mod color_adjustment;
 mod compositing;
 mod flat_fill;
 mod fragment;
@@ -18,7 +19,8 @@ mod short_stroke_tests;
 mod transform;
 pub use affine::{AffineResult, transform_selection_affine};
 pub use affine_draft::{AffineDraft, AffineDraftError};
-pub use flat_fill::{FloodFillRequest, flood_fill};
+pub use color_adjustment::{ColorAdjustment, adjust_raster_colors};
+pub use flat_fill::{FloodFillRequest, flood_fill, wand_selection_signed};
 pub use fragment::{RasterFragment, copy_selection, cut_selection, paste_fragment};
 pub use selection::{
     EditError, EditLimits, SelectionCombine, SelectionMask, SelectionPaint, SelectionPaintResult,
@@ -786,6 +788,7 @@ mod tests {
                     reference: id == 2,
                     opacity_u16: opacity,
                     content_root: ContentRootId(0),
+                    color_effect: None,
                 })
             };
             let tree = LayerTree::new(GroupNode {
@@ -1003,6 +1006,7 @@ mod tests {
                     reference: false,
                     opacity_u16: u16::MAX,
                     content_root: ContentRootId(0),
+                    color_effect: None,
                 })],
             })],
         })
@@ -1080,6 +1084,7 @@ mod tests {
                 reference: false,
                 opacity_u16: u16::MAX,
                 content_root: ContentRootId(0),
+                color_effect: None,
             })],
         })
         .expect("valid tree");

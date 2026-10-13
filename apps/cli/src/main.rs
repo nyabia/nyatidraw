@@ -54,7 +54,7 @@ fn run() -> Result<(), String> {
             match current {
                 Some(batch) => println!(
                     "{{\"event\":\"validate\",\"status\":\"ok\",\"root\":\"{}\"}}",
-                    hash_hex(batch.materialized.after.root().hash)
+                    hash_hex(batch.current_tiles().root().hash)
                 ),
                 None => println!("{{\"event\":\"validate\",\"status\":\"empty\"}}"),
             }
@@ -89,10 +89,10 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn validate_project(path: &Path) -> Result<Option<ProjectCommitBatch>, String> {
+fn validate_project(path: &Path) -> Result<Option<nyatidraw_project::ReopenedProject>, String> {
     let database = ProjectDb::open(path).map_err(|error| format!("open: {error:?}"))?;
     database
-        .load_current()
+        .load_reopened()
         .map_err(|error| format!("validate: {error:?}"))
 }
 
@@ -103,9 +103,11 @@ fn export_project(
 ) -> Result<FlattenedRgba8, String> {
     let database = ProjectDb::open(project).map_err(|error| format!("open: {error:?}"))?;
     let snapshot = database
-        .load_current()
+        .load_reopened()
         .map_err(|error| format!("load current snapshot: {error:?}"))?
-        .map_or_else(TileSnapshot::empty, |batch| batch.materialized.after);
+        .map_or_else(TileSnapshot::empty, |project| {
+            project.current_tiles().clone()
+        });
     let canvas = database
         .load_canvas_spec()
         .map_err(|error| format!("load canvas metadata: {error:?}"))?;
@@ -175,8 +177,8 @@ fn run_nonempty_project_smoke() -> Result<(), String> {
         }
         let loaded = validate_project(&project)?
             .ok_or_else(|| "validate unexpectedly reported an empty fixture".to_owned())?;
-        if loaded.snapshot_id != batch.snapshot_id
-            || loaded.materialized.after.root() != batch.materialized.after.root()
+        if loaded.current_snapshot() != batch.snapshot_id
+            || loaded.current_tiles().root() != batch.materialized.after.root()
         {
             return Err("validate reopened a different durable snapshot/root".to_owned());
         }
@@ -393,4 +395,59 @@ fn hash_hex(hash: ObjectHash) -> String {
         write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_and_history_cursor_cannot_validate_or_export_as_empty_artwork() {
+        let scratch = scratch_directory("cli-checkpoint-cursor").unwrap();
+        let path = scratch.join("fixture.ntdr");
+        let initial = prepared_batch(
+            SnapshotId(0),
+            TileSnapshot::empty(),
+            SnapshotId(1),
+            HistoryNodeId(1),
+            42,
+            10,
+        )
+        .unwrap()
+        .materialized
+        .after;
+        let batch = prepared_batch(
+            SnapshotId(0),
+            initial.clone(),
+            SnapshotId(2),
+            HistoryNodeId(2),
+            43,
+            20,
+        )
+        .unwrap();
+        let db = ProjectDb::open(&path).unwrap();
+        db.commit(&batch).unwrap();
+        let reopened = db.load_reopened().unwrap().unwrap();
+        let initial_cursor = reopened.cursor_for_head(None).unwrap();
+        drop(db);
+        for (index, expected) in [batch.materialized.after, initial].into_iter().enumerate() {
+            if index == 1 {
+                let db = ProjectDb::open(&path).unwrap();
+                db.persist_history_cursor(initial_cursor).unwrap();
+                assert!(db.load_current().unwrap().is_none());
+            }
+            let loaded = validate_project(&path)
+                .unwrap()
+                .expect("saved base artwork is not empty");
+            assert_eq!(loaded.current_tiles(), &expected);
+            let flattened = expected
+                .crop_base_layer_rgba8_to_canvas(LayerId(4), nyatidraw_api::CanvasSpec::DEFAULT)
+                .unwrap();
+            let output = scratch.join(format!("cursor-{index}.ppm"));
+            let exported = export_project(&path, &output, LayerId(4)).unwrap();
+            assert_eq!(exported, flattened);
+            assert_eq!(fs::read(output).unwrap(), ppm_bytes(&flattened).unwrap());
+        }
+        fs::remove_dir_all(scratch).unwrap();
+    }
 }

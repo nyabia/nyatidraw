@@ -48,6 +48,7 @@ fn tree() -> LayerTree {
         opacity_u16: u16::MAX,
         children: vec![LayerTreeNode::Raster(LayerNode {
             alpha_locked: false,
+            color_effect: None,
             clip_to_below: false,
             blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             id: LayerId(1),

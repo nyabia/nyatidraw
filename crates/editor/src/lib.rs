@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+pub mod color_adjustment;
 pub mod gesture;
 pub mod layer_edit;
 pub mod pixel_edit;

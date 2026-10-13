@@ -26,6 +26,7 @@ fn main() {
                 reference: layer == 2,
                 opacity_u16: 40_000,
                 content_root: ContentRootId(0),
+                color_effect: None,
             }));
             for y in 0..17 {
                 for x in 0..30 {

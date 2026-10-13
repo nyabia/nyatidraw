@@ -8,6 +8,7 @@ pub struct EditGesture {
     tool: DrawingTool,
     settings: EditSettings,
     color: [u8; 4],
+    background_color: [u8; 4],
     has_selection: bool,
     viewport_revision: u64,
     start: [i32; 2],
@@ -24,12 +25,24 @@ impl EditGesture {
         has_selection: bool,
         sample: StylusSample,
     ) -> Self {
+        Self::begin_with_colors(tool, settings, [color, [0; 4]], has_selection, sample)
+    }
+
+    #[must_use]
+    pub fn begin_with_colors(
+        tool: DrawingTool,
+        settings: EditSettings,
+        colors: [[u8; 4]; 2],
+        has_selection: bool,
+        sample: StylusSample,
+    ) -> Self {
         let point = document_pixel(sample);
         let start = point.unwrap_or([0; 2]);
         Self {
             tool,
             settings,
-            color,
+            color: colors[0],
+            background_color: colors[1],
             has_selection,
             viewport_revision: sample.viewport_revision,
             start,
@@ -116,6 +129,16 @@ impl EditGesture {
                 point: end,
                 source: self.settings.source,
             },
+            DrawingTool::Wand
+                if self.settings.selection_mode != nyatidraw_api::SelectionMode::Replace =>
+            {
+                EditCommand::CombineWand {
+                    seed: self.start,
+                    tolerance: self.settings.tolerance,
+                    source: self.settings.source,
+                    mode: self.settings.selection_mode,
+                }
+            }
             DrawingTool::Wand => EditCommand::SelectWand {
                 seed: self.start,
                 tolerance: self.settings.tolerance,
@@ -158,21 +181,22 @@ impl EditGesture {
             }
             DrawingTool::Fill => EditCommand::FloodFillAdvanced {
                 seed: self.start,
-                tolerance: self.settings.tolerance,
-                source: self.settings.source,
+                tolerance: self.settings.fill_tolerance,
+                source: self.settings.fill_source,
                 color: self.color,
                 settings: self.settings.fill,
             },
-            DrawingTool::Gradient if self.has_selection && self.start != end => {
-                EditCommand::GradientSelection {
-                    start: self.start,
-                    end,
-                    start_color: self.color,
-                    end_color: [0; 4],
-                }
-            }
+            DrawingTool::Gradient if self.start != end => EditCommand::GradientSelection {
+                start: self.start,
+                end,
+                start_color: self.color,
+                end_color: match self.settings.gradient_mode {
+                    nyatidraw_api::GradientMode::ForegroundToTransparent => [0; 4],
+                    nyatidraw_api::GradientMode::ForegroundToBackground => self.background_color,
+                },
+            },
             DrawingTool::Gradient => {
-                return Err("선택 영역에서 서로 다른 두 점을 연결하세요.".into());
+                return Err("서로 다른 두 점을 연결하세요.".into());
             }
             _ => return Err("올가미는 서로 다른 점 세 개 이상이 필요합니다.".into()),
         })
@@ -203,7 +227,69 @@ fn document_pixel(sample: StylusSample) -> Option<[i32; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nyatidraw_api::EditSource;
     use nyatidraw_input::{PenButtons, Point};
+
+    #[test]
+    fn fill_and_wand_keep_independent_reference_and_tolerance() {
+        // Product risk: changing fill controls must not change wand selection,
+        // and the wrong reference can flood outside the intended artwork.
+        let sample = |phase| StylusSample {
+            sequence: 1,
+            timestamp_ns: 1,
+            device_id: 1,
+            position_document: Point { x: 3.0, y: 4.0 },
+            pressure: 1.0,
+            phase,
+            tilt: None,
+            twist_radians: None,
+            tangential_pressure: None,
+            buttons: PenButtons(0),
+            eraser: false,
+            viewport_revision: 1,
+        };
+        assert!(matches!(
+            EditGesture::begin(
+                DrawingTool::Fill,
+                EditSettings::default(),
+                [255; 4],
+                false,
+                sample(PointerPhase::Begin),
+            )
+            .finish(sample(PointerPhase::End)),
+            Ok(EditCommand::FloodFillAdvanced {
+                source: EditSource::AllVisible,
+                tolerance: 16,
+                ..
+            })
+        ));
+        let settings = EditSettings {
+            source: EditSource::ActiveLayer,
+            tolerance: 0,
+            fill_source: EditSource::ReferenceLayers,
+            fill_tolerance: 31,
+            ..EditSettings::default()
+        };
+        for (tool, expected_source, expected_tolerance) in [
+            (DrawingTool::Fill, EditSource::ReferenceLayers, 31),
+            (DrawingTool::Wand, EditSource::ActiveLayer, 0),
+        ] {
+            let command =
+                EditGesture::begin(tool, settings, [255; 4], false, sample(PointerPhase::Begin))
+                    .finish(sample(PointerPhase::End))
+                    .unwrap();
+            let (EditCommand::FloodFillAdvanced {
+                source, tolerance, ..
+            }
+            | EditCommand::SelectWand {
+                source, tolerance, ..
+            }) = command
+            else {
+                panic!("unexpected edit command");
+            };
+            assert_eq!((source, tolerance), (expected_source, expected_tolerance));
+        }
+    }
 
     #[test]
     fn rectangle_edges_and_move_rejection_preserve_exact_selected_pixels() {

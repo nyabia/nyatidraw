@@ -39,7 +39,7 @@ extern "C" {
     #[wasm_bindgen(js_name = downloadBytes)]
     pub fn download_bytes(bytes: &Uint8Array, filename: &str, mime: &str);
     #[wasm_bindgen(js_name = pickFile)]
-    pub fn pick_file() -> Promise;
+    pub fn pick_file(png_only: bool) -> Promise;
     #[wasm_bindgen(js_name = setModalOpen)]
     pub fn set_modal_open(open: bool);
     #[wasm_bindgen(js_name = focusModal)]

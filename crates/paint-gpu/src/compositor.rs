@@ -4,7 +4,8 @@ use std::{
 };
 
 use nyatidraw_api::{
-    CompositeTileKey, GroupId, LayerBlendMode, LayerId, LayerTreeNodeId, TileCoordinate,
+    CompositeTileKey, GroupId, LayerBlendMode, LayerColorEffect, LayerId, LayerTreeNodeId,
+    TileCoordinate,
 };
 use nyatidraw_brush::BrushDab;
 use nyatidraw_document::{
@@ -13,6 +14,7 @@ use nyatidraw_document::{
 };
 use nyatidraw_input::{Point, ViewportTransform, ViewportValidationError};
 use nyatidraw_tiles::{CompositeCache, TILE_BYTE_LEN, TILE_EDGE, TileKey};
+use wgpu::util::DeviceExt;
 
 use crate::{
     GpuRoundDabPainter, GpuWorkingTile, PaintSubmission, RGBA8_BYTES_PER_PIXEL,
@@ -20,11 +22,13 @@ use crate::{
 };
 
 const INITIAL_COMPOSITE_CHILD_CAPACITY: usize = 32;
-const UNIFORM_VALUE_BYTES: usize = 16;
+const UNIFORM_VALUE_BYTES: usize = 32;
 const WORKSPACE_TILE_UNIFORM_BYTES: usize = 64;
 const VIEWPORT_UNIFORM_BYTES: u64 = 80;
 const MAX_SPARSE_ATLAS_SLOTS: u32 = 2_048;
 const COMPOSITE_SCRATCH_BYTES: u64 = TILE_BYTE_LEN as u64 * 4;
+const COMPOSITE_FIXED_BYTES: u64 = COMPOSITE_SCRATCH_BYTES
+    + (nyatidraw_tiles::color::LAYER_COLOR_TRANSFER_ENTRIES * size_of::<u32>()) as u64;
 /// Explicit cap for the temporary full-document Sprint 3 texture strategy.
 pub const MAX_PERSISTENT_SCENE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -281,7 +285,21 @@ struct StackPass {
     input: StackInput,
     backdrop: usize,
     target: usize,
-    params: [u32; 4],
+    params: [u32; 8],
+}
+fn stack_parameters(node: Option<&LayerTreeNode>, blend: [u32; 4]) -> [u32; 8] {
+    let mut values = [0; 8];
+    values[..4].copy_from_slice(&blend);
+    if let Some(LayerTreeNode::Raster(layer)) = node
+        && let Some(effect) = layer.color_effect.filter(|effect| effect.enabled)
+    {
+        let pack =
+            |rgb: [u8; 3]| u32::from(rgb[0]) | (u32::from(rgb[1]) << 8) | (u32::from(rgb[2]) << 16);
+        values[4] = 1;
+        values[5] = pack(effect.dark_rgb);
+        values[6] = pack(effect.light_rgb);
+    }
+    values
 }
 fn node_opacity(node: &LayerTreeNode) -> u16 {
     match node {
@@ -350,7 +368,7 @@ impl DynamicOpacityBuffer {
         );
     }
 
-    fn write(&self, queue: &wgpu::Queue, parameters: &[[u32; 4]]) {
+    fn write(&self, queue: &wgpu::Queue, parameters: &[[u32; 8]]) {
         let mut bytes = vec![0_u8; self.stride.saturating_mul(parameters.len())];
         for (index, values) in parameters.iter().enumerate() {
             let start = index * self.stride;
@@ -479,6 +497,7 @@ pub struct GpuCompositeScene {
     source_layout: wgpu::BindGroupLayout,
     opacity_layout: wgpu::BindGroupLayout,
     composite_pipeline: wgpu::RenderPipeline,
+    color_transfer_bind_group: wgpu::BindGroup,
     composite_scratch: [CompositeSurface; 4],
     opacity: DynamicOpacityBuffer,
     viewport_pipeline: wgpu::RenderPipeline,
@@ -539,7 +558,7 @@ impl GpuCompositeScene {
             .and_then(|size| size.checked_mul(u64::try_from(surfaces).ok()?))
             .unwrap_or(u64::MAX);
         let required_bytes = page_bytes
-            .saturating_add(COMPOSITE_SCRATCH_BYTES)
+            .saturating_add(COMPOSITE_FIXED_BYTES)
             .saturating_add(TILE_BYTE_LEN as u64);
         if required_bytes > MAX_PERSISTENT_SCENE_BYTES {
             return Err(CompositeRenderError::AllocationBudgetExceeded {
@@ -550,7 +569,7 @@ impl GpuCompositeScene {
         }
         Ok(self.sparse_atlas.slots.len().min(
             usize::try_from(
-                (MAX_PERSISTENT_SCENE_BYTES - page_bytes - COMPOSITE_SCRATCH_BYTES)
+                (MAX_PERSISTENT_SCENE_BYTES - page_bytes - COMPOSITE_FIXED_BYTES)
                     / TILE_BYTE_LEN as u64,
             )
             .unwrap_or(usize::MAX),
@@ -698,7 +717,7 @@ impl GpuCompositeScene {
             .and_then(|pixels| pixels.checked_mul(u64::from(RGBA8_BYTES_PER_PIXEL)))
             .and_then(|surface_bytes| surface_bytes.checked_mul(u64::try_from(surface_count).ok()?))
             .unwrap_or(u64::MAX)
-            .saturating_add(COMPOSITE_SCRATCH_BYTES);
+            .saturating_add(COMPOSITE_FIXED_BYTES);
         if required_bytes > MAX_PERSISTENT_SCENE_BYTES {
             return Err(CompositeRenderError::AllocationBudgetExceeded {
                 required_bytes,
@@ -722,7 +741,14 @@ impl GpuCompositeScene {
         }
         let source_layout = create_source_layout(device);
         let opacity_layout = create_opacity_layout(device);
-        let composite_pipeline = create_composite_pipeline(device, &source_layout, &opacity_layout);
+        let (color_transfer_layout, color_transfer_bind_group) =
+            create_color_transfer_binding(device);
+        let composite_pipeline = create_composite_pipeline(
+            device,
+            &source_layout,
+            &opacity_layout,
+            &color_transfer_layout,
+        );
         let composite_scratch = std::array::from_fn(|_| {
             CompositeSurface::new(
                 create_document_texture(
@@ -792,6 +818,7 @@ impl GpuCompositeScene {
             source_layout,
             opacity_layout,
             composite_pipeline,
+            color_transfer_bind_group,
             composite_scratch,
             opacity,
             viewport_pipeline,
@@ -1599,6 +1626,20 @@ impl GpuCompositeScene {
         Ok(())
     }
 
+    /// Changes only composite metadata; raw working textures remain reusable.
+    /// # Errors
+    /// Rejects missing rasters through the document model.
+    pub fn set_color_effect(
+        &mut self,
+        layer: LayerId,
+        effect: Option<LayerColorEffect>,
+    ) -> Result<(), LayerTreeError> {
+        let invalidation = self.tree.set_color_effect(layer, effect)?;
+        self.page_cache.apply_invalidation(&invalidation);
+        self.sparse_cache.apply_invalidation(&invalidation);
+        Ok(())
+    }
+
     /// # Errors
     ///
     /// Returns the document model's validation error for an invalid node/name.
@@ -1688,7 +1729,7 @@ impl GpuCompositeScene {
             .and_then(|pixels| pixels.checked_mul(u64::from(RGBA8_BYTES_PER_PIXEL)))
             .and_then(|surface_bytes| surface_bytes.checked_mul(u64::try_from(surface_count).ok()?))
             .unwrap_or(u64::MAX)
-            .saturating_add(COMPOSITE_SCRATCH_BYTES);
+            .saturating_add(COMPOSITE_FIXED_BYTES);
         if required_bytes > MAX_PERSISTENT_SCENE_BYTES {
             return Err(CompositeRenderError::AllocationBudgetExceeded {
                 required_bytes,
@@ -2369,7 +2410,7 @@ impl GpuCompositeScene {
                 input,
                 backdrop: 3,
                 target: 2,
-                params: [65535, 4, origin[0], origin[1]],
+                params: stack_parameters(Some(stack.base), [65535, 4, origin[0], origin[1]]),
             });
             let mut current_stack = 2;
             for clip in stack.clips {
@@ -2385,12 +2426,15 @@ impl GpuCompositeScene {
                     input,
                     backdrop: current_stack,
                     target: next,
-                    params: [
-                        u32::from(node_opacity(clip)),
-                        blend_operation(clip) + 2,
-                        origin[0],
-                        origin[1],
-                    ],
+                    params: stack_parameters(
+                        Some(clip),
+                        [
+                            u32::from(node_opacity(clip)),
+                            blend_operation(clip) + 2,
+                            origin[0],
+                            origin[1],
+                        ],
+                    ),
                 });
                 current_stack = next;
             }
@@ -2399,12 +2443,15 @@ impl GpuCompositeScene {
                 input: StackInput::Scratch(current_stack),
                 backdrop: accumulated,
                 target: next,
-                params: [
-                    u32::from(node_opacity(stack.base)),
-                    blend_operation(stack.base),
-                    0,
-                    0,
-                ],
+                params: stack_parameters(
+                    None,
+                    [
+                        u32::from(node_opacity(stack.base)),
+                        blend_operation(stack.base),
+                        0,
+                        0,
+                    ],
+                ),
             });
             accumulated = next;
         }
@@ -2453,6 +2500,7 @@ impl GpuCompositeScene {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.composite_pipeline);
+            pass.set_bind_group(3, &self.color_transfer_bind_group, &[]);
             pass.set_bind_group(0, self.stack_source(operation.input)?, &[]);
             pass.set_bind_group(
                 1,
@@ -2567,6 +2615,42 @@ fn create_source_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+fn create_color_transfer_binding(
+    device: &wgpu::Device,
+) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("nyatidraw-layer-color-transfer-layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let bytes: Vec<u8> = nyatidraw_tiles::color::layer_color_transfer_tables()
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect();
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("nyatidraw-layer-color-transfer-tables"),
+        contents: &bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("nyatidraw-layer-color-transfer-binding"),
+        layout: &layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
+    });
+    (layout, binding)
+}
+
 fn create_opacity_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("nayati-composite-opacity-layout"),
@@ -2587,6 +2671,7 @@ fn create_composite_pipeline(
     device: &wgpu::Device,
     source_layout: &wgpu::BindGroupLayout,
     opacity_layout: &wgpu::BindGroupLayout,
+    color_transfer_layout: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("nayati-composite-shader"),
@@ -2594,7 +2679,12 @@ fn create_composite_pipeline(
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("nayati-composite-pipeline-layout"),
-        bind_group_layouts: &[source_layout, source_layout, opacity_layout],
+        bind_group_layouts: &[
+            source_layout,
+            source_layout,
+            opacity_layout,
+            color_transfer_layout,
+        ],
         push_constant_ranges: &[],
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {

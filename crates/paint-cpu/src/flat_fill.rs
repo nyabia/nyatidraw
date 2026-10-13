@@ -282,6 +282,77 @@ fn enqueue(queue: &mut VecDeque<usize>, index: usize, limits: EditLimits) -> Res
     Ok(())
 }
 
+/// Selects a connected tolerance region in the page, relevant source tiles and seed union.
+/// # Errors
+/// Rejects missing sources, invalid coordinates, and bounded work or memory exhaustion.
+pub fn wand_selection_signed(
+    snapshot: &TileSnapshot,
+    tree: &LayerTree,
+    request: crate::WandRequest,
+    limits: EditLimits,
+) -> Result<SelectionMask, EditError> {
+    let limits = limits.bounded();
+    tree.raster(request.active).ok_or(EditError::UnknownLayer)?;
+    let request = FloodFillRequest {
+        canvas: request.canvas,
+        active: request.active,
+        source: request.source,
+        seed: request.seed,
+        tolerance: request.tolerance,
+        settings: FillSettings::default(),
+    };
+    let source = Source::new(snapshot, tree, request)?;
+    let domain = Domain::new(&source, request, None)?;
+    let count = domain.len()?;
+    let pixels = count as u64;
+    let workspace = pixels
+        .saturating_mul(3)
+        .saturating_add((limits.max_frontier.min(count) as u64).saturating_mul(8))
+        .saturating_add(source.tree_bytes);
+    if pixels > limits.max_pixels
+        || pixels.saturating_mul(source.work_per_pixel + 4) > limits.max_filter_work
+        || workspace > limits.max_workspace_bytes
+    {
+        return Err(EditError::LimitExceeded);
+    }
+    let seed_color = source.pixel(request.seed);
+    let seed = domain.index(request.seed);
+    let mut visited = vec![0_u8; count];
+    let mut queue = VecDeque::with_capacity(limits.max_frontier.min(count));
+    enqueue(&mut queue, seed, limits)?;
+    visited[seed] = 1;
+    while let Some(index) = queue.pop_front() {
+        for neighbor in domain.neighbors(index).into_iter().flatten() {
+            if visited[neighbor] != 0 {
+                continue;
+            }
+            let matches = source
+                .pixel(domain.point(neighbor))
+                .into_iter()
+                .zip(seed_color)
+                .all(|(channel, seed)| channel.abs_diff(seed) <= request.tolerance);
+            visited[neighbor] = if matches { 1 } else { 2 };
+            if matches {
+                enqueue(&mut queue, neighbor, limits)?;
+            }
+        }
+    }
+    let mut packed = vec![0; count.div_ceil(8)];
+    for (index, selected) in visited.into_iter().enumerate() {
+        if selected == 1 {
+            packed[index / 8] |= 1 << (index % 8);
+        }
+    }
+    SelectionMask::from_packed_bits_at(
+        domain.origin,
+        [
+            u32::try_from(domain.width).map_err(|_| EditError::LimitExceeded)?,
+            u32::try_from(domain.height).map_err(|_| EditError::LimitExceeded)?,
+        ],
+        &packed,
+    )
+}
+
 /// Fills a four-connected seed region on an immutable sampled source. Domain
 /// is page union relevant signed source-tile extents and seed, intersected with
 /// selection bounds. Selection holes block traversal and expansion.
@@ -292,6 +363,7 @@ fn enqueue(queue: &mut VecDeque<usize>, index: usize, limits: EditLimits) -> Res
 /// one-pixel backing fringe under the source line, not supersampling or a
 /// fractional selection. Barrier backing uses destination-over so existing
 /// target lines survive even when target participates in the sampled source.
+/// Alpha lock repaints only the connected region; backing cannot change alpha.
 ///
 /// # Errors
 /// Missing/locked targets, missing references, invalid settings/colors/seeds,
@@ -330,10 +402,14 @@ pub fn flood_fill(
     let domain = Domain::new(&source, request, clip)?;
     let count = domain.len()?;
     let count_u64 = count as u64;
-    let radius = request
-        .settings
-        .expand_px
-        .max(u8::from(request.settings.antialias));
+    let radius = if target.alpha_locked {
+        0
+    } else {
+        request
+            .settings
+            .expand_px
+            .max(u8::from(request.settings.antialias))
+    };
     let work = count_u64.saturating_mul(
         source.work_per_pixel
             + 16
@@ -514,6 +590,7 @@ mod tests {
                         reference: id == 2,
                         opacity_u16: u16::MAX,
                         content_root: ContentRootId(0),
+                        color_effect: None,
                     })
                 })
                 .collect(),
@@ -662,6 +739,76 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_flat_colors_preserve_neighbor_artwork_across_line_and_clip_modes() {
+        // Product risk: backing or closing must not recolor an adjacent hair/skin
+        // region or alter immutable linework when painting an empty region.
+        for (thick, alpha, gap, close) in [
+            (false, 255, false, 0),
+            (true, 255, false, 0),
+            (false, 96, false, 0),
+            (true, 128, true, 1),
+        ] {
+            let mut pixels = Vec::new();
+            ring(&mut pixels, 2, 14, alpha, false);
+            if thick {
+                ring(&mut pixels, 3, 13, alpha, false);
+            }
+            for y in 2..=14 {
+                for x in 8..=if thick { 9 } else { 8 } {
+                    if !gap || y != 7 {
+                        pixels.push((LayerId(2), [x, y], [0, 0, 0, alpha]));
+                    }
+                }
+            }
+            let neighbor = [0, 160, 120, 255];
+            pixels.push((LayerId(1), [11, 7], neighbor));
+            let before = fixture(&pixels);
+            let original = before.root();
+            for source in [
+                SelectionSource::ReferenceLayers,
+                SelectionSource::AllVisible,
+            ] {
+                for clipped in [false, true] {
+                    let clip = clipped.then(|| {
+                        crate::selection_all([0, 0], [7, 16], EditLimits::default()).unwrap()
+                    });
+                    let after = flood_fill(
+                        &before,
+                        &tree(),
+                        FloodFillRequest {
+                            seed: [5, 7],
+                            source,
+                            tolerance: 16,
+                            settings: FillSettings {
+                                gap_close_px: close,
+                                expand_px: 1,
+                                antialias: true,
+                            },
+                            ..request(FillSettings::default())
+                        },
+                        clip.as_ref(),
+                        PremultipliedRgba8([255, 0, 0, 255]),
+                        EditLimits::default(),
+                    )
+                    .unwrap()
+                    .after;
+                    assert_eq!(raster_pixel(&after, LayerId(1), [5, 7]), [255, 0, 0, 255]);
+                    assert_eq!(raster_pixel(&after, LayerId(1), [11, 7]), neighbor);
+                    assert_eq!(raster_pixel(&after, LayerId(1), [12, 7]), [0; 4]);
+                    assert_eq!(raster_pixel(&after, LayerId(1), [0, 7]), [0; 4]);
+                    if clipped {
+                        assert_eq!(raster_pixel(&after, LayerId(1), [7, 7]), [0; 4]);
+                    }
+                    for (key, tile) in before.iter().filter(|(key, _)| key.layer == LayerId(2)) {
+                        assert_eq!(after.get(key).unwrap().pixels(), tile.pixels());
+                    }
+                    assert_eq!(before.root(), original);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn signed_fill_clip_is_impermeable_and_disabled_options_match_existing_flood() {
         // Product risk: outside-page filling and optional selection must not
         // destroy pixels on the other side of a selection hole or silently
@@ -736,6 +883,62 @@ mod tests {
         assert_eq!(raster_pixel(&after, LayerId(1), [-9, -9]), [0; 4]);
         assert_eq!(raster_pixel(&after, LayerId(1), [-8, -9]), [0; 4]);
         assert_eq!(raster_pixel(&after, LayerId(1), [0, 0]), [0; 4]);
+    }
+
+    #[test]
+    fn alpha_locked_fill_preserves_barrier_artwork_while_recoloring_the_seed_region() {
+        for source in [
+            SelectionSource::ActiveLayer,
+            SelectionSource::ReferenceLayers,
+            SelectionSource::AllVisible,
+        ] {
+            for (expand_px, antialias) in [(0, true), (1, false), (4, true)] {
+                let mut pixels = Vec::new();
+                ring(&mut pixels, 3, 11, 255, false);
+                pixels.extend(
+                    pixels
+                        .clone()
+                        .into_iter()
+                        .map(|(_, point, color)| (LayerId(1), point, color)),
+                );
+                for y in 4..11 {
+                    for x in 4..11 {
+                        pixels.push((LayerId(1), [x, y], [0, 128, 0, 128]));
+                    }
+                }
+                let before = fixture(&pixels);
+                let mut layers = tree();
+                layers.set_alpha_locked(LayerId(1), true).unwrap();
+                let after = flood_fill(
+                    &before,
+                    &layers,
+                    FloodFillRequest {
+                        source,
+                        ..request(FillSettings {
+                            gap_close_px: 0,
+                            expand_px,
+                            antialias,
+                        })
+                    },
+                    None,
+                    PremultipliedRgba8([255, 0, 0, 255]),
+                    EditLimits::default(),
+                )
+                .unwrap()
+                .after;
+                assert_eq!(raster_pixel(&after, LayerId(1), [7, 7]), [128, 0, 0, 128]);
+                for (layer, point, color) in &pixels {
+                    if *layer == LayerId(2) || *color == [0, 0, 0, 255] {
+                        assert_eq!(
+                            raster_pixel(&after, *layer, *point),
+                            *color,
+                            "alpha lock must not turn backing into line recoloring: {source:?}"
+                        );
+                    }
+                }
+                assert_eq!(raster_pixel(&after, LayerId(1), [2, 7]), [0; 4]);
+            }
+        }
     }
 
     #[test]

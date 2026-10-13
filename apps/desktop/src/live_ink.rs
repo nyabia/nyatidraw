@@ -643,6 +643,31 @@ impl LiveInkBridge {
         if commands.len() >= self.inner.command_capacity {
             return Err(CanvasCommandQueueFull);
         }
+        if let EditorCommand::Edit(nyatidraw_api::EditCommand::FreeTransform(
+            nyatidraw_api::TransformCommand::ImportRaster(import),
+        )) = &command
+        {
+            let length = nyatidraw_paint_cpu::RasterFragment::byte_len([0, 0], import.size)
+                .map_err(|_| CanvasCommandQueueFull)?;
+            if import.project_epoch != self.project_epoch()
+                || import.pixels.len() != length
+                || commands.iter().any(|queued| {
+                    matches!(
+                        queued,
+                        CanvasCommand::Ui(CommandEnvelope {
+                            command: EditorCommand::Edit(
+                                nyatidraw_api::EditCommand::FreeTransform(
+                                    nyatidraw_api::TransformCommand::ImportRaster(_)
+                                )
+                            ),
+                            ..
+                        })
+                    )
+                })
+            {
+                return Err(CanvasCommandQueueFull);
+            }
+        }
         commands.push_back(CanvasCommand::Ui(CommandEnvelope {
             id,
             based_on,

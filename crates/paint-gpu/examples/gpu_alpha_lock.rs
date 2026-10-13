@@ -42,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             reference: false,
             opacity_u16: u16::MAX,
             content_root: ContentRootId(0),
+            color_effect: None,
             alpha_locked: true,
             clip_to_below: false,
             blend_mode: LayerBlendMode::Normal,

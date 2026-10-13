@@ -24,6 +24,10 @@ pub fn prepare_layer_edit(
     let next_id = identifier;
     let mut pixel_change = None;
     match command {
+        LayerCommand::SetColorEffect { layer, effect } => {
+            tree.set_color_effect(layer, effect)
+                .map_err(|_| CommandRejectReason::UnknownLayer)?;
+        }
         LayerCommand::AddRaster | LayerCommand::AddGroup => {
             let is_group = matches!(command, LayerCommand::AddGroup);
             let (parent, index) = tree
@@ -64,6 +68,21 @@ pub fn prepare_layer_edit(
                 source,
                 destination: active,
             });
+        }
+        LayerCommand::DuplicateGroup(source) => {
+            let mapping = tree.duplicate_group(source, next_id).map_err(|error| {
+                if error == nyatidraw_document::LayerTreeError::IdentifierExhausted {
+                    CommandRejectReason::RevisionExhausted
+                } else {
+                    CommandRejectReason::InvalidLayerMove
+                }
+            })?;
+            active = mapping
+                .iter()
+                .find(|(source, _)| *source == preferred)
+                .or_else(|| mapping.first())
+                .map_or(preferred, |(_, destination)| *destination);
+            pixel_change = Some(LayerPixelChange::DuplicateMany(mapping));
         }
         LayerCommand::SetReference { layer, reference } => {
             tree.set_reference(layer, reference)
@@ -160,6 +179,7 @@ pub fn prepare_layer_edit(
 #[must_use]
 pub fn empty_raster(id: LayerId, name: String) -> LayerNode {
     LayerNode {
+        color_effect: None,
         alpha_locked: false,
         clip_to_below: false,
         blend_mode: nyatidraw_api::LayerBlendMode::Normal,
@@ -273,6 +293,7 @@ pub fn opaque_white_layer_tiles(canvas: CanvasSpec, layer: LayerId) -> TileSnaps
 #[derive(Clone, Debug)]
 pub enum LayerPixelChange {
     White(LayerId),
+    DuplicateMany(Vec<(LayerId, LayerId)>),
     Duplicate {
         source: LayerId,
         destination: LayerId,
@@ -294,25 +315,38 @@ impl LayerPixelChange {
             Self::Duplicate {
                 source,
                 destination,
-            } => {
-                if source == destination || tiles.iter().any(|(key, _)| key.layer == destination) {
+            } => Self::DuplicateMany(vec![(source, destination)]).apply(tiles, canvas),
+            Self::DuplicateMany(mapping) => {
+                let destinations: std::collections::BTreeSet<_> = mapping
+                    .iter()
+                    .map(|(_, destination)| *destination)
+                    .collect();
+                if destinations.len() != mapping.len()
+                    || mapping
+                        .iter()
+                        .any(|(source, _)| destinations.contains(source))
+                    || tiles
+                        .iter()
+                        .any(|(key, _)| destinations.contains(&key.layer))
+                {
                     return Err("duplicate destination already contains artwork".into());
                 }
                 // Keep signed off-page coordinates and shared immutable pixel objects.
                 TileSnapshot::from_objects(
                     tiles.iter().map(|(key, tile)| (key, tile.clone())).chain(
-                        tiles
-                            .iter()
-                            .filter(|(key, _)| key.layer == source)
-                            .map(|(key, tile)| {
-                                (
-                                    TileKey {
-                                        layer: destination,
-                                        ..key
-                                    },
-                                    tile.clone(),
-                                )
-                            }),
+                        tiles.iter().filter_map(|(key, tile)| {
+                            mapping.iter().find(|(source, _)| *source == key.layer).map(
+                                |(_, destination)| {
+                                    (
+                                        TileKey {
+                                            layer: *destination,
+                                            ..key
+                                        },
+                                        tile.clone(),
+                                    )
+                                },
+                            )
+                        }),
                     ),
                 )
                 .map_err(|error| format!("duplicate tiles: {error:?}"))

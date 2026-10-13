@@ -6,7 +6,9 @@ use super::{
     SNAPSHOTS, STATE, SnapshotId, TableDefinition, decode_envelope, decode_layer_tree,
     encode_layer_tree,
 };
-use nyatidraw_project::{CANVAS_HISTORY_SCHEMA_VERSION, SELECTION_STROKE_SCHEMA_VERSION};
+use nyatidraw_project::{
+    CANVAS_HISTORY_SCHEMA_VERSION, LAYER_COLOR_EFFECT_SCHEMA_FLAG, SELECTION_STROKE_SCHEMA_VERSION,
+};
 use std::collections::BTreeSet;
 
 pub(super) const SNAPSHOT_LAYERS: TableDefinition<&[u8], &[u8]> =
@@ -198,7 +200,7 @@ impl ProjectDb {
                 .map_err(|error| self.io(error))?;
         }
         if tree.is_some() {
-            self.mark_layer_compositing(transaction)?;
+            self.mark_layer_compositing(transaction, &next)?;
             let mut state = transaction
                 .open_table(STATE)
                 .map_err(|error| self.io(error))?;
@@ -300,10 +302,11 @@ impl ProjectDb {
             .map_err(|error| self.corrupt(error))
     }
 
-    // Called in the same write transaction as any v3 current/history record.
+    // Called in the same write transaction as current/history layer records.
     pub(super) fn mark_layer_compositing(
         &self,
         transaction: &redb::WriteTransaction,
+        record: &[u8],
     ) -> Result<(), ProjectOpenError> {
         let mut metadata = transaction
             .open_table(META)
@@ -312,8 +315,18 @@ impl ProjectDb {
             .get("schema_version")
             .map_err(|error| self.io(error))?
             .map_or(0, |value| value.value());
+        let envelope =
+            decode_envelope(RecordKind::LayerTree, record).map_err(|error| self.io(error))?;
+        let color_flag = if envelope.payload.get(..2) == Some(&[4, 0]) {
+            LAYER_COLOR_EFFECT_SCHEMA_FLAG
+        } else {
+            0
+        };
         metadata
-            .insert("schema_version", schema | LAYER_COMPOSITING_SCHEMA_FLAG)
+            .insert(
+                "schema_version",
+                schema | LAYER_COMPOSITING_SCHEMA_FLAG | color_flag,
+            )
             .map_err(|error| self.io(error))?;
         Ok(())
     }
@@ -331,7 +344,12 @@ impl ProjectDb {
         &self,
         payload: &[u8],
     ) -> Result<(), ProjectOpenError> {
-        if payload.get(..2) != Some(&[3, 0]) {
+        let required = match payload.get(..2) {
+            Some([3, 0]) => LAYER_COMPOSITING_SCHEMA_FLAG,
+            Some([4, 0]) => LAYER_COMPOSITING_SCHEMA_FLAG | LAYER_COLOR_EFFECT_SCHEMA_FLAG,
+            _ => 0,
+        };
+        if required == 0 {
             return Ok(());
         }
         let transaction = self.db.begin_read().map_err(|error| self.io(error))?;
@@ -342,7 +360,7 @@ impl ProjectDb {
             .get("schema_version")
             .map_err(|error| self.corrupt(error))?
             .map_or(0, |value| value.value());
-        if schema & LAYER_COMPOSITING_SCHEMA_FLAG == 0 {
+        if schema & required != required {
             return Err(self.corrupt("layer composition metadata lacks required reader capability"));
         }
         Ok(())

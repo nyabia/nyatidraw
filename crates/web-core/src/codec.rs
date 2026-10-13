@@ -4,12 +4,13 @@ use std::collections::BTreeSet;
 use nyatidraw_tiles::TileObject;
 
 use crate::{
-    BrushSettings, CanvasSpec, ContentRootId, GroupId, GroupNode, LayerBlendMode, LayerId,
-    LayerNode, LayerTree, LayerTreeNode, MAX_LAYERS, MAX_PORTABLE_BYTES, MAX_RESIDENT_TILES,
-    TILE_BYTE_LEN, TileKey, TileSnapshot, WebDocument, WebError, WebTool,
+    BrushSettings, CanvasSpec, ContentRootId, GroupId, GroupNode, LayerBlendMode, LayerColorEffect,
+    LayerId, LayerNode, LayerTree, LayerTreeNode, MAX_LAYERS, MAX_PORTABLE_BYTES,
+    MAX_RESIDENT_TILES, TILE_BYTE_LEN, TileKey, TileSnapshot, WebDocument, WebError, WebTool,
 };
 
-const MAGIC: &[u8; 8] = b"NYWEB001";
+const MAGIC: &[u8; 8] = b"NYWEB002";
+const LEGACY_MAGIC: &[u8; 8] = b"NYWEB001";
 const CHECKSUM_BYTES: usize = 32;
 const MAX_NAME_BYTES: usize = 512;
 const MAX_TILE_COORDINATE: u32 = 257;
@@ -85,7 +86,8 @@ impl WebDocument {
         if bytes.len() < MAGIC.len() + CHECKSUM_BYTES {
             return Err(WebError::InvalidPortable);
         }
-        if &bytes[..MAGIC.len()] != MAGIC {
+        let has_color_effect = &bytes[..MAGIC.len()] == MAGIC;
+        if !has_color_effect && &bytes[..MAGIC.len()] != LEGACY_MAGIC {
             return Err(WebError::UnsupportedVersion);
         }
         let (payload, checksum) = bytes.split_at(bytes.len() - CHECKSUM_BYTES);
@@ -123,7 +125,7 @@ impl WebDocument {
         let mut ids = BTreeSet::new();
         let mut next = 1;
         for _ in 0..count {
-            let layer = decode_layer(&mut reader)?;
+            let layer = decode_layer(&mut reader, has_color_effect)?;
             if !ids.insert(layer.id) {
                 return Err(WebError::InvalidPortable);
             }
@@ -201,10 +203,16 @@ fn encode_layer(bytes: &mut Vec<u8>, layer: &LayerNode) -> Result<(), WebError> 
     });
     bytes.extend_from_slice(&layer.opacity_u16.to_le_bytes());
     bytes.extend_from_slice(&layer.content_root.0.to_le_bytes());
+    bytes.push(u8::from(layer.color_effect.is_some()));
+    if let Some(effect) = layer.color_effect {
+        bytes.push(u8::from(effect.enabled));
+        bytes.extend_from_slice(&effect.dark_rgb);
+        bytes.extend_from_slice(&effect.light_rgb);
+    }
     Ok(())
 }
 
-fn decode_layer(reader: &mut Reader<'_>) -> Result<LayerNode, WebError> {
+fn decode_layer(reader: &mut Reader<'_>, has_color_effect: bool) -> Result<LayerNode, WebError> {
     let id = LayerId(reader.u128()?);
     let length = reader.count(MAX_NAME_BYTES)?;
     let name = std::str::from_utf8(reader.take(length)?)
@@ -225,6 +233,15 @@ fn decode_layer(reader: &mut Reader<'_>) -> Result<LayerNode, WebError> {
     };
     let opacity_u16 = u16::from_le_bytes(reader.array()?);
     let content_root = ContentRootId(reader.u128()?);
+    let color_effect = if has_color_effect && reader.boolean()? {
+        Some(LayerColorEffect {
+            enabled: reader.boolean()?,
+            dark_rgb: reader.array()?,
+            light_rgb: reader.array()?,
+        })
+    } else {
+        None
+    };
     Ok(LayerNode {
         id,
         name,
@@ -236,6 +253,7 @@ fn decode_layer(reader: &mut Reader<'_>) -> Result<LayerNode, WebError> {
         blend_mode,
         opacity_u16,
         content_root,
+        color_effect,
     })
 }
 

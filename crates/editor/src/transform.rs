@@ -7,7 +7,9 @@ use nyatidraw_api::{
 };
 use nyatidraw_document::{LayerNode, LayerTree, LayerTreeNode};
 
-use nyatidraw_paint_cpu::{AffineDraft, EditLimits, SelectionMask, paste_fragment, selection_all};
+use nyatidraw_paint_cpu::{
+    AffineDraft, EditLimits, RasterFragment, SelectionMask, paste_fragment, selection_all,
+};
 
 use nyatidraw_tiles::{TILE_BYTE_LEN, TileSnapshot};
 use std::sync::Arc;
@@ -117,7 +119,9 @@ impl TransformSession {
         clipboard: &mut dyn ArtworkClipboard,
     ) -> Result<TransformOutcome, TransformError> {
         match command {
-            TransformCommand::Begin | TransformCommand::Paste => {
+            TransformCommand::Begin
+            | TransformCommand::Paste
+            | TransformCommand::ImportRaster(_) => {
                 if command == TransformCommand::Begin
                     && tree.raster(target).is_some_and(|layer| layer.alpha_locked)
                 {
@@ -133,8 +137,46 @@ impl TransformSession {
                 let mut source_tree = tree.clone();
                 let mut layer = target;
                 let mut retained_bytes = 0;
-                let mask = if command == TransformCommand::Paste {
-                    let fragment = clipboard.read().map_err(TransformError::Rejected)?;
+                let pasted = command != TransformCommand::Begin;
+                let mask = if pasted {
+                    let (fragment, name) = if let TransformCommand::ImportRaster(import) = &command
+                    {
+                        let origin = [
+                            i32::try_from(
+                                (i64::from(canvas.width_px) - i64::from(import.size[0])) / 2,
+                            )
+                            .map_err(rejected)?,
+                            i32::try_from(
+                                (i64::from(canvas.height_px) - i64::from(import.size[1])) / 2,
+                            )
+                            .map_err(rejected)?,
+                        ];
+                        let length =
+                            RasterFragment::byte_len(origin, import.size).map_err(rejected)?;
+                        if import.pixels.len() != length {
+                            return Err(rejected("잘못된 이미지 크기입니다."));
+                        }
+                        let name: String = import
+                            .name
+                            .chars()
+                            .filter(|ch| !ch.is_control())
+                            .take(128)
+                            .collect();
+                        (
+                            RasterFragment::new(origin, import.size, import.pixels.to_vec())
+                                .map_err(rejected)?,
+                            if name.trim().is_empty() {
+                                "가져온 이미지".into()
+                            } else {
+                                name
+                            },
+                        )
+                    } else {
+                        (
+                            clipboard.read().map_err(TransformError::Rejected)?,
+                            "붙여넣기".into(),
+                        )
+                    };
                     let id = crate::layer_edit::next_layer_node_id(tree)
                         .map_err(TransformError::Rejected)?
                         .max(*next_id);
@@ -142,18 +184,19 @@ impl TransformSession {
                         .ok_or_else(|| rejected("IdentifierExhausted"))?;
                     layer = LayerId(id);
                     let (parent, index) = tree
-                        .parent_and_index(LayerTreeNodeId::Raster(target))
+                        .insertion_above_clipping_run(LayerTreeNodeId::Raster(target))
                         .ok_or_else(|| rejected("붙여넣기 위치 레이어가 없습니다."))?;
                     source_tree
                         .insert(
                             parent,
-                            index + 1,
+                            index,
                             LayerTreeNode::Raster(LayerNode {
+                                color_effect: None,
                                 alpha_locked: false,
                                 clip_to_below: false,
                                 blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                                 id: layer,
-                                name: "붙여넣기".into(),
+                                name,
                                 visible: true,
                                 locked: false,
                                 reference: false,
@@ -216,7 +259,7 @@ impl TransformSession {
                 let displayed = result.paint.after.clone();
                 let displayed_selection = Arc::new(result.selection.clone());
                 self.draft = Some(Transaction {
-                    pasted: command == TransformCommand::Paste,
+                    pasted,
                     snapshot: session.current_snapshot(),
                     original: session.tiles().clone(),
                     original_tree: tree.clone(),

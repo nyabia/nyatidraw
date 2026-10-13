@@ -29,6 +29,7 @@ pub fn App() -> Element {
         picker: use_signal(|| None),
         integration_busy: use_signal(|| false),
         integration_closed: use_signal(|| false),
+        copying_png: use_signal(|| false),
     };
     use_context_provider(|| editor);
     let backend = use_hook(|| WebUiBackend::new(&editor));
@@ -36,6 +37,7 @@ pub fn App() -> Element {
     use_context_provider(|| UiSlots {
         canvas: || rsx! { BrowserCanvas {} },
         file_buttons: |extended| rsx! { BrowserFileButtons { extended } },
+        reference_loader: |reference| rsx! { crate::reference_image::ReferenceImageButton { reference } },
         update_control: || rsx! { BrowserHelp {} },
     });
     let mut projection = use_signal(UiProjection::empty);
@@ -80,7 +82,7 @@ pub fn App() -> Element {
                 span { "NyatiDraw" }
                 button { disabled: !((editor.ready)()) || (editor.integration_busy)() || (editor.integration_closed)(), onclick: move |_| editor.download_project(), "작업 파일" }
                 button { disabled: !((editor.ready)()) || (editor.integration_busy)() || (editor.integration_closed)(), onclick: move |_| editor.download_png(), "PNG 내려받기" }
-                button { disabled: !((editor.ready)()) || (editor.integration_busy)() || (editor.integration_closed)(), onclick: move |_| editor.copy_png(), "PNG 복사" }
+                button { disabled: !((editor.ready)()) || (editor.integration_busy)() || (editor.integration_closed)() || (editor.copying_png)(), onclick: move |_| editor.copy_png(), "PNG 복사" }
                 button { disabled: !((editor.ready)()) || (editor.integration_busy)() || (editor.integration_closed)(), onclick: move |_| editor.show_modal(EditorModal::CancelIntegration), "취소" }
                 button { disabled: !((editor.ready)()) || (editor.integration_busy)() || (editor.integration_closed)(), onclick: move |_| editor.show_modal(EditorModal::CancelIntegration), "닫기" }
                 button { class: "browser-integration-done", disabled: !((editor.ready)()) || (editor.integration_busy)() || (editor.integration_closed)(), onclick: move |_| editor.complete_integration(), "완료" }
@@ -117,16 +119,33 @@ fn BrowserCanvas() -> Element {
 #[component]
 fn BrowserFileButtons(extended: bool) -> Element {
     let editor = use_context::<Editor>();
+    let mut importing = use_signal(|| false);
     let ready = (editor.ready)();
     rsx! {
+        button { class: if extended { "command" } else { "command compact" }, title: "새 그림", aria_label: "새 그림", disabled: !ready,
+            onclick: move |_| editor.show_modal(EditorModal::NewDocument),
+            UiIcon { name: "file-plus" }
+            if extended { span { "새 그림" } }
+        }
         button { class: "command", title: "NTDR 작업 파일 또는 PNG 열기", disabled: !ready, onclick: move |_| editor.open(),
             UiIcon { name: "folder" } span { class: "command-label", "열기" }
         }
         if extended {
-            button { class: "command", disabled: !ready, onclick: move |_| editor.show_modal(EditorModal::NewDocument), "새 그림" }
+            button { class: "command", disabled: !ready || importing(),
+                onclick: move |_| async move {
+                    if importing() { return; }
+                    importing.set(true);
+                    editor.import_png_layer().await;
+                    importing.set(false);
+                }, "PNG를 레이어로 가져오기"
+            }
             button { class: "command", disabled: !ready, onclick: move |_| editor.download_project(), "작업 파일 저장" }
             button { class: "command", disabled: !ready, onclick: move |_| editor.download_png(), "PNG 내보내기" }
-            button { class: "command", disabled: !ready, onclick: move |_| editor.copy_png(), "PNG 복사" }
+        }
+        button { class: if extended { "command" } else { "command compact" }, title: "그림 전체를 PNG로 복사", aria_label: "PNG 복사", disabled: !ready || (editor.copying_png)(),
+            onclick: move |_| editor.copy_png(),
+            UiIcon { name: "copy" }
+            if extended { span { "PNG 복사" } }
         }
     }
 }
@@ -187,6 +206,7 @@ fn BrowserDialog() -> Element {
                         p { "데스크톱과 같은 공용 UI를 사용하는 웹 실험판입니다. 아직 웹에 연결되지 않은 기능은 비활성화됩니다." }
                         p { role: "status", "{editor.status}" }
                         ul {
+                            li { "파일을 열거나 저장 위치를 정하지 않아도 바로 그릴 수 있습니다. PNG 복사로 다른 앱에 붙여넣고, 작업 파일 저장과 PNG 내보내기는 필요할 때만 사용하세요." }
                             li { if crate::browser::is_hosted() { "이 연결 세션은 브라우저 자동 복구에 저장하지 않습니다. 완료하면 PNG가 호스트로 전달됩니다." } else { "그림은 서버로 전송하지 않고 이 브라우저에 자동 복구용으로 저장합니다. 중요한 작업은 파일로 내려받아 보관하세요." } }
                             li { "작업 파일은 데스크톱과 같은 .ntdr 형식이며 레이어와 그룹을 유지합니다. 브라우저 자원 한도를 넘는 파일은 내용 손실을 막기 위해 열지 않습니다. 이전 .nyatidraw-web 파일도 가져올 수 있습니다." }
                             li { "최대 4096 × 4096 캔버스, 32개 레이어. 되돌리기는 메모리 한도 내 최대 128개이며 다시 열 때 복원되지 않습니다." }
@@ -195,7 +215,7 @@ fn BrowserDialog() -> Element {
                         }
                         button { "data-dialog-initial": "", onclick: move |_| editor.close_modal(), "닫기" }
                     } else if modal == Some(EditorModal::NewDocument) {
-                        p { "투명한 레이어 하나로 시작합니다." }
+                        p { "파일이나 저장 위치를 정하지 않고 투명한 레이어 하나로 시작합니다." }
                         for (name, width, height) in [("HD · 1280 × 720", 1280, 720), ("FHD · 1920 × 1080", 1920, 1080), ("정사각형 · 512 × 512", 512, 512), ("픽셀 작업 · 64 × 64", 64, 64)] {
                             button { class: "browser-preset", onclick: move |_| editor.new_document(width, height), "{name}" }
                         }

@@ -25,6 +25,12 @@ const observer = new MutationObserver(() => {
     document.removeEventListener('focusin', focusInside);
     overlay.removeEventListener('keydown', tabInside);
     observer.disconnect();
-    if (previous?.isConnected) previous.focus();
+    const active = document.activeElement;
+    const pageRoot = node => node === document.body || node === document.documentElement;
+    if (active?.isConnected && !pageRoot(active) && !overlay.contains(active)) return;
+    const restore = previous?.isConnected && !pageRoot(previous)
+        ? previous
+        : document.querySelector('main.app-shell');
+    restore?.focus();
 });
 observer.observe(document.body, { childList: true, subtree: true });

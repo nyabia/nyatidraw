@@ -3,6 +3,24 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
+## alpha.18 후보 검증
+
+무파일 낙서·PNG 복사 요청과 함께 사용자가 게시를 승인했다. 이 후보에는 앞선 로컬
+채우기·색 보정·러프 색상화·PNG 레이어 가져오기·그룹 복제·보기 회전·참조 창 보완도 포함한다.
+
+- workspace 전체 핵심 테스트, Windows 전체 타깃 Clippy, WASM UI/Worker Clippy,
+  fmt·JavaScript 문법 검사, 웹/Worker release 빌드와 Astro/Starlight 문서 빌드를 통과했다.
+- 새 브라우저 프로필에서 저장 파일 없이 그리기·실제 PNG 클립보드 쓰기·권한 실패 후 보존,
+  프로세스 재시작 복구·새 그림 교체를 확인했다.
+- Windows는 관리 복구 문서와 PNG 짝이 있는 기존 프로젝트를 구분하고,
+  독립 복사 작업의 핵심 픽셀·실패 보존·별도 프로세스 복구를 검사했다.
+- Windows의 실제 다른 앱 붙여넣기·설치 업데이트·물리 펜은 이번 검증에 포함하지 않는다.
+  사용자 작품과 설치본을 자동 교체하지 않는다.
+
+[변경 내용](releases/0.1.0-alpha.18.md), [무파일 낙서 검증](measurements/unsaved-drawing.md),
+[앞선 통합 검증](core-workflow-completion.md)을 기준으로 새 태그를 게시한다.
+태그를 올린 것만으로 게시 완료라고 보고하지 않고 CI·공개 자산·홈페이지를 따로 확인한다.
+
 ## 문서 사이트·작성창 유저스크립트 게시
 
 Astro/Starlight 사용자 문서와 범용 유저스크립트는 Windows 버전과 별도로 Website workflow로 배포한다.
@@ -148,7 +166,8 @@ Astro/Starlight 사용자 문서와 범용 유저스크립트는 Windows 버전�
   GitHub 사전 릴리스 자동 공개→Pages 다운로드 링크 갱신까지 진행한다.
   업로드 중에만 초안을 사용하며, 성공하면 별도 승인 없이 공개한다.
   테스트·빌드·패키징·업로드 실패 시 공개 단계로 진행하지 않는다.
-  일반 main push는 검증만 하며 배포하지 않는다. 정식 버전 태그는 아직 지원하지 않는다.
+  일반 main push는 Windows 설치판을 배포하지 않는다. 웹·공용 코드·사이트 경로 변경은
+  Website workflow를 통해 웹판과 문서를 게시한다. 정식 버전 태그는 아직 지원하지 않는다.
 
 태그 push가 배포 승인이다. 아래 설치 확인과 버전별 필수 수정은 **태그 생성 전**에 끝낸다.
 CI 성공만으로 설치·실제 펜·GUI 검증을 대신하지 않는다.

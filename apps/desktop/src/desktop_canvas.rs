@@ -932,6 +932,7 @@ unsafe extern "system" fn canvas_wnd_proc(
 struct ViewportDrag {
     last_client_px: [i32; 2],
     source: ViewportDragSource,
+    rotation: Option<(nyatidraw_input::ViewportRotationDrag, f64)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -985,15 +986,30 @@ impl WindowsViewportInput {
             .is_some_and(|drag| matches!(drag.source, ViewportDragSource::TouchContact(_)))
     }
 
+    fn begin_drag(&mut self, point: [i32; 2], source: ViewportDragSource, allow_rotation: bool) {
+        let viewport = self.live_ink.canvas_viewport_snapshot();
+        let rotation = if allow_rotation && space_is_down() && shift_is_down() && !alt_is_down() {
+            nyatidraw_input::ViewportRotationDrag::new(
+                f64::from(point[0]) / viewport.scale,
+                viewport.rotation_radians,
+            )
+            .map(|drag| (drag, viewport.scale))
+        } else {
+            None
+        };
+        self.drag = Some(ViewportDrag {
+            last_client_px: point,
+            source,
+            rotation,
+        });
+    }
+
     fn observe_touch(&mut self, hwnd: HWND, message: u32, pointer: u32, point: [i32; 2]) -> bool {
         if message == WM_POINTERDOWN
             && (space_is_down() || (self.live_ink.navigation_tool() && !alt_is_down()))
         {
             if self.drag.is_none() {
-                self.drag = Some(ViewportDrag {
-                    last_client_px: point,
-                    source: ViewportDragSource::TouchContact(pointer),
-                });
+                self.begin_drag(point, ViewportDragSource::TouchContact(pointer), true);
             }
             return true;
         }
@@ -1046,10 +1062,11 @@ impl WindowsViewportInput {
             if self.pen_drag(pointer) {
                 self.move_drag(hwnd, screen_message_point(hwnd, message.lParam));
             } else if self.drag.is_none() {
-                self.drag = Some(ViewportDrag {
-                    last_client_px: screen_message_point(hwnd, message.lParam),
-                    source: ViewportDragSource::PenButton(pointer),
-                });
+                self.begin_drag(
+                    screen_message_point(hwnd, message.lParam),
+                    ViewportDragSource::PenButton(pointer),
+                    false,
+                );
             }
             return true;
         }
@@ -1059,10 +1076,11 @@ impl WindowsViewportInput {
                     && !alt_is_down()
                     && !controls.is_some_and(|controls| controls.shortcut == PenShortcut::Picker)))
         {
-            self.drag = Some(ViewportDrag {
-                last_client_px: screen_message_point(hwnd, message.lParam),
-                source: ViewportDragSource::PenContact(pointer),
-            });
+            self.begin_drag(
+                screen_message_point(hwnd, message.lParam),
+                ViewportDragSource::PenContact(pointer),
+                !controls.is_some_and(|controls| controls.shortcut == PenShortcut::Picker),
+            );
             return true;
         }
         if message.message == WM_POINTERUPDATE && self.pen_drag(pointer) {
@@ -1178,19 +1196,21 @@ impl WindowsViewportInput {
                 }
             }
             WM_MBUTTONDOWN => {
-                self.drag = Some(ViewportDrag {
-                    last_client_px: client_point(message.lParam),
-                    source: ViewportDragSource::MouseMiddle,
-                });
+                self.begin_drag(
+                    client_point(message.lParam),
+                    ViewportDragSource::MouseMiddle,
+                    false,
+                );
                 true
             }
             WM_LBUTTONDOWN
                 if space_is_down() || (self.live_ink.navigation_tool() && !alt_is_down()) =>
             {
-                self.drag = Some(ViewportDrag {
-                    last_client_px: client_point(message.lParam),
-                    source: ViewportDragSource::MousePrimary,
-                });
+                self.begin_drag(
+                    client_point(message.lParam),
+                    ViewportDragSource::MousePrimary,
+                    true,
+                );
                 true
             }
             WM_POINTERDOWN
@@ -1301,6 +1321,14 @@ impl WindowsViewportInput {
         ];
         drag.last_client_px = point;
         if delta == [0, 0] {
+            return;
+        }
+        if let Some((rotation, scale)) = drag.rotation {
+            if let Some(angle) = rotation.millidegrees_at(f64::from(point[0]) / scale) {
+                self.command(nyatidraw_api::ViewportCommand::SetRotationMillidegrees(
+                    angle,
+                ));
+            }
             return;
         }
         let scale = f64::from(

@@ -1216,7 +1216,7 @@ impl ProjectDb {
         transaction
             .set_durability(Durability::Immediate)
             .map_err(|error| self.io(error))?;
-        self.mark_layer_compositing(&transaction)?;
+        self.mark_layer_compositing(&transaction, &bytes)?;
         {
             let mut state = transaction
                 .open_table(STATE)
@@ -1855,6 +1855,7 @@ mod tests {
             clip_to_below: false,
             blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             children: vec![LayerTreeNode::Raster(LayerNode {
+                color_effect: None,
                 id: LayerId(4),
                 name: "Sketch".into(),
                 visible: true,
@@ -2594,6 +2595,78 @@ mod tests {
     }
 
     #[test]
+    fn base_only_artwork_remains_editable_and_undo_restores_its_pixels_and_effect() {
+        let path = temp("base-only-artwork");
+        let db = ProjectDb::open(&path).unwrap();
+        let tiles = TileSnapshot::from_tiles([(
+            TileKey {
+                layer: LayerId(20),
+                mip: 0,
+                x: -1,
+                y: 0,
+            },
+            vec![80; TILE_BYTE_LEN],
+        )])
+        .unwrap();
+        let mut tree = layer_tree_fixture();
+        tree.set_color_effect(
+            LayerId(20),
+            Some(nyatidraw_api::LayerColorEffect {
+                enabled: false,
+                dark_rgb: [10, 80, 200],
+                light_rgb: [230, 240, 250],
+            }),
+        )
+        .unwrap();
+        db.persist_layer_tree(&tree).unwrap();
+        let tx = db.db.begin_write().unwrap();
+        store_tile_objects(&mut tx.open_table(OBJECTS).unwrap(), &tiles).unwrap();
+        db.store_roots(&tx, &tiles, &tiles).unwrap();
+        let initial = Envelope::new(
+            RecordKind::InitialHistoryCursor,
+            encode_initial_history_cursor(SnapshotId(17), tiles.root()),
+        )
+        .encode();
+        tx.open_table(STATE)
+            .unwrap()
+            .insert(INITIAL_HISTORY_CURSOR, initial.as_slice())
+            .unwrap();
+        tx.commit().unwrap();
+        drop(db);
+
+        let db = ProjectDb::open(&path).unwrap();
+        let reopened = db.load_reopened().unwrap().unwrap();
+        assert_eq!(reopened.current_tiles(), &tiles);
+        assert_eq!(reopened.current_snapshot(), SnapshotId(17));
+        assert_eq!(reopened.history().node_count(), 0);
+        let mut session = HeadlessStrokeSession::from_reopened(reopened);
+        let mut changed = tree.clone();
+        changed.set_color_effect(LayerId(20), None).unwrap();
+        let batch = session
+            .prepare_structural_change(SnapshotId(18), HistoryNodeId(18), 0, tiles.clone())
+            .unwrap();
+        db.commit_structural_with_layer_tree(&batch, &changed)
+            .unwrap();
+        session.accept_structural_change(&batch).unwrap();
+        let undo = session.prepare_undo_cursor().unwrap();
+        db.persist_history_cursor(undo.target()).unwrap();
+        drop(db);
+
+        let db = ProjectDb::open(&path).unwrap();
+        let reopened = db.load_reopened().unwrap().unwrap();
+        assert_eq!(reopened.current_tiles(), &tiles);
+        assert_eq!(reopened.current_snapshot(), SnapshotId(17));
+        assert_eq!(db.load_layer_tree().unwrap(), Some(tree));
+        assert!(
+            HeadlessStrokeSession::from_reopened(reopened)
+                .prepare_redo_cursor()
+                .is_ok()
+        );
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn retention_preserves_artwork_metadata_and_128_undo_steps_across_restart() {
         // Product risk: evicting history must not drop current/off-page pixels,
@@ -2622,6 +2695,15 @@ mod tests {
                 &format!("Layer {index}"),
             )
             .unwrap();
+            tree.set_color_effect(
+                LayerId(20),
+                Some(nyatidraw_api::LayerColorEffect {
+                    enabled: index.is_multiple_of(2),
+                    dark_rgb: [index, 90, 200],
+                    light_rgb: [240, 245, 255],
+                }),
+            )
+            .unwrap();
             tree
         }
         fn page(index: u8) -> CanvasSpec {
@@ -2633,6 +2715,11 @@ mod tests {
         }
         if let Some(path) = std::env::var_os("NYATIDRAW_RETENTION_REOPEN") {
             let database = ProjectDb::open(Path::new(&path)).unwrap();
+            assert_eq!(
+                database.load_editor_tool_state().unwrap().as_deref(),
+                Some(b"future tool preferences".as_slice())
+            );
+            assert_eq!(database.load_active_layer().unwrap(), Some(LayerId(20)));
             let reopened = database.load_reopened().unwrap().unwrap();
             assert_eq!(reopened.history().node_count(), 128);
             assert_eq!(reopened.current_tiles(), &tiles(132));
@@ -2678,6 +2765,10 @@ mod tests {
         let path = temp("retention-128");
         let database = ProjectDb::open(&path).unwrap();
         database.persist_layer_tree(&tree(0)).unwrap();
+        database
+            .persist_editor_tool_state(b"future tool preferences")
+            .unwrap();
+        database.persist_active_layer(LayerId(20)).unwrap();
         let mut session = HeadlessStrokeSession::new(SnapshotId(0), TileSnapshot::empty());
         for index in 1..=132_u8 {
             let batch = session
@@ -2931,6 +3022,7 @@ mod tests {
     fn layer_tree_fixture() -> LayerTree {
         let raster = |id, name: &str| {
             LayerTreeNode::Raster(LayerNode {
+                color_effect: None,
                 alpha_locked: false,
                 clip_to_below: false,
                 blend_mode: nyatidraw_api::LayerBlendMode::Normal,
@@ -3934,6 +4026,15 @@ mod tests {
         let changed_tree = || {
             let mut tree = layer_tree_fixture();
             tree.set_alpha_locked(LayerId(20), true).unwrap();
+            tree.set_color_effect(
+                LayerId(20),
+                Some(nyatidraw_api::LayerColorEffect {
+                    enabled: false,
+                    dark_rgb: [30, 80, 190],
+                    light_rgb: [240, 245, 250],
+                }),
+            )
+            .unwrap();
             tree.set_clip_to_below(LayerTreeNodeId::Raster(LayerId(20)), true)
                 .unwrap();
             tree.set_blend_mode(
@@ -4000,6 +4101,11 @@ mod tests {
         db.commit_structural_with_layer_tree(&batch, &tree).unwrap();
         let upgraded = marker(&db);
         assert_ne!(upgraded & LAYER_COMPOSITING_SCHEMA_FLAG, 0);
+        assert_ne!(
+            upgraded & nyatidraw_project::LAYER_COLOR_EFFECT_SCHEMA_FLAG,
+            0,
+            "disabled but configured effects still require matching readers"
+        );
         let old_known = COMPRESSED_TILE_SCHEMA_FLAG
             | CONFIGURABLE_BRUSH_SCHEMA_FLAG
             | SIGNED_SELECTION_SCHEMA_FLAG;
@@ -4029,22 +4135,31 @@ mod tests {
             upgraded,
             "Undo cannot downgrade retained redo records"
         );
-        // Forge a missing flag while current state is legacy. Historical v3
-        // metadata must still reject read-only, not only the current tree.
-        let transaction = db.db.begin_write().unwrap();
-        transaction
-            .open_table(META)
-            .unwrap()
-            .insert("schema_version", upgraded & !LAYER_COMPOSITING_SCHEMA_FLAG)
-            .unwrap();
-        transaction.commit().unwrap();
         drop(db);
-        let original = std::fs::read(&path).unwrap();
-        assert!(matches!(
-            ProjectDb::open(&path),
-            Err(ProjectOpenError::Corrupt { .. })
-        ));
-        assert_eq!(std::fs::read(&path).unwrap(), original);
+        // Retained redo metadata requires both capabilities even after Undo.
+        for missing in [
+            LAYER_COMPOSITING_SCHEMA_FLAG,
+            nyatidraw_project::LAYER_COLOR_EFFECT_SCHEMA_FLAG,
+        ] {
+            let corrupt_path = temp(&format!("missing-layer-capability-{missing}"));
+            std::fs::copy(&path, &corrupt_path).unwrap();
+            let db = ProjectDb::open(&corrupt_path).unwrap();
+            let transaction = db.db.begin_write().unwrap();
+            transaction
+                .open_table(META)
+                .unwrap()
+                .insert("schema_version", upgraded & !missing)
+                .unwrap();
+            transaction.commit().unwrap();
+            drop(db);
+            let original = std::fs::read(&corrupt_path).unwrap();
+            assert!(matches!(
+                ProjectDb::open(&corrupt_path),
+                Err(ProjectOpenError::Corrupt { .. })
+            ));
+            assert_eq!(std::fs::read(&corrupt_path).unwrap(), original);
+            std::fs::remove_file(corrupt_path).unwrap();
+        }
         std::fs::remove_file(path).unwrap();
     }
 

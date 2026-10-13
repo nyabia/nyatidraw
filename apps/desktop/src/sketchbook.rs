@@ -15,6 +15,41 @@ pub(crate) fn directory() -> Option<PathBuf> {
         .map(|parent| parent.join("Sketchbook"))
 }
 
+pub(crate) fn is_managed_recovery(path: &Path) -> bool {
+    let Some(directory) = directory() else {
+        return false;
+    };
+    is_managed_recovery_in(path, &directory)
+}
+
+fn is_managed_recovery_in(path: &Path, directory: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let same_directory = match (
+        std::fs::canonicalize(parent),
+        std::fs::canonicalize(directory),
+    ) {
+        (Ok(parent), Ok(directory)) => parent == directory,
+        _ => parent == directory,
+    };
+    same_directory
+        && !path.with_extension("png").try_exists().unwrap_or(true)
+        && path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("ntdr"))
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|name| {
+                name == "작업 중"
+                    || name
+                        .strip_prefix("새 그림 ")
+                        .and_then(|index| index.parse::<u32>().ok())
+                        .is_some_and(|index| (1..=100_000).contains(&index))
+            })
+}
+
 fn reserve_in(directory: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(directory).map_err(|error| format!("자동 복구 폴더: {error}"))?;
     for index in 1..=100_000 {
@@ -60,6 +95,27 @@ mod tests {
         let second = super::reserve_in(&directory).unwrap();
         assert_eq!(first, directory.join("새 그림 3.ntdr"));
         assert_eq!(second, directory.join("새 그림 4.ntdr"));
+        assert!(super::is_managed_recovery_in(&first, &directory));
+        assert!(!super::is_managed_recovery_in(
+            &export.with_extension("ntdr"),
+            &directory
+        ));
+        assert!(super::is_managed_recovery_in(
+            &directory.join("작업 중.ntdr"),
+            &directory
+        ));
+        assert!(!super::is_managed_recovery_in(
+            &directory.join("내 작품.ntdr"),
+            &directory
+        ));
+        assert!(!super::is_managed_recovery_in(
+            &directory.join("새 그림 2.png"),
+            &directory
+        ));
+        assert!(!super::is_managed_recovery_in(
+            &directory.join("other/새 그림 1.ntdr"),
+            &directory
+        ));
         assert_eq!(std::fs::metadata(&first).unwrap().len(), 0);
         assert_eq!(
             std::fs::read(&project).unwrap(),

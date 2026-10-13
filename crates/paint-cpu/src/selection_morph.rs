@@ -404,6 +404,7 @@ mod tests {
                         reference: false,
                         opacity_u16: 0,
                         content_root: ContentRootId(0),
+                        color_effect: None,
                     })
                 })
                 .to_vec(),

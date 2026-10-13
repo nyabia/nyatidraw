@@ -5,7 +5,9 @@ use nyatidraw_web_core::{BrushSettings, MAX_RESIDENT_TILES, WebDocument, WebPref
 
 use crate::{MAX_NTDR_BYTES, WebProject, message};
 
-const MAGIC: &[u8; 8] = b"NYWORK03";
+const LEGACY_MAGIC: &[u8; 8] = b"NYWORK03";
+const FILL_MAGIC: &[u8; 8] = b"NYWORK04";
+const MAGIC: &[u8; 8] = b"NYWORK05";
 const MAX_METADATA_BYTES: usize = 128 * 1024;
 const MAX_REQUEST_BYTES: usize =
     MAX_NTDR_BYTES + MAX_RESIDENT_TILES * (TILE_BYTE_LEN + 25) + MAX_METADATA_BYTES + 512;
@@ -162,9 +164,12 @@ fn read_request(
         return Err("Recovery request too large".into());
     }
     let mut reader = Reader(packet);
-    if reader.take(8)? != MAGIC {
-        return Err("Unknown recovery protocol".into());
-    }
+    let version = match reader.take(8)? {
+        bytes if bytes == LEGACY_MAGIC => 3,
+        bytes if bytes == FILL_MAGIC => 4,
+        bytes if bytes == MAGIC => 5,
+        _ => return Err("Unknown recovery protocol".into()),
+    };
     let epoch = u64::from_le_bytes(reader.array()?);
     let revision = u64::from_le_bytes(reader.array()?);
     let base = u64::from_le_bytes(reader.array()?);
@@ -199,7 +204,7 @@ fn read_request(
     };
     let layers = decode_layer_tree(reader.blob(MAX_METADATA_BYTES)?).map_err(message)?;
     let active = LayerId(u128::from_le_bytes(reader.array()?));
-    let (preferences, selected) = read_preferences(&mut reader)?;
+    let (preferences, selected) = read_preferences(&mut reader, version)?;
     let pencil_template = match reader.byte()? {
         0 => nyatidraw_api::PencilTemplate::Mechanical2H,
         1 => nyatidraw_api::PencilTemplate::Graphite2B,
@@ -242,6 +247,7 @@ fn read_request(
         project.saved_preferences = previous.saved_preferences;
         project.saved_selected_tool = previous.saved_selected_tool;
         project.saved_pencil_template = previous.saved_pencil_template;
+        project.tool_state_readable = previous.tool_state_readable;
     }
     project.selected_tool = selected;
     project.pencil_template = pencil_template;
@@ -296,6 +302,18 @@ fn put_preferences(
         edit.fill.expand_px,
         u8::from(edit.fill.antialias),
     ]);
+    bytes.extend_from_slice(&[
+        match edit.fill_source {
+            nyatidraw_api::EditSource::ActiveLayer => 0,
+            nyatidraw_api::EditSource::AllVisible => 1,
+            nyatidraw_api::EditSource::ReferenceLayers => 2,
+        },
+        edit.fill_tolerance,
+    ]);
+    bytes.push(match edit.gradient_mode {
+        nyatidraw_api::GradientMode::ForegroundToTransparent => 0,
+        nyatidraw_api::GradientMode::ForegroundToBackground => 1,
+    });
     for brush in preferences.brushes {
         for value in [brush.size_px, brush.opacity, brush.hardness] {
             bytes.extend_from_slice(&value.to_le_bytes());
@@ -313,6 +331,7 @@ fn put_preferences(
 
 fn read_preferences(
     reader: &mut Reader<'_>,
+    version: u8,
 ) -> Result<(WebPreferences, Option<DrawingTool>), String> {
     let selected = match reader.byte()? {
         u8::MAX => None,
@@ -344,10 +363,37 @@ fn read_preferences(
     if fill.gap_close_px > 8 || fill.expand_px > 64 {
         return Err("Invalid fill settings".into());
     }
+    let fill_source = if version == 3 {
+        source
+    } else {
+        match reader.byte()? {
+            0 => nyatidraw_api::EditSource::ActiveLayer,
+            1 => nyatidraw_api::EditSource::AllVisible,
+            2 => nyatidraw_api::EditSource::ReferenceLayers,
+            _ => return Err("Invalid fill source".into()),
+        }
+    };
+    let fill_tolerance = if version == 3 {
+        tolerance
+    } else {
+        reader.byte()?
+    };
+    let gradient_mode = if version < 5 {
+        nyatidraw_api::GradientMode::ForegroundToTransparent
+    } else {
+        match reader.byte()? {
+            0 => nyatidraw_api::GradientMode::ForegroundToTransparent,
+            1 => nyatidraw_api::GradientMode::ForegroundToBackground,
+            _ => return Err("Invalid gradient mode".into()),
+        }
+    };
     let edit_settings = nyatidraw_api::EditSettings {
         source,
         tolerance,
+        fill_source,
+        fill_tolerance,
         selection_mode,
+        gradient_mode,
         fill,
     };
     let mut brushes = WebTool::ALL.map(BrushSettings::for_tool);
@@ -407,5 +453,46 @@ impl<'a> Reader<'a> {
             return Err("Recovery field too large".into());
         }
         self.take(length)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nyatidraw_api::EditSource;
+
+    #[test]
+    fn recovery_preferences_migrate_legacy_fill_and_preserve_new_independent_values() {
+        // Product risk: a recovered browser session must retain the same fill
+        // boundary settings when the worker writes its native project.
+        let mut preferences = WebDocument::default().preferences();
+        preferences.edit_settings.source = EditSource::ReferenceLayers;
+        preferences.edit_settings.tolerance = 43;
+        preferences.edit_settings.fill_source = EditSource::AllVisible;
+        preferences.edit_settings.fill_tolerance = 16;
+        preferences.edit_settings.gradient_mode =
+            nyatidraw_api::GradientMode::ForegroundToBackground;
+        let mut bytes = Vec::new();
+        put_preferences(&mut bytes, preferences, Some(DrawingTool::Fill)).unwrap();
+        let (restored, tool) = read_preferences(&mut Reader(&bytes), 5).unwrap();
+        assert_eq!(tool, Some(DrawingTool::Fill));
+        assert_eq!(restored.edit_settings, preferences.edit_settings);
+        let mut invalid = bytes.clone();
+        invalid[18] = 2;
+        assert!(read_preferences(&mut Reader(&invalid), 5).is_err());
+
+        bytes.remove(18);
+        let (fill_version, _) = read_preferences(&mut Reader(&bytes), 4).unwrap();
+        assert_eq!(
+            fill_version.edit_settings.gradient_mode,
+            nyatidraw_api::GradientMode::ForegroundToTransparent
+        );
+        bytes.drain(16..18);
+        let (legacy, _) = read_preferences(&mut Reader(&bytes), 3).unwrap();
+        assert_eq!(
+            legacy.edit_settings.fill_source,
+            EditSource::ReferenceLayers
+        );
+        assert_eq!(legacy.edit_settings.fill_tolerance, 43);
     }
 }

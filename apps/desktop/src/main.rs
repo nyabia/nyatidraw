@@ -33,9 +33,12 @@ mod updates;
 mod workspace_appearance;
 
 mod editor_ui_host;
+#[cfg(windows)]
+mod image_import;
 mod input_preferences;
 mod palette_preferences;
 mod pressure_preferences;
+mod reference_image;
 
 use dioxus::prelude::*;
 use live_ink::{CloseStatus, LiveInkBridge};
@@ -111,6 +114,7 @@ fn app() -> Element {
     use_context_provider(|| UiSlots {
         canvas: || rsx! { SharedCanvas {} },
         file_buttons: |extended| rsx! { FileButtons { extended } },
+        reference_loader: |reference| rsx! { reference_image::ReferenceImageButton { reference } },
         update_control: || rsx! { UpdateControl {} },
     });
     let authoritative = live_ink.protocol_snapshot().0;
@@ -224,10 +228,11 @@ fn FileButtons(#[props(default = false)] extended: bool) -> Element {
         let mut busy = use_signal(|| false);
         let window = dioxus_desktop::window().window.clone();
         return rsx! {
-            for file_action in (0_u8..=2).filter(|action| extended || *action == 0) {
+            for file_action in [1_u8, 0, 2].into_iter().filter(|action| extended || *action != 2) {
                 button {
-                    class: "command", disabled: busy() || host.is_none(),
-                    title: match file_action { 1 => "저장 위치를 정하지 않고 새 그림 시작", 2 => "현재 그림과 모든 실행 취소 기록을 다른 이름으로 저장", _ => "PNG 또는 NyatiDraw 프로젝트 열기" },
+                    class: if !extended && file_action == 1 { "command compact" } else { "command" }, disabled: busy() || host.is_none(),
+                    title: match file_action { 1 => "새 그림", 2 => "현재 그림과 모든 실행 취소 기록을 다른 이름으로 저장", _ => "PNG 또는 NyatiDraw 프로젝트 열기" },
+                    aria_label: match file_action { 1 => "새 그림", 2 => "다른 이름으로 저장", _ => "열기" },
                     onclick: {
                         let host = host.clone();
                         let live_ink = live_ink.clone();
@@ -270,11 +275,24 @@ fn FileButtons(#[props(default = false)] extended: bool) -> Element {
                         }
                     },
                     if file_action == 2 { span { "다른 이름으로 저장" } }
-                    else if file_action == 1 { span { "새 그림" } }
+                    else if file_action == 1 { UiIcon { name: "file-plus" } if extended { span { "새 그림" } } }
                     else { UiIcon { name: "folder" } span { "열기" } }
                 }
             }
+            button { class: if extended { "command" } else { "command compact" }, title: "그림 전체를 PNG로 복사", aria_label: "PNG 복사",
+                disabled: busy() || host.is_none(),
+                onclick: move |_| {
+                    if live_ink.push_ui_editor_command(nyatidraw_api::EditorCommand::Project(
+                        nyatidraw_api::ProjectCommand::CopyPng,
+                    )).is_err() {
+                        live_ink.publish_activation_notice("현재 작업을 마친 뒤 PNG 복사를 다시 눌러주세요.".into());
+                    }
+                },
+                UiIcon { name: "copy" }
+                if extended { span { "PNG 복사" } }
+            }
             if extended {
+                image_import::ImportImageButton {}
                 RecentProjects { disabled: busy() }
             }
         };

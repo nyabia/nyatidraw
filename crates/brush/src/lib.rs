@@ -20,6 +20,12 @@ pub const ROUND_BRUSH_PRESET_SCHEMA_VERSION: u32 = 2;
 pub const MAX_PENCIL_DABS_PER_SEGMENT: u64 = 4_096;
 pub const MAX_PENCIL_DABS_PER_STROKE: u64 = 1_048_576;
 
+#[derive(Clone, Copy, Debug)]
+pub struct LiveDabLimits {
+    pub per_segment: u64,
+    pub per_stroke: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BrushPresetId(pub u128);
 
@@ -141,6 +147,24 @@ impl RoundBrushEvaluator {
             stroke_index: 0,
         }
     }
+
+    /// Bounds live input without imposing new limits on recorded replay.
+    /// A rejected segment emits no dabs and permanently marks this token for cancellation.
+    pub fn push_live(
+        &mut self,
+        token: &mut RoundBrushStroke,
+        samples: &[StylusSample],
+        out: &mut Vec<BrushDab>,
+        limits: LiveDabLimits,
+    ) {
+        for &sample in samples {
+            let segment_start = out.len();
+            resample_segment(token, sample, out, Some(limits));
+            if token.is_discontinuous() {
+                out.truncate(segment_start);
+            }
+        }
+    }
 }
 
 impl Default for RoundBrushEvaluator {
@@ -163,7 +187,7 @@ pub struct RoundBrushStroke {
 }
 
 impl RoundBrushStroke {
-    /// A v3 budget failure requires cancellation, never a shortened valid stroke.
+    /// A budget failure requires cancellation, never a shortened valid stroke.
     #[must_use]
     pub const fn is_discontinuous(&self) -> bool {
         self.evaluation_failed
@@ -198,7 +222,7 @@ impl BrushEvaluator for RoundBrushEvaluator {
         out: &mut Vec<BrushDab>,
     ) {
         for &sample in samples {
-            resample_segment(token, sample, out);
+            resample_segment(token, sample, out, None);
         }
     }
 
@@ -299,7 +323,12 @@ pub fn replay_round_stroke(
     Ok(())
 }
 
-fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut Vec<BrushDab>) {
+fn resample_segment(
+    token: &mut RoundBrushStroke,
+    next: StylusSample,
+    out: &mut Vec<BrushDab>,
+    live_limits: Option<LiveDabLimits>,
+) {
     let start = token.last_input;
     token.sample_count = token.sample_count.saturating_add(1);
     if token.evaluation_failed {
@@ -307,11 +336,23 @@ fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut 
         return;
     }
 
+    let limits = if pencil_grain_version(token.preset.engine_version).is_some() {
+        Some(LiveDabLimits {
+            per_segment: live_limits.map_or(MAX_PENCIL_DABS_PER_SEGMENT, |limits| {
+                limits.per_segment.min(MAX_PENCIL_DABS_PER_SEGMENT)
+            }),
+            per_stroke: live_limits.map_or(MAX_PENCIL_DABS_PER_STROKE, |limits| {
+                limits.per_stroke.min(MAX_PENCIL_DABS_PER_STROKE)
+            }),
+        })
+    } else {
+        live_limits
+    };
     let dx = next.position_document.x - start.position_document.x;
     let dy = next.position_document.y - start.position_document.y;
     let mut remaining = dx.hypot(dy);
     if !remaining.is_finite() {
-        if pencil_grain_version(token.preset.engine_version).is_some() {
+        if limits.is_some() {
             token.evaluation_failed = true;
         }
         token.last_input = next;
@@ -319,12 +360,13 @@ fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut 
     }
 
     let spacing = f64::from(spacing_px(&token.preset));
-    if pencil_grain_version(token.preset.engine_version).is_some() {
-        let projected = ((remaining + token.distance_since_dab) / spacing).floor();
+    if let Some(limits) = limits {
+        let projected = projected_dabs(remaining, token.distance_since_dab, spacing);
         #[allow(clippy::cast_precision_loss)]
-        let available = MAX_PENCIL_DABS_PER_STROKE
+        let available = limits
+            .per_stroke
             .saturating_sub(token.emitted_dabs)
-            .min(MAX_PENCIL_DABS_PER_SEGMENT) as f64;
+            .min(limits.per_segment) as f64;
         if projected > available {
             token.evaluation_failed = true;
             token.last_input = next;
@@ -334,10 +376,7 @@ fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut 
     let mut segment_progress = 0.0_f64;
     let mut segment_dabs = 0_u64;
     while remaining + token.distance_since_dab >= spacing {
-        if pencil_grain_version(token.preset.engine_version).is_some()
-            && (token.emitted_dabs >= MAX_PENCIL_DABS_PER_STROKE
-                || segment_dabs >= MAX_PENCIL_DABS_PER_SEGMENT)
-        {
+        if dab_limit_reached(limits, token.emitted_dabs, segment_dabs) {
             token.evaluation_failed = true;
             token.last_input = next;
             return;
@@ -367,9 +406,13 @@ fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut 
         && !token.contact_started
         && next.pressure > 0.0
     {
-        if pencil_grain_version(token.preset.engine_version).is_some()
-            && token.emitted_dabs >= MAX_PENCIL_DABS_PER_STROKE
-        {
+        let fallback_limit = if live_limits.is_some() {
+            dab_limit_reached(limits, token.emitted_dabs, segment_dabs)
+        } else {
+            pencil_grain_version(token.preset.engine_version).is_some()
+                && token.emitted_dabs >= MAX_PENCIL_DABS_PER_STROKE
+        };
+        if fallback_limit {
             token.evaluation_failed = true;
             token.last_input = next;
             return;
@@ -380,6 +423,16 @@ fn resample_segment(token: &mut RoundBrushStroke, next: StylusSample, out: &mut 
         token.distance_since_dab = 0.0;
     }
     token.last_input = next;
+}
+
+fn projected_dabs(distance: f64, carry: f64, spacing: f64) -> f64 {
+    ((distance + carry) / spacing).floor()
+}
+
+fn dab_limit_reached(limits: Option<LiveDabLimits>, stroke_dabs: u64, segment_dabs: u64) -> bool {
+    limits.is_some_and(|limits| {
+        stroke_dabs >= limits.per_stroke || segment_dabs >= limits.per_segment
+    })
 }
 
 #[must_use]
@@ -651,6 +704,173 @@ mod tests {
             assert!(
                 dab.radius_px.is_finite() && dab.opacity.is_finite() && dab.hardness.is_finite()
             );
+        }
+    }
+
+    #[test]
+    fn live_limits_preserve_round_replay_and_minimum_spacing_4k_and_8k_gestures() {
+        let limits = LiveDabLimits {
+            per_segment: 65_536,
+            per_stroke: 1_048_576,
+        };
+        for engine_version in [1, 2, ROUND_BRUSH_ENGINE_VERSION] {
+            for distance in [0.0, 4_096.0, 8_192.0] {
+                let preset = BrushPreset {
+                    engine_version,
+                    size_px: 1.0,
+                    spacing_ratio: 0.01,
+                    ..preset()
+                };
+                let samples = [
+                    StylusSample {
+                        phase: PointerPhase::Begin,
+                        ..sample(1, 0.0, 0.0)
+                    },
+                    StylusSample {
+                        position_document: Point {
+                            x: distance,
+                            y: distance,
+                        },
+                        ..sample(2, distance, 1.0)
+                    },
+                    StylusSample {
+                        phase: PointerPhase::End,
+                        position_document: Point {
+                            x: distance,
+                            y: distance,
+                        },
+                        ..sample(3, distance, 0.0)
+                    },
+                ];
+                let mut evaluator = RoundBrushEvaluator::default();
+                let mut dabs = Vec::new();
+                let mut token = begin_round_stroke(&mut evaluator, &preset, samples[0], &mut dabs);
+                for next in &samples[1..] {
+                    evaluator.push_live(&mut token, &[*next], &mut dabs, limits);
+                    assert!(!token.is_discontinuous());
+                }
+                if distance > 0.0 {
+                    assert!(dabs.len() > 16_384 && dabs.len() < 65_536);
+                }
+                let record = evaluator.end(token, &mut dabs);
+                let mut replay = Vec::new();
+                replay_round_stroke(&BrushSnapshot { preset }, &record, &samples, &mut replay)
+                    .unwrap();
+                assert_eq!(dabs, replay, "live admission must not change saved pixels");
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_live_segments_and_contact_fallback_cannot_publish_partial_or_resumed_ink() {
+        let preset = BrushPreset {
+            size_px: 1.0,
+            spacing_ratio: 0.01,
+            ..preset()
+        };
+        let generous = LiveDabLimits {
+            per_segment: 65_536,
+            per_stroke: 1_048_576,
+        };
+        let only_begin = LiveDabLimits {
+            per_stroke: 1,
+            ..generous
+        };
+        for phase in [PointerPhase::Move, PointerPhase::End] {
+            for (x, first_pressure, limits) in [
+                (16_384.25, 1.0, generous),
+                (0.25, 1.0, only_begin),
+                (0.0, 0.0, only_begin),
+                (
+                    0.0,
+                    0.0,
+                    LiveDabLimits {
+                        per_segment: 0,
+                        per_stroke: 10,
+                    },
+                ),
+                (
+                    0.3,
+                    -10.0,
+                    LiveDabLimits {
+                        per_segment: 1,
+                        ..generous
+                    },
+                ),
+                (f64::INFINITY, 1.0, generous),
+                (f64::NAN, 1.0, generous),
+                (f64::MAX, 1.0, generous),
+            ] {
+                let mut evaluator = RoundBrushEvaluator::default();
+                let mut dabs = Vec::new();
+                let mut token = begin_round_stroke(
+                    &mut evaluator,
+                    &preset,
+                    sample(1, 0.0, first_pressure),
+                    &mut dabs,
+                );
+                let before = dabs.clone();
+                evaluator.push_live(
+                    &mut token,
+                    &[StylusSample {
+                        phase,
+                        ..sample(2, x, 1.0)
+                    }],
+                    &mut dabs,
+                    limits,
+                );
+                assert!(token.is_discontinuous());
+                assert_eq!(
+                    dabs, before,
+                    "rejected segment must publish no partial dabs"
+                );
+                evaluator.push_live(&mut token, &[sample(3, 0.25, 1.0)], &mut dabs, limits);
+                assert!(token.is_discontinuous());
+                assert_eq!(dabs, before, "a rejected token cannot recover on its tail");
+            }
+        }
+        let limits = LiveDabLimits {
+            per_segment: 1,
+            per_stroke: 2,
+        };
+        let mut evaluator = RoundBrushEvaluator::default();
+        let mut dabs = Vec::new();
+        let mut fresh = begin_round_stroke(&mut evaluator, &preset, sample(1, 0.0, 0.0), &mut dabs);
+        evaluator.push_live(&mut fresh, &[sample(2, 0.0, 1.0)], &mut dabs, limits);
+        assert!(
+            !fresh.is_discontinuous(),
+            "a fresh contact fallback may use the exact remaining budget"
+        );
+        assert_eq!(dabs.len(), 2);
+        evaluator.push_live(&mut fresh, &[sample(3, 0.25, 1.0)], &mut dabs, limits);
+        assert!(fresh.is_discontinuous());
+        assert_eq!(
+            dabs.len(),
+            2,
+            "fallback counts toward the cumulative stroke budget"
+        );
+    }
+
+    #[test]
+    fn legacy_round_recordings_above_live_limits_still_replay_every_dab() {
+        for engine_version in [1, 2, ROUND_BRUSH_ENGINE_VERSION] {
+            let preset = BrushPreset {
+                engine_version,
+                size_px: 1.0,
+                spacing_ratio: 0.01,
+                ..preset()
+            };
+            let samples = [sample(1, 0.0, 1.0), sample(2, 16_384.25, 1.0)];
+            let mut evaluator = RoundBrushEvaluator::default();
+            let mut original = Vec::new();
+            let mut token = begin_round_stroke(&mut evaluator, &preset, samples[0], &mut original);
+            evaluator.push(&mut token, &samples[1..], &mut original);
+            let recorded = evaluator.end(token, &mut original);
+            let mut replay = Vec::new();
+            replay_round_stroke(&BrushSnapshot { preset }, &recorded, &samples, &mut replay)
+                .unwrap();
+            assert_eq!(replay.len(), 65_538);
+            assert_eq!(original, replay);
         }
     }
 

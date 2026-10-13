@@ -12,6 +12,34 @@ pub struct Point {
     pub y: f64,
 }
 
+/// Shift+Space horizontal drag: half a degree per logical pixel, independent of zoom.
+#[derive(Clone, Copy, Debug)]
+pub struct ViewportRotationDrag {
+    start_x: f64,
+    start_degrees: f64,
+}
+
+impl ViewportRotationDrag {
+    #[must_use]
+    pub fn new(start_x: f64, rotation_radians: f64) -> Option<Self> {
+        let start_degrees = rotation_radians.to_degrees();
+        (start_x.is_finite() && start_degrees.is_finite()).then_some(Self {
+            start_x,
+            start_degrees,
+        })
+    }
+
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn millidegrees_at(self, logical_x: f64) -> Option<i32> {
+        let degrees = self.start_degrees + (logical_x - self.start_x) * 0.5;
+        if !degrees.is_finite() {
+            return None;
+        }
+        Some(((degrees + 180.0).rem_euclid(360.0) * 1_000.0).round() as i32 - 180_000)
+    }
+}
+
 /// Backend-neutral canvas viewport. Coordinates entering the model are
 /// physical window-client pixels; document coordinates are logical canvas
 /// units. `revision` identifies the exact mapping used for a sample.
@@ -465,6 +493,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn free_rotation_keeps_offpage_ink_and_mirrored_input_on_the_same_document_coordinates() {
+        for (scale, zoom, mirrored) in [(1.0, 0.25, false), (1.5, 2.5, true), (2.0, 0.5, true)] {
+            let original = ViewportTransform {
+                revision: 5,
+                window_origin_physical: Point { x: 21.0, y: 45.0 },
+                physical_size: [900, 600],
+                dpi_scale: scale,
+                pan: Point {
+                    x: 2400.0,
+                    y: -1800.0,
+                },
+                zoom,
+                rotation_radians: 17.375_f64.to_radians(),
+                mirrored_horizontal: mirrored,
+            };
+            let center = Point {
+                x: 450.0 / scale,
+                y: 300.0 / scale,
+            };
+            let anchor = original
+                .logical_to_document(center)
+                .expect("offpage anchor");
+            let drag = ViewportRotationDrag::new(120.0, original.rotation_radians).expect("drag");
+            let mut view = original;
+            for delta in [0.0, 13.75, -49.25, 720.0, -2160.0, 0.0] {
+                let angle = drag.millidegrees_at(120.0 + delta).expect("finite angle");
+                view = view
+                    .with_view_at(
+                        center,
+                        zoom,
+                        (f64::from(angle) / 1_000.0).to_radians(),
+                        mirrored,
+                    )
+                    .expect("rotate");
+                assert_point_near(view.logical_to_document(center).expect("anchor"), anchor);
+                let ink = Point {
+                    x: -8192.75,
+                    y: 2055.125,
+                };
+                let physical = view.document_to_window(ink).expect("display");
+                assert_point_near(view.window_to_document(physical).expect("input"), ink);
+            }
+            assert_point_near(view.pan, original.pan);
+            let reset = view
+                .with_view_at(center, zoom, 0.0, mirrored)
+                .expect("reset");
+            assert_point_near(
+                reset.logical_to_document(center).expect("reset anchor"),
+                anchor,
+            );
+            assert!(drag.millidegrees_at(f64::NAN).is_none());
+            assert!(drag.millidegrees_at(f64::INFINITY).is_none());
+        }
+        assert!(ViewportRotationDrag::new(f64::NAN, 0.0).is_none());
+        assert!(ViewportRotationDrag::new(0.0, f64::INFINITY).is_none());
     }
 
     fn assert_point_near(actual: Point, expected: Point) {

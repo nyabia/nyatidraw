@@ -80,10 +80,17 @@ pub enum EditCommand {
     },
     /// Provisional free transform; only explicit Commit creates history.
     FreeTransform(TransformCommand),
+    ColorAdjustment(ColorAdjustmentCommand),
     SelectWand {
         seed: [i32; 2],
         tolerance: u8,
         source: EditSource,
+    },
+    CombineWand {
+        seed: [i32; 2],
+        tolerance: u8,
+        source: EditSource,
+        mode: SelectionMode,
     },
     /// Admission rejects payloads outside 3..=4096 vertices.
     SelectLasso {
@@ -123,6 +130,7 @@ pub enum EditCommand {
         color: [u8; 4],
         settings: FillSettings,
     },
+    /// Paint the explicit selection, or the finite output page when none exists.
     GradientSelection {
         start: [i32; 2],
         end: [i32; 2],
@@ -173,9 +181,20 @@ impl Default for AffineTransform {
 pub enum TransformCommand {
     Begin,
     Paste,
+    ImportRaster(RasterImport),
     Preview(AffineTransform),
     Commit { generation: u64 },
     Cancel,
+}
+
+/// Bounded canonical linear-premultiplied pixels; host epoch prevents an async
+/// file picker from importing into a different document.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RasterImport {
+    pub project_epoch: u64,
+    pub name: String,
+    pub size: [u32; 2],
+    pub pixels: std::sync::Arc<[u8]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -185,6 +204,31 @@ pub struct TransformProjection {
     pub origin: [i32; 2],
     pub size: [u32; 2],
     pub corners_milli: [[i64; 2]; 4],
+    pub can_commit: bool,
+}
+
+/// Artwork corrections in straight sRGB; zero is an exact identity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ColorAdjustment {
+    pub hue_degrees: i16,
+    pub saturation_percent: i16,
+    pub value_percent: i16,
+    pub brightness_percent: i16,
+    pub contrast_percent: i16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ColorAdjustmentCommand {
+    Begin,
+    Preview(ColorAdjustment),
+    Commit { generation: u64 },
+    Cancel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColorAdjustmentProjection {
+    pub generation: u64,
+    pub adjustment: ColorAdjustment,
     pub can_commit: bool,
 }
 
@@ -198,6 +242,7 @@ pub struct EditProjection {
     pub selected_pixels: u64,
     pub error: Option<String>,
     pub transform: Option<TransformProjection>,
+    pub color_adjustment: Option<ColorAdjustmentProjection>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,11 +306,21 @@ impl Default for FillSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GradientMode {
+    #[default]
+    ForegroundToTransparent,
+    ForegroundToBackground,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EditSettings {
     pub source: EditSource,
     pub tolerance: u8,
+    pub fill_source: EditSource,
+    pub fill_tolerance: u8,
     pub selection_mode: SelectionMode,
+    pub gradient_mode: GradientMode,
     pub fill: FillSettings,
 }
 
@@ -274,7 +329,10 @@ impl Default for EditSettings {
         Self {
             source: EditSource::ActiveLayer,
             tolerance: 0,
+            fill_source: EditSource::AllVisible,
+            fill_tolerance: 16,
             selection_mode: SelectionMode::Replace,
+            gradient_mode: GradientMode::default(),
             fill: FillSettings::default(),
         }
     }
@@ -333,6 +391,11 @@ impl Default for BrushSettings {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolCommand {
+    SaveBrushPreset(crate::BrushPresetName),
+    ApplyBrushPreset(u8),
+    UpdateBrushPreset(u8),
+    RenameBrushPreset(u8, crate::BrushPresetName),
+    DeleteBrushPreset(u8),
     /// Cancels a transform draft (including its pending start), otherwise an
     /// active native gesture, otherwise clears the completed selection. Each
     /// command consumes one stage and never deletes selected artwork.
@@ -359,11 +422,14 @@ pub enum ToolCommand {
     SwapColors,
     SetEditSource(EditSource),
     SetEditTolerance(u8),
+    SetFillSource(EditSource),
+    SetFillTolerance(u8),
     SetFillSettings(FillSettings),
     SetFillGapClose(u8),
     SetFillExpansion(u8),
     SetFillAntialias(bool),
     SetSelectionMode(SelectionMode),
+    SetGradientMode(GradientMode),
 }
 
 /// Discrete viewport operations keep the cross-thread protocol deterministic
@@ -394,6 +460,8 @@ pub enum ViewportCommand {
     },
     /// Center-anchored 45 degree clockwise increments; negative values rotate left.
     RotateQuarterSteps(i8),
+    /// Absolute clockwise view angle, preserving the viewport-center document anchor.
+    SetRotationMillidegrees(i32),
     /// Reflect document X in the view around the current viewport center.
     ToggleMirrorHorizontal,
     /// Reset only rotation, preserving the center document anchor, zoom and mirror.
@@ -414,6 +482,7 @@ pub enum HistoryCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectCommand {
     Save,
+    CopyPng,
 }
 
 /// Raster/group composition over a premultiplied linear-light backdrop.
@@ -424,8 +493,30 @@ pub enum LayerBlendMode {
     Multiply,
 }
 
+/// Maps straight sRGB luminance between two display colors, preserving alpha.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LayerColorEffect {
+    pub enabled: bool,
+    pub dark_rgb: [u8; 3],
+    pub light_rgb: [u8; 3],
+}
+
+impl Default for LayerColorEffect {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dark_rgb: [96, 144, 224],
+            light_rgb: [255; 3],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LayerCommand {
+    SetColorEffect {
+        layer: LayerId,
+        effect: Option<LayerColorEffect>,
+    },
     SetAlphaLocked {
         layer: LayerId,
         alpha_locked: bool,
@@ -446,6 +537,7 @@ pub enum LayerCommand {
     /// Inserts one empty raster immediately above the active raster.
     AddRaster,
     DuplicateRaster(LayerId),
+    DuplicateGroup(GroupId),
     SetLocked {
         layer: LayerId,
         locked: bool,
@@ -554,6 +646,7 @@ pub enum LayerProjectionKind {
 // Orthogonal user layer toggles, not states of one state machine.
 #[allow(clippy::struct_excessive_bools)]
 pub struct LayerProjection {
+    pub color_effect: Option<LayerColorEffect>,
     pub alpha_locked: bool,
     pub clip_to_below: bool,
     pub blend_mode: LayerBlendMode,
@@ -659,6 +752,8 @@ pub struct UiProjection {
     pub recent_brush_sizes: Vec<u16>,
     pub brush_opacity_u16: u16,
     pub brush_settings: BrushSettings,
+    pub brush_presets: Vec<crate::NamedBrushPreset>,
+    pub brush_presets_writable: bool,
     /// Straight sRGB8 UI color; alpha is linear. Convert before artwork commands.
     pub brush_color: [u8; 4],
     pub background_color: [u8; 4],
@@ -704,6 +799,8 @@ impl UiProjection {
             recent_brush_sizes: Vec::new(),
             brush_opacity_u16: u16::MAX,
             brush_settings: BrushSettings::for_tool(DrawingTool::Pen),
+            brush_presets: Vec::new(),
+            brush_presets_writable: true,
             brush_color: [0, 0, 0, 255],
             background_color: [255; 4],
             recent_colors: Vec::new(),

@@ -218,6 +218,7 @@ mod tests {
                 alpha_locked: false,
                 clip_to_below: false,
                 blend_mode: nyatidraw_api::LayerBlendMode::Normal,
+                color_effect: None,
                 id,
                 parent: GroupId(parent),
                 index,

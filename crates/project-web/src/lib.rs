@@ -30,6 +30,7 @@ pub struct WebProject {
     pencil_template: PencilTemplate,
     saved_pencil_template: PencilTemplate,
     import_notice: Option<&'static str>,
+    tool_state_readable: bool,
 }
 
 impl Deref for WebProject {
@@ -72,14 +73,15 @@ impl WebProject {
             pencil_template,
             saved_pencil_template: pencil_template,
             import_notice: None,
+            tool_state_readable: true,
         }
     }
 
-    /// Loads native bytes without modifying the input. Legacy NYWEB001 is import-only.
+    /// Loads native bytes without modifying the input. Portable NYWEB is import-only.
     /// # Errors
     /// Rejects corruption and resource limits before replacement, preserving groups.
     pub fn decode_ntdr(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.starts_with(b"NYWEB001") {
+        if bytes.starts_with(b"NYWEB001") || bytes.starts_with(b"NYWEB002") {
             let mut project =
                 Self::from_document(WebDocument::decode_portable(bytes).map_err(message)?);
             project.selected_tool = Some(match project.document.tool() {
@@ -95,6 +97,7 @@ impl WebProject {
         }
         let memory = MemoryProjectDb::open(bytes, MAX_NTDR_BYTES).map_err(message)?;
         let db = memory.db();
+        let restored_active = db.load_active_layer();
         let reopened = db.load_reopened().map_err(message)?;
         let (canvas, layers, tiles) = if let Some(reopened) = reopened {
             let parts = reopened.into_parts();
@@ -113,9 +116,17 @@ impl WebProject {
             )
         };
         let mut document = if let Some(layers) = layers {
-            let active = nyatidraw_editor::layer_edit::raster_layer_ids(&layers)
-                .first()
+            let active = restored_active
+                .as_ref()
+                .ok()
                 .copied()
+                .flatten()
+                .filter(|id| layers.raster(*id).is_some())
+                .or_else(|| {
+                    nyatidraw_editor::layer_edit::raster_layer_ids(&layers)
+                        .first()
+                        .copied()
+                })
                 .ok_or("The browser requires at least one raster layer")?;
             WebDocument::from_snapshot(canvas, tiles, layers, active).map_err(message)?
         } else if tiles.is_empty() {
@@ -123,11 +134,20 @@ impl WebProject {
         } else {
             return Err("This project has artwork but no layer metadata; open it in NyatiDraw Desktop first.".into());
         };
-        let state = db.load_editor_tool_state().map_err(message)?;
-        let decoded = state.as_deref().and_then(decode_editor_tool_state);
-        let import_notice = if state.is_some() && decoded.is_none() {
+        let state = db.load_editor_tool_state();
+        let decoded = state
+            .as_ref()
+            .ok()
+            .and_then(|state| state.as_deref())
+            .and_then(decode_editor_tool_state);
+        let tool_state_readable = matches!(&state, Ok(None)) || decoded.is_some();
+        let import_notice = if !tool_state_readable {
             Some(
-                "Unrecognized tool settings were preserved unchanged. Browser defaults are temporary; saving changed settings requires NyatiDraw Desktop.",
+                "도구 설정을 읽지 못해 기존 정보는 보존했습니다. 현재 도구 설정은 임시로 사용하며 그림은 저장할 수 있습니다.",
+            )
+        } else if restored_active.is_err() {
+            Some(
+                "마지막 레이어 정보를 읽지 못해 첫 레이어를 선택했습니다. 기존 정보와 그림은 보존했습니다.",
             )
         } else {
             None
@@ -151,6 +171,7 @@ impl WebProject {
             pencil_template,
             saved_pencil_template: pencil_template,
             import_notice,
+            tool_state_readable,
         })
     }
 
@@ -200,7 +221,7 @@ impl WebProject {
     /// Rejects invalid fallback settings without modifying artwork or history.
     pub fn restore_fallback_tool_preferences(&mut self, bytes: &[u8]) -> Result<(), String> {
         let state = decode_editor_tool_state(bytes).ok_or("Invalid app tool preferences")?;
-        if self.selected_tool.is_none() && self.import_notice.is_none() {
+        if self.selected_tool.is_none() && self.tool_state_readable {
             self.document
                 .restore_preferences(preferences::to_web(state))
                 .map_err(message)?;
@@ -266,22 +287,25 @@ impl WebProject {
             .map_err(message)?;
         }
         let current_preferences = self.document.preferences();
-        let original = db.load_editor_tool_state().map_err(message)?;
-        if original.is_none()
-            || self.saved_preferences != current_preferences
-            || self.selected_tool != self.saved_selected_tool
-            || self.pencil_template != self.saved_pencil_template
-        {
-            let decoded = original.as_deref().and_then(decode_editor_tool_state);
-            if original.is_some() && decoded.is_none() {
-                return Err("This project has unrecognized tool settings. They were preserved; change them in NyatiDraw Desktop before saving new browser settings.".into());
+        if self.tool_state_readable {
+            let original = db.load_editor_tool_state().map_err(message)?;
+            if original.is_none()
+                || self.saved_preferences != current_preferences
+                || self.selected_tool != self.saved_selected_tool
+                || self.pencil_template != self.saved_pencil_template
+            {
+                let decoded = original.as_deref().and_then(decode_editor_tool_state);
+                let mut state =
+                    preferences::to_native(current_preferences, self.selected_tool, decoded)?;
+                if state.tool != DrawingTool::Pencil {
+                    state.pencil_template = self.pencil_template;
+                }
+                db.persist_editor_tool_state(&nyatidraw_project::encode_editor_tool_state(&state))
+                    .map_err(message)?;
             }
-            let mut state =
-                preferences::to_native(current_preferences, self.selected_tool, decoded)?;
-            if state.tool != DrawingTool::Pencil {
-                state.pencil_template = self.pencil_template;
-            }
-            db.persist_editor_tool_state(&nyatidraw_project::encode_editor_tool_state(&state))
+        }
+        if db.load_active_layer().is_ok() {
+            db.persist_active_layer(self.document.active_layer())
                 .map_err(message)?;
         }
         let bytes = memory.into_bytes().map_err(message)?;

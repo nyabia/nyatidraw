@@ -1,11 +1,110 @@
 //! OS boundary for artwork exchange. Pixel algorithms and tests use the trait,
 //! never the user's system clipboard. Windows supports private exact RGBA plus
-//! registered PNG; DIB-only producers and other platforms are explicit follow-ups.
+//! registered PNG or bounded Windows DIB input.
 use nyatidraw_paint_cpu::RasterFragment;
+
+#[cfg(any(windows, test))]
+pub(crate) mod dib;
 
 pub(crate) use nyatidraw_editor::pixel_edit::ArtworkClipboard;
 
 pub(crate) struct SystemClipboard;
+
+#[derive(Default)]
+pub(crate) struct PageCopyWorker {
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PageCopyWorker {
+    pub(crate) fn start(
+        &mut self,
+        tiles: &std::collections::BTreeMap<nyatidraw_tiles::TileKey, Vec<u8>>,
+        tree: nyatidraw_document::LayerTree,
+        canvas: nyatidraw_api::CanvasSpec,
+        live_ink: crate::live_ink::LiveInkBridge,
+    ) -> Result<(), String> {
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return Err("PNG 복사를 처리 중입니다. 잠시 뒤 다시 시도해주세요.".into());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        let tiles = page_tiles(tiles, canvas)?;
+        live_ink.publish_activation_notice("그림 전체를 PNG로 복사하고 있습니다.".into());
+        self.handle = Some(
+            std::thread::Builder::new()
+                .name("nyatidraw-png-clipboard".into())
+                .spawn(move || {
+                    let result = nyatidraw_tiles::TileSnapshot::from_tiles(tiles)
+                        .map_err(|error| format!("복사할 픽셀을 준비하지 못했습니다: {error:?}"))
+                        .and_then(|tiles| copy_page(&tiles, &tree, canvas, &mut SystemClipboard));
+                    live_ink.publish_activation_notice(match result {
+                        Ok(()) => {
+                            "그림 전체를 PNG로 복사했습니다. 다른 앱에 붙여넣을 수 있습니다.".into()
+                        }
+                        Err(error) => {
+                            format!("PNG를 복사하지 못했습니다. 그림은 그대로 유지됩니다: {error}")
+                        }
+                    });
+                })
+                .map_err(|error| format!("PNG 복사 작업을 시작하지 못했습니다: {error}"))?,
+        );
+        Ok(())
+    }
+}
+
+impl Drop for PageCopyWorker {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+pub(crate) fn page_tiles(
+    tiles: &std::collections::BTreeMap<nyatidraw_tiles::TileKey, Vec<u8>>,
+    canvas: nyatidraw_api::CanvasSpec,
+) -> Result<Vec<(nyatidraw_tiles::TileKey, Vec<u8>)>, String> {
+    RasterFragment::byte_len([0, 0], [canvas.width_px, canvas.height_px])
+        .map_err(|_| "그림이 PNG 클립보드 크기 한도(16백만 픽셀)를 넘습니다.".to_owned())?;
+    let columns = i64::from(canvas.width_px.div_ceil(nyatidraw_tiles::TILE_EDGE));
+    let rows = i64::from(canvas.height_px.div_ceil(nyatidraw_tiles::TILE_EDGE));
+    let mut captured_bytes = 0_usize;
+    tiles
+        .iter()
+        .filter(|(key, _)| {
+            key.mip == 0
+                && (0..columns).contains(&i64::from(key.x))
+                && (0..rows).contains(&i64::from(key.y))
+        })
+        .map(|(key, pixels)| {
+            captured_bytes = captured_bytes.saturating_add(pixels.len());
+            if captured_bytes > MAX_BYTES {
+                return Err("레이어 픽셀이 PNG 복사 메모리 한도(128 MiB)를 넘습니다.".into());
+            }
+            Ok((*key, pixels.clone()))
+        })
+        .collect()
+}
+
+pub(crate) fn copy_page(
+    tiles: &nyatidraw_tiles::TileSnapshot,
+    tree: &nyatidraw_document::LayerTree,
+    canvas: nyatidraw_api::CanvasSpec,
+    clipboard: &mut dyn ArtworkClipboard,
+) -> Result<(), String> {
+    RasterFragment::byte_len([0, 0], [canvas.width_px, canvas.height_px])
+        .map_err(|_| "그림이 PNG 클립보드 크기 한도(16백만 픽셀)를 넘습니다.".to_owned())?;
+    let surface = nyatidraw_paint_cpu::flatten_layer_tree_rgba8(tiles, tree, canvas)
+        .map_err(|error| format!("PNG 합성 실패: {error:?}"))?;
+    let fragment = RasterFragment::new([0, 0], [surface.width, surface.height], surface.pixels)
+        .map_err(|error| format!("PNG 복사 실패: {error:?}"))?;
+    clipboard.write(&fragment)
+}
 
 #[cfg(test)]
 #[derive(Default)]
@@ -62,7 +161,8 @@ fn decode_exact(bytes: &[u8]) -> Result<RasterFragment, String> {
 #[cfg(windows)]
 mod windows_clipboard {
     use super::{
-        ArtworkClipboard, MAX_BYTES, RasterFragment, SystemClipboard, decode_exact, encode_exact,
+        ArtworkClipboard, MAX_BYTES, RasterFragment, SystemClipboard, decode_exact, dib,
+        encode_exact,
     };
     use windows::{
         Win32::{
@@ -80,6 +180,9 @@ mod windows_clipboard {
         },
         core::w,
     };
+
+    const CF_DIB: u32 = 8;
+    const CF_DIBV5: u32 = 17;
 
     struct Owner(HWND);
     impl Drop for Owner {
@@ -148,7 +251,7 @@ mod windows_clipboard {
         // SAFETY: caller holds Open until all bytes are copied.
         let handle = unsafe { GetClipboardData(format) }.map_err(|e| e.to_string())?;
         let global = HGLOBAL(handle.0);
-        // SAFETY: selected registered formats carry an HGLOBAL, not a GDI object.
+        // SAFETY: registered PNG/exact and CF_DIB(V5) carry HGLOBAL, not GDI handles.
         let length = unsafe { GlobalSize(global) };
         if length == 0 || length > MAX_BYTES {
             return Err("클립보드 크기 한도 초과".into());
@@ -212,25 +315,29 @@ mod windows_clipboard {
         }
         fn read(&mut self) -> Result<RasterFragment, String> {
             let (exact, png) = formats()?;
-            let (is_exact, bytes) = {
+            let (format, bytes) = {
                 // SAFETY: read-only access needs no owner; release before decode.
                 unsafe { OpenClipboard(None) }
                     .map_err(|_| "클립보드를 다른 앱이 사용 중입니다. 다시 시도하세요.")?;
                 let _open = Open;
                 // SAFETY: queries registered identifiers only.
                 if unsafe { IsClipboardFormatAvailable(exact) }.is_ok() {
-                    (true, read_bytes(exact)?)
+                    (exact, read_bytes(exact)?)
                 } else if unsafe { IsClipboardFormatAvailable(png) }.is_ok() {
-                    (false, read_bytes(png)?)
+                    (png, read_bytes(png)?)
+                } else if unsafe { IsClipboardFormatAvailable(CF_DIBV5) }.is_ok() {
+                    (CF_DIBV5, read_bytes(CF_DIBV5)?)
+                } else if unsafe { IsClipboardFormatAvailable(CF_DIB) }.is_ok() {
+                    (CF_DIB, read_bytes(CF_DIB)?)
                 } else {
-                    return Err(
-                        "PNG 그림이 클립보드에 없습니다. DIB 전용 형식은 아직 지원하지 않습니다."
-                            .into(),
-                    );
+                    return Err("PNG 또는 비트맵 그림이 클립보드에 없습니다.".into());
                 }
             };
-            if is_exact {
+            if format == exact {
                 return decode_exact(&bytes);
+            }
+            if format != png {
+                return dib::decode(&bytes);
             }
             let imported = nyatidraw_png_io::decode_png_bytes(
                 &bytes,

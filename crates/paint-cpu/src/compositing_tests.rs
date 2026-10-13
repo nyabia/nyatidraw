@@ -15,6 +15,7 @@ fn raster(id: u128, clip: bool, opacity: u16, mode: LayerBlendMode) -> LayerTree
         blend_mode: mode,
         opacity_u16: opacity,
         content_root: ContentRootId(0),
+        color_effect: None,
     })
 }
 
@@ -27,6 +28,200 @@ fn group(id: u128, children: Vec<LayerTreeNode>) -> GroupNode {
         blend_mode: LayerBlendMode::Normal,
         opacity_u16: u16::MAX,
         children,
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn nondestructive_layer_colors_agree_across_artwork_consumers_and_stack_rules() {
+    use nyatidraw_api::LayerColorEffect;
+    use nyatidraw_tiles::color::apply_layer_color_effect;
+    let effect = LayerColorEffect::default();
+    let clip_effect = LayerColorEffect {
+        dark_rgb: [240, 96, 48],
+        light_rgb: [20, 40, 60],
+        ..effect
+    };
+    let snapshot = TileSnapshot::from_tiles([-1, 0].into_iter().flat_map(|x| {
+        [
+            (1, [30, 60, 90, 255]),
+            (2, [16, 32, 64, 128]),
+            (4, [0, 32, 16, 64]),
+        ]
+        .map(move |(layer, pixel)| {
+            (
+                TileKey {
+                    layer: LayerId(layer),
+                    mip: 0,
+                    x,
+                    y: 0,
+                },
+                pixel.repeat(TILE_BYTE_LEN / 4),
+            )
+        })
+    }))
+    .unwrap();
+    let canvas = CanvasSpec {
+        width_px: 2,
+        height_px: 1,
+        pixels_per_inch: 96,
+    };
+    for (opacity, mode, clip, nested) in [
+        (65535, LayerBlendMode::Normal, None, false),
+        (32768, LayerBlendMode::Normal, None, false),
+        (32768, LayerBlendMode::Multiply, None, false),
+        (
+            40000,
+            LayerBlendMode::Normal,
+            Some(LayerBlendMode::Normal),
+            false,
+        ),
+        (
+            32768,
+            LayerBlendMode::Multiply,
+            Some(LayerBlendMode::Multiply),
+            true,
+        ),
+    ] {
+        let mut children = vec![raster(2, false, opacity, mode)];
+        if let Some(mode) = clip {
+            children.push(raster(4, true, 45000, mode));
+        }
+        let foreground = if nested {
+            let mut isolated = group(50, children);
+            isolated.opacity_u16 = 50000;
+            vec![LayerTreeNode::Group(isolated)]
+        } else {
+            children
+        };
+        let mut nodes = vec![raster(1, false, u16::MAX, LayerBlendMode::Normal)];
+        nodes.extend(foreground);
+        let raw_tree = LayerTree::new(group(100, nodes)).unwrap();
+        let mut tree = raw_tree.clone();
+        tree.set_color_effect(LayerId(2), Some(effect)).unwrap();
+        if clip.is_some() {
+            tree.set_color_effect(LayerId(4), Some(clip_effect))
+                .unwrap();
+        }
+        let mapped = snapshot
+            .with_replacements(snapshot.iter().map(|(key, tile)| {
+                let effect = if key.layer == LayerId(2) {
+                    Some(effect)
+                } else if key.layer == LayerId(4) && clip.is_some() {
+                    Some(clip_effect)
+                } else {
+                    None
+                };
+                let pixels = tile
+                    .pixels()
+                    .chunks_exact(4)
+                    .flat_map(|pixel| {
+                        apply_layer_color_effect([pixel[0], pixel[1], pixel[2], pixel[3]], effect)
+                    })
+                    .collect();
+                (key, pixels)
+            }))
+            .unwrap();
+        let expected = crate::flatten_layer_tree_rgba8(&mapped, &raw_tree, canvas).unwrap();
+        let flat = crate::flatten_layer_tree_rgba8(&snapshot, &tree, canvas).unwrap();
+        assert_eq!(flat, expected, "colorize before opacity/clipping/blend");
+        assert_eq!(
+            crate::render_page_preview_rgba8(&snapshot, &tree, canvas, 2, 1).unwrap(),
+            flat
+        );
+        for point in [[0, 0], [-1, 0]] {
+            assert_eq!(
+                crate::sample_display_pixel(&snapshot, &tree, point, None).unwrap(),
+                expected.pixels[..4]
+            );
+            assert_eq!(
+                crate::sample_artwork_pixel(
+                    &snapshot,
+                    &tree,
+                    LayerId(2),
+                    point,
+                    SelectionSource::AllVisible
+                )
+                .unwrap(),
+                expected.pixels[..4]
+            );
+            assert_eq!(
+                crate::sample_artwork_pixel(
+                    &snapshot,
+                    &tree,
+                    LayerId(2),
+                    point,
+                    SelectionSource::ActiveLayer
+                )
+                .unwrap(),
+                [16, 32, 64, 128]
+            );
+            if clip.is_some() {
+                assert_eq!(
+                    crate::sample_artwork_pixel(
+                        &snapshot,
+                        &tree,
+                        LayerId(2),
+                        point,
+                        SelectionSource::ReferenceLayers
+                    )
+                    .unwrap(),
+                    crate::sample_artwork_pixel(
+                        &mapped,
+                        &raw_tree,
+                        LayerId(2),
+                        point,
+                        SelectionSource::ReferenceLayers
+                    )
+                    .unwrap()
+                );
+                assert_eq!(
+                    crate::sample_display_pixel(
+                        &snapshot,
+                        &tree,
+                        point,
+                        Some(LayerTreeNodeId::Raster(LayerId(4)))
+                    )
+                    .unwrap(),
+                    crate::sample_display_pixel(
+                        &mapped,
+                        &raw_tree,
+                        point,
+                        Some(LayerTreeNodeId::Raster(LayerId(4)))
+                    )
+                    .unwrap()
+                );
+            }
+        }
+        assert_eq!(
+            crate::render_raster_page_preview_rgba8(&snapshot, LayerId(2), canvas, 2, 1)
+                .unwrap()
+                .pixels,
+            [16, 32, 64, 128].repeat(2)
+        );
+        tree.set_color_effect(
+            LayerId(2),
+            Some(LayerColorEffect {
+                enabled: false,
+                ..effect
+            }),
+        )
+        .unwrap();
+        if clip.is_some() {
+            tree.set_color_effect(LayerId(4), None).unwrap();
+        }
+        assert_eq!(
+            crate::flatten_layer_tree_rgba8(&snapshot, &tree, canvas).unwrap(),
+            crate::flatten_layer_tree_rgba8(&snapshot, &raw_tree, canvas).unwrap()
+        );
+        for (key, tile) in snapshot.iter() {
+            let expected = match key.layer.0 {
+                1 => [30, 60, 90, 255],
+                2 => [16, 32, 64, 128],
+                _ => [0, 32, 16, 64],
+            };
+            assert_eq!(tile.pixels(), expected.repeat(TILE_BYTE_LEN / 4));
+        }
     }
 }
 

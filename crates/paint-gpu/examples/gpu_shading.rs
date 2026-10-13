@@ -25,6 +25,7 @@ fn raster(id: u128, clip: bool, blend_mode: LayerBlendMode, opacity_u16: u16) ->
         blend_mode,
         opacity_u16,
         content_root: ContentRootId(0),
+        color_effect: None,
     })
 }
 

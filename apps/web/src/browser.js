@@ -268,11 +268,11 @@ export function downloadBytes(bytes, filename, mime) {
   link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
-export function pickFile() {
+export function pickFile(pngOnly = false) {
   return new Promise((resolve, reject) => {
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = ".ntdr,.png,.nyatidraw-web";
+    input.accept = pngOnly ? ".png" : ".ntdr,.png,.nyatidraw-web";
     input.hidden = true;
     document.body.append(input);
     input.oncancel = () => {
@@ -449,7 +449,7 @@ export function bindCanvas(canvas, callback) {
   const releaseActivePointer = () => {
     clearPicker();
     const captured = active;
-    const phase = mode === "pan" ? "panEnd" : "cancel";
+    const phase = mode === "rotate" ? "rotateCancel" : mode === "pan" ? "panEnd" : "cancel";
     active = null;
     activePointerType = null;
     mode = null;
@@ -490,16 +490,22 @@ export function bindCanvas(canvas, callback) {
     active = event.pointerId;
     activePointerType = event.pointerType;
     mode =
-      event.button === 1 || space || canvasTool === "pan"
+      event.button !== 1 && space && event.shiftKey && !event.altKey
+        ? "rotate"
+        : event.button === 1 || space || canvasTool === "pan"
         ? "pan"
         : event.altKey || canvasTool === "pick" ? "pick" : "stroke";
     canvas.setPointerCapture(active);
-    send(mode === "pan" ? "panBegin" : mode === "pick" ? "pickBegin" : "begin", event);
+    send(mode === "rotate" ? "rotateBegin" : mode === "pan" ? "panBegin" : mode === "pick" ? "pickBegin" : "begin", event);
   });
   canvas.addEventListener("pointermove", (event) => {
     if (event.pointerType === "pen") lastPenActivity = performance.now();
     if (modalOpen || event.pointerId !== active) return;
     event.preventDefault();
+    if (mode === "rotate") {
+      send("rotateMove", event);
+      return;
+    }
     if (mode === "pan") {
       send("panMove", event);
       return;
@@ -524,7 +530,7 @@ export function bindCanvas(canvas, callback) {
     if (event.pointerType === "pen") lastPenActivity = performance.now();
     if (modalOpen || event.pointerId !== active) return;
     clearPicker();
-    send(mode === "pan" ? "panEnd" : mode === "pick" ? "pickEnd" : "end", event);
+    send(mode === "rotate" ? "rotateEnd" : mode === "pan" ? "panEnd" : mode === "pick" ? "pickEnd" : "end", event);
     active = null;
     activePointerType = null;
     mode = null;

@@ -1,6 +1,8 @@
 use std::{fmt, sync::Arc};
 
-use nyatidraw_api::{ContentRootId, GroupId, HistoryNodeId, LayerBlendMode, LayerId, SnapshotId};
+use nyatidraw_api::{
+    ContentRootId, GroupId, HistoryNodeId, LayerBlendMode, LayerColorEffect, LayerId, SnapshotId,
+};
 use nyatidraw_brush::{BrushPreset, BrushPresetId, BrushSnapshot, RecordedStroke};
 use nyatidraw_document::{GroupNode, LayerNode, LayerTree, LayerTreeNode};
 use nyatidraw_history::{HistoryNode, OperationRecord};
@@ -21,7 +23,7 @@ const SAMPLE_MIN_ENCODED_LEN: usize = 61;
 const SELECTION_EXTENSION: [u8; 8] = *b"NYSEL001";
 const SIGNED_SELECTION_EXTENSION: [u8; 8] = *b"NYSEL002";
 const ALPHA_LOCK_EXTENSION: [u8; 8] = *b"NYALP001";
-const LAYER_TREE_WIRE_VERSION: u16 = 3;
+const LAYER_TREE_WIRE_VERSION: u16 = 4;
 const MAX_LAYER_TREE_NODES: usize = 4_096;
 const MAX_LAYER_TREE_DEPTH: usize = 64;
 const MAX_LAYER_NAME_BYTES: usize = 1_024;
@@ -440,10 +442,21 @@ pub fn decode_initial_history_cursor(
 /// Returns an error when a layer name or total node count exceeds the project
 /// format limits.
 pub fn encode_layer_tree(tree: &LayerTree) -> Result<Vec<u8>, WireError> {
+    fn has_color_effect(group: &GroupNode) -> bool {
+        group.children.iter().any(|node| match node {
+            LayerTreeNode::Raster(layer) => layer.color_effect.is_some(),
+            LayerTreeNode::Group(child) => has_color_effect(child),
+        })
+    }
     let mut output = Vec::new();
-    output.extend_from_slice(&LAYER_TREE_WIRE_VERSION.to_le_bytes());
+    let version = if has_color_effect(tree.root()) {
+        4_u16
+    } else {
+        3_u16
+    };
+    output.extend_from_slice(&version.to_le_bytes());
     let mut node_count = 0_usize;
-    encode_group_node(&mut output, tree.root(), 0, &mut node_count)?;
+    encode_group_node(&mut output, tree.root(), 0, &mut node_count, version)?;
     Ok(output)
 }
 
@@ -471,6 +484,7 @@ fn encode_group_node(
     group: &GroupNode,
     depth: usize,
     node_count: &mut usize,
+    version: u16,
 ) -> Result<(), WireError> {
     if depth > MAX_LAYER_TREE_DEPTH {
         return Err(WireError::InvalidData("layer tree exceeds depth limit"));
@@ -488,9 +502,9 @@ fn encode_group_node(
     output.extend_from_slice(&child_count.to_le_bytes());
     for child in &group.children {
         match child {
-            LayerTreeNode::Raster(layer) => encode_raster_node(output, layer, node_count)?,
+            LayerTreeNode::Raster(layer) => encode_raster_node(output, layer, node_count, version)?,
             LayerTreeNode::Group(child) => {
-                encode_group_node(output, child, depth + 1, node_count)?;
+                encode_group_node(output, child, depth + 1, node_count, version)?;
             }
         }
     }
@@ -501,6 +515,7 @@ fn encode_raster_node(
     output: &mut Vec<u8>,
     layer: &LayerNode,
     node_count: &mut usize,
+    version: u16,
 ) -> Result<(), WireError> {
     count_layer_node(node_count)?;
     output.push(1);
@@ -514,6 +529,14 @@ fn encode_raster_node(
     output.push(u8::from(layer.alpha_locked));
     output.push(u8::from(layer.clip_to_below));
     output.push(encode_blend_mode(layer.blend_mode));
+    if version >= 4 {
+        output.push(u8::from(layer.color_effect.is_some()));
+        if let Some(effect) = layer.color_effect {
+            output.push(u8::from(effect.enabled));
+            output.extend_from_slice(&effect.dark_rgb);
+            output.extend_from_slice(&effect.light_rgb);
+        }
+    }
     Ok(())
 }
 
@@ -627,6 +650,15 @@ fn decode_raster_node(
             decode_blend_mode(decoder)?
         } else {
             LayerBlendMode::Normal
+        },
+        color_effect: if version >= 4 && decoder.boolean()? {
+            Some(LayerColorEffect {
+                enabled: decoder.boolean()?,
+                dark_rgb: [decoder.u8()?, decoder.u8()?, decoder.u8()?],
+                light_rgb: [decoder.u8()?, decoder.u8()?, decoder.u8()?],
+            })
+        } else {
+            None
         },
     })
 }
@@ -1731,6 +1763,7 @@ mod project_head_compatibility_tests {
         assert!(!layer.reference);
         assert!(!layer.alpha_locked && !layer.clip_to_below);
         assert_eq!(layer.blend_mode, LayerBlendMode::Normal);
+        assert_eq!(layer.color_effect, None);
         assert_eq!(layer.id, LayerId(7));
         let mut v2 = legacy.clone();
         v2[..2].copy_from_slice(&2_u16.to_le_bytes());
@@ -1740,6 +1773,7 @@ mod project_head_compatibility_tests {
         assert!(v2_layer.reference);
         assert!(!v2_layer.alpha_locked && !v2_layer.clip_to_below);
         assert_eq!(v2_layer.blend_mode, LayerBlendMode::Normal);
+        assert_eq!(v2_layer.color_effect, None);
         let prior = tree.clone();
         assert!(tree.set_reference(LayerId(99), true).is_err());
         assert_eq!(tree, prior, "unknown source must preserve artwork metadata");
@@ -1754,6 +1788,14 @@ mod project_head_compatibility_tests {
         .unwrap();
         let current = encode_layer_tree(&tree).expect("v3 composition encoding");
         assert_eq!(&current[..2], &[3, 0]);
+        assert_eq!(
+            decode_layer_tree(&current)
+                .unwrap()
+                .raster(LayerId(7))
+                .unwrap()
+                .color_effect,
+            None
+        );
         assert_eq!(decode_layer_tree(&current), Ok(tree));
         let reference_offset = current.len() - 22;
         for invalid in [2, 255] {
@@ -1778,8 +1820,56 @@ mod project_head_compatibility_tests {
             );
         }
         let mut unsupported = current;
-        unsupported[..2].copy_from_slice(&4_u16.to_le_bytes());
+        unsupported[..2].copy_from_slice(&5_u16.to_le_bytes());
         assert!(decode_layer_tree(&unsupported).is_err());
+    }
+
+    #[test]
+    fn color_effect_wire_preserves_disabled_settings_and_rejects_invalid_or_future_records() {
+        // Product risk: a save must retain display colors while disabled, and
+        // malformed effect metadata must never be silently dropped on reopen.
+        let mut bytes = vec![4, 0, 2];
+        bytes.extend_from_slice(&100_u128.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(b"R");
+        bytes.extend_from_slice(&[1, 255, 255, 0, 0]);
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&7_u128.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(b"L");
+        bytes.extend_from_slice(&[1, 0, 1, 255, 255]);
+        bytes.extend_from_slice(&0_u128.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0, 12, 90, 220, 240, 245, 250]);
+        let effect = LayerColorEffect {
+            enabled: false,
+            dark_rgb: [12, 90, 220],
+            light_rgb: [240, 245, 250],
+        };
+        let tree = decode_layer_tree(&bytes).unwrap();
+        assert_eq!(tree.raster(LayerId(7)).unwrap().color_effect, Some(effect));
+        assert_eq!(encode_layer_tree(&tree).unwrap(), bytes);
+        for enabled in [false, true] {
+            let mut configured = tree.clone();
+            configured
+                .set_color_effect(LayerId(7), Some(LayerColorEffect { enabled, ..effect }))
+                .unwrap();
+            assert_eq!(
+                decode_layer_tree(&encode_layer_tree(&configured).unwrap()).unwrap(),
+                configured
+            );
+        }
+        for offset in [bytes.len() - 8, bytes.len() - 7] {
+            let mut corrupt = bytes.clone();
+            corrupt[offset] = 2;
+            assert_eq!(decode_layer_tree(&corrupt), Err(WireError::InvalidEnum));
+        }
+        for length in (bytes.len() - 8)..bytes.len() {
+            assert!(decode_layer_tree(&bytes[..length]).is_err());
+        }
+        let mut future = bytes;
+        future[..2].copy_from_slice(&5_u16.to_le_bytes());
+        assert!(decode_layer_tree(&future).is_err());
     }
 
     #[test]

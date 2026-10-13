@@ -144,6 +144,9 @@ mod tests {
         database
             .persist_editor_tool_state(b"fixture tool preferences")
             .unwrap();
+        database
+            .persist_active_layer(nyatidraw_api::LayerId(23))
+            .unwrap();
         drop(database); // Untouched project deliberately has no layer metadata.
         let original = fs::read(&source).unwrap();
         for (index, extension, bytes) in [
@@ -163,6 +166,10 @@ mod tests {
         copy_closed_project(&source, &target).unwrap();
         let reopened = ProjectDb::open(&target).unwrap();
         assert!(reopened.load_reopened().unwrap().is_none());
+        assert_eq!(
+            reopened.load_active_layer().unwrap(),
+            Some(nyatidraw_api::LayerId(23))
+        );
         assert_eq!(
             reopened.load_editor_tool_state().unwrap().unwrap(),
             b"fixture tool preferences"

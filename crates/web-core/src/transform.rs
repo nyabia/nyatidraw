@@ -27,6 +27,9 @@ impl WebDocument {
     }
     #[must_use]
     pub fn display_snapshot(&self) -> &TileSnapshot {
+        if let Some(preview) = &self.color_adjustment_preview {
+            return &preview.tiles;
+        }
         self.transform_preview
             .as_ref()
             .map_or(self.snapshot(), |preview| &preview.tiles)
@@ -48,7 +51,7 @@ impl WebDocument {
         &mut self,
         command: TransformCommand,
     ) -> Result<CanvasUpdate, WebError> {
-        if self.is_drawing() {
+        if self.is_drawing() || self.color_adjustment_projection().is_some() {
             return Err(WebError::StrokeInProgress);
         }
         let mut transform = std::mem::take(&mut self.transform);
@@ -96,9 +99,9 @@ impl WebDocument {
     }
 }
 
-struct BrowserTransform<'a> {
-    document: &'a mut WebDocument,
-    active: LayerId,
+pub(super) struct BrowserTransform<'a> {
+    pub(super) document: &'a mut WebDocument,
+    pub(super) active: LayerId,
 }
 impl TransformStore for BrowserTransform<'_> {
     fn current_snapshot(&self) -> SnapshotId {

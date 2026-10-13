@@ -134,6 +134,24 @@ pub fn execute_pixel_edit(
             "잠긴 레이어에는 그릴 수 없습니다. 잠금을 해제하세요.".into(),
         ));
     }
+    if matches!(
+        command,
+        EditCommand::FillSelection { .. }
+            | EditCommand::FloodFill { .. }
+            | EditCommand::FloodFillAdvanced { .. }
+            | EditCommand::GradientSelection { .. }
+    ) && !nyatidraw_document::composition_scope_nodes(
+        tree.root(),
+        nyatidraw_document::CompositionScope::Solo(nyatidraw_api::LayerTreeNodeId::Group(
+            tree.root_id(),
+        )),
+    )
+    .contains(&nyatidraw_api::LayerTreeNodeId::Raster(target))
+    {
+        return Err(PixelEditError(
+            "칠할 레이어나 상위 그룹이 숨겨져 있습니다. 레이어 패널에서 표시를 켜주세요.".into(),
+        ));
+    }
     let mut flood_mask = None;
     let mut sampled_color = None;
     let mut transformed = None;
@@ -148,9 +166,9 @@ pub fn execute_pixel_edit(
             | EditCommand::PasteSelection
     );
     let paint = match command {
-        EditCommand::FreeTransform(_) => {
+        EditCommand::FreeTransform(_) | EditCommand::ColorAdjustment(_) => {
             return Err(PixelEditError(
-                "FreeTransform requires its transaction worker".into(),
+                "Artwork previews require their transaction worker".into(),
             ));
         }
         EditCommand::CopySelection | EditCommand::CutSelection => {
@@ -185,6 +203,7 @@ pub fn execute_pixel_edit(
                     parent,
                     index + 1,
                     nyatidraw_document::LayerTreeNode::Raster(nyatidraw_document::LayerNode {
+                        color_effect: None,
                         alpha_locked: false,
                         clip_to_below: false,
                         blend_mode: nyatidraw_api::LayerBlendMode::Normal,
@@ -366,13 +385,19 @@ pub fn execute_pixel_edit(
             seed,
             tolerance,
             source,
+        }
+        | EditCommand::CombineWand {
+            seed,
+            tolerance,
+            source,
+            ..
         } => {
             let source = match source {
                 EditSource::ActiveLayer => SelectionSource::ActiveLayer,
                 EditSource::ReferenceLayers => SelectionSource::ReferenceLayers,
                 EditSource::AllVisible => SelectionSource::AllVisible,
             };
-            let mask = wand_selection(
+            let mask = nyatidraw_paint_cpu::wand_selection_signed(
                 tiles,
                 tree,
                 WandRequest {
@@ -385,7 +410,16 @@ pub fn execute_pixel_edit(
                 limits,
             )
             .map_err(reject)?;
-            *selection = Some(Arc::new(mask));
+            let mode = match command {
+                EditCommand::CombineWand { mode, .. } => mode,
+                _ => nyatidraw_api::SelectionMode::Replace,
+            };
+            *selection = Some(Arc::new(combine_edit_selection(
+                selection.as_deref(),
+                mask,
+                mode,
+                limits,
+            )?));
             None
         }
         EditCommand::SelectLasso { ref vertices }
@@ -395,23 +429,7 @@ pub fn execute_pixel_edit(
                 EditCommand::CombineLasso { mode, .. } => mode,
                 _ => nyatidraw_api::SelectionMode::Replace,
             };
-            let mode = match mode {
-                nyatidraw_api::SelectionMode::Replace => {
-                    nyatidraw_paint_cpu::SelectionCombine::Replace
-                }
-                nyatidraw_api::SelectionMode::Add => nyatidraw_paint_cpu::SelectionCombine::Add,
-                nyatidraw_api::SelectionMode::Subtract => {
-                    nyatidraw_paint_cpu::SelectionCombine::Subtract
-                }
-            };
-            let mask = if let Some(current) = selection.as_deref() {
-                nyatidraw_paint_cpu::combine_selection(current, &incoming, mode, limits)
-                    .map_err(reject)?
-            } else if mode == nyatidraw_paint_cpu::SelectionCombine::Subtract {
-                return Err(PixelEditError("뺄 선택 영역이 없습니다.".into()));
-            } else {
-                incoming
-            };
+            let mask = combine_edit_selection(selection.as_deref(), incoming, mode, limits)?;
             *selection = Some(Arc::new(mask));
             None
         }
@@ -483,7 +501,7 @@ pub fn execute_pixel_edit(
                     PremultipliedRgba8(color),
                     limits,
                 )
-                .map_err(reject)?,
+                .map_err(|error| fill_error(&error))?,
             );
             None
         }
@@ -492,12 +510,27 @@ pub fn execute_pixel_edit(
             end,
             start_color,
             end_color,
-        } => Some(SelectionPaint::LinearGradient {
-            start,
-            end,
-            start_color: PremultipliedRgba8(start_color),
-            end_color: PremultipliedRgba8(end_color),
-        }),
+        } => {
+            if selection.is_none() {
+                canvas
+                    .validate()
+                    .map_err(|error| PixelEditError(format!("{error:?}")))?;
+                flood_mask = Some(Arc::new(
+                    nyatidraw_paint_cpu::selection_all(
+                        [0, 0],
+                        [canvas.width_px, canvas.height_px],
+                        limits,
+                    )
+                    .map_err(reject)?,
+                ));
+            }
+            Some(SelectionPaint::LinearGradient {
+                start,
+                end,
+                start_color: PremultipliedRgba8(start_color),
+                end_color: PremultipliedRgba8(end_color),
+            })
+        }
     };
     if let Some(paint) = paint {
         let mask = flood_mask
@@ -524,6 +557,53 @@ pub fn execute_pixel_edit(
         canvas: changed_canvas,
         selection: candidate_selection,
     })
+}
+
+fn combine_edit_selection(
+    current: Option<&SelectionMask>,
+    incoming: SelectionMask,
+    mode: nyatidraw_api::SelectionMode,
+    limits: EditLimits,
+) -> Result<SelectionMask, PixelEditError> {
+    use nyatidraw_api::SelectionMode;
+    use nyatidraw_paint_cpu::SelectionCombine;
+    if mode == SelectionMode::Replace {
+        return Ok(incoming);
+    }
+    if let Some(current) = current {
+        nyatidraw_paint_cpu::combine_selection(
+            current,
+            &incoming,
+            match mode {
+                SelectionMode::Add => SelectionCombine::Add,
+                SelectionMode::Subtract => SelectionCombine::Subtract,
+                SelectionMode::Replace => unreachable!(),
+            },
+            limits,
+        )
+        .map_err(|error| PixelEditError(format!("{error:?}")))
+    } else if mode == SelectionMode::Subtract {
+        Err(PixelEditError("뺄 선택 영역이 없습니다.".into()))
+    } else {
+        Ok(incoming)
+    }
+}
+
+fn fill_error(error: &nyatidraw_paint_cpu::EditError) -> PixelEditError {
+    use nyatidraw_paint_cpu::EditError;
+    let message = match error {
+        EditError::MissingReference => {
+            "참조 레이어가 없습니다. 선화에 참조 표시를 켜거나 '다른 레이어도 참조'를 선택하세요."
+        }
+        EditError::InvalidSeed => {
+            "이 위치는 채울 수 없습니다. 선택 영역 안을 누르거나 틈 닫기 값을 낮춰보세요."
+        }
+        EditError::LimitExceeded => {
+            "채울 범위가 너무 큽니다. 올가미나 사각형으로 범위를 제한한 뒤 다시 채워주세요. 그림은 변경하지 않았습니다."
+        }
+        _ => return PixelEditError(format!("{error:?}")),
+    };
+    PixelEditError(message.into())
 }
 
 fn translated_selection(

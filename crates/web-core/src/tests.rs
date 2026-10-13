@@ -34,20 +34,26 @@ fn malicious_records() -> Vec<Vec<u8>> {
         .unwrap()
         .encode_portable()
         .unwrap();
+    assert_eq!(fixture[175], 0, "fixture has no color effect");
+    assert_eq!(&fixture[176..180], &1_u32.to_le_bytes(), "one tile");
+    assert_eq!(fixture[204], 1, "fixture uses run encoding");
+    assert_eq!(&fixture[205..209], &12_u32.to_le_bytes(), "two runs");
+    assert_eq!(&fixture[209..211], &1_u16.to_le_bytes(), "one opaque pixel");
     [
         (20, vec![5]),
         (29, f32::NAN.to_bits().to_le_bytes().to_vec()),
         (41, vec![2]),
         (104, u128::MAX.to_le_bytes().to_vec()),
         (124, u128::MAX.to_le_bytes().to_vec()),
-        (175, 1025_u32.to_le_bytes().to_vec()),
-        (179, 99_u128.to_le_bytes().to_vec()),
-        (195, i32::MIN.to_le_bytes().to_vec()),
-        (203, vec![2]),
-        (204, 65_537_u32.to_le_bytes().to_vec()),
-        (208, 0_u16.to_le_bytes().to_vec()),
-        (208, 16_385_u16.to_le_bytes().to_vec()),
-        (210, vec![255, 255, 255, 0]),
+        (175, vec![2]),
+        (176, 1025_u32.to_le_bytes().to_vec()),
+        (180, 99_u128.to_le_bytes().to_vec()),
+        (196, i32::MIN.to_le_bytes().to_vec()),
+        (204, vec![2]),
+        (205, 65_537_u32.to_le_bytes().to_vec()),
+        (209, 0_u16.to_le_bytes().to_vec()),
+        (209, 16_385_u16.to_le_bytes().to_vec()),
+        (211, vec![255, 255, 255, 0]),
     ]
     .into_iter()
     .map(|(offset, replacement)| mutate_record(&fixture, offset, &replacement))
@@ -181,7 +187,7 @@ fn portable_round_trip_keeps_pixels_layers_preferences_and_rejects_damage_atomic
     for (offset, value) in [(8, 0_u32), (8, 4097), (120, u32::MAX)] {
         invalid.push(mutate_record(&bytes, offset, &value.to_le_bytes()));
     }
-    invalid.push(mutate_record(&bytes, 175, &1_u128.to_le_bytes()));
+    invalid.push(mutate_record(&bytes, 176, &1_u128.to_le_bytes()));
     invalid.extend(malicious_records());
     for bytes in invalid {
         assert!(WebDocument::decode_portable(&bytes).is_err());
@@ -189,6 +195,77 @@ fn portable_round_trip_keeps_pixels_layers_preferences_and_rejects_damage_atomic
     }
     assert!(WebDocument::import_rgba8(u32::MAX, 1, &[]).is_err());
     assert!(WebDocument::import_rgba8(2, 2, &[0; 15]).is_err());
+}
+
+#[test]
+fn layer_color_metadata_preserves_raw_artwork_history_and_portable_recovery() {
+    // Risk: display colorization overwrites pixels or loses its settings during undo/recovery.
+    use nyatidraw_api::LayerCommand;
+    for enabled in [true, false] {
+        let mut document = WebDocument::import_rgba8(
+            4,
+            1,
+            &[
+                0, 0, 0, 255, 255, 255, 255, 255, 128, 128, 128, 128, 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+        let layer = document.active_layer();
+        let original = document.snapshot().clone();
+        let original_export = document.export_rgba8().unwrap();
+        let effect = LayerColorEffect {
+            enabled,
+            dark_rgb: [24, 80, 210],
+            light_rgb: [245, 220, 190],
+        };
+        let command = LayerCommand::SetColorEffect {
+            layer,
+            effect: Some(effect),
+        };
+        let update = document.apply_layer_command(command.clone()).unwrap();
+        assert!(update.committed && update.structure_changed);
+        assert_eq!(document.history_len(), 1);
+        assert_eq!(document.snapshot(), &original);
+        assert!(!document.apply_layer_command(command).unwrap().committed);
+        assert_eq!(document.history_len(), 1);
+        let colorized = document.export_rgba8().unwrap();
+        assert_eq!(colorized == original_export, !enabled);
+        assert_eq!(colorized[3], original_export[3]);
+        assert_eq!(colorized[11], original_export[11]);
+        document.undo().unwrap();
+        assert_eq!(document.layers().raster(layer).unwrap().color_effect, None);
+        assert_eq!(document.export_rgba8().unwrap(), original_export);
+        document.redo().unwrap();
+        let portable = document.encode_portable().unwrap();
+        assert_eq!(portable[175], 1, "effect metadata is present");
+        assert_eq!(portable[176], u8::from(enabled));
+        assert!(WebDocument::decode_portable(&mutate_record(&portable, 176, &[2])).is_err());
+        let reopened = WebDocument::decode_portable(&portable).unwrap();
+        assert_eq!(
+            reopened.layers().raster(layer).unwrap().color_effect,
+            Some(effect)
+        );
+        assert_eq!(reopened.snapshot(), &original);
+        assert_eq!(reopened.export_rgba8().unwrap(), colorized);
+    }
+
+    let original = WebDocument::import_rgba8(1, 1, &[255; 4]).unwrap();
+    let mut legacy = original.encode_portable().unwrap();
+    legacy.truncate(legacy.len() - 32);
+    assert_eq!(legacy.remove(175), 0);
+    legacy[..8].copy_from_slice(b"NYWEB001");
+    let hash = blake3::hash(&legacy);
+    legacy.extend_from_slice(hash.as_bytes());
+    let reopened = WebDocument::decode_portable(&legacy).unwrap();
+    assert_eq!(reopened.snapshot(), original.snapshot());
+    assert_eq!(
+        reopened
+            .layers()
+            .raster(original.active_layer())
+            .unwrap()
+            .color_effect,
+        None
+    );
 }
 
 #[test]
@@ -292,6 +369,207 @@ fn shared_selection_fill_and_transform_preserve_undo_and_cancelled_artwork() {
 }
 
 #[test]
+fn inserting_import_or_duplicate_cannot_rebind_existing_clipped_artwork() {
+    use nyatidraw_api::{
+        EditCommand as E, LayerCommand as L, LayerTreeNodeId as N, RasterImport,
+        TransformCommand as T,
+    };
+    let mut pixels = vec![0; 16 * 4];
+    pixels[..4].copy_from_slice(&[255, 0, 0, 255]);
+    let mut doc = WebDocument::import_rgba8(16, 1, &pixels).unwrap();
+    let base = doc.active_layer();
+    doc.apply_layer_command(L::AddRaster).unwrap();
+    let clip = doc.active_layer();
+    doc.apply_edit(E::SelectAll).unwrap();
+    doc.apply_edit(E::FillSelection {
+        color: [0, 0, 255, 255],
+    })
+    .unwrap();
+    doc.apply_layer_command(L::SetClipToBelow {
+        node: N::Raster(clip),
+        clip_to_below: true,
+    })
+    .unwrap();
+    doc.set_active_layer(base).unwrap();
+    let expected = doc.export_rgba8().unwrap()[..4].to_vec();
+    for duplicate in [false, true] {
+        if duplicate {
+            doc.apply_layer_command(L::DuplicateRaster(base)).unwrap();
+            doc.apply_edit(E::ClearActiveLayer).unwrap();
+        } else {
+            doc.apply_edit(E::FreeTransform(T::ImportRaster(RasterImport {
+                project_epoch: 1,
+                name: "image".into(),
+                size: [1, 1],
+                pixels: std::sync::Arc::from([0, 255, 0, 255]),
+            })))
+            .unwrap();
+            let preview = nyatidraw_paint_cpu::flatten_layer_tree_rgba8(
+                doc.display_snapshot(),
+                doc.display_layers(),
+                doc.canvas(),
+            )
+            .unwrap();
+            assert_eq!(&preview.pixels[..4], &[0, 0, 255, 255]);
+            let generation = doc.transform_projection().unwrap().generation;
+            doc.apply_edit(E::FreeTransform(T::Commit { generation }))
+                .unwrap();
+        }
+        assert_eq!(&doc.export_rgba8().unwrap()[..4], expected.as_slice());
+        doc.undo().unwrap();
+        if duplicate {
+            doc.undo().unwrap();
+        }
+        doc.set_active_layer(base).unwrap();
+    }
+}
+
+#[test]
+fn image_import_preserves_page_clipboard_and_cancel_then_commits_one_undo() {
+    use nyatidraw_api::{EditCommand as E, RasterImport, TransformCommand as T};
+    let mut doc = WebDocument::import_rgba8(2, 2, &[255, 0, 0, 255].repeat(4)).unwrap();
+    doc.apply_edit(E::SelectAll).unwrap();
+    doc.apply_edit(E::CopySelection).unwrap();
+    let clipboard = doc.clipboard.0.clone();
+    let before = doc.snapshot().clone();
+    let tree = doc.layers().clone();
+    let canvas = doc.canvas();
+    let selection = doc.selection().cloned();
+    let history = doc.undo_len();
+    let import = RasterImport {
+        project_epoch: 1,
+        name: "외부 PNG".into(),
+        size: [4, 2],
+        pixels: std::sync::Arc::from([0, 80, 0, 128].repeat(8)),
+    };
+    let mut invalid = import.clone();
+    invalid.size = [u32::MAX, u32::MAX];
+    assert!(
+        doc.apply_edit(E::FreeTransform(T::ImportRaster(invalid)))
+            .is_err()
+    );
+    for cancel in [true, false] {
+        doc.apply_edit(E::FreeTransform(T::ImportRaster(import.clone())))
+            .unwrap();
+        assert_eq!(
+            doc.snapshot(),
+            &before,
+            "unconfirmed import must stay out of autosave"
+        );
+        assert_eq!(doc.layers(), &tree);
+        assert_eq!(doc.transform_projection().unwrap().origin, [-1, 0]);
+        assert_eq!(doc.canvas(), canvas);
+        assert_eq!(doc.clipboard.0, clipboard);
+        if cancel {
+            doc.apply_edit(E::FreeTransform(T::Cancel)).unwrap();
+            assert_eq!(doc.selection(), selection.as_ref());
+            assert_eq!(doc.undo_len(), history);
+        } else {
+            let generation = doc.transform_projection().unwrap().generation;
+            doc.apply_edit(E::FreeTransform(T::Commit { generation }))
+                .unwrap();
+            assert_eq!(doc.undo_len(), history + 1);
+            assert_ne!(doc.snapshot(), &before);
+            assert_eq!(
+                doc.layers().raster(doc.active_layer()).unwrap().name,
+                "외부 PNG"
+            );
+            doc.undo().unwrap();
+            assert_eq!(doc.snapshot(), &before);
+            assert_eq!(doc.layers(), &tree);
+        }
+    }
+}
+
+#[test]
+fn color_preview_never_enters_saved_artwork_and_confirmation_is_one_reversible_edit() {
+    // Risk: previews leak into save/history or committed color leaves composite readers stale.
+    use nyatidraw_api::{ColorAdjustment, ColorAdjustmentCommand as C, EditCommand as E};
+    let mut doc = WebDocument::import_rgba8(2, 1, &[255, 0, 0, 255, 60, 100, 160, 128]).unwrap();
+    let original = doc.snapshot().clone();
+    let original_history = doc.undo_len();
+    let hue = ColorAdjustment {
+        hue_degrees: 120,
+        ..Default::default()
+    };
+    assert!(
+        !doc.apply_edit(E::ColorAdjustment(C::Begin))
+            .unwrap()
+            .changed
+    );
+    assert!(
+        !doc.apply_edit(E::ColorAdjustment(C::Preview(hue)))
+            .unwrap()
+            .changed
+    );
+    let preview = doc.display_snapshot().clone();
+    let generation = doc.color_adjustment_projection().unwrap().generation;
+    assert_ne!(preview, original);
+    assert_eq!(doc.snapshot(), &original);
+    assert_eq!(doc.undo_len(), original_history);
+    assert!(doc.apply_edit(E::ClearActiveLayer).is_err());
+    assert!(doc.undo().is_err());
+    assert!(
+        doc.apply_edit(E::ColorAdjustment(C::Commit {
+            generation: generation - 1
+        }))
+        .is_err()
+    );
+    doc.apply_edit(E::ColorAdjustment(C::Preview(hue))).unwrap();
+    assert_eq!(
+        doc.display_snapshot(),
+        &preview,
+        "preview must restart from pinned original"
+    );
+    doc.apply_edit(E::ColorAdjustment(C::Preview(ColorAdjustment::default())))
+        .unwrap();
+    assert_eq!(doc.display_snapshot(), &original);
+    assert!(
+        !doc.apply_edit(E::ColorAdjustment(C::Cancel))
+            .unwrap()
+            .changed
+    );
+    assert_eq!(doc.snapshot(), &original);
+    assert_eq!(doc.undo_len(), original_history);
+    doc.apply_edit(E::ColorAdjustment(C::Begin)).unwrap();
+    doc.apply_edit(E::ColorAdjustment(C::Preview(hue))).unwrap();
+    assert!(
+        doc.apply_edit(E::ColorAdjustment(C::Preview(ColorAdjustment {
+            hue_degrees: 181,
+            ..Default::default()
+        })))
+        .is_err()
+    );
+    let invalid = doc.color_adjustment_projection().unwrap();
+    assert!(!invalid.can_commit);
+    assert!(
+        doc.apply_edit(E::ColorAdjustment(C::Commit {
+            generation: invalid.generation
+        }))
+        .is_err()
+    );
+    doc.apply_edit(E::ColorAdjustment(C::Preview(hue))).unwrap();
+    let generation = doc.color_adjustment_projection().unwrap().generation;
+    let committed = doc
+        .apply_edit(E::ColorAdjustment(C::Commit { generation }))
+        .unwrap();
+    assert!(committed.changed && committed.committed);
+    assert_eq!(doc.snapshot(), &preview);
+    assert_eq!(doc.undo_len(), original_history + 1);
+    doc.undo().unwrap();
+    assert_eq!(doc.snapshot(), &original);
+    doc.redo().unwrap();
+    assert_eq!(doc.snapshot(), &preview);
+    doc.apply_edit(E::ColorAdjustment(C::Begin)).unwrap();
+    let generation = doc.color_adjustment_projection().unwrap().generation;
+    let neutral = doc
+        .apply_edit(E::ColorAdjustment(C::Commit { generation }))
+        .unwrap();
+    assert!(!neutral.changed && !neutral.committed);
+    assert_eq!(doc.undo_len(), original_history + 1);
+}
+
+#[test]
 fn direct_artwork_move_preserves_off_page_pixels_and_undo_as_one_edit() {
     use nyatidraw_api::EditCommand as E;
     let mut doc = WebDocument::new(CanvasSpec {
@@ -351,6 +629,98 @@ fn direct_artwork_move_preserves_off_page_pixels_and_undo_as_one_edit() {
     let bytes = doc.encode_portable().unwrap();
     let reopened = WebDocument::decode_portable(&bytes).unwrap();
     assert_eq!(reopened.snapshot(), &moved);
+}
+
+#[test]
+fn hidden_or_locked_fill_targets_preserve_artwork_selection_and_undo() {
+    use nyatidraw_api::{EditCommand as E, EditSource, FillSettings, GroupId};
+    use nyatidraw_document::GroupNode;
+
+    for (layer_visible, parent_visible, ancestor_visible, locked) in [
+        (false, true, true, false),
+        (true, false, true, false),
+        (true, true, false, false),
+        (true, true, true, true),
+        (true, true, true, false),
+    ] {
+        let mut doc = WebDocument::import_rgba8(8, 8, &[255; 8 * 8 * 4]).unwrap();
+        let mut root = doc.layers().root().clone();
+        let LayerTreeNode::Raster(layer) = &mut root.children[0] else {
+            panic!("fixture requires a raster");
+        };
+        layer.visible = layer_visible;
+        layer.locked = locked;
+        let parent = GroupNode {
+            id: GroupId(2),
+            name: "parent".into(),
+            visible: parent_visible,
+            opacity_u16: u16::MAX,
+            clip_to_below: false,
+            blend_mode: nyatidraw_api::LayerBlendMode::Normal,
+            children: std::mem::take(&mut root.children),
+        };
+        root.children = vec![LayerTreeNode::Group(GroupNode {
+            id: GroupId(3),
+            name: "ancestor".into(),
+            visible: ancestor_visible,
+            children: vec![LayerTreeNode::Group(parent.clone())],
+            ..parent
+        })];
+        doc.artwork.layers = LayerTree::new(root).unwrap();
+        doc.apply_edit(E::SelectLasso {
+            vertices: vec![[1, 1], [5, 1], [5, 5], [1, 5]],
+        })
+        .unwrap();
+        let before = doc.artwork.clone();
+        let selection = doc.selection.clone();
+        let color = [255, 0, 0, 255];
+        for command in [
+            E::FillSelection { color },
+            E::FloodFill {
+                seed: [2, 2],
+                tolerance: 0,
+                source: EditSource::ActiveLayer,
+                color,
+            },
+            E::FloodFillAdvanced {
+                seed: [2, 2],
+                tolerance: 0,
+                source: EditSource::ActiveLayer,
+                color,
+                settings: FillSettings::default(),
+            },
+            E::GradientSelection {
+                start: [1, 1],
+                end: [5, 5],
+                start_color: color,
+                end_color: [0, 0, 255, 255],
+            },
+        ] {
+            doc.selection = if matches!(command, E::FloodFill { .. }) {
+                None
+            } else {
+                selection.clone()
+            };
+            let current_selection = doc.selection.clone();
+            let history = doc.history_len();
+            let undo = doc.undo_len();
+            let result = doc.apply_edit(command);
+            if layer_visible && parent_visible && ancestor_visible && !locked {
+                assert!(result.unwrap().committed);
+                assert_ne!(doc.snapshot(), &before.tiles);
+                assert_eq!(doc.selection, current_selection);
+                assert_eq!(doc.undo_len(), undo + 1);
+                doc.undo().unwrap();
+                assert_eq!(doc.undo_len(), undo);
+                doc.selection.clone_from(&current_selection);
+            } else {
+                assert!(matches!(result, Err(WebError::EditRejected(_))));
+                assert_eq!(doc.history_len(), history);
+            }
+            assert_eq!(doc.artwork, before);
+            assert_eq!(doc.selection, current_selection);
+        }
+    }
 }
 
 #[test]

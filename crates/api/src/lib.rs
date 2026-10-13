@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod brush_presets;
 mod dock;
 mod protocol;
+pub use brush_presets::*;
 
 use std::collections::BTreeSet;
 
@@ -10,13 +12,15 @@ pub use dock::{
     DockNode, DockPosition, DockTree, PanelKind,
 };
 pub use protocol::{
-    AffineTransform, BrushSettings, CommandEnvelope, CommandRejectReason, DockCommand, DrawingTool,
+    AffineTransform, BrushSettings, ColorAdjustment, ColorAdjustmentCommand,
+    ColorAdjustmentProjection, CommandEnvelope, CommandRejectReason, DockCommand, DrawingTool,
     EditCommand, EditProjection, EditSettings, EditSource, EditorCommand, EditorEvent,
-    EventEnvelope, FillSettings, HISTORY_PROJECTION_MAX_ENTRIES, HistoryBranchProjection,
-    HistoryCommand, HistoryEntryProjection, HistoryOperationLabel, HistoryProjection,
-    LayerBlendMode, LayerCommand, LayerProjection, LayerProjectionKind, PencilTemplate,
-    ProjectCommand, RasterTransform, SelectionMode, ToolCommand, TransformCommand,
-    TransformProjection, UiProjection, ViewportCommand, ViewportProjection, WorkspaceProjection,
+    EventEnvelope, FillSettings, GradientMode, HISTORY_PROJECTION_MAX_ENTRIES,
+    HistoryBranchProjection, HistoryCommand, HistoryEntryProjection, HistoryOperationLabel,
+    HistoryProjection, LayerBlendMode, LayerColorEffect, LayerCommand, LayerProjection,
+    LayerProjectionKind, PencilTemplate, ProjectCommand, RasterImport, RasterTransform,
+    SelectionMode, ToolCommand, TransformCommand, TransformProjection, UiProjection,
+    ViewportCommand, ViewportProjection, WorkspaceProjection,
 };
 
 macro_rules! id_type {

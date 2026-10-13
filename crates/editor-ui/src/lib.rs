@@ -1,24 +1,28 @@
 mod host;
 pub use host::{ExportStatus, PalettePins, UiBackend, UiHost, UiSlots};
+mod brush_presets;
 mod brush_preview;
+mod color_adjustment_dialog;
 mod color_panel;
 mod color_picker;
 mod dock_drag;
+mod fill_panel;
 mod layer_drag;
 pub mod layout_codec;
 pub mod layout_store;
 mod page_panel;
 pub mod picker_loupe;
 pub mod preview;
+pub mod reference_panel;
 mod transform_panel;
 pub mod workspace_appearance;
 
 use dioxus::prelude::*;
 use nyatidraw_api::{
     CommandRejectReason, DockAxis, DockCommand, DockNode, DrawingTool, EditorCommand, EditorEvent,
-    EventEnvelope, GroupId, HistoryCommand, HistoryOperationLabel, LayerCommand, LayerId,
-    LayerProjection, LayerProjectionKind, LayerTreeNodeId, PanelKind, ProjectCommand, ToolCommand,
-    UiProjection, ViewportCommand, WorkspaceProjection,
+    EventEnvelope, GroupId, HistoryCommand, HistoryOperationLabel, LayerColorEffect, LayerCommand,
+    LayerId, LayerProjection, LayerProjectionKind, LayerTreeNodeId, PanelKind, ProjectCommand,
+    ToolCommand, UiProjection, ViewportCommand, WorkspaceProjection,
 };
 use nyatidraw_input::{CanvasInputMode, PressurePreset};
 use preview::LayerThumbnailFrame;
@@ -49,6 +53,7 @@ pub fn EditorChrome(
     let _ = host_update;
     let live_ink = use_context::<UiHost>();
     color_panel::use_palette_preferences(ui_projection);
+    reference_panel::provide_reference();
     dock_drag::use_dock_drag(live_ink.clone());
     use_context_provider(|| transform_panel::TransformPanelOpen(Signal::new(false)));
     let page_panel::PagePanelOpen(page_open) =
@@ -92,6 +97,13 @@ pub fn EditorChrome(
             },
             onkeydown: move |event| {
                 let key = event.key().to_string();
+                if ui_projection.read().edit.color_adjustment.is_some() {
+                    event.prevent_default(); event.stop_propagation();
+                    if key == "Escape" {
+                        let _ = shortcut_ink.push_ui_editor_command(EditorCommand::Edit(nyatidraw_api::EditCommand::ColorAdjustment(nyatidraw_api::ColorAdjustmentCommand::Cancel)));
+                    }
+                    return;
+                }
                 if page_shortcuts() {
                     if key == "Escape" { page_shortcuts.set(false); }
                     event.prevent_default(); event.stop_propagation(); return;
@@ -119,6 +131,7 @@ pub fn EditorChrome(
             if let Some(reason) = &edit.error { TransientNotice { key: "edit-{reason}", message: format!("편집 실패: {reason}") } }
             if let Some((command, reason)) = rejection { TransientNotice { key: "reject-{command.0}", message: reject_label(reason).to_owned() } }
             if page_open() { page_panel::PagePanel { ui_projection } }
+            if edit.color_adjustment.is_some() { color_adjustment_dialog::ColorAdjustmentDialog { ui_projection } }
             {overlays}
         }
     }
@@ -222,6 +235,8 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
     let reset_layout_ink = live_ink.clone();
     let mut menu_open = use_signal(|| false);
     let mut menu_settings = use_signal(|| false);
+    let correction_ink = live_ink.clone();
+    let correction_error = use_signal(|| None::<String>);
     let save_ink = live_ink.clone();
     let retry_ink = live_ink.clone();
     let undo_ink = live_ink.clone();
@@ -288,6 +303,12 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
                         FileButtons { extended: true }
                         span { class: "divider" }
                         ClipboardActions { ui_projection }
+                        button { class: "command", disabled: ui_projection.read().edit.busy || ui_projection.read().edit.transform.is_some() || ui_projection.read().edit.color_adjustment.is_some(),
+                            onclick: move |_| {
+                                menu_open.set(false);
+                                send_editor_command(&correction_ink, EditorCommand::Edit(nyatidraw_api::EditCommand::ColorAdjustment(nyatidraw_api::ColorAdjustmentCommand::Begin)), correction_error);
+                            }, "그림 색 보정…"
+                        }
                         span { class: "divider" }
                         button { class: "command", onclick: move |_| menu_settings.set(true), "환경설정" }
                         div { class: "menu-line-spacer" }
@@ -415,6 +436,9 @@ fn CanvasActions(ui_projection: Signal<UiProjection>) -> Element {
                         }
                     }, span { class: "command-label", "취소" } span { class: "shortcut", "Esc" }
                 }
+                if let Some(message) = error() {
+                    TransientNotice { key: "canvas-action-{message}", message }
+                }
     }
 }
 
@@ -445,7 +469,10 @@ fn ViewportActions(ui_projection: Signal<UiProjection>) -> Element {
     let mirror_ink = live_ink;
     let viewport = ui_projection.read().viewport;
     let zoom = viewport.zoom_ppm / 10_000;
-    let rotation = viewport.rotation_millidegrees / 1_000;
+    let rotation = f64::from(
+        (viewport.rotation_millidegrees.rem_euclid(360_000) + 180_000).rem_euclid(360_000)
+            - 180_000,
+    ) / 1_000.0;
     rsx! {
                 button { class: "command compact", title: "화면 맞춤", onclick: move |_| {
                     send_editor_command(&fit_ink, EditorCommand::Viewport(ViewportCommand::FitDocument), error);
@@ -457,12 +484,28 @@ fn ViewportActions(ui_projection: Signal<UiProjection>) -> Element {
                 button { class: "command compact", title: "확대", onclick: move |_| {
                     send_editor_command(&zoom_in_ink, EditorCommand::Viewport(ViewportCommand::ZoomSteps(1)), error);
                 }, UiIcon { name: "plus" } }
-                button { class: "command compact", title: "45도 회전", disabled: !rotate_ink.supports_command(&EditorCommand::Viewport(ViewportCommand::RotateQuarterSteps(1))), onclick: move |_| {
-                    send_editor_command(&rotate_ink, EditorCommand::Viewport(ViewportCommand::RotateQuarterSteps(1)), error);
-                }, UiIcon { name: "rotate" } }
-                button { class: "command compact toolbar-value", title: "회전 초기화 · 화면 중심과 확대 배율 유지", aria_label: "회전 초기화, 현재 {rotation}도", disabled: !reset_ink.supports_command(&EditorCommand::Viewport(ViewportCommand::ResetRotation)),
+                label { class: "viewport-angle", title: "보기 회전 · 각도 입력 또는 Shift+Space+좌우 드래그",
+                    input { r#type: "number", step: "0.1", value: "{rotation}", aria_label: "보기 회전 각도",
+                        disabled: !rotate_ink.supports_command(&EditorCommand::Viewport(ViewportCommand::SetRotationMillidegrees(0))),
+                        onkeydown: move |event| {
+                            event.stop_propagation();
+                            if event.key() == Key::Enter {
+                                focus_editor_shortcuts();
+                            }
+                        },
+                        onchange: move |event| {
+                            if let Ok(degrees) = event.value().parse::<f64>() && degrees.is_finite() {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let angle = (degrees.rem_euclid(360.0) * 1_000.0).round() as i32;
+                                send_editor_command(&rotate_ink, EditorCommand::Viewport(ViewportCommand::SetRotationMillidegrees(angle)), error);
+                            }
+                        }
+                    }
+                    span { "°" }
+                }
+                button { class: "command compact", title: "회전 초기화 · 화면 중심과 확대 배율 유지", aria_label: "보기 회전 0도로 초기화", disabled: !reset_ink.supports_command(&EditorCommand::Viewport(ViewportCommand::ResetRotation)),
                     onclick: move |_| send_editor_command(&reset_ink, EditorCommand::Viewport(ViewportCommand::ResetRotation), error),
-                    "{rotation}°"
+                    "0°"
                 }
                 button { class: "command compact", title: "보기 좌우 반전 · 그림과 PNG는 바뀌지 않습니다", aria_label: "보기 좌우 반전", aria_pressed: "{viewport.mirrored_horizontal}", disabled: !mirror_ink.supports_command(&EditorCommand::Viewport(ViewportCommand::ToggleMirrorHorizontal)),
                     onclick: move |_| send_editor_command(&mirror_ink, EditorCommand::Viewport(ViewportCommand::ToggleMirrorHorizontal), error),
@@ -887,6 +930,12 @@ fn BrushPanel(ui_projection: Signal<UiProjection>) -> Element {
     let error = use_signal(|| Option::<String>::None);
     let tool = ui_projection.read().drawing_tool;
     let pencil_template = ui_projection.read().pencil_template;
+    let current_brush = nyatidraw_api::BrushPresetValues::from_projection(&ui_projection.read());
+    let named_active = ui_projection
+        .read()
+        .brush_presets
+        .iter()
+        .any(|p| p.values.matches(current_brush));
     let name = match tool {
         DrawingTool::Pencil => "기본 연필",
         DrawingTool::Pen => "기본 펜",
@@ -909,17 +958,22 @@ fn BrushPanel(ui_projection: Signal<UiProjection>) -> Element {
                     (nyatidraw_api::PencilTemplate::Mechanical2H, "2H 샤프펜슬"),
                     (nyatidraw_api::PencilTemplate::Graphite2B, "2B 연필"),
                 ] {
-                    button { class: if template == pencil_template { "subtool selected" } else { "subtool" },
-                        title: name, aria_pressed: template == pencil_template,
+                    button { class: if template == pencil_template && !named_active { "subtool selected" } else { "subtool" },
+                        title: name, aria_pressed: template == pencil_template && !named_active,
                         onclick: { let ink = live_ink.clone(); move |_| send_editor_command(&ink, EditorCommand::Tool(ToolCommand::SelectPencilTemplate(template)), error) },
                         span { class: "subtool-name", "{name}" }
                     }
                 }
+            } else if tool == DrawingTool::Fill {
+                fill_panel::FillSubtools { ui_projection }
             } else {
-            SubtoolButton { name, tool: Some(tool), active: true }
+            SubtoolButton { name, tool: Some(tool), active: !named_active }
             }
             if tool == DrawingTool::MoveSelection {
                 button { class: "subtool unavailable", disabled: true, "메시 변형 · 준비 중" }
+            }
+            if matches!(tool, DrawingTool::Pencil | DrawingTool::Pen | DrawingTool::Brush | DrawingTool::Eraser) {
+                brush_presets::BrushPresets { ui_projection }
             }
         }
     }
@@ -934,6 +988,9 @@ fn ToolPropertiesPanel(ui_projection: Signal<UiProjection>) -> Element {
     }
     if ui_projection.read().drawing_tool == DrawingTool::MoveArtwork {
         return rsx! { MoveArtworkPanel { ui_projection } };
+    }
+    if ui_projection.read().drawing_tool == DrawingTool::Fill {
+        return rsx! { fill_panel::FillProperties { ui_projection } };
     }
     if ui_projection.read().drawing_tool.is_edit() {
         return rsx! { EditToolPanel { ui_projection } };
@@ -1213,6 +1270,7 @@ fn EditToolPanel(ui_projection: Signal<UiProjection>) -> Element {
     let tolerance_ink = live_ink.clone();
     let tolerance_number_ink = live_ink.clone();
     let mode_ink = live_ink.clone();
+    let gradient_ink = live_ink.clone();
     let error = use_signal(|| Option::<String>::None);
     let settings = ui_projection.read().edit_settings;
     let tool = ui_projection.read().drawing_tool;
@@ -1228,11 +1286,29 @@ fn EditToolPanel(ui_projection: Signal<UiProjection>) -> Element {
         DrawingTool::MoveSelection => "끌어 변형을 미리 보고 Enter로 확정, Esc로 취소합니다.",
         DrawingTool::Eyedropper => "그림에서 색을 가져옵니다. 투명한 픽셀은 현재 색을 유지합니다.",
         DrawingTool::Fill => "클릭한 연결 영역을 채웁니다. 선택이 있으면 그 안에서만 채웁니다.",
-        _ => "선택 영역에서 끌어 현재 색 → 투명 그라데이션을 만듭니다.",
+        _ => "끌어 두 색을 연결합니다. 선택이 없으면 출력 페이지 전체에 칠합니다.",
     };
     rsx! {
         div { class: "edit-tool-properties", "aria-description": help,
-            if matches!(tool, DrawingTool::Lasso | DrawingTool::RectangleSelection) {
+            if tool == DrawingTool::Gradient {
+                label { "색 연결"
+                    select { aria_label: "그라데이션 색 연결",
+                        value: match settings.gradient_mode {
+                            nyatidraw_api::GradientMode::ForegroundToTransparent => "transparent",
+                            nyatidraw_api::GradientMode::ForegroundToBackground => "background",
+                        },
+                        onchange: move |event| {
+                            let mode = if event.value() == "background" { nyatidraw_api::GradientMode::ForegroundToBackground }
+                                else { nyatidraw_api::GradientMode::ForegroundToTransparent };
+                            send_editor_command(&gradient_ink, EditorCommand::Tool(ToolCommand::SetGradientMode(mode)), error);
+                        },
+                        option { value: "transparent", "전경색 → 투명" }
+                        option { value: "background", "전경색 → 배경색" }
+                    }
+                }
+                p { class: "transform-help", "선택 안에 칠하기 · 선택이 없으면 페이지 전체. 배경색은 색 패널에서 X로 교환해 바꿉니다." }
+            }
+            if matches!(tool, DrawingTool::Lasso | DrawingTool::RectangleSelection | DrawingTool::Wand) {
                 select { aria_label: "선택 조합",
                     value: match settings.selection_mode {
                         nyatidraw_api::SelectionMode::Replace => "replace",
@@ -1255,7 +1331,7 @@ fn EditToolPanel(ui_projection: Signal<UiProjection>) -> Element {
             if matches!(tool, DrawingTool::Lasso | DrawingTool::RectangleSelection | DrawingTool::Wand | DrawingTool::MoveSelection) {
                 SelectionActions { ui_projection }
             }
-            if matches!(tool, DrawingTool::Wand | DrawingTool::Fill | DrawingTool::Eyedropper) {
+            if matches!(tool, DrawingTool::Wand | DrawingTool::Eyedropper) {
                 label { "참조 범위"
                     select { value: source, aria_label: "선택 참조 범위",
                         onchange: move |event| {
@@ -1282,44 +1358,6 @@ fn EditToolPanel(ui_projection: Signal<UiProjection>) -> Element {
                     }
                 } }
             }
-            if tool == DrawingTool::Fill { FillBoundaryControls { ui_projection } }
-        }
-    }
-}
-
-#[component]
-fn FillBoundaryControls(ui_projection: Signal<UiProjection>) -> Element {
-    let live_ink = use_context::<UiHost>();
-    let gap_ink = live_ink.clone();
-    let expand_ink = live_ink.clone();
-    let error = use_signal(|| Option::<String>::None);
-    let fill = ui_projection.read().edit_settings.fill;
-    rsx! {
-        label { class: "property-row", title: "참조 경계의 형태학적 닫기 반경입니다. 0은 끄기이며, 같은 폭의 모든 틈을 막는다는 뜻은 아닙니다.",
-            span { "틈 닫기" }
-            EditNumberInput { value: fill.gap_close_px, min: 0, max: 8, label: "틈 닫기 반경 문서 픽셀",
-                on_commit: move |value| {
-                    send_editor_command(&gap_ink, EditorCommand::Tool(ToolCommand::SetFillGapClose(value)), error);
-                }
-            }
-            span { "px" }
-        }
-        label { class: "property-row", title: "선 경계 안쪽으로 맨해튼 거리 기준으로 받쳐 칠합니다. 다른 연결 영역이나 현재 선택 밖으로는 넘어가지 않습니다.",
-            span { "채우기 확장" }
-            EditNumberInput { value: fill.expand_px, min: 0, max: 64, label: "채우기 확장 문서 픽셀",
-                on_commit: move |value| {
-                    send_editor_command(&expand_ink, EditorCommand::Tool(ToolCommand::SetFillExpansion(value)), error);
-                }
-            }
-            span { "px" }
-        }
-        label { style: "display:flex;align-items:center;gap:5px", title: "참조 선 아래를 최소 한 픽셀 받쳐 칠해 반투명 경계의 빈틈을 줄입니다. 초과 샘플링은 하지 않습니다.",
-            input { r#type: "checkbox", style: "width:auto", checked: fill.antialias, aria_label: "채우기 경계 안티앨리어싱",
-                onchange: move |event| {
-                    send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::SetFillAntialias(event.checked())), error);
-                }
-            }
-            "AA 경계 받침"
         }
     }
 }
@@ -1375,6 +1413,7 @@ fn EditNumberInput(
     max: u8,
     label: String,
     on_commit: EventHandler<u8>,
+    #[props(default)] disabled: bool,
 ) -> Element {
     let mut draft = use_signal(|| value.to_string());
     let mut editing = use_signal(|| false);
@@ -1384,10 +1423,15 @@ fn EditNumberInput(
         }
     }));
     rsx! {
-        input { class: "property-number", r#type: "number", min: "{min}", max: "{max}", step: "1", value: "{draft}", aria_label: "{label}",
+        input { class: "property-number", r#type: "number", min: "{min}", max: "{max}", step: "1", value: "{draft}", aria_label: "{label}", disabled,
             onfocus: move |_| editing.set(true),
             oninput: move |event| draft.set(event.value()),
             onblur: move |_| {
+                if disabled {
+                    draft.set(value.to_string());
+                    editing.set(false);
+                    return;
+                }
                 let parsed = draft().trim().parse::<i64>().unwrap_or_else(|error| match error.kind() {
                     std::num::IntErrorKind::PosOverflow => i64::MAX,
                     std::num::IntErrorKind::NegOverflow => i64::MIN,
@@ -1448,6 +1492,22 @@ fn OpacityControl(percent: u32) -> Element {
 
 #[component]
 fn NavigatorPanel(ui_projection: Signal<UiProjection>) -> Element {
+    let reference = use_context::<reference_panel::ReferenceState>();
+    let show_reference = reference.show_reference();
+    rsx! {
+        div { class: "navigator-subviews",
+            div { class: "navigator-tabs",
+                button { aria_pressed: "{!show_reference}", onclick: move |_| reference.select(false), "내비게이터" }
+                button { aria_pressed: "{show_reference}", onclick: move |_| reference.select(true), "참조" }
+            }
+            if show_reference { reference_panel::ReferencePanel {} }
+            else { DocumentNavigatorPanel { ui_projection } }
+        }
+    }
+}
+
+#[component]
+fn DocumentNavigatorPanel(ui_projection: Signal<UiProjection>) -> Element {
     let live_ink = use_context::<UiHost>();
     let fit_ink = live_ink.clone();
     let actual_ink = live_ink.clone();
@@ -1671,9 +1731,13 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
                 button { title: "래스터 레이어 추가", onclick: move |_| {
                     send_editor_command(&add_raster_ink, EditorCommand::Layer(LayerCommand::AddRaster), error);
                 }, UiIcon { name: "plus" } }
-                button { title: "선택 래스터 레이어 복제", disabled: active.is_none() || group_settings().is_some() || active.is_some_and(|layer| !duplicate_ink.supports_command(&EditorCommand::Layer(LayerCommand::DuplicateRaster(layer)))), onclick: move |_| {
-                    if let Some(layer) = active {
-                        send_editor_command(&duplicate_ink, EditorCommand::Layer(LayerCommand::DuplicateRaster(layer)), error);
+                button { title: "선택 레이어 또는 그룹 전체 복제", disabled: settings_id.is_none(), onclick: move |_| {
+                    if let Some(node) = settings_id {
+                        let command = match node {
+                            LayerTreeNodeId::Raster(layer) => LayerCommand::DuplicateRaster(layer),
+                            LayerTreeNodeId::Group(group) => LayerCommand::DuplicateGroup(group),
+                        };
+                        send_editor_command(&duplicate_ink, EditorCommand::Layer(command), error);
                     }
                 }, UiIcon { name: "copy" } }
                 button { title: "그룹 추가", disabled: !add_group_ink.supports_command(&EditorCommand::Layer(LayerCommand::AddGroup)), onclick: move |_| {
@@ -1841,6 +1905,7 @@ fn LayerRow(
                     if layer.alpha_locked { "α · " }
                     if layer.clip_to_below { "↳ · " }
                     if layer.blend_mode == nyatidraw_api::LayerBlendMode::Multiply { "곱하기 · " }
+                    if layer.color_effect.is_some_and(|effect| effect.enabled) { "색상화 · " }
                     if is_group { "그룹 · " }
                     "{opacity}%"
                 }
@@ -1862,7 +1927,11 @@ fn LayerStyleControls(layer: LayerProjection, error: Signal<Option<String>>) -> 
     let clip_ink = live_ink.clone();
     let reference_ink = live_ink.clone();
     let lock_ink = live_ink.clone();
+    let color_ink = live_ink.clone();
     let id = layer.id;
+    let color_effect = layer.color_effect.unwrap_or_default();
+    let color_enabled = layer.color_effect.is_some_and(|effect| effect.enabled);
+    let color_hex = layer_color_hex(color_effect.dark_rgb);
     rsx! { div { class: "layer-style-controls", aria_label: "{layer.name} 합성 설정",
         div { class: "layer-style-row",
         select { class: "layer-blend", disabled: !live_ink.supports_command(&EditorCommand::Layer(LayerCommand::SetBlendMode { node: id, blend_mode: layer.blend_mode })), aria_label: "레이어 합성 모드", title: "{layer.name} 합성 모드",
@@ -1894,11 +1963,86 @@ fn LayerStyleControls(layer: LayerProjection, error: Signal<Option<String>>) -> 
                 UiIcon { name: "reference" }
             }
         }
-        button { class: "unavailable", disabled: true, title: "레이어 색상화 · 준비 중", aria_label: "레이어 색상화 · 준비 중", span { class: "layer-color-chip" } }
+        if let LayerTreeNodeId::Raster(layer_id) = id {
+            button { title: if color_enabled { "레이어 색상화 끄기 · 원본 픽셀 보존" } else { "레이어 색상화 · 검정/흰색을 지정색으로 표시" },
+                aria_label: "레이어 색상화", aria_pressed: "{color_enabled}",
+                disabled: !color_ink.supports_command(&EditorCommand::Layer(LayerCommand::SetColorEffect { layer: layer_id, effect: Some(color_effect) })),
+                onclick: move |_| send_editor_command(&color_ink, EditorCommand::Layer(LayerCommand::SetColorEffect {
+                    layer: layer_id, effect: Some(LayerColorEffect { enabled: !color_enabled, ..color_effect }),
+                }), error),
+                span { class: "layer-color-chip", style: "background:{color_hex}" }
+            }
+        } else {
+            button { disabled: true, title: "레이어 색상화는 래스터 레이어에서 사용할 수 있습니다", aria_label: "레이어 색상화 · 래스터 전용", span { class: "layer-color-chip" } }
+        }
         }
         }
         LayerOpacityControl { key: "{id:?}", node: id, opacity_u16: layer.opacity_u16, error }
+        if color_enabled && let LayerTreeNodeId::Raster(layer_id) = id {
+            LayerColorSwatches { layer: layer_id, effect: color_effect, error }
+        }
     } }
+}
+
+#[component]
+fn LayerColorSwatches(
+    layer: LayerId,
+    effect: LayerColorEffect,
+    error: Signal<Option<String>>,
+) -> Element {
+    let dark_ink = use_context::<UiHost>();
+    let light_ink = dark_ink.clone();
+    let disabled =
+        !dark_ink.supports_command(&EditorCommand::Layer(LayerCommand::SetColorEffect {
+            layer,
+            effect: Some(effect),
+        }));
+    let dark_hex = layer_color_hex(effect.dark_rgb);
+    let light_hex = layer_color_hex(effect.light_rgb);
+    rsx! {
+        div { class: "layer-color-swatches", role: "group", aria_label: "레이어 색상화 색",
+            label { "진한 색"
+                input { r#type: "color", value: "{dark_hex}", disabled,
+                    aria_label: "레이어 색상화 진한 색", title: "검정 픽셀에 적용할 색",
+                    onkeydown: move |event| event.stop_propagation(),
+                    onchange: move |event| {
+                        if let Some(dark_rgb) = parse_layer_color_hex(&event.value()) {
+                            send_editor_command(&dark_ink, EditorCommand::Layer(LayerCommand::SetColorEffect {
+                                layer, effect: Some(LayerColorEffect { dark_rgb, ..effect }),
+                            }), error);
+                        }
+                    },
+                }
+            }
+            label { "밝은 색"
+                input { r#type: "color", value: "{light_hex}", disabled,
+                    aria_label: "레이어 색상화 밝은 색", title: "흰색 픽셀에 적용할 색",
+                    onkeydown: move |event| event.stop_propagation(),
+                    onchange: move |event| {
+                        if let Some(light_rgb) = parse_layer_color_hex(&event.value()) {
+                            send_editor_command(&light_ink, EditorCommand::Layer(LayerCommand::SetColorEffect {
+                                layer, effect: Some(LayerColorEffect { light_rgb, ..effect }),
+                            }), error);
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+fn layer_color_hex([red, green, blue]: [u8; 3]) -> String {
+    format!("#{red:02x}{green:02x}{blue:02x}")
+}
+
+fn parse_layer_color_hex(value: &str) -> Option<[u8; 3]> {
+    if value.len() != 7 {
+        return None;
+    }
+    let [_, red, green, blue] = u32::from_str_radix(value.strip_prefix('#')?, 16)
+        .ok()?
+        .to_be_bytes();
+    Some([red, green, blue])
 }
 
 #[component]
@@ -1970,6 +2114,12 @@ fn SharedCanvas() -> Element {
 #[component]
 pub fn UiIcon(name: &'static str) -> Element {
     let paths: &[&str] = match name {
+        "file-plus" => &[
+            "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z",
+            "M14 2v6h6",
+            "M12 11v6",
+            "M9 14h6",
+        ],
         "folder" => &["M3 6h6l2 2h10v10H3z"],
         "save" => &["M5 3h12l2 2v16H5z", "M8 3v6h8V3", "M8 21v-7h8v7"],
         "undo" => &["M9 7 4 12l5 5", "M5 12h8a6 6 0 0 1 6 6"],

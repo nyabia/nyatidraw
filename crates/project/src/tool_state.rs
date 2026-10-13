@@ -1,10 +1,13 @@
 use nyatidraw_api::{
-    BrushSettings, DrawingTool, EditSettings, EditSource, FillSettings, PencilTemplate,
-    SelectionMode,
+    BrushSettings, DrawingTool, EditSettings, EditSource, FillSettings, GradientMode,
+    PencilTemplate, SelectionMode,
 };
 
-const MAGIC: &[u8; 8] = b"NYTOOL01";
-pub const EDITOR_TOOL_STATE_BYTES: usize = 85;
+const LEGACY_MAGIC: &[u8; 8] = b"NYTOOL01";
+const FILL_MAGIC: &[u8; 8] = b"NYTOOL02";
+const MAGIC: &[u8; 8] = b"NYTOOL03";
+const LEGACY_EDITOR_TOOL_STATE_BYTES: usize = 85;
+pub const EDITOR_TOOL_STATE_BYTES: usize = 88;
 const TOOLS: [DrawingTool; 13] = [
     DrawingTool::Move,
     DrawingTool::MoveSelection,
@@ -36,7 +39,7 @@ pub struct ProjectToolState {
     pub color: [u8; 4],
     pub background_color: [u8; 4],
     pub edit_settings: EditSettings,
-    /// Stable NYTOOL01 order: 2H pencil, pen, brush, eraser, 2B pencil.
+    /// Stable brush slot order: 2H pencil, pen, brush, eraser, 2B pencil.
     pub remembered: [ProjectBrushState; 5],
 }
 
@@ -93,6 +96,18 @@ pub fn encode_editor_tool_state(state: &ProjectToolState) -> Vec<u8> {
         bytes.extend_from_slice(&brush.settings.hardness_u16.to_le_bytes());
         bytes.push(brush.settings.smoothing);
     }
+    bytes.extend_from_slice(&[
+        match state.edit_settings.fill_source {
+            EditSource::ActiveLayer => 0,
+            EditSource::ReferenceLayers => 1,
+            EditSource::AllVisible => 2,
+        },
+        state.edit_settings.fill_tolerance,
+    ]);
+    bytes.push(match state.edit_settings.gradient_mode {
+        GradientMode::ForegroundToTransparent => 0,
+        GradientMode::ForegroundToBackground => 1,
+    });
     debug_assert_eq!(bytes.len(), EDITOR_TOOL_STATE_BYTES);
     bytes
 }
@@ -100,7 +115,12 @@ pub fn encode_editor_tool_state(state: &ProjectToolState) -> Vec<u8> {
 /// Unknown or malformed optional settings return `None`; retain their original bytes.
 #[must_use]
 pub fn decode_editor_tool_state(bytes: &[u8]) -> Option<ProjectToolState> {
-    if bytes.len() != EDITOR_TOOL_STATE_BYTES || !bytes.starts_with(MAGIC) {
+    let legacy = bytes.len() == LEGACY_EDITOR_TOOL_STATE_BYTES && bytes.starts_with(LEGACY_MAGIC);
+    let fill_version = bytes.len() == 87 && bytes.starts_with(FILL_MAGIC);
+    if !legacy
+        && !fill_version
+        && (bytes.len() != EDITOR_TOOL_STATE_BYTES || !bytes.starts_with(MAGIC))
+    {
         return None;
     }
     let tool = *TOOLS.get(usize::from(bytes[8]))?;
@@ -129,39 +149,78 @@ pub fn decode_editor_tool_state(bytes: &[u8]) -> Option<ProjectToolState> {
     if expected_slot.is_some_and(|slot| slot != last_painting_slot) {
         return None;
     }
-    let edit_settings = EditSettings {
-        source: match bytes[19] {
-            0 => EditSource::ActiveLayer,
-            1 => EditSource::ReferenceLayers,
-            2 => EditSource::AllVisible,
+    let edit_settings = decode_edit_settings(bytes, legacy)?;
+    let remembered = decode_brushes(bytes)?;
+    Some(ProjectToolState {
+        tool,
+        pencil_template,
+        last_painting_slot,
+        color,
+        background_color,
+        edit_settings,
+        remembered,
+    })
+}
+
+fn decode_edit_source(tag: u8) -> Option<EditSource> {
+    match tag {
+        0 => Some(EditSource::ActiveLayer),
+        1 => Some(EditSource::ReferenceLayers),
+        2 => Some(EditSource::AllVisible),
+        _ => None,
+    }
+}
+
+fn decode_edit_settings(bytes: &[u8], legacy: bool) -> Option<EditSettings> {
+    let source = decode_edit_source(bytes[19])?;
+    let tolerance = bytes[20];
+    let selection_mode = match bytes[21] {
+        0 => SelectionMode::Replace,
+        1 => SelectionMode::Add,
+        2 => SelectionMode::Subtract,
+        _ => return None,
+    };
+    let fill = FillSettings {
+        gap_close_px: bytes[22],
+        expand_px: bytes[23],
+        antialias: match bytes[24] {
+            0 => false,
+            1 => true,
             _ => return None,
-        },
-        tolerance: bytes[20],
-        selection_mode: match bytes[21] {
-            0 => SelectionMode::Replace,
-            1 => SelectionMode::Add,
-            2 => SelectionMode::Subtract,
-            _ => return None,
-        },
-        fill: FillSettings {
-            gap_close_px: bytes[22],
-            expand_px: bytes[23],
-            antialias: match bytes[24] {
-                0 => false,
-                1 => true,
-                _ => return None,
-            },
         },
     };
-    if edit_settings.fill.gap_close_px > 8 || edit_settings.fill.expand_px > 64 {
+    if fill.gap_close_px > 8 || fill.expand_px > 64 {
         return None;
     }
+    Some(EditSettings {
+        source,
+        tolerance,
+        fill_source: if legacy {
+            source
+        } else {
+            decode_edit_source(bytes[85])?
+        },
+        fill_tolerance: if legacy { tolerance } else { bytes[86] },
+        selection_mode,
+        gradient_mode: match bytes.get(87) {
+            None | Some(0) => GradientMode::ForegroundToTransparent,
+            Some(1) => GradientMode::ForegroundToBackground,
+            _ => return None,
+        },
+        fill,
+    })
+}
+
+fn decode_brushes(bytes: &[u8]) -> Option<[ProjectBrushState; 5]> {
     let mut remembered = [ProjectBrushState {
         size_tenths: 50,
         opacity_u16: u16::MAX,
         settings: BrushSettings::for_tool(DrawingTool::Pencil),
     }; 5];
-    for (slot, encoded) in remembered.iter_mut().zip(bytes[25..].chunks_exact(12)) {
+    for (slot, encoded) in remembered
+        .iter_mut()
+        .zip(bytes[25..LEGACY_EDITOR_TOOL_STATE_BYTES].chunks_exact(12))
+    {
         let number = |index| u16::from_le_bytes([encoded[index], encoded[index + 1]]);
         *slot = ProjectBrushState {
             size_tenths: number(0),
@@ -183,23 +242,14 @@ pub fn decode_editor_tool_state(bytes: &[u8]) -> Option<ProjectToolState> {
             return None;
         }
     }
-    Some(ProjectToolState {
-        tool,
-        pencil_template,
-        last_painting_slot,
-        color,
-        background_color,
-        edit_settings,
-        remembered,
-    })
+    Some(remembered)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn existing_tool_records_reopen_identically_and_unknown_records_are_not_rewritten() {
+    fn legacy_fixture() -> ([u8; LEGACY_EDITOR_TOOL_STATE_BYTES], ProjectToolState) {
         let fixture = [
             b'N', b'Y', b'T', b'O', b'O', b'L', b'0', b'1', 6, 1, 4, 21, 42, 63, 255, 65, 43, 21,
             255, 2, 37, 2, 8, 64, 1, 10, 0, 64, 156, 3, 152, 58, 88, 27, 0, 125, 37, 11, 0, 65,
@@ -216,7 +266,10 @@ mod tests {
             edit_settings: EditSettings {
                 source: EditSource::AllVisible,
                 tolerance: 37,
+                fill_source: EditSource::AllVisible,
+                fill_tolerance: 37,
                 selection_mode: SelectionMode::Subtract,
+                gradient_mode: GradientMode::ForegroundToTransparent,
                 fill: FillSettings {
                     gap_close_px: 8,
                     expand_px: 64,
@@ -236,9 +289,38 @@ mod tests {
                 },
             }),
         };
-        assert_eq!(fixture.len(), EDITOR_TOOL_STATE_BYTES);
+        (fixture, expected)
+    }
+
+    #[test]
+    fn legacy_fill_settings_migrate_without_changing_reference_or_tolerance() {
+        // Product risk: reopening an old project must not alter a bucket fill.
+        let (fixture, expected) = legacy_fixture();
         assert_eq!(decode_editor_tool_state(&fixture), Some(expected));
-        assert_eq!(encode_editor_tool_state(&expected), fixture);
+        let upgraded = encode_editor_tool_state(&expected);
+        assert_eq!(upgraded.len(), EDITOR_TOOL_STATE_BYTES);
+        assert_eq!(decode_editor_tool_state(&upgraded), Some(expected));
+        assert_eq!(&upgraded[8..85], &fixture[8..]);
+        let mut independent = expected;
+        independent.edit_settings.fill_source = EditSource::ReferenceLayers;
+        independent.edit_settings.fill_tolerance = 16;
+        let mut fill_version = encode_editor_tool_state(&independent);
+        fill_version.truncate(87);
+        fill_version[..8].copy_from_slice(FILL_MAGIC);
+        assert_eq!(decode_editor_tool_state(&fill_version), Some(independent));
+        independent.edit_settings.gradient_mode = GradientMode::ForegroundToBackground;
+        assert_eq!(
+            decode_editor_tool_state(&encode_editor_tool_state(&independent)),
+            Some(independent)
+        );
+    }
+
+    #[test]
+    fn malformed_tool_records_are_rejected_without_overwriting_unknown_data() {
+        // Product risk: malformed optional settings must not replace artwork or
+        // reinterpret a different brush preset when reopened.
+        let (fixture, expected) = legacy_fixture();
+        let upgraded = encode_editor_tool_state(&expected);
         for (index, value) in [
             (0, 0),
             (8, 255),
@@ -267,6 +349,12 @@ mod tests {
         let mut extended = fixture.to_vec();
         extended.push(0);
         assert!(decode_editor_tool_state(&extended).is_none());
+        let mut invalid_gradient = upgraded.clone();
+        invalid_gradient[87] = 2;
+        assert!(decode_editor_tool_state(&invalid_gradient).is_none());
+        let mut invalid_fill_source = upgraded;
+        invalid_fill_source[85] = 3;
+        assert!(decode_editor_tool_state(&invalid_fill_source).is_none());
         for tool in TOOLS {
             for template in [PencilTemplate::Mechanical2H, PencilTemplate::Graphite2B] {
                 for slot in 0..5 {

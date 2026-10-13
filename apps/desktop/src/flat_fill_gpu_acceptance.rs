@@ -12,7 +12,7 @@ const PAGE: CanvasSpec = CanvasSpec {
     pixels_per_inch: 96,
 };
 
-fn settle(canvas: &mut ActiveCanvas) {
+pub(super) fn settle(canvas: &mut ActiveCanvas) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         canvas.render(VIEW[0], VIEW[1], 1.0, 0);
@@ -95,7 +95,11 @@ fn pixel(snapshot: &TileSnapshot, layer: LayerId, [x, y]: [i32; 2]) -> [u8; 4] {
     })
 }
 
-fn compare_gpu(canvas: &ActiveCanvas, snapshot: &TileSnapshot, checked: &BTreeSet<TileKey>) {
+pub(super) fn compare_gpu(
+    canvas: &ActiveCanvas,
+    snapshot: &TileSnapshot,
+    checked: &BTreeSet<TileKey>,
+) {
     for &key in checked {
         let expected = snapshot.get(key).map_or(
             &TRANSPARENT_HISTORY_TILE[..],
@@ -121,7 +125,7 @@ fn compare_gpu(canvas: &ActiveCanvas, snapshot: &TileSnapshot, checked: &BTreeSe
     clippy::cast_sign_loss,
     reason = "Finite nonnegative display coordinates are range-checked before integer indexing"
 )]
-fn display_pixel(canvas: &ActiveCanvas, [x, y]: [i32; 2]) -> [u8; 4] {
+pub(super) fn display_pixel(canvas: &ActiveCanvas, [x, y]: [i32; 2]) -> [u8; 4] {
     let display = canvas.scene.readback_display().unwrap().unwrap();
     let point = canvas
         .view
@@ -139,7 +143,7 @@ fn display_pixel(canvas: &ActiveCanvas, [x, y]: [i32; 2]) -> [u8; 4] {
     display.pixels[offset..offset + 4].try_into().unwrap()
 }
 
-fn actual_pixels(canvas: &mut ActiveCanvas) {
+pub(super) fn actual_pixels(canvas: &mut ActiveCanvas) {
     canvas
         .apply_editor_command(
             EditorCommand::Viewport(ViewportCommand::ActualPixels),
@@ -296,6 +300,14 @@ fn actor_reference_fill_undo_redo_matches_gpu_and_reopened_artwork() {
     }
     canvas
         .apply_editor_command(
+            EditorCommand::Layer(LayerCommand::SetActive(LINE)),
+            VIEW[0],
+            VIEW[1],
+            1.0,
+        )
+        .unwrap();
+    canvas
+        .apply_editor_command(
             EditorCommand::Project(ProjectCommand::Save),
             VIEW[0],
             VIEW[1],
@@ -322,6 +334,11 @@ fn actor_reference_fill_undo_redo_matches_gpu_and_reopened_artwork() {
     drop(sink);
     let reopened_ink = LiveInkBridge::with_capacity(64, LIVE_LAYER);
     let mut reopened_canvas = ActiveCanvas::new(&device, &queue, &reopened_ink, &location).unwrap();
+    assert_eq!(reopened_canvas.active_layer, LINE);
+    assert_eq!(
+        reopened_canvas.projection.current().active_layer,
+        Some(LINE)
+    );
     settle(&mut reopened_canvas);
     actual_pixels(&mut reopened_canvas);
     assert_eq!(reopened_canvas.cpu_tiles, pixels(&after));

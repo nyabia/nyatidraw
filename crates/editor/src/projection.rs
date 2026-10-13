@@ -114,6 +114,15 @@ impl ProjectionState {
         self.current.brush_settings = settings;
     }
 
+    pub fn stage_brush_presets(
+        &mut self,
+        presets: &[nyatidraw_api::NamedBrushPreset],
+        writable: bool,
+    ) {
+        self.current.brush_presets = presets.to_vec();
+        self.current.brush_presets_writable = writable;
+    }
+
     pub fn stage_pencil_template(&mut self, template: nyatidraw_api::PencilTemplate) {
         self.current.pencil_template = template;
     }
@@ -241,6 +250,7 @@ pub fn project_children(group: &GroupNode, depth: u16, out: &mut Vec<LayerProjec
     for (index, child) in group.children.iter().enumerate().rev() {
         match child {
             LayerTreeNode::Raster(layer) => out.push(LayerProjection {
+                color_effect: layer.color_effect,
                 alpha_locked: layer.alpha_locked,
                 clip_to_below: layer.clip_to_below,
                 blend_mode: layer.blend_mode,
@@ -257,6 +267,7 @@ pub fn project_children(group: &GroupNode, depth: u16, out: &mut Vec<LayerProjec
             }),
             LayerTreeNode::Group(child_group) => {
                 out.push(LayerProjection {
+                    color_effect: None,
                     alpha_locked: false,
                     clip_to_below: child_group.clip_to_below,
                     blend_mode: child_group.blend_mode,

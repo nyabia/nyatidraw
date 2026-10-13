@@ -78,6 +78,7 @@ fn fill_gesture(has_selection: bool) -> EditCommand {
     };
     let settings = EditSettings {
         source: EditSource::ReferenceLayers,
+        fill_source: EditSource::ReferenceLayers,
         fill: FillSettings {
             gap_close_px: 1,
             expand_px: 1,
@@ -331,5 +332,242 @@ fn reference_fill_selection_undo_and_fresh_reopen_preserve_artwork() {
         .env(REOPEN, &path).env(EXPECTED_ROOT, format!("{:?}", after.root()))
         .status().unwrap().success());
     std::fs::remove_file(path.with_extension("png")).unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+fn alpha_locked_fixture() -> (LayerTree, TileSnapshot) {
+    let (mut tree, fixture) = fixture();
+    tree.set_alpha_locked(LIVE_LAYER, true).unwrap();
+    let key = TileKey::from_pixel(LIVE_LAYER, 128, 0, 0);
+    let mut target = fixture
+        .get(TileKey { layer: LINE, ..key })
+        .unwrap()
+        .pixels()
+        .to_vec();
+    for y in 10..22 {
+        for x in 10..22 {
+            let index = (y * 128 + x) * 4;
+            target[index..index + 4].copy_from_slice(&[0, 128, 0, 128]);
+        }
+    }
+    (tree, fixture.with_replacements([(key, target)]).unwrap())
+}
+
+fn assert_alpha_locked_artwork(before: &TileSnapshot, actual: &TileSnapshot) {
+    assert_eq!(before.iter().count(), actual.iter().count());
+    for (key, original) in before.iter() {
+        let actual = actual.get(key).unwrap();
+        for (index, (original, actual)) in original
+            .pixels()
+            .chunks_exact(4)
+            .zip(actual.pixels().chunks_exact(4))
+            .enumerate()
+        {
+            let x = index % 128;
+            let y = index / 128;
+            let expected =
+                if key.layer == LIVE_LAYER && (10..22).contains(&x) && (10..22).contains(&y) {
+                    &[128, 0, 0, 128][..]
+                } else {
+                    original
+                };
+            assert_eq!(
+                actual, expected,
+                "repaint must preserve barrier RGB and all alpha at {key:?}:{x},{y}"
+            );
+        }
+    }
+}
+
+#[test]
+fn alpha_locked_fill_fresh_reopen_preserves_barriers_and_translucent_alpha() {
+    const REOPEN: &str = "NYATIDRAW_TEST_ALPHA_FILL_REOPEN";
+    const EXPECTED_ROOT: &str = "NYATIDRAW_TEST_ALPHA_FILL_ROOT";
+    let (tree, before) = alpha_locked_fixture();
+    if let Some(path) = std::env::var_os(REOPEN) {
+        let (_, actual, reopened_tree, reopened_canvas, _, _) =
+            open_materialization_session(&ProjectLocation::UntitledRecovery(PathBuf::from(path)))
+                .unwrap();
+        assert_eq!(
+            format!("{:?}", actual.root()),
+            std::env::var(EXPECTED_ROOT).unwrap()
+        );
+        assert_eq!(reopened_tree, tree);
+        assert_eq!(reopened_canvas, CANVAS);
+        assert_alpha_locked_artwork(&before, &actual);
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "nyatidraw-alpha-fill-{}-{}.ntdr",
+        std::process::id(),
+        system_timestamp_ns()
+    ));
+    let (mut session, _, _, _, mut next_id, sink) =
+        open_materialization_session(&ProjectLocation::UntitledRecovery(path.clone())).unwrap();
+    let db = match &sink {
+        ProjectSink::UntitledRecovery { db, .. } | ProjectSink::ExplicitProject { db, .. } => db,
+    };
+    db.persist_canvas_spec(CANVAS).unwrap();
+    let seed = session
+        .prepare_structural_change(
+            SnapshotId(next_id),
+            HistoryNodeId(next_id),
+            1,
+            before.clone(),
+        )
+        .unwrap();
+    db.commit_structural_with_layer_tree(&seed, &tree).unwrap();
+    session.accept_structural_change(&seed).unwrap();
+    next_id += 1;
+    execute(
+        fill_gesture(false),
+        &tree,
+        &mut None,
+        &mut session,
+        &mut next_id,
+        db,
+    );
+    let after = session.tiles().clone();
+    assert_alpha_locked_artwork(&before, &after);
+    drop(session);
+    drop(sink);
+    assert!(std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "native_canvas::flat_fill_acceptance::alpha_locked_fill_fresh_reopen_preserves_barriers_and_translucent_alpha"])
+        .env(REOPEN, &path).env(EXPECTED_ROOT, format!("{:?}", after.root()))
+        .status().unwrap().success());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn gradient_and_signed_wand_artwork_and_mode_survive_fresh_reopen() {
+    use nyatidraw_api::{GradientMode, SelectionMode};
+    const REOPEN: &str = "NYATIDRAW_TEST_GRADIENT_WAND_REOPEN";
+    const EXPECTED_ROOT: &str = "NYATIDRAW_TEST_GRADIENT_WAND_ROOT";
+    let (tree, fixture) = fixture();
+    let mut signed = vec![0; TILE_BYTE_LEN];
+    for x in [-3_i32, -1] {
+        let offset = usize::try_from((128 + x + 128) * 4).unwrap();
+        signed[offset..offset + 4].copy_from_slice(&[0, 128, 0, 128]);
+    }
+    let before = fixture
+        .with_replacements([(TileKey::from_pixel(LIVE_LAYER, 128, -3, 1), signed)])
+        .unwrap();
+    if let Some(path) = std::env::var_os(REOPEN) {
+        let (_, actual, reopened_tree, reopened_canvas, _, sink) =
+            open_materialization_session(&ProjectLocation::UntitledRecovery(PathBuf::from(path)))
+                .unwrap();
+        assert_eq!(
+            format!("{:?}", actual.root()),
+            std::env::var(EXPECTED_ROOT).unwrap()
+        );
+        assert_eq!(reopened_tree, tree);
+        assert_eq!(reopened_canvas, CANVAS);
+        assert_eq!(pixel(&actual, LIVE_LAYER, 31, 0), [0, 0, 255, 255]);
+        assert_eq!(pixel(&actual, LIVE_LAYER, -3, 1), [0, 128, 0, 128]);
+        assert_eq!(pixel(&actual, LIVE_LAYER, -1, 1), [255, 0, 0, 255]);
+        for (key, tile) in fixture.iter() {
+            assert_eq!(actual.get(key).unwrap().pixels(), tile.pixels());
+        }
+        let db = match &sink {
+            ProjectSink::UntitledRecovery { db, .. } | ProjectSink::ExplicitProject { db, .. } => {
+                db
+            }
+        };
+        let state = nyatidraw_project::decode_editor_tool_state(
+            &db.load_editor_tool_state().unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            state.edit_settings.gradient_mode,
+            GradientMode::ForegroundToBackground
+        );
+        assert_eq!(state.edit_settings.selection_mode, SelectionMode::Subtract);
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "nyatidraw-gradient-wand-{}-{}.ntdr",
+        std::process::id(),
+        system_timestamp_ns()
+    ));
+    let (mut session, _, _, _, mut next_id, sink) =
+        open_materialization_session(&ProjectLocation::UntitledRecovery(path.clone())).unwrap();
+    let db = match &sink {
+        ProjectSink::UntitledRecovery { db, .. } | ProjectSink::ExplicitProject { db, .. } => db,
+    };
+    db.persist_canvas_spec(CANVAS).unwrap();
+    let seed = session
+        .prepare_structural_change(SnapshotId(next_id), HistoryNodeId(next_id), 1, before)
+        .unwrap();
+    db.commit_structural_with_layer_tree(&seed, &tree).unwrap();
+    session.accept_structural_change(&seed).unwrap();
+    next_id += 1;
+    let mut selection = None;
+    execute(
+        EditCommand::GradientSelection {
+            start: [0, 0],
+            end: [31, 0],
+            start_color: COLOR,
+            end_color: [0, 0, 255, 255],
+        },
+        &tree,
+        &mut selection,
+        &mut session,
+        &mut next_id,
+        db,
+    );
+    assert!(selection.is_none());
+    let head = session.current_snapshot();
+    for (seed, mode) in [
+        ([-3, 1], SelectionMode::Replace),
+        ([-1, 1], SelectionMode::Add),
+        ([-3, 1], SelectionMode::Subtract),
+    ] {
+        execute(
+            EditCommand::CombineWand {
+                seed,
+                tolerance: 0,
+                source: EditSource::ActiveLayer,
+                mode,
+            },
+            &tree,
+            &mut selection,
+            &mut session,
+            &mut next_id,
+            db,
+        );
+        assert_eq!(
+            session.current_snapshot(),
+            head,
+            "wand must not create artwork history"
+        );
+    }
+    assert_eq!(selection.as_ref().unwrap().selected_pixels(), 1);
+    assert!(selection.as_ref().unwrap().contains_signed(-1, 1));
+    execute(
+        EditCommand::GradientSelection {
+            start: [0, 1],
+            end: [1, 1],
+            start_color: COLOR,
+            end_color: [0, 0, 255, 255],
+        },
+        &tree,
+        &mut selection,
+        &mut session,
+        &mut next_id,
+        db,
+    );
+    let after = session.tiles().clone();
+    let mut drawing = DrawingConfig::from_projection(&nyatidraw_api::UiProjection::empty());
+    drawing.edit_settings.gradient_mode = GradientMode::ForegroundToBackground;
+    drawing.edit_settings.selection_mode = SelectionMode::Subtract;
+    db.persist_editor_tool_state(&tool_state::encode(drawing))
+        .unwrap();
+    drop(session);
+    drop(sink);
+    assert!(std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "native_canvas::flat_fill_acceptance::gradient_and_signed_wand_artwork_and_mode_survive_fresh_reopen"])
+        .env(REOPEN, &path).env(EXPECTED_ROOT, format!("{:?}", after.root()))
+        .status().unwrap().success());
     std::fs::remove_file(path).unwrap();
 }

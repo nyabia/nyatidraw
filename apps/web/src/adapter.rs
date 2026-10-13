@@ -19,6 +19,8 @@ use crate::{browser, runtime::Editor};
 
 #[derive(Default)]
 struct Preferences {
+    brush_presets: Vec<nyatidraw_api::NamedBrushPreset>,
+    brush_presets_writable: bool,
     canvas_input_mode: CanvasInputMode,
     input_mode_writable: bool,
     pressure_preset: PressurePreset,
@@ -36,6 +38,7 @@ impl Preferences {
         let mut preferences = Self {
             pressure_writable: true,
             input_mode_writable: true,
+            brush_presets_writable: true,
             ..Self::default()
         };
         for key in [
@@ -45,9 +48,13 @@ impl Preferences {
             "dock",
             "pen-pressure",
             "input-mode",
+            "brush-presets",
         ] {
             match browser::load_preference(key) {
                 Ok(Some(value)) if preferences.restore(key, &value).is_none() => {
+                    if key == "brush-presets" {
+                        preferences.brush_presets_writable = false;
+                    }
                     if key == "input-mode" {
                         preferences.input_mode_writable = false;
                     }
@@ -59,6 +66,9 @@ impl Preferences {
                     );
                 }
                 Err(error) => {
+                    if key == "brush-presets" {
+                        preferences.brush_presets_writable = false;
+                    }
                     if key == "input-mode" {
                         preferences.input_mode_writable = false;
                     }
@@ -79,6 +89,17 @@ impl Preferences {
 
     fn restore(&mut self, key: &str, value: &str) -> Option<()> {
         match key {
+            "brush-presets" => {
+                if value.len() > nyatidraw_api::BRUSH_PRESETS_MAX_BYTES * 4 {
+                    return None;
+                }
+                let bytes = value
+                    .split(',')
+                    .map(str::parse::<u8>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
+                self.brush_presets = nyatidraw_api::decode_brush_presets(&bytes)?;
+            }
             "input-mode" => self.canvas_input_mode = CanvasInputMode::from_storage(value)?,
             "pen-pressure" => {
                 self.pressure_preset = PressurePreset::from_storage(value)?;
@@ -250,6 +271,17 @@ impl WebUiBackend {
     fn select_tool(&self, tool: DrawingTool) -> Result<(), String> {
         if self
             .editor
+            .read(|r| r.document.color_adjustment_projection().is_some())
+            .unwrap_or(false)
+        {
+            self.editor.try_edit(|document| {
+                document.apply_edit(nyatidraw_api::EditCommand::ColorAdjustment(
+                    nyatidraw_api::ColorAdjustmentCommand::Cancel,
+                ))
+            })?;
+        }
+        if self
+            .editor
             .read(|r| r.document.transform_projection().is_some())
             .unwrap_or(false)
         {
@@ -297,6 +329,95 @@ impl WebUiBackend {
     #[allow(clippy::too_many_lines)]
     fn tool_command(&self, command: ToolCommand) -> Result<(), String> {
         match command {
+            ToolCommand::ApplyBrushPreset(index) => {
+                if self
+                    .editor
+                    .read(|r| r.document.color_adjustment_projection().is_some())
+                    .unwrap_or(false)
+                {
+                    self.editor.try_edit(|document| {
+                        document.apply_edit(nyatidraw_api::EditCommand::ColorAdjustment(
+                            nyatidraw_api::ColorAdjustmentCommand::Cancel,
+                        ))
+                    })?;
+                }
+                if self
+                    .editor
+                    .read(|r| r.document.transform_projection().is_some())
+                    .unwrap_or(false)
+                {
+                    return Err("변형을 확정하거나 취소한 뒤 프리셋을 적용하세요.".into());
+                }
+                let value = self
+                    .preferences
+                    .borrow()
+                    .brush_presets
+                    .get(usize::from(index))
+                    .ok_or("프리셋이 없습니다.")?
+                    .values;
+                let tool = match value.tool {
+                    DrawingTool::Pencil if value.pencil_template == PencilTemplate::Graphite2B => {
+                        WebTool::Pencil2B
+                    }
+                    DrawingTool::Pencil => WebTool::Pencil2H,
+                    DrawingTool::Pen => WebTool::Pen,
+                    DrawingTool::Brush => WebTool::SoftBrush,
+                    DrawingTool::Eraser => WebTool::Eraser,
+                    _ => return Err("그리기 도구 프리셋이 아닙니다.".into()),
+                };
+                self.editor.try_preferences(|document| {
+                    document.select_tool(tool)?;
+                    document.set_brush_settings(nyatidraw_web_core::BrushSettings {
+                        size_px: f32::from(value.size_tenths) / 10.0,
+                        opacity: f32::from(value.opacity_u16) / 65535.0,
+                        hardness: f32::from(value.settings.hardness_u16) / 65535.0,
+                        size_pressure: value.settings.size_pressure,
+                        opacity_pressure: value.settings.opacity_pressure,
+                        size_minimum_u16: value.settings.size_minimum_u16,
+                        opacity_minimum_u16: value.settings.opacity_minimum_u16,
+                        smoothing: value.settings.smoothing,
+                    })
+                })?;
+                if value.tool == DrawingTool::Pencil {
+                    self.preferences.borrow_mut().pencil = value.pencil_template;
+                }
+                if let Some(runtime) = self.editor.runtime.peek().borrow_mut().as_mut() {
+                    runtime.selected_tool = value.tool;
+                    runtime.document.set_project_tool(value.tool);
+                }
+                browser::set_canvas_tool(crate::runtime::canvas_input_mode(value.tool));
+                self.editor.refresh();
+                self.editor.persist();
+                Ok(())
+            }
+            ToolCommand::SaveBrushPreset(_)
+            | ToolCommand::UpdateBrushPreset(_)
+            | ToolCommand::RenameBrushPreset(_, _)
+            | ToolCommand::DeleteBrushPreset(_) => {
+                let projection = self.protocol_snapshot().0;
+                let current = nyatidraw_api::BrushPresetValues::from_projection(&projection);
+                let mut preferences = self.preferences.borrow_mut();
+                if !preferences.brush_presets_writable {
+                    return Err("프리셋 원본을 보존하여 이번 실행에서는 저장하지 않습니다.".into());
+                }
+                let mut next = preferences.brush_presets.clone();
+                nyatidraw_api::edit_brush_presets(&mut next, command, current)
+                    .map_err(str::to_owned)?;
+                let bytes = nyatidraw_api::encode_brush_presets(&next);
+                browser::store_preference(
+                    "brush-presets",
+                    &bytes
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+                .map_err(|error| browser::error_text(&error))?;
+                preferences.brush_presets = next;
+                drop(preferences);
+                self.editor.refresh();
+                Ok(())
+            }
             ToolCommand::Select(tool) => self.select_tool(tool),
             ToolCommand::SelectPencilTemplate(template) => {
                 let previous = self.preferences.borrow().pencil;
@@ -355,8 +476,20 @@ impl WebUiBackend {
                 d.edit_settings.tolerance = value;
                 Ok(())
             }),
+            ToolCommand::SetFillSource(source) => self.editor.try_preferences(|d| {
+                d.edit_settings.fill_source = source;
+                Ok(())
+            }),
+            ToolCommand::SetFillTolerance(value) => self.editor.try_preferences(|d| {
+                d.edit_settings.fill_tolerance = value;
+                Ok(())
+            }),
             ToolCommand::SetSelectionMode(mode) => self.editor.try_preferences(|d| {
                 d.edit_settings.selection_mode = mode;
+                Ok(())
+            }),
+            ToolCommand::SetGradientMode(mode) => self.editor.try_preferences(|d| {
+                d.edit_settings.gradient_mode = mode;
                 Ok(())
             }),
             ToolCommand::SetFillSettings(settings) => self.editor.try_preferences(|d| {
@@ -476,6 +609,11 @@ impl WebUiBackend {
                         ViewportCommand::ToggleMirrorHorizontal => {
                             (view.zoom, view.rotation_radians, !view.mirrored_horizontal)
                         }
+                        ViewportCommand::SetRotationMillidegrees(angle) => (
+                            view.zoom,
+                            f64::from(angle.rem_euclid(360_000)).to_radians() / 1_000.0,
+                            view.mirrored_horizontal,
+                        ),
                         _ => (view.zoom, 0.0, view.mirrored_horizontal),
                     };
                     if let Some(changed) = view.with_view_at(center, zoom, rotation, mirror) {
@@ -536,6 +674,10 @@ impl UiBackend for WebUiBackend {
         projection.workspace = WorkspaceProjection::Loading;
         projection.dock = self.preferences.borrow().dock.clone();
         projection.pencil_template = self.preferences.borrow().pencil;
+        projection
+            .brush_presets
+            .clone_from(&self.preferences.borrow().brush_presets);
+        projection.brush_presets_writable = self.preferences.borrow().brush_presets_writable;
         self.editor.read(|runtime| {
             let document = &runtime.document;
             let settings = document.brush_settings();
@@ -563,8 +705,10 @@ impl UiBackend for WebUiBackend {
             projection.edit.can_cancel = document.is_drawing()
                 || document.selection().is_some()
                 || runtime.gesture.is_some()
-                || document.transform_projection().is_some();
+                || document.transform_projection().is_some()
+                || document.color_adjustment_projection().is_some();
             projection.edit.transform = document.transform_projection().cloned();
+            projection.edit.color_adjustment = document.color_adjustment_projection().cloned();
             projection.edit.has_selection = document.selection().is_some();
             projection.edit.selected_pixels = document
                 .selection()
@@ -650,7 +794,12 @@ impl UiBackend for WebUiBackend {
         }
         let save_dock = matches!(command, EditorCommand::Dock(_));
         match command {
-            EditorCommand::Project(_) => self.editor.download_project(),
+            EditorCommand::Project(nyatidraw_api::ProjectCommand::Save) => {
+                self.editor.download_project();
+            }
+            EditorCommand::Project(nyatidraw_api::ProjectCommand::CopyPng) => {
+                self.editor.copy_png();
+            }
             EditorCommand::Tool(command) => return self.tool_command(command),
             EditorCommand::Layer(command) => return self.layer_command(command),
             EditorCommand::Viewport(command) => self.viewport_command(command),

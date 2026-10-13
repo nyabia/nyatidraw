@@ -1,4 +1,4 @@
-use nyatidraw_api::{ContentRootId, GroupId, LayerBlendMode, LayerId};
+use nyatidraw_api::{ContentRootId, GroupId, LayerBlendMode, LayerId, LayerTreeNodeId};
 use nyatidraw_document::{GroupNode, LayerNode, LayerTree};
 use nyatidraw_project::{ProjectToolState, encode_editor_tool_state};
 use nyatidraw_project_redb::ProjectDb;
@@ -59,15 +59,32 @@ fn file_first_tool_fallback_and_worker_save_preserve_brush_state_without_changin
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn browser_edits_and_group_metadata_survive_native_process_restart() {
     use nyatidraw_api::{AffineTransform, EditCommand as E, LayerCommand, TransformCommand as T};
     const FILE: &str = "NYATIDRAW_TEST_WEB_REOPEN_FILE";
     const ROOT: &str = "NYATIDRAW_TEST_WEB_REOPEN_ROOT";
+    const ACTIVE: &str = "NYATIDRAW_TEST_WEB_REOPEN_ACTIVE";
     if let Some(path) = std::env::var_os(FILE) {
         let bytes = std::fs::read(&path).unwrap();
         let browser = WebProject::decode_ntdr(&bytes).unwrap();
         let native = ProjectDb::open(std::path::Path::new(&path)).unwrap();
         let reopened = native.load_reopened().unwrap().unwrap().into_parts();
+        let expected_active = LayerId(std::env::var(ACTIVE).unwrap().parse().unwrap());
+        assert_eq!(browser.active_layer(), expected_active);
+        assert_eq!(
+            browser
+                .layers()
+                .raster(expected_active)
+                .unwrap()
+                .color_effect,
+            Some(nyatidraw_api::LayerColorEffect {
+                enabled: false,
+                dark_rgb: [24, 80, 190],
+                light_rgb: [240, 250, 255],
+            })
+        );
+        assert_eq!(native.load_active_layer().unwrap(), Some(expected_active));
         assert_eq!(reopened.current_tiles, *browser.snapshot());
         assert_eq!(
             format!("{:?}", reopened.current_tiles.root()),
@@ -109,6 +126,39 @@ fn browser_edits_and_group_metadata_survive_native_process_restart() {
     browser
         .apply_layer_command(LayerCommand::DuplicateRaster(active))
         .unwrap();
+    let raw = browser.snapshot().clone();
+    let active = browser.active_layer();
+    let effect = nyatidraw_api::LayerColorEffect {
+        enabled: true,
+        dark_rgb: [24, 80, 190],
+        light_rgb: [240, 250, 255],
+    };
+    browser
+        .apply_layer_command(LayerCommand::SetColorEffect {
+            layer: active,
+            effect: Some(effect),
+        })
+        .unwrap();
+    browser
+        .apply_layer_command(LayerCommand::SetColorEffect {
+            layer: active,
+            effect: Some(nyatidraw_api::LayerColorEffect {
+                enabled: false,
+                ..effect
+            }),
+        })
+        .unwrap();
+    browser.undo().unwrap();
+    assert_eq!(
+        browser.layers().raster(active).unwrap().color_effect,
+        Some(effect)
+    );
+    browser.redo().unwrap();
+    assert_eq!(
+        browser.snapshot(),
+        &raw,
+        "effect edits and their history preserve original raster bytes"
+    );
     let bytes = browser.encode_ntdr().unwrap();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -127,6 +177,7 @@ fn browser_edits_and_group_metadata_survive_native_process_restart() {
         ])
         .env(FILE, &path)
         .env(ROOT, format!("{:?}", browser.snapshot().root()))
+        .env(ACTIVE, browser.active_layer().0.to_string())
         .output()
         .unwrap();
     assert!(
@@ -136,6 +187,197 @@ fn browser_edits_and_group_metadata_survive_native_process_restart() {
         String::from_utf8_lossy(&result.stderr)
     );
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn imported_image_and_group_copy_preserve_sources_through_undo_and_fresh_reopen() {
+    use nyatidraw_api::{EditCommand as E, LayerCommand as L, RasterImport, TransformCommand as T};
+    const FILE: &str = "NYATIDRAW_IMPORT_GROUP_REOPEN_FILE";
+    const ROOT: &str = "NYATIDRAW_IMPORT_GROUP_REOPEN_ROOT";
+    if let Some(path) = std::env::var_os(FILE) {
+        let bytes = std::fs::read(&path).unwrap();
+        let web = WebProject::decode_ntdr(&bytes).unwrap();
+        let native = ProjectDb::open(std::path::Path::new(&path)).unwrap();
+        let reopened = native.load_reopened().unwrap().unwrap();
+        assert_eq!(web.snapshot(), reopened.current_tiles());
+        assert_eq!(
+            format!("{:?}", web.snapshot().root()),
+            std::env::var(ROOT).unwrap()
+        );
+        assert_eq!(
+            native.load_layer_tree().unwrap().as_ref(),
+            Some(web.layers())
+        );
+        assert_eq!(web.layers().root().children.len(), 2);
+        assert_eq!(
+            web.layers().raster(web.active_layer()).unwrap().name,
+            "가져온 PNG"
+        );
+        assert_eq!(web.canvas().width_px, 64);
+        return;
+    }
+    let (original, _, _, _) = fixture();
+    let mut web = WebProject::decode_ntdr(&original).unwrap();
+    web.apply_layer_command(L::AddGroup).unwrap();
+    let group = match web.layers().root().children.last().unwrap() {
+        LayerTreeNode::Group(group) => group.id,
+        LayerTreeNode::Raster(_) => panic!("new group missing"),
+    };
+    for (index, layer) in [LayerId(19), LayerId(23)].into_iter().enumerate() {
+        web.apply_layer_command(L::Reorder {
+            node: LayerTreeNodeId::Raster(layer),
+            new_parent: group,
+            index,
+        })
+        .unwrap();
+    }
+    web.set_active_layer(LayerId(19)).unwrap();
+    web.apply_layer_command(L::AddGroup).unwrap();
+    let inner = match &web.layers().root().children[0] {
+        LayerTreeNode::Group(outer) => match &outer.children[1] {
+            LayerTreeNode::Group(inner) => inner.id,
+            LayerTreeNode::Raster(_) => panic!("nested group missing"),
+        },
+        LayerTreeNode::Raster(_) => panic!("outer group missing"),
+    };
+    web.apply_layer_command(L::Reorder {
+        node: LayerTreeNodeId::Raster(LayerId(23)),
+        new_parent: inner,
+        index: 0,
+    })
+    .unwrap();
+    web.apply_layer_command(L::SetOpacity {
+        node: LayerTreeNodeId::Group(group),
+        opacity_u16: 32_000,
+    })
+    .unwrap();
+    let before_tree = web.layers().clone();
+    let before_tiles = web.snapshot().clone();
+    let history = web.undo_len();
+    web.apply_layer_command(L::DuplicateGroup(group)).unwrap();
+    let copied_layer = web.active_layer();
+    assert_ne!(copied_layer, LayerId(19));
+    let mut expected = before_tree.clone();
+    let copied_group = match &web.layers().root().children[1] {
+        LayerTreeNode::Group(group) => group.id,
+        LayerTreeNode::Raster(_) => panic!("copy missing"),
+    };
+    let mapping = expected.duplicate_group(group, copied_group.0).unwrap();
+    assert_eq!(web.layers(), &expected);
+    assert_eq!(web.undo_len(), history + 1);
+    for (source, destination) in mapping {
+        let mut expected_layer = before_tree.raster(source).unwrap().clone();
+        expected_layer.id = destination;
+        assert_eq!(
+            web.layers().raster(destination),
+            Some(&expected_layer),
+            "raw source, disabled color effect, clip, lock and blend metadata must survive"
+        );
+        for (key, tile) in before_tiles.iter().filter(|(key, _)| key.layer == source) {
+            assert_eq!(
+                web.snapshot().get(TileKey {
+                    layer: destination,
+                    ..key
+                }),
+                Some(tile)
+            );
+        }
+    }
+    let duplicated = web.snapshot().clone();
+    web.undo().unwrap();
+    assert_eq!(web.snapshot(), &before_tiles);
+    assert_eq!(web.layers(), &before_tree);
+    web.redo().unwrap();
+    assert_eq!(web.snapshot(), &duplicated);
+    web.set_active_layer(copied_layer).unwrap();
+    web.apply_layer_command(L::SetAlphaLocked {
+        layer: copied_layer,
+        alpha_locked: false,
+    })
+    .unwrap();
+    web.apply_edit(E::ClearActiveLayer).unwrap();
+    for (key, tile) in before_tiles.iter() {
+        assert_eq!(
+            web.snapshot().get(key),
+            Some(tile),
+            "editing copy must not touch original"
+        );
+    }
+    web.undo().unwrap();
+    web.undo().unwrap();
+    let mut invalid = before_tree.clone();
+    assert!(invalid.duplicate_group(group, u128::MAX).is_err());
+    assert_eq!(invalid, before_tree);
+    assert!(invalid.duplicate_group(group, group.0).is_err());
+    assert_eq!(invalid, before_tree);
+    web.apply_edit(E::FreeTransform(T::ImportRaster(RasterImport {
+        project_epoch: 1,
+        name: "가져온 PNG".into(),
+        size: [2, 1],
+        pixels: std::sync::Arc::from([0, 90, 0, 128, 0, 0, 0, 0]),
+    })))
+    .unwrap();
+    let generation = web.transform_projection().unwrap().generation;
+    web.apply_edit(E::FreeTransform(T::Commit { generation }))
+        .unwrap();
+    // The imported raster is inside the copied group, preserving the page and hierarchy.
+    assert_eq!(web.layers().root().children.len(), 2);
+    let path = scratch_path("import-group-fresh");
+    std::fs::write(&path, web.encode_ntdr().unwrap()).unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::imported_image_and_group_copy_preserve_sources_through_undo_and_fresh_reopen",
+            "--nocapture",
+        ])
+        .env(FILE, &path)
+        .env(ROOT, format!("{:?}", web.snapshot().root()))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn recovered_color_target_survives_selection_only_save_without_artwork_history() {
+    let (original, tiles, _, _) = fixture();
+    let mut web = WebProject::decode_ntdr(&original).unwrap();
+    let initial_memory = MemoryProjectDb::open(&original, MAX_NTDR_BYTES).unwrap();
+    let before = initial_memory
+        .db()
+        .load_reopened()
+        .unwrap()
+        .unwrap()
+        .into_parts();
+    assert_eq!(web.active_layer(), LayerId(23));
+    web.set_active_layer(LayerId(19)).unwrap();
+    let tools = web.encode_tool_preferences().unwrap();
+    let request = web.prepare_recovery(1, 1, None).unwrap();
+    let mut writer = RecoveryWriter::default();
+    let bytes = writer.stage(&request.bytes).unwrap();
+    writer.accept().unwrap();
+    let restored = WebProject::decode_ntdr(&bytes).unwrap();
+    assert_eq!(restored.active_layer(), LayerId(19));
+    assert_eq!(restored.encode_tool_preferences().unwrap(), tools);
+    assert_eq!(restored.snapshot(), &tiles);
+    let memory = MemoryProjectDb::open(&bytes, MAX_NTDR_BYTES).unwrap();
+    let after = memory.db().load_reopened().unwrap().unwrap().into_parts();
+    assert_eq!(after.current_cursor, before.current_cursor);
+    assert_eq!(after.history.node_count(), before.history.node_count());
+    for stale in [LayerId(999), LayerId(77)] {
+        let memory = MemoryProjectDb::open(&bytes, MAX_NTDR_BYTES).unwrap();
+        memory.db().persist_active_layer(stale).unwrap();
+        let bytes = memory.into_bytes().unwrap();
+        let restored = WebProject::decode_ntdr(&bytes).unwrap();
+        assert_eq!(restored.active_layer(), LayerId(23));
+        assert_eq!(restored.snapshot(), &tiles);
+    }
 }
 
 fn fixture() -> (Vec<u8>, TileSnapshot, LayerTree, ProjectToolState) {
@@ -157,6 +399,15 @@ fn fixture() -> (Vec<u8>, TileSnapshot, LayerTree, ProjectToolState) {
             .into_iter()
             .map(|id| {
                 LayerTreeNode::Raster(LayerNode {
+                    color_effect: if id.0 == 19 {
+                        Some(nyatidraw_api::LayerColorEffect {
+                            enabled: false,
+                            dark_rgb: [20, 90, 200],
+                            light_rgb: [240, 245, 255],
+                        })
+                    } else {
+                        None
+                    },
                     id,
                     name: format!("Layer {}", id.0),
                     visible: true,
@@ -391,8 +642,40 @@ fn legacy_browser_import_saves_native_format_and_unknown_tool_records_are_not_ov
         Some(b"future prefs".to_vec())
     );
     imported.set_foreground([200, 100, 50, 255]);
-    assert!(imported.encode_ntdr().is_err());
-    assert_eq!(imported.backing, no_change);
+    imported.set_project_tool(DrawingTool::Pen);
+    let point = StrokePoint {
+        x: 4.0,
+        y: 4.0,
+        pressure: 1.0,
+        time_ms: 1.0,
+    };
+    imported.begin_stroke(point).unwrap();
+    imported.end_stroke(point).unwrap();
+    let expected = imported.snapshot().clone();
+    assert_ne!(expected, pixels);
+    let request = imported.prepare_recovery(1, 1, None).unwrap();
+    let mut writer = RecoveryWriter::default();
+    let recovered = writer.stage(&request.bytes).unwrap();
+    writer.accept().unwrap();
+    for bytes in [imported.encode_ntdr().unwrap(), recovered] {
+        let memory = MemoryProjectDb::open(&bytes, MAX_NTDR_BYTES).unwrap();
+        assert_eq!(
+            memory.db().load_editor_tool_state().unwrap(),
+            Some(b"future prefs".to_vec())
+        );
+        assert_eq!(
+            memory
+                .db()
+                .load_reopened()
+                .unwrap()
+                .unwrap()
+                .current_tiles(),
+            &expected
+        );
+        let reopened = WebProject::decode_ntdr(&bytes).unwrap();
+        assert_eq!(reopened.snapshot(), &expected);
+        assert!(reopened.import_notice().is_some());
+    }
 }
 
 fn scratch_path(label: &str) -> std::path::PathBuf {

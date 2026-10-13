@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-pub use nyatidraw_api::{CanvasSpec, LayerBlendMode, LayerId};
+pub use nyatidraw_api::{CanvasSpec, LayerBlendMode, LayerColorEffect, LayerId};
 use nyatidraw_api::{ContentRootId, GroupId, LayerTreeNodeId};
 pub use nyatidraw_brush::BrushPreset;
 use nyatidraw_brush::{
@@ -19,6 +19,7 @@ use nyatidraw_tiles::color::{linear_premultiplied_to_srgb8, srgb8_to_linear_prem
 pub use nyatidraw_tiles::{TILE_BYTE_LEN, TILE_EDGE, TileKey, TileSnapshot};
 
 mod codec;
+mod color_adjustment;
 mod drawing;
 mod editing;
 mod interchange;
@@ -225,6 +226,8 @@ pub struct WebDocument {
     solo: Option<LayerTreeNodeId>,
     transform: nyatidraw_editor::transform::TransformSession,
     transform_preview: Option<nyatidraw_editor::transform::TransformOutcome>,
+    color_adjustment: nyatidraw_editor::color_adjustment::ColorAdjustmentSession,
+    color_adjustment_preview: Option<nyatidraw_editor::color_adjustment::ColorAdjustmentOutcome>,
     revision: u128,
 }
 
@@ -275,6 +278,8 @@ impl WebDocument {
             solo: None,
             transform: nyatidraw_editor::transform::TransformSession::default(),
             transform_preview: None,
+            color_adjustment: nyatidraw_editor::color_adjustment::ColorAdjustmentSession::default(),
+            color_adjustment_preview: None,
             revision: 1,
         })
     }
@@ -654,7 +659,10 @@ impl WebDocument {
     }
 
     fn require_idle(&self) -> Result<(), WebError> {
-        if self.stroke.is_some() || self.transform_preview.is_some() {
+        if self.stroke.is_some()
+            || self.transform_preview.is_some()
+            || self.color_adjustment_preview.is_some()
+        {
             Err(WebError::StrokeInProgress)
         } else {
             Ok(())
@@ -724,6 +732,7 @@ fn new_layer(id: LayerId, name: &str) -> LayerNode {
         clip_to_below: false,
         blend_mode: LayerBlendMode::Normal,
         reference: false,
+        color_effect: None,
         opacity_u16: u16::MAX,
         content_root: ContentRootId(0),
     }

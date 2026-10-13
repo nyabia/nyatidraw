@@ -176,6 +176,7 @@ fn raster(id: LayerId, name: &str) -> LayerTreeNode {
         reference: false,
         opacity_u16: u16::MAX,
         content_root: ContentRootId(0),
+        color_effect: None,
     })
 }
 

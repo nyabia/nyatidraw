@@ -55,6 +55,7 @@ impl ActiveCanvas {
                     Some(
                         TransformCommand::Begin
                             | TransformCommand::Paste
+                            | TransformCommand::ImportRaster(_)
                             | TransformCommand::Preview(_)
                     )
                 ) && !self.stroke.pending_transform_cancel
@@ -67,6 +68,7 @@ impl ActiveCanvas {
                     || self.stroke.active.is_some())
         };
         self.projection.stage_edit(edit);
+        self.stage_color_adjustment();
     }
 
     pub(super) fn switch_transform_tool(
@@ -91,6 +93,11 @@ impl ActiveCanvas {
         &mut self,
         command: TransformCommand,
     ) -> Result<bool, CommandRejectReason> {
+        if let TransformCommand::ImportRaster(import) = &command
+            && import.project_epoch != self.stroke.live_ink.project_epoch()
+        {
+            return Err(CommandRejectReason::UnsupportedCommand);
+        }
         let active = self.stroke.transform_projection.is_some();
         if command == TransformCommand::Cancel && self.transform_active() {
             // A dispatched commit is already durable work; Escape cannot turn
@@ -133,27 +140,15 @@ impl ActiveCanvas {
             return Err(CommandRejectReason::CommandQueueBusy);
         }
         self.ensure_artwork_command_idle()?;
-        if matches!(command, TransformCommand::Begin | TransformCommand::Paste) {
-            if active || (self.stroke.transform_starting && command == TransformCommand::Paste) {
+        if matches!(
+            command,
+            TransformCommand::Begin | TransformCommand::Paste | TransformCommand::ImportRaster(_)
+        ) {
+            if active || (self.stroke.transform_starting && command != TransformCommand::Begin) {
                 return Err(CommandRejectReason::CommandQueueBusy);
             }
-            if command == TransformCommand::Paste {
-                let mut candidate = self.scene.tree().clone();
-                let (parent, index) = candidate
-                    .parent_and_index(nyatidraw_api::LayerTreeNodeId::Raster(self.active_layer))
-                    .ok_or(CommandRejectReason::UnknownLayer)?;
-                let id = next_layer_node_id(&candidate)
-                    .map_err(|_| CommandRejectReason::RevisionExhausted)?;
-                candidate
-                    .insert(
-                        parent,
-                        index + 1,
-                        LayerTreeNode::Raster(empty_raster(LayerId(id), "붙여넣기".into())),
-                    )
-                    .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
-                self.scene
-                    .validate_tree_replacement(&candidate)
-                    .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
+            if command != TransformCommand::Begin {
+                self.validate_provisional_layer_capacity()?;
             }
         } else if !active {
             return Err(CommandRejectReason::UnsupportedCommand);
@@ -169,8 +164,14 @@ impl ActiveCanvas {
             return Err(CommandRejectReason::CommandQueueBusy);
         }
         let (reply, received) = sync_channel(1);
-        let starting = matches!(command, TransformCommand::Begin | TransformCommand::Paste);
-        let pasting = command == TransformCommand::Paste;
+        let starting = matches!(
+            command,
+            TransformCommand::Begin | TransformCommand::Paste | TransformCommand::ImportRaster(_)
+        );
+        let pasting = matches!(
+            command,
+            TransformCommand::Paste | TransformCommand::ImportRaster(_)
+        );
         let result = self.enqueue_artwork(
             WorkerRequest::Edit {
                 command: EditCommand::FreeTransform(command),
@@ -196,6 +197,25 @@ impl ActiveCanvas {
             );
         }
         result
+    }
+
+    fn validate_provisional_layer_capacity(&self) -> Result<(), CommandRejectReason> {
+        let mut candidate = self.scene.tree().clone();
+        let (parent, index) = candidate
+            .insertion_above_clipping_run(nyatidraw_api::LayerTreeNodeId::Raster(self.active_layer))
+            .ok_or(CommandRejectReason::UnknownLayer)?;
+        let id =
+            next_layer_node_id(&candidate).map_err(|_| CommandRejectReason::RevisionExhausted)?;
+        candidate
+            .insert(
+                parent,
+                index,
+                LayerTreeNode::Raster(empty_raster(LayerId(id), "붙여넣기".into())),
+            )
+            .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
+        self.scene
+            .validate_tree_replacement(&candidate)
+            .map_err(|_| CommandRejectReason::WorkspaceFailed)
     }
 
     pub(super) fn flush_transform_preview(&mut self) {
@@ -230,7 +250,12 @@ impl ActiveCanvas {
                 // clears it before reaching this flush.
                 self.stroke.pending_tool = pending_tool;
                 self.stroke.pending_pencil_template = pending_pencil_template;
-                if !matches!(command, TransformCommand::Begin | TransformCommand::Paste) {
+                if !matches!(
+                    command,
+                    TransformCommand::Begin
+                        | TransformCommand::Paste
+                        | TransformCommand::ImportRaster(_)
+                ) {
                     self.stroke.pending_transform = None;
                     self.stroke.pending_transform_cancel = false;
                 }
@@ -264,7 +289,11 @@ impl ActiveCanvas {
     pub(super) fn reject_transform_outcome(&mut self, command: Option<&TransformCommand>) {
         if matches!(
             command,
-            Some(TransformCommand::Begin | TransformCommand::Paste)
+            Some(
+                TransformCommand::Begin
+                    | TransformCommand::Paste
+                    | TransformCommand::ImportRaster(_)
+            )
         ) {
             self.stroke.transform_starting = false;
             self.stroke.transform_gesture = None;

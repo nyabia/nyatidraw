@@ -25,9 +25,9 @@ pub(crate) struct TransformOutcome {
     pub(crate) committed: bool,
     pub(crate) history: HistoryProjection,
 }
-struct DurableTransform<'a> {
-    session: &'a mut HeadlessStrokeSession,
-    db: &'a ProjectDb,
+pub(crate) struct DurableTransform<'a> {
+    pub(crate) session: &'a mut HeadlessStrokeSession,
+    pub(crate) db: &'a ProjectDb,
 }
 impl TransformStore for DurableTransform<'_> {
     fn current_snapshot(&self) -> SnapshotId {
@@ -193,8 +193,27 @@ mod tests {
         let mut worker = TransformWorker::default();
         let mut next = 10;
         let mut clipboard = MemoryClipboard::default();
+        let mut dib = vec![0_u8; 124];
+        for (offset, value) in [
+            (0, 124_u32),
+            (4, 2),
+            (8, 2),
+            (12, (32 << 16) | 1),
+            (16, 3),
+            (40, 0x00ff_0000),
+            (44, 0x0000_ff00),
+            (48, 0x0000_00ff),
+            (52, 0xff00_0000),
+            (56, 0x7352_4742),
+        ] {
+            dib[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        dib.extend_from_slice(&[0, 0, 255, 128].repeat(4));
+        let decoded = crate::artwork_clipboard::dib::decode(&dib).unwrap();
         clipboard
-            .write(&RasterFragment::new([-2, 2], [2, 2], [128, 0, 0, 128].repeat(4)).unwrap())
+            .write(
+                &RasterFragment::new([-2, 2], decoded.size(), decoded.pixels().to_vec()).unwrap(),
+            )
             .unwrap();
         let run = |worker: &mut TransformWorker,
                    command,

@@ -4,6 +4,7 @@ use nyatidraw_tiles::{CompositeCache, TILE_EDGE, TileKey};
 
 fn raster(id: u128) -> LayerTreeNode {
     LayerTreeNode::Raster(LayerNode {
+        color_effect: None,
         alpha_locked: false,
         clip_to_below: false,
         blend_mode: nyatidraw_api::LayerBlendMode::Normal,

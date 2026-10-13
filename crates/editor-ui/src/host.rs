@@ -119,6 +119,7 @@ pub struct UiSlots {
     pub canvas: fn() -> Element,
     pub file_buttons: fn(bool) -> Element,
     pub update_control: fn() -> Element,
+    pub reference_loader: fn(crate::reference_panel::ReferenceState) -> Element,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]

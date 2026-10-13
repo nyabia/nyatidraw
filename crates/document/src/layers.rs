@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use nyatidraw_api::{
-    CompositeInvalidation, ContentRootId, GroupId, LayerBlendMode, LayerId, LayerTreeNodeId,
-    TileCoordinate,
+    CompositeInvalidation, ContentRootId, GroupId, LayerBlendMode, LayerColorEffect, LayerId,
+    LayerTreeNodeId, TileCoordinate,
 };
 
 const MAX_LAYER_TREE_DEPTH: usize = 64;
@@ -12,6 +12,7 @@ const MAX_LAYER_NAME_CHARS: usize = 128;
 // Visibility, edit protection, alpha protection and source roles are independent.
 #[allow(clippy::struct_excessive_bools)]
 pub struct LayerNode {
+    pub color_effect: Option<LayerColorEffect>,
     /// Preserve stored pixel alpha while recoloring; distinct from edit lock.
     pub alpha_locked: bool,
     /// Uses the nearest preceding unclipped sibling as the clipping base.
@@ -66,6 +67,7 @@ pub enum LayerTreeError {
     IndexOutOfBounds { index: usize, len: usize },
     InvalidName,
     LockedNode(LayerTreeNodeId),
+    IdentifierExhausted,
 }
 
 /// Validated raster/group hierarchy in bottom-to-top compositing order.
@@ -154,7 +156,23 @@ impl LayerTree {
         Ok(invalidation)
     }
 
-    /// Copies raster metadata immediately above its source in the same group.
+    /// Returns an insertion point above the source's clipping run so an independent
+    /// new layer cannot change the base of existing clipped siblings.
+    #[must_use]
+    pub fn insertion_above_clipping_run(&self, node: LayerTreeNodeId) -> Option<(GroupId, usize)> {
+        let (parent, index) = self.parent_and_index(node)?;
+        let siblings = &find_group(&self.root, parent)?.children;
+        let mut insertion = index + 1;
+        while siblings.get(insertion).is_some_and(|node| match node {
+            LayerTreeNode::Raster(layer) => layer.clip_to_below,
+            LayerTreeNode::Group(group) => group.clip_to_below,
+        }) {
+            insertion += 1;
+        }
+        Some((parent, insertion))
+    }
+
+    /// Copies raster metadata above its source's clipping run in the same group.
     /// The caller must duplicate its tile keys in the same durable transaction.
     ///
     /// # Errors
@@ -166,7 +184,7 @@ impl LayerTree {
     ) -> Result<CompositeInvalidation, LayerTreeError> {
         let source_node = LayerTreeNodeId::Raster(source);
         let (parent, index) = self
-            .parent_and_index(source_node)
+            .insertion_above_clipping_run(source_node)
             .ok_or(LayerTreeError::UnknownNode(source_node))?;
         let Some(LayerTreeNode::Raster(layer)) = find_node_mut(&mut self.root, source_node) else {
             return Err(LayerTreeError::UnknownNode(source_node));
@@ -180,7 +198,37 @@ impl LayerTree {
             .take(MAX_LAYER_NAME_CHARS - suffix.chars().count())
             .chain(suffix.chars())
             .collect();
-        self.insert(parent, index + 1, LayerTreeNode::Raster(copy))
+        self.insert(parent, index, LayerTreeNode::Raster(copy))
+    }
+
+    /// Copies a complete subtree above its source and returns the raster ID mapping.
+    /// The caller duplicates the mapped tile keys in the same artwork transaction.
+    /// # Errors
+    /// Rejects root copies, exhausted identifiers and invalid trees without mutation.
+    pub fn duplicate_group(
+        &mut self,
+        source: GroupId,
+        first_id: u128,
+    ) -> Result<Vec<(LayerId, LayerId)>, LayerTreeError> {
+        let source_node = LayerTreeNodeId::Group(source);
+        let (parent, index) = self
+            .insertion_above_clipping_run(source_node)
+            .ok_or(LayerTreeError::UnknownNode(source_node))?;
+        let mut copy = find_group_mut(&mut self.root, source)
+            .ok_or(LayerTreeError::UnknownNode(source_node))?
+            .clone();
+        let mut next = first_id;
+        let mut rasters = Vec::new();
+        remap_group_ids(&mut copy, &mut next, &mut rasters)?;
+        let suffix = " 복사";
+        copy.name = copy
+            .name
+            .chars()
+            .take(MAX_LAYER_NAME_CHARS - suffix.chars().count())
+            .chain(suffix.chars())
+            .collect();
+        self.insert(parent, index, LayerTreeNode::Group(copy))?;
+        Ok(rasters)
     }
 
     /// Changes a user-visible node name without invalidating pixel composites.
@@ -270,6 +318,26 @@ impl LayerTree {
             return Ok(CompositeInvalidation::empty());
         }
         *slot = value;
+        Ok(invalidate_all(ancestors))
+    }
+
+    /// Changes raster display colors without rewriting stored artwork.
+    /// # Errors
+    /// Rejects unknown rasters without mutation.
+    pub fn set_color_effect(
+        &mut self,
+        id: LayerId,
+        effect: Option<LayerColorEffect>,
+    ) -> Result<CompositeInvalidation, LayerTreeError> {
+        let node = LayerTreeNodeId::Raster(id);
+        let ancestors = self.editable_ancestors(node)?;
+        let Some(LayerTreeNode::Raster(layer)) = find_node_mut(&mut self.root, node) else {
+            return Err(LayerTreeError::UnknownNode(node));
+        };
+        if layer.color_effect == effect {
+            return Ok(CompositeInvalidation::empty());
+        }
+        layer.color_effect = effect;
         Ok(invalidate_all(ancestors))
     }
 
@@ -513,6 +581,31 @@ impl LayerTree {
     }
 }
 
+fn remap_group_ids(
+    group: &mut GroupNode,
+    next: &mut u128,
+    rasters: &mut Vec<(LayerId, LayerId)>,
+) -> Result<(), LayerTreeError> {
+    group.id = GroupId(*next);
+    *next = next
+        .checked_add(1)
+        .ok_or(LayerTreeError::IdentifierExhausted)?;
+    for child in &mut group.children {
+        match child {
+            LayerTreeNode::Group(group) => remap_group_ids(group, next, rasters)?,
+            LayerTreeNode::Raster(layer) => {
+                let source = layer.id;
+                layer.id = LayerId(*next);
+                *next = next
+                    .checked_add(1)
+                    .ok_or(LayerTreeError::IdentifierExhausted)?;
+                rasters.push((source, layer.id));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_children(
     group: &GroupNode,
     depth: usize,
@@ -646,6 +739,7 @@ mod tests {
 
     fn raster(id: u128) -> LayerTreeNode {
         LayerTreeNode::Raster(LayerNode {
+            color_effect: None,
             alpha_locked: false,
             clip_to_below: false,
             blend_mode: nyatidraw_api::LayerBlendMode::Normal,
@@ -811,10 +905,28 @@ mod tests {
             );
         }
         tree.set_alpha_locked(LayerId(3), true).unwrap();
+        let effect = Some(LayerColorEffect {
+            enabled: false,
+            dark_rgb: [12, 30, 90],
+            light_rgb: [240, 235, 225],
+        });
+        assert_eq!(
+            tree.set_color_effect(LayerId(3), effect)
+                .unwrap()
+                .all_tiles()
+                .collect::<Vec<_>>(),
+            vec![GroupId(1), GroupId(2)]
+        );
+        assert!(
+            tree.set_color_effect(LayerId(3), effect)
+                .unwrap()
+                .is_empty()
+        );
         tree.duplicate_raster(LayerId(3), LayerId(4)).unwrap();
         let copy = tree.raster(LayerId(4)).unwrap();
         assert!(copy.alpha_locked && copy.clip_to_below);
         assert_eq!(copy.blend_mode, LayerBlendMode::Multiply);
+        assert_eq!(copy.color_effect, effect);
         let original = tree.clone();
         for node in [
             LayerTreeNodeId::Group(GroupId(1)),
@@ -825,6 +937,7 @@ mod tests {
             assert_eq!(tree, original);
         }
         assert!(tree.set_alpha_locked(LayerId(99), true).is_err());
+        assert!(tree.set_color_effect(LayerId(99), effect).is_err());
         assert_eq!(tree, original);
         for mutate_clip in [false, true] {
             let mut root = tree.root().clone();
