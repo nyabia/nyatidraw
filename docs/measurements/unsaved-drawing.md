@@ -38,3 +38,15 @@ Windows의 격리 Edge 프로필, 1600×1000 창, Dioxus release Web/Worker, Web
 실패·성공을 검증하고 기존 별도 프로세스 복구 검사와 함께 확인한다.
 OS 클립보드의 실제 다른 앱 붙여넣기, 설치판 창 조작, 물리 펜, macOS/Linux는
 이 기록의 검증 범위가 아니다. 전체 검사·빌드와 게시 결과는 [릴리즈 기록](../releasing.md)에서 구분한다.
+
+## 최종 로컬 검사
+
+- `cargo test --workspace --all-features --locked --quiet`: 성공.
+  자식 재열기 verifier를 포함한 로그 집계는 72개 결과, 252 passed, 기존 5 ignored다.
+- workspace all-targets/all-features Clippy와 web/Worker WASM Clippy: 성공.
+- fmt·diff 공백·JavaScript 문법 검사, DX Windows release와 Web/Worker release: 성공.
+- Astro/Starlight 문서와 범용 유저스크립트 빌드: 성공. 기존 i18n/404 안내는 비차단이다.
+- Windows 로컬 실행 파일 SHA-256:
+  `27a580a4d2ca3e81c2f86e815d4105ead942a392176c67310087e07d554c914c`.
+  공개 설치 파일은 이 개발 머신 바이너리가 아니라 CI에서 따로 생성한다.
+- 검증용 Edge 프로필과 로컬 서버는 종료했다. 사용자 작품과 설치본은 변경하지 않았다.
