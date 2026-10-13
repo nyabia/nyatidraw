@@ -3,9 +3,9 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
-## alpha.18 후보 검증
+## alpha.18 배포 검증
 
-무파일 낙서·PNG 복사 요청과 함께 사용자가 게시를 승인했다. 이 후보에는 앞선 로컬
+무파일 낙서·PNG 복사 요청과 함께 사용자가 게시를 승인했다. 이 버전에는 앞선 로컬
 채우기·색 보정·러프 색상화·PNG 레이어 가져오기·그룹 복제·보기 회전·참조 창 보완도 포함한다.
 
 - workspace 전체 핵심 테스트, Windows 전체 타깃 Clippy, WASM UI/Worker Clippy,
@@ -17,9 +17,25 @@
 - Windows의 실제 다른 앱 붙여넣기·설치 업데이트·물리 펜은 이번 검증에 포함하지 않는다.
   사용자 작품과 설치본을 자동 교체하지 않는다.
 
+- 소스 `110698c`, 태그 `v0.1.0-alpha.18`의
+  [릴리즈 작업](https://github.com/nyabia/nyatidraw/actions/runs/38354501826)에서
+  source 검사·Windows release 빌드·패키징·사전 릴리즈 공개·Pages 게시가 성공했다.
+  별도 [Windows CI](https://github.com/nyabia/nyatidraw/actions/runs/38354498403)도 성공했다.
+- [공개 릴리즈](https://github.com/nyabia/nyatidraw/releases/tag/v0.1.0-alpha.18)의
+  자산 7개를 실제 다운로드해 GitHub 크기·SHA256 digest와 대조했다.
+  `SHA256SUMS.txt`의 6개 항목, JSON·legacy 업데이트 피드의 제품 ID·버전·크기·SHA1/SHA256,
+  포터블 manifest의 `NyatiDraw` / `0.1.0-alpha.18` / `nyatidraw.exe` /
+  `nyatidraw-alpha` / `win-x64`가 일치했다. 양쪽 라이선스 원문과 Lucide 고지도 확인했다.
+  설치 파일은 14,326,748 bytes,
+  SHA256 `63c52ce512c320a6149cd001bc18d90a4a75d796194c1dcba1044e67c4460eda`다.
+- [공개 웹 확인](measurements/unsaved-drawing.md#공개-웹-확인)에서 저장 파일 없이 그린 후
+  실제 PNG 복사·붙여넣기를 확인했다. 본체·복구 Worker·문서 파일이 Pages CI 산출물과 일치했다.
+- 최초 릴리즈 Pages 완료 후 공개 `release.json`과 Edge 다운로드 버튼은 alpha.17이었다.
+  릴리즈 Pages 산출물의 `release.json`은 alpha.18이므로 홈페이지만 별도 재게시한다.
+  기존 태그·Windows 릴리즈 자산은 교체하지 않는다.
+
 [변경 내용](releases/0.1.0-alpha.18.md), [무파일 낙서 검증](measurements/unsaved-drawing.md),
-[앞선 통합 검증](core-workflow-completion.md)을 기준으로 새 태그를 게시한다.
-태그를 올린 것만으로 게시 완료라고 보고하지 않고 CI·공개 자산·홈페이지를 따로 확인한다.
+[앞선 통합 검증](core-workflow-completion.md)에 실제 입력·설치 등 검증하지 않은 경계를 유지한다.
 
 ## 문서 사이트·작성창 유저스크립트 게시
 
@@ -27,7 +43,7 @@ Astro/Starlight 사용자 문서와 범용 유저스크립트는 Windows 버전�
 소스 `796b015`의 [Pages 게시](https://github.com/nyabia/nyatidraw/actions/runs/36338004353)와
 [공개 URL·파일 해시 검증](measurements/docs-userscript.md)이 완료됐다.
 홈페이지의 문서 메뉴는 `/nyatidraw/docs/`로 연결되며 기존 guide URL도 유지한다.
-앱 태그와 설치본은 alpha.17 그대로다. 확장 관리자·사이트별 실제 첨부는 아직 미검증이다.
+이 문서 사이트 게시 시점의 앱 태그는 alpha.17이었다. 확장 관리자·사이트별 실제 첨부는 아직 미검증이다.
 
 ## alpha.17 배포 확인
 
