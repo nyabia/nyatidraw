@@ -50,15 +50,16 @@ fn launch_with_instance(
     ));
     #[cfg(windows)]
     let window_exit_host = exit_host.clone();
+    let window = WindowBuilder::new()
+        .with_title("NyatiDraw")
+        .with_inner_size(dioxus_desktop::LogicalSize::new(1280.0, 800.0))
+        .with_maximized(true);
+    #[cfg(windows)]
+    let window = parent_presentation_trial(window);
     let config = Config::new()
         // Windows' native file-drop handler intercepts HTML layer drag/drop.
         .with_disable_drag_drop_handler(true)
-        .with_window(
-            WindowBuilder::new()
-                .with_title("NyatiDraw")
-                .with_inner_size(dioxus_desktop::LogicalSize::new(1280.0, 800.0))
-                .with_maximized(true),
-        )
+        .with_window(window)
         .with_icon(
             dioxus_desktop::tao::window::Icon::from_rgba(
                 include_bytes!("../assets/nyatidraw.rgba").to_vec(),
@@ -113,6 +114,19 @@ fn launch_with_instance(
     dioxus::LaunchBuilder::desktop()
         .with_cfg(config)
         .launch(app);
+}
+
+#[cfg(windows)]
+fn parent_presentation_trial(window: WindowBuilder) -> WindowBuilder {
+    use dioxus_desktop::tao::platform::windows::WindowBuilderExtWindows as _;
+
+    let enabled = crate::desktop_canvas::composition_host_enabled();
+    if enabled {
+        println!(
+            "desktop-shell event=composition-host-trial parent_no_redirection=true canvas_target=parent-bottom web_target=parent-top"
+        );
+    }
+    window.with_no_redirection_bitmap(enabled)
 }
 
 /// Positions the restored window on the monitor containing the cursor before

@@ -1,10 +1,11 @@
 use std::{fmt, sync::Arc};
 
 use nyatidraw_api::{
-    ContentRootId, GroupId, HistoryNodeId, LayerBlendMode, LayerColorEffect, LayerId, SnapshotId,
+    ContentRootId, GroupId, HistoryNodeId, LayerBlendMode, LayerColorEffect, LayerId, MaskId,
+    SnapshotId,
 };
 use nyatidraw_brush::{BrushPreset, BrushPresetId, BrushSnapshot, RecordedStroke};
-use nyatidraw_document::{GroupNode, LayerNode, LayerTree, LayerTreeNode};
+use nyatidraw_document::{GroupNode, LayerMask, LayerNode, LayerTree, LayerTreeNode};
 use nyatidraw_history::{HistoryNode, OperationRecord};
 use nyatidraw_input::{PenButtons, Point, PointerPhase, StylusSample};
 use nyatidraw_stroke::{
@@ -12,8 +13,8 @@ use nyatidraw_stroke::{
     StrokeCommitId, StrokeSelection,
 };
 use nyatidraw_tiles::{
-    ContentRoot, ObjectHash, TILE_BYTE_LEN, TILE_EDGE, TileBounds, TileKey, TileSnapshot,
-    TileSnapshotError,
+    COVERAGE_TILE_BYTE_LEN, ContentRoot, CoverageTileKey, ObjectHash, TILE_BYTE_LEN, TILE_EDGE,
+    TileBounds, TileKey, TileSnapshot, TileSnapshotError,
 };
 
 const RECORD_MAGIC: [u8; 8] = *b"NYREC001";
@@ -22,8 +23,9 @@ const ROOT_ENTRY_ENCODED_LEN: usize = 57;
 const SAMPLE_MIN_ENCODED_LEN: usize = 61;
 const SELECTION_EXTENSION: [u8; 8] = *b"NYSEL001";
 const SIGNED_SELECTION_EXTENSION: [u8; 8] = *b"NYSEL002";
+const FRACTIONAL_SELECTION_EXTENSION: [u8; 8] = *b"NYSEL003";
 const ALPHA_LOCK_EXTENSION: [u8; 8] = *b"NYALP001";
-const LAYER_TREE_WIRE_VERSION: u16 = 4;
+const LAYER_TREE_WIRE_VERSION: u16 = 5;
 const MAX_LAYER_TREE_NODES: usize = 4_096;
 const MAX_LAYER_TREE_DEPTH: usize = 64;
 const MAX_LAYER_NAME_BYTES: usize = 1_024;
@@ -44,6 +46,8 @@ pub enum RecordKind {
     InitialHistoryCursor = 7,
     LayerTree = 8,
     CanvasSpec = 9,
+    AnimationTimeline = 10,
+    CoverageTile = 11,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,8 +82,13 @@ impl Envelope {
     /// fails or does not reduce size. Hashes always describe original bytes.
     #[must_use]
     pub fn encode_for_storage(&self) -> Vec<u8> {
-        if self.kind == RecordKind::Tile
-            && self.payload.len() == TILE_BYTE_LEN
+        if matches!(self.kind, RecordKind::Tile | RecordKind::CoverageTile)
+            && self.payload.len()
+                == if self.kind == RecordKind::Tile {
+                    TILE_BYTE_LEN
+                } else {
+                    COVERAGE_TILE_BYTE_LEN
+                }
             && let Ok(compressed) = zstd::bulk::compress(&self.payload, 1)
             && compressed.len() < self.payload.len()
         {
@@ -98,6 +107,16 @@ impl Envelope {
         output.extend_from_slice(&self.checksum.0);
         output.extend_from_slice(payload);
         output
+    }
+
+    /// # Errors
+    /// Accepts only the explicit RGBA8 and R8 object kinds, with their full checksum validation.
+    pub fn decode_tile_object(bytes: &[u8]) -> Result<Self, WireError> {
+        match bytes.get(8) {
+            Some(1) => Self::decode(bytes, RecordKind::Tile),
+            Some(11) => Self::decode(bytes, RecordKind::CoverageTile),
+            _ => Err(WireError::InvalidEnum),
+        }
     }
 
     /// Decodes and verifies a project record envelope.
@@ -122,15 +141,33 @@ impl Envelope {
             return Err(WireError::UnsupportedSchema(schema_version));
         }
         let codec = decoder.u8()?;
-        if codec > 1 || (codec == 1 && expected_kind != RecordKind::Tile) {
+        if codec > 1
+            || (codec == 1 && !matches!(expected_kind, RecordKind::Tile | RecordKind::CoverageTile))
+        {
             return Err(WireError::UnsupportedCodec(codec));
         }
         let uncompressed_len = decoder.u64()?;
         let checksum = ObjectHash(decoder.array()?);
+        if expected_kind == RecordKind::CoverageTile
+            && uncompressed_len != COVERAGE_TILE_BYTE_LEN as u64
+        {
+            return Err(WireError::LengthMismatch);
+        }
         let stored = decoder.remaining();
+        if codec == 0
+            && expected_kind == RecordKind::CoverageTile
+            && stored.len() != COVERAGE_TILE_BYTE_LEN
+        {
+            return Err(WireError::LengthMismatch);
+        }
         let payload = if codec == 1 {
             // Never allocate from an untrusted declared length or frame size.
-            if uncompressed_len != TILE_BYTE_LEN as u64 || stored.len() >= TILE_BYTE_LEN {
+            let tile_bytes = if expected_kind == RecordKind::Tile {
+                TILE_BYTE_LEN
+            } else {
+                COVERAGE_TILE_BYTE_LEN
+            };
+            if uncompressed_len != tile_bytes as u64 || stored.len() >= tile_bytes {
                 return Err(WireError::LengthMismatch);
             }
             let frame_len = zstd::zstd_safe::find_frame_compressed_size(stored)
@@ -138,10 +175,10 @@ impl Envelope {
             if frame_len != stored.len() {
                 return Err(WireError::TrailingBytes);
             }
-            let mut pixels = vec![0; TILE_BYTE_LEN];
+            let mut pixels = vec![0; tile_bytes];
             let written = zstd::bulk::decompress_to_buffer(stored, &mut pixels[..])
                 .map_err(|_| WireError::LengthMismatch)?;
-            if written != TILE_BYTE_LEN {
+            if written != tile_bytes {
                 return Err(WireError::LengthMismatch);
             }
             pixels
@@ -179,6 +216,8 @@ impl TryFrom<u8> for RecordKind {
             7 => Ok(Self::InitialHistoryCursor),
             8 => Ok(Self::LayerTree),
             9 => Ok(Self::CanvasSpec),
+            10 => Ok(Self::AnimationTimeline),
+            11 => Ok(Self::CoverageTile),
             _ => Err(WireError::InvalidEnum),
         }
     }
@@ -187,6 +226,38 @@ impl TryFrom<u8> for RecordKind {
 #[cfg(test)]
 mod tile_codec_tests {
     use super::*;
+
+    #[test]
+    fn coverage_objects_and_root_planes_reject_type_confusion_and_preserve_image_only_roots() {
+        let image = TileSnapshot::from_tiles([(
+            TileKey::from_pixel(LayerId(1), 128, -1, 0),
+            vec![127; TILE_BYTE_LEN],
+        )])
+        .unwrap();
+        let key = CoverageTileKey::from_pixel(MaskId(2), 128, -1, 0);
+        let masked = image
+            .with_coverage_replacements([(key, vec![64; COVERAGE_TILE_BYTE_LEN])])
+            .unwrap();
+        let bytes = encode_root_manifest(&masked);
+        let manifest = decode_root_manifest(&bytes).unwrap();
+        assert_eq!(manifest.coverage[0].0, key);
+        assert_eq!(manifest.root, masked.root());
+        assert_eq!(
+            encode_root_manifest(&masked.without_masks([MaskId(2)])),
+            encode_root_manifest(&image)
+        );
+        let record = Envelope::new(RecordKind::CoverageTile, vec![64; COVERAGE_TILE_BYTE_LEN]);
+        for encoded in [record.encode(), record.encode_for_storage()] {
+            assert_eq!(Envelope::decode_tile_object(&encoded).unwrap(), record);
+            assert!(Envelope::decode(&encoded, RecordKind::Tile).is_err());
+        }
+        for index in [48, bytes.len() - 1] {
+            let mut damaged = bytes.clone();
+            damaged[index] ^= 1;
+            assert!(decode_root_manifest(&damaged).is_err());
+        }
+        assert!(decode_root_manifest(&bytes[..bytes.len() - 1]).is_err());
+    }
 
     #[test]
     fn forged_manifest_cannot_redirect_reclamation_to_unrelated_artwork() {
@@ -449,7 +520,9 @@ pub fn encode_layer_tree(tree: &LayerTree) -> Result<Vec<u8>, WireError> {
         })
     }
     let mut output = Vec::new();
-    let version = if has_color_effect(tree.root()) {
+    let version = if tree.has_masks() {
+        5_u16
+    } else if has_color_effect(tree.root()) {
         4_u16
     } else {
         3_u16
@@ -537,6 +610,14 @@ fn encode_raster_node(
             output.extend_from_slice(&effect.light_rgb);
         }
     }
+    if version >= 5 {
+        output.push(u8::from(layer.mask.is_some()));
+        if let Some(mask) = layer.mask {
+            output.extend_from_slice(&mask.id.0.to_le_bytes());
+            output.push(u8::from(mask.enabled));
+            output.push(mask.default_coverage);
+        }
+    }
     Ok(())
 }
 
@@ -554,6 +635,9 @@ const fn encode_blend_mode(mode: LayerBlendMode) -> u8 {
     match mode {
         LayerBlendMode::Normal => 0,
         LayerBlendMode::Multiply => 1,
+        LayerBlendMode::Screen => 2,
+        LayerBlendMode::Add => 3,
+        LayerBlendMode::Overlay => 4,
     }
 }
 
@@ -561,6 +645,9 @@ fn decode_blend_mode(decoder: &mut Decoder<'_>) -> Result<LayerBlendMode, WireEr
     match decoder.u8()? {
         0 => Ok(LayerBlendMode::Normal),
         1 => Ok(LayerBlendMode::Multiply),
+        2 => Ok(LayerBlendMode::Screen),
+        3 => Ok(LayerBlendMode::Add),
+        4 => Ok(LayerBlendMode::Overlay),
         _ => Err(WireError::InvalidEnum),
     }
 }
@@ -660,6 +747,15 @@ fn decode_raster_node(
         } else {
             None
         },
+        mask: if version >= 5 && decoder.boolean()? {
+            Some(LayerMask {
+                id: MaskId(decoder.u128()?),
+                enabled: decoder.boolean()?,
+                default_coverage: decoder.u8()?,
+            })
+        } else {
+            None
+        },
     })
 }
 
@@ -667,6 +763,7 @@ fn decode_raster_node(
 pub struct RootManifest {
     pub root: ContentRoot,
     pub tiles: Vec<(TileKey, ObjectHash)>,
+    pub coverage: Vec<(CoverageTileKey, ObjectHash)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -704,21 +801,27 @@ pub fn encode_root_manifest(snapshot: &TileSnapshot) -> Vec<u8> {
     let mut output = Vec::new();
     encode_content_root(&mut output, snapshot.root());
     output.extend_from_slice(&TILE_EDGE.to_le_bytes());
-    output.extend_from_slice(
-        &u64::try_from(snapshot.len())
-            .unwrap_or(u64::MAX)
-            .to_le_bytes(),
-    );
+    output.extend_from_slice(&(snapshot.len() as u64).to_le_bytes());
     for (key, tile) in snapshot.iter() {
         encode_tile_key(&mut output, key);
         output.extend_from_slice(&tile.hash().0);
+    }
+    if snapshot.coverage_len() != 0 {
+        output.extend_from_slice(b"NYMASK01");
+        output.extend_from_slice(&(snapshot.coverage_len() as u64).to_le_bytes());
+        for (key, tile) in snapshot.coverage_iter() {
+            output.extend_from_slice(&key.mask.0.to_le_bytes());
+            output.push(key.mip);
+            output.extend_from_slice(&key.x.to_le_bytes());
+            output.extend_from_slice(&key.y.to_le_bytes());
+            output.extend_from_slice(&tile.hash().0);
+        }
     }
     output
 }
 
 /// # Errors
-///
-/// Returns an error when the manifest is malformed or uses another tile edge.
+/// Rejects unknown planes, malformed or noncanonical keys, and wrong content roots.
 pub fn decode_root_manifest(bytes: &[u8]) -> Result<RootManifest, WireError> {
     let mut decoder = Decoder::new(bytes);
     let root = decode_content_root(&mut decoder)?;
@@ -733,16 +836,51 @@ pub fn decode_root_manifest(bytes: &[u8]) -> Result<RootManifest, WireError> {
     for _ in 0..count {
         tiles.push((decode_tile_key(&mut decoder)?, ObjectHash(decoder.array()?)));
     }
+    let mut coverage = Vec::new();
+    if decoder.remaining_len() != 0 {
+        if decoder.array::<8>()? != *b"NYMASK01" {
+            return Err(WireError::InvalidData("unsupported root plane"));
+        }
+        let count = decoder.bounded_len(
+            decoder.remaining_len() / ROOT_ENTRY_ENCODED_LEN,
+            "coverage count exceeds payload",
+        )?;
+        if count == 0 {
+            return Err(WireError::InvalidData("noncanonical empty coverage plane"));
+        }
+        coverage.reserve(count);
+        for _ in 0..count {
+            let key = CoverageTileKey {
+                mask: MaskId(decoder.u128()?),
+                mip: decoder.u8()?,
+                x: decoder.i32()?,
+                y: decoder.i32()?,
+            };
+            if key.mask.0 == 0 || key.mip != 0 {
+                return Err(WireError::InvalidData("invalid coverage key"));
+            }
+            coverage.push((key, ObjectHash(decoder.array()?)));
+        }
+    }
     decoder.finish()?;
-    if tiles.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+    if tiles.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        || coverage.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+    {
         return Err(WireError::InvalidData("root entries not canonical"));
     }
-    // The first 48 bytes are the claimed root ID/hash. Verify the remaining
-    // canonical manifest before reference collection can trust its tile keys.
-    if ObjectHash::digest_tagged(b"nyatidraw-content-root-v1", &bytes[48..]) != root.hash {
+    let tag = if coverage.is_empty() {
+        b"nyatidraw-content-root-v1".as_slice()
+    } else {
+        b"nyatidraw-content-root-planes-v2".as_slice()
+    };
+    if ObjectHash::digest_tagged(tag, &bytes[48..]) != root.hash {
         return Err(WireError::RootMismatch);
     }
-    Ok(RootManifest { root, tiles })
+    Ok(RootManifest {
+        root,
+        tiles,
+        coverage,
+    })
 }
 
 #[must_use]
@@ -771,7 +909,11 @@ pub fn encode_stroke_commit(commit: &StrokeCommit) -> Vec<u8> {
     }
     if let Some(selection) = commit.selection() {
         let origin = selection.origin();
-        if origin == [0, 0] {
+        if !selection.is_binary() {
+            output.extend_from_slice(&FRACTIONAL_SELECTION_EXTENSION);
+            output.extend_from_slice(&origin[0].to_le_bytes());
+            output.extend_from_slice(&origin[1].to_le_bytes());
+        } else if origin == [0, 0] {
             output.extend_from_slice(&SELECTION_EXTENSION);
         } else {
             output.extend_from_slice(&SIGNED_SELECTION_EXTENSION);
@@ -781,7 +923,11 @@ pub fn encode_stroke_commit(commit: &StrokeCommit) -> Vec<u8> {
         let [width, height] = selection.dimensions();
         output.extend_from_slice(&width.to_le_bytes());
         output.extend_from_slice(&height.to_le_bytes());
-        output.extend_from_slice(&selection.packed_bits());
+        if selection.is_binary() {
+            output.extend_from_slice(&selection.packed_bits());
+        } else {
+            output.extend_from_slice(selection.coverage_bytes());
+        }
     }
     output
 }
@@ -822,7 +968,9 @@ pub fn decode_stroke_commit(
     let selection = if decoder.remaining_len() == 0 {
         None
     } else {
-        let origin = match decoder.array::<8>()? {
+        let extension = decoder.array::<8>()?;
+        let origin = match extension {
+            FRACTIONAL_SELECTION_EXTENSION => [decoder.i32()?, decoder.i32()?],
             SELECTION_EXTENSION => [0, 0],
             SIGNED_SELECTION_EXTENSION => {
                 let origin = [decoder.i32()?, decoder.i32()?];
@@ -843,10 +991,18 @@ pub fn decode_stroke_commit(
         let height = decoder.u32()?;
         let packed = &decoder.bytes[decoder.position..];
         decoder.position = decoder.bytes.len();
-        Some(Arc::new(
+        let selection = if extension == FRACTIONAL_SELECTION_EXTENSION {
+            let selection = StrokeSelection::from_coverage_at(origin, [width, height], packed)
+                .map_err(|_| WireError::InvalidData("invalid fractional selection coverage"))?;
+            if selection.is_binary() {
+                return Err(WireError::InvalidData("noncanonical fractional selection"));
+            }
+            selection
+        } else {
             StrokeSelection::from_packed_bits_at(origin, [width, height], packed)
-                .map_err(|_| WireError::InvalidData("invalid stroke selection coverage"))?,
-        ))
+                .map_err(|_| WireError::InvalidData("invalid stroke selection coverage"))?
+        };
+        Some(Arc::new(selection))
     };
     decoder.finish()?;
     if before.root() != before_root {
@@ -999,7 +1155,11 @@ fn preflight_stroke_selection(decoder: &mut Decoder<'_>, max_tiles: u32) -> Resu
     if decoder.remaining_len() == 0 {
         return Ok(());
     }
-    match decoder.array::<8>()? {
+    let extension = decoder.array::<8>()?;
+    match extension {
+        FRACTIONAL_SELECTION_EXTENSION => {
+            let _origin = [decoder.i32()?, decoder.i32()?];
+        }
         SELECTION_EXTENSION => {}
         SIGNED_SELECTION_EXTENSION => {
             if [decoder.i32()?, decoder.i32()?] == [0, 0] {
@@ -1023,7 +1183,13 @@ fn preflight_stroke_selection(decoder: &mut Decoder<'_>, max_tiles: u32) -> Resu
             "stroke selection exceeds import pixel budget",
         ));
     }
-    if u64::try_from(decoder.remaining_len()).ok() != Some(pixels.div_ceil(8)) {
+    if u64::try_from(decoder.remaining_len()).ok()
+        != Some(if extension == FRACTIONAL_SELECTION_EXTENSION {
+            pixels
+        } else {
+            pixels.div_ceil(8)
+        })
+    {
         return Err(WireError::InvalidData("invalid stroke selection coverage"));
     }
     decoder.position = decoder.bytes.len();
@@ -1507,6 +1673,93 @@ mod project_head_compatibility_tests {
     use nyatidraw_stroke::{CpuReplayMaterializer, StrokeMaterializer};
 
     #[test]
+    fn fractional_selection_wire_preserves_coverage_hash_and_replay_without_changing_binary_format()
+    {
+        let preset = BrushPreset {
+            id: BrushPresetId(1),
+            schema_version: 1,
+            engine_version: 1,
+            size_px: 4.0,
+            opacity: 1.0,
+            flow: 1.0,
+            spacing_ratio: 0.2,
+            size_pressure: false,
+            opacity_pressure: false,
+            size_min_ratio: 0.0,
+            opacity_min_ratio: 0.0,
+            hardness: 1.0,
+        };
+        let sample = StylusSample {
+            sequence: 1,
+            timestamp_ns: 1,
+            device_id: 1,
+            phase: PointerPhase::Begin,
+            position_document: Point { x: 0.0, y: 0.0 },
+            pressure: 1.0,
+            tilt: None,
+            twist_radians: None,
+            tangential_pressure: None,
+            buttons: PenButtons::default(),
+            eraser: false,
+            viewport_revision: 0,
+        };
+        let samples = vec![
+            sample,
+            StylusSample {
+                sequence: 2,
+                timestamp_ns: 2,
+                phase: PointerPhase::End,
+                ..sample
+            },
+        ];
+        let mut evaluator = RoundBrushEvaluator::default();
+        let mut dabs = Vec::new();
+        let mut token = begin_round_stroke(&mut evaluator, &preset, samples[0], &mut dabs);
+        evaluator.push(&mut token, &samples[1..], &mut dabs);
+        let recorded = evaluator.end(token, &mut dabs);
+        let before = TileSnapshot::empty();
+        for (origin, coverage, extension) in [
+            ([0, 0], [0, 255, 255, 0], SELECTION_EXTENSION),
+            ([-1, -1], [255, 0, 0, 255], SIGNED_SELECTION_EXTENSION),
+            ([0, 0], [0, 64, 128, 255], FRACTIONAL_SELECTION_EXTENSION),
+            ([-1, -1], [1, 64, 128, 254], FRACTIONAL_SELECTION_EXTENSION),
+        ] {
+            let selection =
+                Arc::new(StrokeSelection::from_coverage_at(origin, [2, 2], &coverage).unwrap());
+            let commit = StrokeCommit::seal_with_selection(
+                SnapshotId(1),
+                LayerId(1),
+                &before,
+                BrushSnapshot { preset },
+                recorded.clone(),
+                StrokeColor::new([255; 4]).unwrap(),
+                samples.clone(),
+                Some(selection),
+            )
+            .unwrap();
+            let bytes = encode_stroke_commit(&commit);
+            assert!(bytes.windows(8).any(|window| window == extension));
+            assert!(preflight_stroke_decode(&bytes, 1024).is_ok());
+            let restored = decode_stroke_commit(&bytes, &before).unwrap();
+            assert_eq!(restored.id, commit.id);
+            assert_eq!(restored.selection().unwrap().coverage_bytes(), coverage);
+            assert_eq!(
+                CpuReplayMaterializer
+                    .materialize(&restored, &before)
+                    .unwrap()
+                    .after,
+                CpuReplayMaterializer
+                    .materialize(&commit, &before)
+                    .unwrap()
+                    .after
+            );
+            if extension == FRACTIONAL_SELECTION_EXTENSION {
+                assert!(decode_stroke_commit(&bytes[..bytes.len() - 1], &before).is_err());
+            }
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines, clippy::float_cmp)] // Exact legacy replay constants.
     fn legacy_and_configurable_brush_records_preserve_replay_and_content_roots() {
         // Risk: adding pressure switches/tip softness must not reinterpret old
@@ -1803,12 +2056,30 @@ mod project_head_compatibility_tests {
             corrupt[reference_offset] = invalid;
             assert_eq!(decode_layer_tree(&corrupt), Err(WireError::InvalidEnum));
         }
-        for offset in [current.len() - 3, current.len() - 2, current.len() - 1] {
+        for offset in [current.len() - 3, current.len() - 2] {
             for invalid in [2, 255] {
                 let mut corrupt = current.clone();
                 corrupt[offset] = invalid;
                 assert_eq!(decode_layer_tree(&corrupt), Err(WireError::InvalidEnum));
             }
+        }
+        for invalid in [5, 255] {
+            let mut corrupt = current.clone();
+            *corrupt.last_mut().unwrap() = invalid;
+            assert_eq!(decode_layer_tree(&corrupt), Err(WireError::InvalidEnum));
+        }
+        for (tag, mode) in [
+            (0, LayerBlendMode::Normal),
+            (1, LayerBlendMode::Multiply),
+            (2, LayerBlendMode::Screen),
+            (3, LayerBlendMode::Add),
+            (4, LayerBlendMode::Overlay),
+        ] {
+            let mut encoded = current.clone();
+            *encoded.last_mut().unwrap() = tag;
+            let decoded = decode_layer_tree(&encoded).unwrap();
+            assert_eq!(decoded.raster(LayerId(7)).unwrap().blend_mode, mode);
+            assert_eq!(encode_layer_tree(&decoded).unwrap(), encoded);
         }
         for offset in [31, 32] {
             // Root after visible and opacity, before child count.
@@ -1820,7 +2091,7 @@ mod project_head_compatibility_tests {
             );
         }
         let mut unsupported = current;
-        unsupported[..2].copy_from_slice(&5_u16.to_le_bytes());
+        unsupported[..2].copy_from_slice(&6_u16.to_le_bytes());
         assert!(decode_layer_tree(&unsupported).is_err());
     }
 
@@ -1868,7 +2139,7 @@ mod project_head_compatibility_tests {
             assert!(decode_layer_tree(&bytes[..length]).is_err());
         }
         let mut future = bytes;
-        future[..2].copy_from_slice(&5_u16.to_le_bytes());
+        future[..2].copy_from_slice(&6_u16.to_le_bytes());
         assert!(decode_layer_tree(&future).is_err());
     }
 

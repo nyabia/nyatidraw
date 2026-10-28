@@ -14,6 +14,9 @@ use nyatidraw_paint_cpu::{
 use nyatidraw_tiles::{TILE_BYTE_LEN, TileSnapshot};
 use std::sync::Arc;
 
+#[path = "transform_group.rs"]
+mod group;
+
 #[derive(Debug)]
 pub enum TransformError {
     Rejected(String),
@@ -50,6 +53,7 @@ struct Transaction {
     source: TileSnapshot,
     tree: LayerTree,
     layer: LayerId,
+    layers: Vec<LayerId>,
     selection: Arc<SelectionMask>,
     affine: AffineDraft,
     projection: TransformProjection,
@@ -120,6 +124,7 @@ impl TransformSession {
     ) -> Result<TransformOutcome, TransformError> {
         match command {
             TransformCommand::Begin
+            | TransformCommand::BeginGroup(_)
             | TransformCommand::Paste
             | TransformCommand::ImportRaster(_) => {
                 if command == TransformCommand::Begin
@@ -136,8 +141,16 @@ impl TransformSession {
                 let mut source = session.tiles().clone();
                 let mut source_tree = tree.clone();
                 let mut layer = target;
+                let mut layers = if let TransformCommand::BeginGroup(id) = &command {
+                    group::targets(tree, *id)?
+                } else {
+                    vec![target]
+                };
                 let mut retained_bytes = 0;
-                let pasted = command != TransformCommand::Begin;
+                let pasted = matches!(
+                    command,
+                    TransformCommand::Paste | TransformCommand::ImportRaster(_)
+                );
                 let mask = if pasted {
                     let (fragment, name) = if let TransformCommand::ImportRaster(import) = &command
                     {
@@ -183,6 +196,7 @@ impl TransformSession {
                     id.checked_add(1)
                         .ok_or_else(|| rejected("IdentifierExhausted"))?;
                     layer = LayerId(id);
+                    layers = vec![layer];
                     let (parent, index) = tree
                         .insertion_above_clipping_run(LayerTreeNodeId::Raster(target))
                         .ok_or_else(|| rejected("붙여넣기 위치 레이어가 없습니다."))?;
@@ -191,6 +205,7 @@ impl TransformSession {
                             parent,
                             index,
                             LayerTreeNode::Raster(LayerNode {
+                                mask: None,
                                 color_effect: None,
                                 alpha_locked: false,
                                 clip_to_below: false,
@@ -220,6 +235,8 @@ impl TransformSession {
                         selection_all(fragment.origin(), fragment.size(), EditLimits::default())
                             .map_err(rejected)?,
                     )
+                } else if selection.is_none() {
+                    Arc::new(group::occupied_selection(&source, &source_tree, &layers)?)
                 } else {
                     selection
                         .clone()
@@ -233,14 +250,17 @@ impl TransformSession {
                 retained_bytes = retained_bytes.saturating_add(
                     u64::from(mask.dimensions()[0]) * u64::from(mask.dimensions()[1]) * 2,
                 );
-                let mut affine = AffineDraft::new(
+                let mut affine = AffineDraft::new_layers(
                     session.current_snapshot(),
                     &source,
                     &source_tree,
-                    layer,
+                    &layers,
                     &mask,
                 )
                 .map_err(rejected)?;
+                if selection.is_none() && !pasted {
+                    affine.include_whole_layer_masks();
+                }
                 let transform = AffineTransform::default();
                 let result = affine
                     .preview(generation, &transform, preview_limits(retained_bytes)?)
@@ -269,6 +289,7 @@ impl TransformSession {
                     source,
                     tree: source_tree,
                     layer,
+                    layers,
                     selection: mask,
                     affine,
                     projection,
@@ -313,7 +334,7 @@ impl TransformSession {
                         tx.snapshot,
                         &tx.source,
                         &tx.tree,
-                        tx.layer,
+                        tx.layers[0],
                         &tx.selection,
                     )
                     .map_err(rejected)?;

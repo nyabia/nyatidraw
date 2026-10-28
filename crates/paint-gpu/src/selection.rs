@@ -39,7 +39,36 @@ impl GpuSelectionMask {
         {
             return Err(GpuSelectionError::InvalidCoverage);
         }
-        let mut words = packed.to_vec();
+        let coverage: Vec<u8> = (0..usize::try_from(pixels)
+            .map_err(|_| GpuSelectionError::InvalidDimensions)?)
+            .map(|index| ((packed[index / 8] >> (index % 8)) & 1) * 255)
+            .collect();
+        Self::from_coverage(device, origin, dimensions, &coverage)
+    }
+
+    /// # Errors
+    /// Rejects inconsistent or unbounded signed 8-bit coverage before GPU allocation.
+    pub fn from_coverage(
+        device: &wgpu::Device,
+        origin: [i32; 2],
+        dimensions: [u32; 2],
+        coverage: &[u8],
+    ) -> Result<Self, GpuSelectionError> {
+        let [width, height] = dimensions;
+        let pixels = u64::from(width) * u64::from(height);
+        if pixels == 0
+            || pixels > 16 * 1024 * 1024
+            || origin
+                .into_iter()
+                .zip(dimensions)
+                .any(|(start, size)| i64::from(start) + i64::from(size) > i64::from(i32::MAX) + 1)
+        {
+            return Err(GpuSelectionError::InvalidDimensions);
+        }
+        if u64::try_from(coverage.len()).ok() != Some(pixels) {
+            return Err(GpuSelectionError::InvalidCoverage);
+        }
+        let mut words = coverage.to_vec();
         words.resize(words.len().div_ceil(4) * 4, 0);
         let bits = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("nyatidraw-selection-coverage"),

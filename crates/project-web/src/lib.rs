@@ -15,7 +15,11 @@ use nyatidraw_web_core::{WebDocument, WebPreferences};
 
 mod preferences;
 mod recovery;
-pub use recovery::{RecoveryCheckpoint, RecoveryRequest, RecoveryWriter};
+pub use recovery::{RecoveryCheckpoint, RecoveryRequest, RecoveryWriter, decode_export_checkpoint};
+#[cfg(test)]
+mod animation_tests;
+#[cfg(test)]
+mod mask_tests;
 #[cfg(test)]
 mod tests;
 
@@ -99,7 +103,7 @@ impl WebProject {
         let db = memory.db();
         let restored_active = db.load_active_layer();
         let reopened = db.load_reopened().map_err(message)?;
-        let (canvas, layers, tiles) = if let Some(reopened) = reopened {
+        let (canvas, layers, tiles, timeline) = if let Some(reopened) = reopened {
             let parts = reopened.into_parts();
             (
                 db.load_cursor_canvas_spec(parts.current_cursor)
@@ -107,12 +111,15 @@ impl WebProject {
                 db.load_cursor_layer_tree(parts.current_cursor)
                     .map_err(message)?,
                 parts.current_tiles,
+                db.load_cursor_animation_timeline(parts.current_cursor)
+                    .map_err(message)?,
             )
         } else {
             (
                 db.load_canvas_spec().map_err(message)?,
                 db.load_layer_tree().map_err(message)?,
                 TileSnapshot::empty(),
+                db.load_animation_timeline().map_err(message)?,
             )
         };
         let mut document = if let Some(layers) = layers {
@@ -128,7 +135,8 @@ impl WebProject {
                         .copied()
                 })
                 .ok_or("The browser requires at least one raster layer")?;
-            WebDocument::from_snapshot(canvas, tiles, layers, active).map_err(message)?
+            WebDocument::from_animation_snapshot(canvas, tiles, layers, active, timeline, None)
+                .map_err(message)?
         } else if tiles.is_empty() {
             WebDocument::new(canvas).map_err(message)?
         } else {
@@ -255,6 +263,11 @@ impl WebProject {
                         .load_cursor_canvas_spec(parts.current_cursor)
                         .map_err(message)?
                         != self.document.canvas()
+                    || db
+                        .load_cursor_animation_timeline(parts.current_cursor)
+                        .map_err(message)?
+                        .as_ref()
+                        != self.document.animation_timeline()
             }
             None => true,
         };
@@ -279,10 +292,11 @@ impl WebProject {
                     self.document.snapshot().clone(),
                 )
                 .map_err(|error| format!("Cannot prepare project edit: {error:?}"))?;
-            db.commit_structural_with_metadata(
+            db.commit_structural_with_document_metadata(
                 &batch,
                 self.document.layers(),
                 self.document.canvas(),
+                self.document.animation_timeline(),
             )
             .map_err(message)?;
         }

@@ -27,6 +27,20 @@ impl WebDocument {
     /// # Errors
     /// Rejects invalid edits and browser resource limits before replacing artwork.
     pub fn apply_edit(&mut self, command: EditCommand) -> Result<CanvasUpdate, WebError> {
+        if let Some(mask_command) =
+            nyatidraw_editor::masks::mask_edit_command(&command, self.raster_target())
+        {
+            return self.apply_mask_command(mask_command);
+        }
+        if matches!(
+            self.raster_target(),
+            nyatidraw_api::RasterEditTarget::Mask { .. }
+        ) && !nyatidraw_editor::masks::edit_allowed_on_mask(&command)
+        {
+            return Err(WebError::EditRejected(
+                "이 작업은 이미지 대상을 선택한 뒤 사용할 수 있습니다.".into(),
+            ));
+        }
         if let EditCommand::ColorAdjustment(command) = command {
             return self.apply_color_adjustment(command);
         }
@@ -39,11 +53,12 @@ impl WebDocument {
         self.require_idle()?;
         let mut clipboard =
             nyatidraw_editor::pixel_edit::MemoryArtworkClipboard(self.clipboard.0.clone());
+        let edit_tree = self.edit_tree()?;
         let edit = execute_pixel_edit(
             command,
             self.active_layer(),
             self.canvas(),
-            self.layers(),
+            &edit_tree,
             &self.selection,
             self.snapshot(),
             self.next_layer_id,
@@ -59,7 +74,7 @@ impl WebDocument {
             next.tiles = tiles;
         }
         if let Some(tree) = edit.tree {
-            next.layers = tree;
+            next.layers = self.merge_edit_tree(&tree)?;
         }
         if let Some(canvas) = edit.canvas {
             next.canvas = canvas;
@@ -90,7 +105,7 @@ impl WebDocument {
                 return Ok(CanvasUpdate::default());
             }
             LayerCommand::ToggleSolo(node) => {
-                if self.layers().parent_and_index(node).is_none() {
+                if !self.active_node(node) {
                     return Err(WebError::InvalidLayer);
                 }
                 self.solo = if self.solo == Some(node) {
@@ -109,29 +124,39 @@ impl WebDocument {
             let canvas = self.canvas();
             let count = canvas.width_px.div_ceil(crate::TILE_EDGE)
                 * canvas.height_px.div_ceil(crate::TILE_EDGE);
-            if self.snapshot().len() + count as usize > MAX_RESIDENT_TILES {
+            if self.snapshot().total_len() + count as usize > MAX_RESIDENT_TILES {
                 return Err(WebError::LimitExceeded);
             }
         }
+        let edit_tree = self.edit_tree()?;
         let prepared = layer_edit::prepare_layer_edit(
-            self.layers(),
+            &edit_tree,
             self.active_layer(),
             self.next_layer_id,
             command,
         )
         .map_err(|reason| WebError::EditRejected(format!("{reason:?}")))?;
         let mut next = self.artwork.clone();
-        next.layers = prepared.tree;
+        next.layers = self.merge_edit_tree(&prepared.tree)?;
         next.active = prepared.active;
         if let Some(pixels) = prepared.pixels {
             next.tiles = pixels
-                .apply(self.snapshot(), self.canvas())
+                .apply_to_tree(
+                    self.snapshot(),
+                    self.canvas(),
+                    &self.artwork.layers,
+                    &next.layers,
+                )
                 .map_err(WebError::EditRejected)?;
         }
-        next.tiles = TileSnapshot::from_objects(
+        next.tiles = TileSnapshot::from_planes(
             next.tiles
                 .iter()
                 .filter(|(key, _)| next.layers.raster(key.layer).is_some())
+                .map(|(key, tile)| (key, tile.clone())),
+            next.tiles
+                .coverage_iter()
+                .filter(|(key, _)| next.layers.mask_ids().contains(&key.mask))
                 .map(|(key, tile)| (key, tile.clone())),
         )
         .map_err(|_| WebError::InvalidPixels)?;
@@ -166,7 +191,23 @@ pub(super) fn node_count(tree: &crate::LayerTree) -> usize {
 
 pub(super) fn validate_artwork(artwork: &Artwork) -> Result<(), WebError> {
     validate_canvas(artwork.canvas)?;
-    if artwork.tiles.len() > MAX_RESIDENT_TILES || node_count(&artwork.layers) > MAX_LAYERS {
+    if artwork.tiles.total_len() > MAX_RESIDENT_TILES {
+        return Err(WebError::LimitExceeded);
+    }
+    if let Some(timeline) = &artwork.timeline {
+        timeline
+            .validate_against(&artwork.layers)
+            .map_err(|error| WebError::EditRejected(format!("Animation: {error:?}")))?;
+        if node_count(&artwork.layers) > 4096
+            || timeline.frames().iter().any(|frame| {
+                timeline
+                    .resolve_frame_tree(&artwork.layers, frame.id)
+                    .map_or(true, |tree| node_count(&tree) > MAX_LAYERS + 1)
+            })
+        {
+            return Err(WebError::LimitExceeded);
+        }
+    } else if node_count(&artwork.layers) > MAX_LAYERS {
         return Err(WebError::LimitExceeded);
     }
     if artwork.layers.raster(artwork.active).is_none() {
@@ -179,6 +220,15 @@ pub(super) fn validate_artwork(artwork: &Artwork) -> Result<(), WebError> {
             || artwork.layers.raster(key.layer).is_none()
     }) {
         return Err(WebError::LimitExceeded);
+    }
+    let masks = artwork.layers.mask_ids();
+    if artwork.tiles.coverage_iter().any(|(key, _)| {
+        key.mip != 0
+            || key.x.unsigned_abs() > 257
+            || key.y.unsigned_abs() > 257
+            || !masks.contains(&key.mask)
+    }) {
+        return Err(WebError::InvalidPixels);
     }
     Ok(())
 }

@@ -12,6 +12,9 @@ use web_sys::HtmlCanvasElement;
 
 use crate::{browser, gpu::WebRenderer};
 
+mod animation;
+mod frame_previews;
+
 const RECOVERY_QUIET_MS: f64 = 600.0;
 const RECOVERY_MAX_WAIT_MS: f64 = 3000.0;
 const PREVIEW_DELAY_MS: f64 = 200.0;
@@ -91,11 +94,15 @@ pub struct Runtime {
     pub recent_sizes: Vec<u16>,
     pub selected_tool: DrawingTool,
     pub gesture: Option<nyatidraw_editor::gesture::EditGesture>,
+    animation_playback: Option<animation::Playback>,
+    animation_loop: bool,
+    animation_onion: bool,
     transform_drag: Option<(nyatidraw_editor::transform_gesture::TransformGesture, u64)>,
     pub project_epoch: u64,
     pub preview_generation: u64,
     preview_dirty: bool,
     preview_running: bool,
+    frame_previews: frame_previews::State,
     frame_pending: bool,
     pub gpu_failed: bool,
     pan_start: Option<(Point, Point)>,
@@ -131,6 +138,7 @@ pub struct Editor {
     pub integration_busy: Signal<bool>,
     pub integration_closed: Signal<bool>,
     pub copying_png: Signal<bool>,
+    pub exporting_png: Signal<bool>,
 }
 
 impl Editor {
@@ -291,6 +299,9 @@ impl Editor {
             let Some(runtime) = borrow.as_mut() else {
                 return Err("그림을 여는 중입니다.".into());
             };
+            if runtime.animation_playback.is_some() {
+                return Err("먼저 애니메이션 재생을 멈춰주세요.".into());
+            }
             if runtime.document.is_drawing() {
                 return Err("먼저 현재 획을 마쳐주세요.".into());
             }
@@ -360,6 +371,13 @@ impl Editor {
     )]
     pub fn input(mut self, phase: &str, x: f64, y: f64, pressure: f64, time_ms: f64, is_pen: bool) {
         if (self.integration_busy)() || (self.integration_closed)() {
+            return;
+        }
+        if self
+            .read(|runtime| runtime.animation_playback.is_some())
+            .unwrap_or(false)
+            && phase != "resize"
+        {
             return;
         }
         if matches!(phase, "resize" | "cancel" | "overflow" | "begin") {
@@ -554,7 +572,7 @@ impl Editor {
                 let sample = |point| {
                     sample_picker_pixel(
                         document.snapshot(),
-                        document.layers(),
+                        document.render_layers(),
                         document.active_layer(),
                         point,
                         source,
@@ -763,6 +781,7 @@ impl Editor {
 
     pub fn redraw(self) {
         self.queue_previews();
+        self.queue_frame_previews();
         let cell = self.runtime.peek().clone();
         {
             let mut borrow = cell.borrow_mut();
@@ -775,27 +794,37 @@ impl Editor {
             runtime.frame_pending = true;
         }
         let callback = Closure::once_into_js(move || {
-            let result = {
+            let (result, changed, playing) = {
                 let mut borrow = cell.borrow_mut();
                 let Some(runtime) = borrow.as_mut() else {
                     return;
                 };
                 runtime.frame_pending = false;
-                runtime.renderer.transform_guide(
-                    runtime.document.transform_projection(),
-                    runtime.viewport.zoom,
-                );
-                let result = runtime.renderer.render(runtime.viewport);
+                let advanced = runtime.advance_animation();
+                let changed = advanced.as_ref().is_ok_and(|changed| *changed);
+                let result = advanced.and_then(|_| {
+                    runtime.renderer.transform_guide(
+                        runtime.document.transform_projection(),
+                        runtime.viewport.zoom,
+                    );
+                    runtime.renderer.render(runtime.viewport)
+                });
                 if result.is_err() {
+                    runtime.animation_playback = None;
                     runtime.gpu_failed = true;
                     runtime.document.cancel_stroke();
                 }
-                result
+                (result, changed, runtime.animation_playback.is_some())
             };
+            if changed {
+                self.refresh();
+            }
             if let Err(error) = result {
                 self.refresh();
                 self.persist();
                 self.warn(error);
+            } else if playing {
+                self.redraw();
             }
         });
         if let Some(window) = web_sys::window() {
@@ -1065,6 +1094,80 @@ impl Editor {
         }
     }
 
+    pub fn download_scaled_png(mut self, size: [u32; 2]) {
+        if (self.exporting_png)() {
+            return;
+        }
+        let Some(result) = self.read(|runtime| {
+            if runtime.document.is_drawing()
+                || runtime.gesture.is_some()
+                || runtime.transform_drag.is_some()
+                || runtime.document.transform_projection().is_some()
+                || runtime.document.color_adjustment_projection().is_some()
+            {
+                return Err("현재 획·변형·색 보정을 마친 뒤 내보내주세요.".to_owned());
+            }
+            let canvas = runtime.document.canvas();
+            if size[0] == 0
+                || size[1] == 0
+                || size[0] > canvas.width_px
+                || size[1] > canvas.height_px
+            {
+                return Err("출력 크기는 1 px부터 원본 크기까지 지정하세요.".to_owned());
+            }
+            nyatidraw_paint_cpu::flatten_layer_tree_rgba8(
+                runtime.document.snapshot(),
+                runtime.document.render_layers(),
+                canvas,
+            )
+            .map(|surface| (runtime.project_epoch, surface))
+            .map_err(|error| format!("{error:?}"))
+        }) else {
+            return;
+        };
+        let (epoch, surface) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.warn(error);
+                return;
+            }
+        };
+        self.exporting_png.set(true);
+        self.report("PNG 크기 지정 내보내기 중…");
+        let pending = browser::export_png_in_worker(
+            &Uint8Array::from(surface.pixels.as_slice()),
+            surface.width,
+            surface.height,
+            size[0],
+            size[1],
+        );
+        spawn_local(async move {
+            let result = JsFuture::from(pending).await;
+            self.exporting_png.set(false);
+            if self.read(|runtime| runtime.project_epoch) != Some(epoch) {
+                self.warn("그림이 바뀌어 이전 그림의 PNG 내보내기를 취소했습니다.");
+                return;
+            }
+            match result {
+                Ok(bytes) => {
+                    browser::download_bytes(
+                        &Uint8Array::new(&bytes),
+                        &format!("drawing-{}x{}.png", size[0], size[1]),
+                        "image/png",
+                    );
+                    self.report(format!(
+                        "{} × {} PNG 내보내기 완료 · 원본 크기 유지",
+                        size[0], size[1]
+                    ));
+                }
+                Err(error) => self.warn(format!(
+                    "PNG 내보내기 실패 · 원본 유지: {}",
+                    browser::error_text(&error)
+                )),
+            }
+        });
+    }
+
     pub fn copy_png(mut self) {
         if (self.copying_png)() {
             self.warn("PNG 복사가 진행 중입니다. 잠시 기다려주세요.");
@@ -1317,11 +1420,17 @@ impl Editor {
                 Ok(()) => {
                     runtime.selected_tool = supported_restored_tool(&document)
                         .unwrap_or_else(|| crate::adapter::drawing_tool(document.tool()));
+                    runtime.animation_playback = None;
+                    runtime.animation_onion = false;
                     runtime.document = document;
                     runtime.gesture = None;
                     runtime.transform_drag = None;
                     runtime.renderer.set_gesture_preview(&[], false);
                     runtime.project_epoch += 1;
+                    runtime
+                        .frame_previews
+                        .cache
+                        .request(runtime.project_epoch, &[]);
                     runtime.preview_generation += 1;
                     browser::set_canvas_tool(canvas_input_mode(runtime.selected_tool));
                     runtime.gpu_failed = false;
@@ -1383,11 +1492,15 @@ impl Runtime {
             recent_sizes: Vec::new(),
             selected_tool,
             gesture: None,
+            animation_playback: None,
+            animation_loop: true,
+            animation_onion: false,
             transform_drag: None,
             project_epoch: 1,
             preview_generation: 1,
             preview_dirty: false,
             preview_running: false,
+            frame_previews: frame_previews::State::default(),
             frame_pending: false,
             gpu_failed: false,
             pan_start: None,
@@ -1405,14 +1518,28 @@ impl Runtime {
     }
 
     pub fn apply(&mut self, update: &CanvasUpdate) -> Result<(), String> {
-        if update.committed && update.changed {
-            self.preview_dirty = true;
+        let had_overlay = self.document.has_animation_display();
+        if (update.structure_changed
+            || update.committed
+            || (had_overlay && self.document.is_drawing()))
+            && let Err(error) = self.rebuild_onion(self.animation_onion)
+        {
+            self.animation_onion = false;
+            self.document.set_animation_display(None);
+            web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&error));
         }
-        if update.structure_changed {
+        let overlay_changed = had_overlay || self.document.has_animation_display();
+        if (update.committed && update.changed) || update.structure_changed {
+            self.preview_dirty = true;
+            self.frame_previews.cache.invalidate();
+        }
+        if update.structure_changed || overlay_changed {
             self.renderer.sync_document(&self.document)
         } else {
             self.renderer
                 .upload_dirty(&self.document, &update.dirty_tiles)?;
+            self.renderer
+                .upload_dirty_masks(&self.document, &update.dirty_masks)?;
             self.renderer.sync_chrome(&self.document)
         }
     }

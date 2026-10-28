@@ -528,6 +528,17 @@ impl GpuRoundDabPainter {
         GpuSelectionMask::new(&self.device, origin, dimensions, packed)
     }
 
+    /// # Errors
+    /// Rejects invalid extents or inconsistent fractional selection coverage.
+    pub fn create_selection_coverage_at(
+        &self,
+        origin: [i32; 2],
+        dimensions: [u32; 2],
+        coverage: &[u8],
+    ) -> Result<GpuSelectionMask, GpuSelectionError> {
+        GpuSelectionMask::from_coverage(&self.device, origin, dimensions, coverage)
+    }
+
     /// Changes semantic coverage between strokes; no mask upload occurs per dab.
     pub fn set_selection_mask(&mut self, mask: Option<&GpuSelectionMask>) {
         self.selection.replace(&self.device, &self.queue, mask);

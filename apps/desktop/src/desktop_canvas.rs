@@ -16,7 +16,9 @@ use raw_window_handle::{
 use windows::{
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-        Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT, ScreenToClient},
+        Graphics::Gdi::{
+            BeginPaint, EndPaint, InvalidateRect, MapWindowPoints, PAINTSTRUCT, ScreenToClient,
+        },
         System::LibraryLoader::GetModuleHandleW,
         UI::HiDpi::GetDpiForWindow,
         UI::Input::KeyboardAndMouse::{
@@ -30,16 +32,17 @@ use windows::{
         UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         UI::WindowsAndMessaging::{
             CREATESTRUCTW, CS_HREDRAW, CS_OWNDC, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-            DestroyWindow, GWLP_USERDATA, GetClientRect, GetMessageExtraInfo, GetMessagePos,
-            GetMessageTime, GetParent, GetWindowLongPtrW, HWND_BOTTOM, IDC_ARROW, LoadCursorW, MSG,
-            PEN_FLAG_BARREL, POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, PostMessageW, RegisterClassW,
-            SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer, SetWindowLongPtrW, SetWindowPos,
-            ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE,
-            WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-            WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
-            WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERLEAVE, WM_POINTERUP,
-            WM_POINTERUPDATE, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
-            WS_CLIPSIBLINGS, WS_VISIBLE,
+            DestroyWindow, GWLP_HINSTANCE, GWLP_USERDATA, GetClientRect, GetMessageExtraInfo,
+            GetMessagePos, GetMessageTime, GetParent, GetWindowLongPtrW, HWND_BOTTOM, IDC_ARROW,
+            IsWindowVisible, LoadCursorW, MSG, PEN_FLAG_BARREL, POINTER_INPUT_TYPE, PT_PEN,
+            PT_TOUCH, PostMessageW, RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer,
+            SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP,
+            WM_CAPTURECHANGED, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+            WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+            WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_POINTERCAPTURECHANGED,
+            WM_POINTERDOWN, WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE, WM_SIZE, WM_TIMER,
+            WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP,
+            WS_VISIBLE,
         },
     },
     core::w,
@@ -52,6 +55,13 @@ use crate::{
     render_host::{Geometry, RenderHost, RenderLifetime},
     single_instance::{ActivationInbox, PrimaryInstance},
 };
+
+mod composition_surface;
+mod present_trace;
+
+pub(crate) fn composition_host_enabled() -> bool {
+    std::env::var_os("NAYATI_COMPOSITION_HOST").is_some_and(|value| value == "1")
+}
 
 const WM_NAYATI_REDRAW: u32 = WM_APP + 0x4e1;
 // 0x4e2 belongs to the single-instance activation inbox.
@@ -93,7 +103,11 @@ impl DesktopCanvasHandle {
         // adopted state belongs to the HWND until WM_NCDESTROY reclaims it.
         let hwnd = match unsafe {
             CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
+                if composition_host_enabled() {
+                    WS_EX_NOREDIRECTIONBITMAP
+                } else {
+                    WINDOW_EX_STYLE::default()
+                },
                 w!("NyatiDrawWgpuCanvas"),
                 w!(""),
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
@@ -232,6 +246,11 @@ impl DesktopCanvasHandle {
         self.live_ink.invalidate_canvas_viewport();
         // SAFETY: hiding a live or already-destroyed child is harmless.
         let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+        if composition_host_enabled()
+            && let Some(state) = unsafe { canvas_state(self.hwnd) }
+        {
+            state.resize(self.hwnd);
+        }
     }
 
     pub(crate) fn repaint_underlay(&self) {
@@ -462,7 +481,17 @@ impl CanvasWindowState {
             );
         }
         if let Some(host) = &self.host {
+            let mut origin = POINT::default();
+            // SAFETY: UI-owned child and parent are live during this callback.
+            let parent = unsafe { GetParent(hwnd) }.ok();
+            if let Some(parent) = parent {
+                let _ = unsafe {
+                    MapWindowPoints(Some(hwnd), Some(parent), std::slice::from_mut(&mut origin))
+                };
+            }
             host.geometry(Geometry {
+                origin: [origin.x, origin.y],
+                visible: parent.is_some() && unsafe { IsWindowVisible(hwnd) }.as_bool(),
                 width,
                 height,
                 scale,
@@ -1491,9 +1520,48 @@ fn current_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
     }
 }
 
+fn canvas_instance() -> Result<wgpu::Instance, String> {
+    let mut descriptor = wgpu::InstanceDescriptor::default();
+    if let Some(backend) = std::env::var_os("NAYATI_GPU_BACKEND") {
+        descriptor.backends = match backend.to_str() {
+            Some("vulkan") => wgpu::Backends::VULKAN,
+            Some("dx12") => wgpu::Backends::DX12,
+            _ => return Err("NAYATI_GPU_BACKEND must be vulkan or dx12".into()),
+        };
+    }
+    if composition_host_enabled() {
+        if !descriptor.backends.contains(wgpu::Backends::DX12) {
+            return Err("NAYATI_COMPOSITION_HOST=1 requires the dx12 backend".into());
+        }
+        descriptor.backends = wgpu::Backends::DX12;
+    }
+    Ok(wgpu::Instance::new(&descriptor))
+}
+
+fn hwnd_surface(instance: &wgpu::Instance, hwnd: HWND) -> Result<wgpu::Surface<'static>, String> {
+    let mut raw_window =
+        Win32WindowHandle::new(NonZeroIsize::new(hwnd.0 as isize).ok_or("child HWND is null")?);
+    // SAFETY: the render actor retains the child HWND and a strong Tao parent
+    // anchor until this surface and all GPU state drop.
+    raw_window.hinstance = NonZeroIsize::new(unsafe { GetWindowLongPtrW(hwnd, GWLP_HINSTANCE) });
+    if raw_window.hinstance.is_none() {
+        return Err("child HWND has no HINSTANCE".into());
+    }
+    // SAFETY: both handles remain valid for the actor-owned surface lifetime.
+    unsafe {
+        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: RawDisplayHandle::Windows(WindowsDisplayHandle::new()),
+            raw_window_handle: RawWindowHandle::Win32(raw_window),
+        })
+    }
+    .map_err(|error| format!("create WGPU child surface: {error}"))
+}
+
 pub(crate) struct CanvasSurfaceRenderer {
     _instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
+    // Drop the surface before releasing its composition target and COM apartment.
+    composition: Option<composition_surface::CompositionSurface>,
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub(crate) config: wgpu::SurfaceConfiguration,
@@ -1505,6 +1573,7 @@ pub(crate) struct CanvasSurfaceRenderer {
     configured: bool,
     first_presented: bool,
     last_presented: Option<wgpu::Texture>,
+    mask_present_trace: present_trace::MaskPresentTrace,
 }
 
 impl Drop for CanvasSurfaceRenderer {
@@ -1515,19 +1584,20 @@ impl Drop for CanvasSurfaceRenderer {
 
 impl CanvasSurfaceRenderer {
     pub(crate) fn new(hwnd: HWND, live_ink: LiveInkBridge) -> Result<Self, String> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let raw_window =
-            Win32WindowHandle::new(NonZeroIsize::new(hwnd.0 as isize).ok_or("child HWND is null")?);
-        // SAFETY: only render_host constructs this renderer. Its worker owns
-        // a strong Tao parent anchor until this surface and all GPU state drop.
-        // Only creation failure (before actor start) explicitly destroys child.
-        let surface = unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: RawDisplayHandle::Windows(WindowsDisplayHandle::new()),
-                raw_window_handle: RawWindowHandle::Win32(raw_window),
-            })
-        }
-        .map_err(|error| format!("create WGPU child surface: {error}"))?;
+        let instance = canvas_instance()?;
+        let composition = if composition_host_enabled() {
+            // SAFETY: this actor holds the child's strong parent lifetime anchor.
+            let parent = unsafe { GetParent(hwnd) }
+                .map_err(|error| format!("find canvas composition parent: {error}"))?;
+            Some(composition_surface::CompositionSurface::new(parent)?)
+        } else {
+            None
+        };
+        let surface = if let Some(owner) = &composition {
+            owner.create_surface(&instance)?
+        } else {
+            hwnd_surface(&instance, hwnd)?
+        };
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
@@ -1547,6 +1617,7 @@ impl CanvasSurfaceRenderer {
             .find(wgpu::TextureFormat::is_srgb)
             .or_else(|| capabilities.formats.first().copied())
             .ok_or("WGPU surface exposes no texture format")?;
+        let info = adapter.get_info();
         let present_mode = if capabilities
             .present_modes
             .contains(&wgpu::PresentMode::Mailbox)
@@ -1560,7 +1631,7 @@ impl CanvasSurfaceRenderer {
             .first()
             .copied()
             .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
-        let config = wgpu::SurfaceConfiguration {
+        let mut config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: 1,
@@ -1573,14 +1644,20 @@ impl CanvasSurfaceRenderer {
         let presenter = TexturePresenter::new(&device, format);
         let mut canvas = SharedGpuCanvas::new(live_ink.clone());
         canvas.resume(&adapter, &device, &queue);
-        let info = adapter.get_info();
+        let mask_present_trace = present_trace::MaskPresentTrace::new(
+            &device,
+            canvas.mask_render_trace_authorized(),
+            &capabilities,
+            &mut config,
+        );
         println!(
-            "desktop-canvas event=gpu-ready backend={:?} adapter={:?} format={format:?} present={present_mode:?}",
-            info.backend, info.name,
+            "desktop-canvas event=gpu-ready backend={:?} adapter={:?} vendor={} device={} driver={:?} driver_info={:?} format={format:?} present={present_mode:?}",
+            info.backend, info.name, info.vendor, info.device, info.driver, info.driver_info,
         );
         Ok(Self {
             _instance: instance,
             surface,
+            composition,
             device,
             queue,
             config,
@@ -1592,18 +1669,49 @@ impl CanvasSurfaceRenderer {
             configured: false,
             first_presented: false,
             last_presented: None,
+            mask_present_trace,
         })
     }
 
     pub(crate) fn resize_geometry(&mut self, geometry: Geometry) {
+        if let Err(error) = self.try_resize_geometry(geometry) {
+            self.configured = false;
+            self.live_ink.publish_workspace_error(error);
+        }
+    }
+
+    fn configure_surface(&self) -> Result<(), String> {
+        self.surface.configure(&self.device, &self.config);
+        if let Some(owner) = &self.composition {
+            owner.commit()?;
+        }
+        Ok(())
+    }
+
+    fn try_resize_geometry(&mut self, geometry: Geometry) -> Result<(), String> {
+        let composition_changed = if let Some(owner) = &mut self.composition {
+            let changed = owner.geometry(geometry)?;
+            if !geometry.visible || geometry.width == 0 || geometry.height == 0 {
+                owner.commit()?;
+                self.configured = false;
+                return Ok(());
+            }
+            changed
+        } else {
+            false
+        };
         let Geometry {
             width,
             height,
             scale,
             epoch,
+            ..
         } = geometry;
         if self.configured && self.geometry_epoch == epoch {
-            return;
+            if composition_changed && let Some(owner) = &self.composition {
+                owner.commit()?;
+            }
+            return Ok(());
         }
         if self.config.width != width
             || self.config.height != height
@@ -1615,17 +1723,19 @@ impl CanvasSurfaceRenderer {
         self.canvas.set_geometry_epoch(epoch);
         if width == 0 || height == 0 {
             self.configured = false;
-            return;
+            return Ok(());
         }
         self.config.width = width;
         self.config.height = height;
         self.scale = scale;
-        self.surface.configure(&self.device, &self.config);
+        self.configure_surface()?;
         self.configured = true;
+        Ok(())
     }
 
     pub(crate) fn activate_project(&mut self, path: std::path::PathBuf) -> Result<(), String> {
         self.clear_retained_frame();
+        self.mask_present_trace.stop();
         self.canvas.activate_project(
             &self.device,
             &self.queue,
@@ -1636,6 +1746,7 @@ impl CanvasSurfaceRenderer {
     }
 
     pub(crate) fn save_as(&mut self, path: std::path::PathBuf) -> Result<(), String> {
+        self.mask_present_trace.stop();
         self.canvas.save_as(
             &self.device,
             &self.queue,
@@ -1678,7 +1789,7 @@ impl CanvasSurfaceRenderer {
         let frame = match acquired {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                self.surface.configure(&self.device, &self.config);
+                self.configure_surface()?;
                 return Ok(());
             }
             Err(wgpu::SurfaceError::Timeout | wgpu::SurfaceError::Other) => return Ok(()),
@@ -1694,7 +1805,10 @@ impl CanvasSurfaceRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.presenter
             .present(&self.device, &self.queue, &display.texture, &target);
+        self.trace_present(&frame, &display);
         frame.present();
+        self.mask_present_trace
+            .after_present(&self.device, &self.live_ink);
         // Retain only a GPU handle, never a CPU readback or durable copy. The
         // close overlay can expose the surface after ActiveCanvas is drained.
         self.last_presented = Some(display.texture.clone());
@@ -1732,6 +1846,24 @@ impl CanvasSurfaceRenderer {
         self.last_presented = None;
     }
 
+    fn trace_present(
+        &mut self,
+        frame: &wgpu::SurfaceTexture,
+        display: &crate::native_canvas::RenderedCanvas,
+    ) {
+        self.mask_present_trace.sample(
+            &self.device,
+            &self.queue,
+            &frame.texture,
+            &self.config,
+            present_trace::FrameContext {
+                viewport: display.viewport,
+                page_size: self.canvas.mask_render_trace_page_size(),
+                geometry_epoch: display.geometry_epoch,
+            },
+        );
+    }
+
     /// Refreshes exposed surface pixels while the close worker owns artwork.
     /// This does not render the document, admit input, publish a viewport or
     /// report an artwork/latency measurement. The actor calls it only on wakes.
@@ -1746,7 +1878,7 @@ impl CanvasSurfaceRenderer {
         // window-region changes without scheduling a continuous redraw loop.
         let acquired = match self.surface.get_current_texture() {
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                self.surface.configure(&self.device, &self.config);
+                self.configure_surface()?;
                 self.surface.get_current_texture()
             }
             result => result,
@@ -1763,7 +1895,15 @@ impl CanvasSurfaceRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.presenter
             .present(&self.device, &self.queue, texture, &target);
+        self.mask_present_trace.sample_retained(
+            &self.device,
+            &self.queue,
+            &frame.texture,
+            &self.config,
+        );
         frame.present();
+        self.mask_present_trace
+            .after_present(&self.device, &self.live_ink);
         Ok(())
     }
 }

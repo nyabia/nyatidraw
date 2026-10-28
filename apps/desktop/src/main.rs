@@ -22,10 +22,12 @@ mod recent_projects;
 #[cfg(windows)]
 mod render_host;
 mod save_as;
+mod scaled_export;
 #[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]
 mod sketchbook;
+mod sprite_export;
 mod transform_gesture;
 mod transform_worker;
 #[cfg(windows)]
@@ -293,6 +295,8 @@ fn FileButtons(#[props(default = false)] extended: bool) -> Element {
             }
             if extended {
                 image_import::ImportImageButton {}
+                scaled_export::ScaledExportButton {}
+                sprite_export::SpriteExportButton {}
                 RecentProjects { disabled: busy() }
             }
         };

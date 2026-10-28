@@ -75,7 +75,9 @@ fn send(
     command: TransformCommand,
     mut error: Signal<Option<String>>,
 ) {
-    crate::focus_editor_shortcuts();
+    if !matches!(command, TransformCommand::Preview(_)) {
+        crate::focus_editor_shortcuts();
+    }
     let result =
         bridge.push_ui_editor_command(EditorCommand::Edit(EditCommand::FreeTransform(command)));
     error.set(
@@ -92,6 +94,7 @@ pub fn TransformPanel(ui_projection: Signal<UiProjection>) -> Element {
     let preview_bridge = bridge.clone();
     let commit_bridge = bridge.clone();
     let cancel_bridge = bridge.clone();
+    let keyboard_bridge = bridge.clone();
     let TransformPanelOpen(mut opened) = use_context();
     let mut inputs = use_signal(|| TransformInputs::from(AffineTransform::default()));
     let mut dirty = use_signal(|| false);
@@ -127,6 +130,10 @@ pub fn TransformPanel(ui_projection: Signal<UiProjection>) -> Element {
     let current = ui_projection.read();
     let transform = current.edit.transform.as_ref();
     let busy = current.edit.busy;
+    let mask_selected = matches!(
+        current.raster_target,
+        Some(nyatidraw_api::RasterEditTarget::Mask { .. })
+    );
     let can_cancel = current.edit.can_cancel;
     let has_selection = current.edit.has_selection;
     let active = transform.is_some();
@@ -134,11 +141,36 @@ pub fn TransformPanel(ui_projection: Signal<UiProjection>) -> Element {
     let generation = transform.map_or(0, |value| value.generation);
     let worker_error = current.edit.error.clone();
     let values = inputs.read().clone();
+    let commit_hint = if dirty() {
+        "입력한 값을 먼저 미리보기로 확인하세요 (Enter)"
+    } else if can_commit {
+        "미리보기 확정 (Enter)"
+    } else {
+        "그림을 이동하거나 배율·회전을 변경하세요"
+    };
     rsx! {
         section { class: "transform-properties", aria_label: "자유 변형",
             if active {
             div { class: "transform-grid", onkeydown: move |event| {
-                if event.key() != Key::Escape { event.stop_propagation(); }
+                event.stop_propagation();
+                match event.key() {
+                    Key::Escape if can_cancel => {
+                        event.prevent_default();
+                        send(&keyboard_bridge, ui_projection, TransformCommand::Cancel, error);
+                    }
+                    Key::Enter if !busy && !event.is_auto_repeating() => {
+                        event.prevent_default();
+                        if dirty() {
+                            match inputs.read().parse() {
+                                Ok(value) => send(&keyboard_bridge, ui_projection, TransformCommand::Preview(value), error),
+                                Err(message) => error.set(Some(message.to_owned())),
+                            }
+                        } else if can_commit {
+                            send(&keyboard_bridge, ui_projection, TransformCommand::Commit { generation }, error);
+                        }
+                    }
+                    _ => {}
+                }
             },
             label { "X (px)"
                 input { r#type: "number", step: "0.001", value: values.x, disabled: !active || busy,
@@ -170,20 +202,21 @@ pub fn TransformPanel(ui_projection: Signal<UiProjection>) -> Element {
             }
             }
             }
-            if !active && !has_selection {
+            if mask_selected { crate::layer_mask::MaskImageTargetSwitch { ui_projection } }
+            if !active && !has_selection && !mask_selected {
                 p { class: "transform-help", "변형할 영역을 먼저 선택하세요." }
             }
             div { class: "transform-actions",
             if !active {
-                button { disabled: busy || !has_selection, onclick: move |_| send(&bridge, ui_projection, TransformCommand::Begin, error), "변형 시작" }
+                button { disabled: busy || !has_selection || mask_selected, onclick: move |_| send(&bridge, ui_projection, TransformCommand::Begin, error), "변형 시작" }
             } else {
-            button { disabled: !active || busy, onclick: move |_| {
+            button { disabled: !active || busy, title: "입력한 이동·배율·회전 미리보기 (Enter)", onclick: move |_| {
                 match inputs.read().parse() {
                     Ok(value) => send(&preview_bridge, ui_projection, TransformCommand::Preview(value), error),
                     Err(message) => error.set(Some(message.to_owned())),
                 }
             }, "미리보기" }
-            button { disabled: !can_commit, onclick: move |_| {
+            button { disabled: !can_commit, title: commit_hint, onclick: move |_| {
                 send(&commit_bridge, ui_projection, TransformCommand::Commit { generation }, error);
             }, "확정" }
             }

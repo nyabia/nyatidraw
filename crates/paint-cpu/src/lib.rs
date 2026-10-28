@@ -13,6 +13,15 @@ mod color_adjustment;
 mod compositing;
 mod flat_fill;
 mod fragment;
+mod masks;
+mod masks_affine;
+mod masks_fill;
+mod masks_integer;
+pub use masks::{
+    MaskStrokeBudget, apply_mask_pixel, mask_from_selection, paint_mask_dabs, retain_owned_masks,
+};
+pub use masks_affine::transform_linked_masks;
+pub use masks_fill::fill_mask_selection;
 mod selection;
 #[cfg(test)]
 mod short_stroke_tests;
@@ -24,13 +33,14 @@ pub use flat_fill::{FloodFillRequest, flood_fill, wand_selection_signed};
 pub use fragment::{RasterFragment, copy_selection, cut_selection, paste_fragment};
 pub use selection::{
     EditError, EditLimits, SelectionCombine, SelectionMask, SelectionPaint, SelectionPaintResult,
-    SelectionSource, WandRequest, clear_raster, clear_selection, combine_selection, grow_selection,
-    invert_selection, lasso_selection, lasso_selection_signed, paint_selection,
-    rectangle_selection_signed, sample_artwork_pixel, sample_display_pixel, select_layer_alpha,
-    selection_all, shrink_selection, wand_selection,
+    SelectionSource, WandRequest, clear_raster, clear_selection, combine_selection,
+    feather_selection, grow_selection, invert_selection, lasso_selection, lasso_selection_signed,
+    paint_selection, rectangle_selection_signed, sample_artwork_pixel, sample_display_pixel,
+    select_layer_alpha, selection_all, shrink_selection, wand_selection,
 };
 pub use transform::{
     MovableBounds, movable_bounds, move_raster, transform_raster, translate_artwork,
+    translate_artwork_with_masks,
 };
 
 use nyatidraw_brush::BrushDab;
@@ -41,6 +51,13 @@ use nyatidraw_tiles::{FlattenError, FlattenedRgba8, MAX_FLATTENED_PIXELS, TileSn
 /// A premultiplied linear-light RGBA8 colour at full dab opacity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PremultipliedRgba8(pub [u8; 4]);
+
+#[derive(Clone, Copy, Debug)]
+pub enum DabOperation {
+    Paint(PremultipliedRgba8),
+    Recolor(PremultipliedRgba8),
+    Erase,
+}
 
 impl PremultipliedRgba8 {
     #[must_use]
@@ -491,7 +508,29 @@ impl CpuCanvas {
         self.rasterize_dab(dab, composite_destination_out);
     }
 
-    fn rasterize_dab(&mut self, dab: BrushDab, mut composite: impl FnMut(&mut [u8], f32)) {
+    pub fn apply_dab_with_coverage(
+        &mut self,
+        dab: BrushDab,
+        operation: DabOperation,
+        coverage: impl FnMut(u32, u32) -> u8,
+    ) {
+        self.rasterize_covered_dab(dab, coverage, |destination, alpha| match operation {
+            DabOperation::Paint(color) => composite_source_over(destination, color, alpha),
+            DabOperation::Recolor(color) => composite_source_atop(destination, color, alpha),
+            DabOperation::Erase => composite_destination_out(destination, alpha),
+        });
+    }
+
+    fn rasterize_dab(&mut self, dab: BrushDab, composite: impl FnMut(&mut [u8], f32)) {
+        self.rasterize_covered_dab(dab, |_, _| 255, composite);
+    }
+
+    fn rasterize_covered_dab(
+        &mut self,
+        dab: BrushDab,
+        mut selection: impl FnMut(u32, u32) -> u8,
+        mut composite: impl FnMut(&mut [u8], f32),
+    ) {
         let radius = f64::from(dab.radius_px.max(0.0));
         if radius == 0.0 || !radius.is_finite() {
             return;
@@ -506,6 +545,10 @@ impl CpuCanvas {
 
         for y in bounds.top..bounds.bottom {
             for x in bounds.left..bounds.right {
+                let selected = selection(x, y);
+                if selected == 0 {
+                    continue;
+                }
                 let coverage = if dab.grain.is_some() {
                     // Integer circle membership and document-space paper match WGSL.
                     #[allow(clippy::cast_precision_loss)]
@@ -525,9 +568,10 @@ impl CpuCanvas {
                         } else {
                             0.0
                         };
-                        (coverage * alpha * 255.0).round().max(minimum) / 255.0
+                        let pigment = (coverage * alpha * 255.0).round().max(minimum);
+                        (pigment * f32::from(selected) / 255.0).round() / 255.0
                     } else {
-                        coverage * alpha
+                        coverage * alpha * (f32::from(selected) / 255.0)
                     },
                 );
             }
@@ -778,6 +822,7 @@ mod tests {
             };
             let raster = |id, visible| {
                 LayerTreeNode::Raster(LayerNode {
+                    mask: None,
                     alpha_locked: false,
                     clip_to_below: false,
                     blend_mode: nyatidraw_api::LayerBlendMode::Normal,
@@ -996,6 +1041,7 @@ mod tests {
                 visible: true,
                 opacity_u16: 32_768,
                 children: vec![LayerTreeNode::Raster(LayerNode {
+                    mask: None,
                     alpha_locked: false,
                     clip_to_below: false,
                     blend_mode: nyatidraw_api::LayerBlendMode::Normal,
@@ -1074,6 +1120,7 @@ mod tests {
             visible: true,
             opacity_u16: u16::MAX,
             children: vec![LayerTreeNode::Raster(LayerNode {
+                mask: None,
                 alpha_locked: false,
                 clip_to_below: false,
                 blend_mode: nyatidraw_api::LayerBlendMode::Normal,

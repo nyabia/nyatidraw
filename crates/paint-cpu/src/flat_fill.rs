@@ -23,6 +23,7 @@ pub struct FloodFillRequest {
 struct Source<'a> {
     snapshot: &'a TileSnapshot,
     active: Option<LayerId>,
+    active_mask: Option<nyatidraw_document::LayerMask>,
     root: GroupNode,
     layers: BTreeSet<LayerId>,
     work_per_pixel: u64,
@@ -89,6 +90,7 @@ impl<'a> Source<'a> {
         Ok(Self {
             snapshot,
             active,
+            active_mask: tree.raster(request.active).and_then(|layer| layer.mask),
             root,
             layers,
             work_per_pixel,
@@ -99,7 +101,14 @@ impl<'a> Source<'a> {
     fn pixel(&self, point: [i32; 2]) -> [u8; 4] {
         self.active.map_or_else(
             || group_pixel(self.snapshot, &self.root, point),
-            |layer| raster_pixel(self.snapshot, layer, point),
+            |layer| {
+                crate::apply_mask_pixel(
+                    self.snapshot,
+                    self.active_mask,
+                    point,
+                    raster_pixel(self.snapshot, layer, point),
+                )
+            },
         )
     }
 }
@@ -538,12 +547,21 @@ pub fn flood_fill(
         let offset =
             usize::try_from((point[1].rem_euclid(128) * 128 + point[0].rem_euclid(128)) * 4)
                 .map_err(|_| EditError::CoordinateOutOfRange)?;
+        let coverage = clip.map_or(255, |mask| mask.coverage_signed(point[0], point[1]));
         if target.alpha_locked {
-            crate::composite_source_atop(&mut pixels[offset..offset + 4], color, 1.0);
+            crate::composite_source_atop(
+                &mut pixels[offset..offset + 4],
+                color,
+                f32::from(coverage) / 255.0,
+            );
         } else if selected[index] != 0 {
-            composite_surface(&mut pixels[offset..offset + 4], &color.0, u16::MAX);
+            composite_surface(
+                &mut pixels[offset..offset + 4],
+                &color.0,
+                u16::from(coverage) * 257,
+            );
         } else {
-            let mut underpaint = color.0;
+            let mut underpaint = crate::fragment::covered_pixel(&color.0, coverage);
             composite_surface(&mut underpaint, &pixels[offset..offset + 4], u16::MAX);
             pixels[offset..offset + 4].copy_from_slice(&underpaint);
         }
@@ -580,6 +598,7 @@ mod tests {
             children: (1..=2)
                 .map(|id| {
                     LayerTreeNode::Raster(LayerNode {
+                        mask: None,
                         alpha_locked: false,
                         clip_to_below: false,
                         blend_mode: nyatidraw_api::LayerBlendMode::Normal,
@@ -1030,5 +1049,86 @@ mod tests {
             Err(EditError::MissingReference)
         ));
         assert_eq!(before.root(), original);
+    }
+    #[test]
+    fn soft_fill_keeps_zero_coverage_barriers_and_fractional_backing() {
+        let clip =
+            SelectionMask::from_coverage_at([0, 0], [5, 1], &[255, 128, 0, 64, 255]).unwrap();
+        let fill_request = FloodFillRequest {
+            seed: [0, 0],
+            settings: FillSettings {
+                antialias: false,
+                ..Default::default()
+            },
+            ..request(FillSettings::default())
+        };
+        let result = flood_fill(
+            &TileSnapshot::default(),
+            &tree(),
+            fill_request,
+            Some(&clip),
+            PremultipliedRgba8::new(255, 0, 0, 255),
+            EditLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            raster_pixel(&result.after, LayerId(1), [0, 0]),
+            [255, 0, 0, 255]
+        );
+        assert_eq!(
+            raster_pixel(&result.after, LayerId(1), [1, 0]),
+            [128, 0, 0, 128]
+        );
+        for x in 2..5 {
+            assert_eq!(raster_pixel(&result.after, LayerId(1), [x, 0]), [0; 4]);
+        }
+        let clip = SelectionMask::from_coverage_at([0, 0], [2, 1], &[255, 128]).unwrap();
+        let before = fixture(&[
+            (LayerId(1), [1, 0], [0, 0, 0, 128]),
+            (LayerId(2), [1, 0], [0, 0, 0, 255]),
+        ]);
+        let backed = flood_fill(
+            &before,
+            &tree(),
+            FloodFillRequest {
+                settings: FillSettings {
+                    expand_px: 1,
+                    antialias: false,
+                    ..Default::default()
+                },
+                ..fill_request
+            },
+            Some(&clip),
+            PremultipliedRgba8::new(255, 0, 0, 255),
+            EditLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            raster_pixel(&backed.after, LayerId(1), [1, 0]),
+            [64, 0, 0, 192]
+        );
+        assert_eq!(
+            backed.after.get(TileKey::from_pixel(LayerId(2), 128, 1, 0)),
+            before.get(TileKey::from_pixel(LayerId(2), 128, 1, 0))
+        );
+        let mut locked_alpha = tree();
+        locked_alpha.set_alpha_locked(LayerId(1), true).unwrap();
+        let source = fixture(&[
+            (LayerId(1), [0, 0], [0, 0, 128, 128]),
+            (LayerId(1), [1, 0], [0, 0, 128, 128]),
+        ]);
+        let atop = flood_fill(
+            &source,
+            &locked_alpha,
+            fill_request,
+            Some(&clip),
+            PremultipliedRgba8::new(255, 0, 0, 255),
+            EditLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            raster_pixel(&atop.after, LayerId(1), [1, 0]),
+            [64, 0, 64, 128]
+        );
     }
 }

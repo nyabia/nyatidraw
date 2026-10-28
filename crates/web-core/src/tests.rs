@@ -198,6 +198,37 @@ fn portable_round_trip_keeps_pixels_layers_preferences_and_rejects_damage_atomic
 }
 
 #[test]
+fn portable_blend_modes_preserve_raw_artwork_and_composite_after_reopen() {
+    let mut document = WebDocument::import_rgba8(16, 16, &[160; 16 * 16 * 4]).unwrap();
+    document.add_layer("light").unwrap();
+    document.set_foreground([240, 110, 40, 200]);
+    stroke(&mut document);
+    let original = document.snapshot().clone();
+    for mode in [
+        LayerBlendMode::Normal,
+        LayerBlendMode::Multiply,
+        LayerBlendMode::Screen,
+        LayerBlendMode::Add,
+        LayerBlendMode::Overlay,
+    ] {
+        document
+            .set_layer_blend_mode(document.active_layer(), mode)
+            .unwrap();
+        let expected = document.export_rgba8().unwrap();
+        let bytes = document.encode_portable().unwrap();
+        let reopened = WebDocument::decode_portable(&bytes).unwrap();
+        assert_eq!(reopened.layers(), document.layers());
+        assert_eq!(
+            reopened.snapshot(),
+            &original,
+            "mode changes must not repaint raw pixels"
+        );
+        assert_eq!(reopened.export_rgba8().unwrap(), expected);
+        assert_eq!(reopened.encode_portable().unwrap(), bytes);
+    }
+}
+
+#[test]
 fn layer_color_metadata_preserves_raw_artwork_history_and_portable_recovery() {
     // Risk: display colorization overwrites pixels or loses its settings during undo/recovery.
     use nyatidraw_api::LayerCommand;
@@ -421,6 +452,156 @@ fn inserting_import_or_duplicate_cannot_rebind_existing_clipped_artwork() {
             doc.undo().unwrap();
         }
         doc.set_active_layer(base).unwrap();
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn group_transform_preserves_hidden_children_structure_cancel_and_single_undo() {
+    use nyatidraw_api::{AffineTransform, EditCommand as E, GroupId, TransformCommand as T};
+    let mut doc = WebDocument::new(CanvasSpec {
+        width_px: 16,
+        height_px: 16,
+        pixels_per_inch: 96,
+    })
+    .unwrap();
+    let mut root = doc.layers().root().clone();
+    let mut clipped = new_layer(LayerId(2), "shade");
+    clipped.clip_to_below = true;
+    clipped.blend_mode = LayerBlendMode::Multiply;
+    clipped.color_effect = Some(LayerColorEffect::default());
+    let mut hidden = new_layer(LayerId(3), "hidden");
+    hidden.visible = false;
+    let nested = GroupNode {
+        id: GroupId(11),
+        name: "nested".into(),
+        visible: false,
+        opacity_u16: 32768,
+        clip_to_below: false,
+        blend_mode: LayerBlendMode::Screen,
+        children: vec![LayerTreeNode::Raster(hidden)],
+    };
+    root.children = vec![
+        LayerTreeNode::Group(GroupNode {
+            id: GroupId(10),
+            name: "subject".into(),
+            visible: true,
+            opacity_u16: 45000,
+            clip_to_below: false,
+            blend_mode: LayerBlendMode::Overlay,
+            children: vec![
+                LayerTreeNode::Raster(new_layer(LayerId(1), "base")),
+                LayerTreeNode::Raster(clipped),
+                LayerTreeNode::Group(nested),
+            ],
+        }),
+        LayerTreeNode::Raster(new_layer(LayerId(4), "outside")),
+    ];
+    doc.artwork.layers = LayerTree::new(root).unwrap();
+    doc.artwork.active = LayerId(4);
+    doc.artwork.tiles = TileSnapshot::from_tiles(
+        [
+            (1, [-1, 1], [128, 0, 0, 128]),
+            (2, [1, 1], [0, 64, 0, 64]),
+            (3, [2, 1], [0, 0, 255, 255]),
+            (4, [8, 1], [70, 70, 70, 100]),
+        ]
+        .map(|(id, [x, y], rgba)| {
+            let key = TileKey::from_pixel(LayerId(id), 128, x, y);
+            let mut pixels = vec![0; TILE_BYTE_LEN];
+            let offset = usize::try_from(y.rem_euclid(128) * 128 + x.rem_euclid(128)).unwrap() * 4;
+            pixels[offset..offset + 4].copy_from_slice(&rgba);
+            (key, pixels)
+        }),
+    )
+    .unwrap();
+    let original = doc.artwork.clone();
+    for alpha in [false, true] {
+        if alpha {
+            doc.artwork
+                .layers
+                .set_alpha_locked(LayerId(3), true)
+                .unwrap();
+        } else {
+            doc.artwork.layers.set_locked(LayerId(3), true).unwrap();
+        }
+        assert!(
+            doc.apply_edit(E::FreeTransform(T::BeginGroup(GroupId(10))))
+                .is_err()
+        );
+        assert!(doc.transform_projection().is_none());
+        assert_eq!(doc.snapshot(), &original.tiles);
+        doc.artwork.layers = original.layers.clone();
+    }
+    let shift = AffineTransform {
+        offset_milli: [2000, 1000],
+        ..Default::default()
+    };
+    let mask = std::sync::Arc::new(
+        nyatidraw_paint_cpu::selection_all(
+            [-1, 1],
+            [1, 1],
+            nyatidraw_paint_cpu::EditLimits::default(),
+        )
+        .unwrap(),
+    );
+    doc.selection = Some(mask.clone());
+    doc.apply_edit(E::FreeTransform(T::BeginGroup(GroupId(10))))
+        .unwrap();
+    assert_eq!(doc.transform_projection().unwrap().size, [1, 1]);
+    doc.apply_edit(E::FreeTransform(T::Preview(shift))).unwrap();
+    for id in [LayerId(2), LayerId(3)] {
+        let key = TileKey::from_pixel(id, 128, 1, 1);
+        assert_eq!(doc.display_snapshot().get(key), original.tiles.get(key));
+    }
+    doc.apply_edit(E::FreeTransform(T::Cancel)).unwrap();
+    assert_eq!(doc.selection, Some(mask));
+    doc.selection = None;
+    for commit in [false, true] {
+        let history = doc.history_len();
+        doc.apply_edit(E::FreeTransform(T::BeginGroup(GroupId(10))))
+            .unwrap();
+        assert_eq!(doc.transform_projection().unwrap().origin, [-1, 1]);
+        assert_eq!(doc.transform_projection().unwrap().size, [4, 1]);
+        doc.apply_edit(E::FreeTransform(T::Preview(shift))).unwrap();
+        assert_eq!(
+            doc.artwork, original,
+            "previews must not change durable artwork"
+        );
+        assert_eq!(doc.display_layers(), &original.layers);
+        assert_eq!(doc.display_active_layer(), LayerId(4));
+        let preview = doc.display_snapshot().clone();
+        for (id, x, color) in [
+            (1, 1, [128, 0, 0, 128]),
+            (2, 3, [0, 64, 0, 64]),
+            (3, 4, [0, 0, 255, 255]),
+        ] {
+            let key = TileKey::from_pixel(LayerId(id), 128, x, 2);
+            let offset = usize::try_from(2 * 128 + x).unwrap() * 4;
+            assert_eq!(
+                &preview.get(key).unwrap().pixels()[offset..offset + 4],
+                &color
+            );
+        }
+        let outside = TileKey::from_pixel(LayerId(4), 128, 8, 1);
+        assert_eq!(preview.get(outside), original.tiles.get(outside));
+        if commit {
+            let generation = doc.transform_projection().unwrap().generation;
+            doc.apply_edit(E::FreeTransform(T::Commit { generation }))
+                .unwrap();
+            assert_eq!(doc.snapshot(), &preview);
+            assert_eq!(doc.layers(), &original.layers);
+            assert_eq!(doc.history_len(), history + 1);
+            doc.undo().unwrap();
+            assert_eq!(doc.artwork, original);
+            doc.redo().unwrap();
+            assert_eq!(doc.snapshot(), &preview);
+        } else {
+            doc.apply_edit(E::FreeTransform(T::Cancel)).unwrap();
+            assert_eq!(doc.artwork, original);
+            assert!(doc.selection().is_none());
+            assert_eq!(doc.history_len(), history);
+        }
     }
 }
 
@@ -810,4 +991,94 @@ fn switching_tools_commits_moved_or_pasted_artwork_without_recording_unchanged_d
             }
         }
     }
+}
+
+#[test]
+fn coverage_admission_and_history_cannot_bypass_browser_resource_limits() {
+    use nyatidraw_api::MaskId;
+    use nyatidraw_document::LayerMask;
+    use nyatidraw_tiles::{COVERAGE_TILE_BYTE_LEN, CoverageTileKey, CoverageTileObject};
+    let mut document = WebDocument::new(CanvasSpec {
+        width_px: 16,
+        height_px: 16,
+        pixels_per_inch: 96,
+    })
+    .unwrap();
+    let active = document.active_layer();
+    document
+        .artwork
+        .layers
+        .set_mask(
+            active,
+            Some(LayerMask {
+                id: MaskId(2),
+                enabled: true,
+                default_coverage: 255,
+            }),
+        )
+        .unwrap();
+    let key = CoverageTileKey {
+        mask: MaskId(2),
+        mip: 0,
+        x: -1,
+        y: 0,
+    };
+    let tile = CoverageTileObject::new(vec![0; COVERAGE_TILE_BYTE_LEN]).unwrap();
+    document.artwork.tiles = TileSnapshot::from_planes([], [(key, tile.clone())]).unwrap();
+    let bytes = document.resident_bytes();
+    assert!(bytes >= COVERAGE_TILE_BYTE_LEN);
+    document.undo.push_back(document.artwork.clone());
+    let metadata =
+        document.artwork.tiles.total_len() * 256 + editing::node_count(document.layers()) * 1024;
+    assert_eq!(document.resident_bytes(), bytes + metadata);
+    document.artwork.tiles = document
+        .artwork
+        .tiles
+        .with_coverage_replacements([(key, vec![128; COVERAGE_TILE_BYTE_LEN])])
+        .unwrap();
+    assert_eq!(
+        document.resident_bytes(),
+        bytes + metadata + COVERAGE_TILE_BYTE_LEN
+    );
+    for invalid in [
+        CoverageTileKey {
+            mask: MaskId(99),
+            ..key
+        },
+        CoverageTileKey { x: 258, ..key },
+    ] {
+        let snapshot = TileSnapshot::from_planes([], [(invalid, tile.clone())]).unwrap();
+        assert!(
+            WebDocument::from_snapshot(
+                document.canvas(),
+                snapshot,
+                document.layers().clone(),
+                active
+            )
+            .is_err()
+        );
+    }
+    let over_limit = TileSnapshot::from_planes(
+        [],
+        (0..=MAX_RESIDENT_TILES).map(|index| {
+            (
+                CoverageTileKey {
+                    x: i32::try_from(index % 257).unwrap(),
+                    y: i32::try_from(index / 257).unwrap(),
+                    ..key
+                },
+                tile.clone(),
+            )
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        WebDocument::from_snapshot(
+            document.canvas(),
+            over_limit,
+            document.layers().clone(),
+            active
+        ),
+        Err(WebError::LimitExceeded)
+    ));
 }

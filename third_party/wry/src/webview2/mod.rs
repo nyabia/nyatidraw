@@ -5,6 +5,7 @@
 mod drag_drop;
 mod util;
 mod composition;
+mod focus_trace;
 
 use std::{
   borrow::Cow, cell::RefCell, collections::HashSet, fmt::Write, fs, path::PathBuf, rc::Rc,
@@ -51,6 +52,11 @@ impl From<windows::core::Error> for Error {
   fn from(err: windows::core::Error) -> Self {
     Error::WebView2Error(webview2_com::Error::WindowsError(err))
   }
+}
+
+struct ParentSubclassData {
+  controller: ICoreWebView2Controller,
+  container: Option<HWND>,
 }
 
 pub(crate) struct InnerWebView {
@@ -557,7 +563,13 @@ impl InnerWebView {
 
     // Subclass parent for resizing and focus
     if !is_child {
-      unsafe { Self::attach_parent_subclass(parent, controller) };
+      unsafe {
+        Self::attach_parent_subclass(
+          parent,
+          pl_attrs.parent_composition.then_some(hwnd),
+          controller,
+        )
+      };
     }
 
     unsafe {
@@ -566,7 +578,12 @@ impl InnerWebView {
       if attributes.focused {
         // Backport wry #1799: initial focus is advisory, not a build failure.
         // Later activation/user interaction can focus the completed webview.
-        if let Err(error) = controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC) {
+        let focus = if pl_attrs.parent_composition {
+          focus_trace::move_focus(controller, hwnd, "initial")
+        } else {
+          controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)
+        };
+        if let Err(error) = focus {
           eprintln!("desktop-webview event=initial-focus-deferred error={error}");
         }
       }
@@ -1231,26 +1248,37 @@ impl InnerWebView {
     _uidsubclass: usize,
     dwrefdata: usize,
   ) -> LRESULT {
+    if dwrefdata == 0 {
+      return DefSubclassProc(hwnd, msg, wparam, lparam);
+    }
+    let state = &*(dwrefdata as *const ParentSubclassData);
+    // COM may pump messages and retire the subclass during a call.
+    let controller = state.controller.clone();
+    let container = state.container;
+    if container.is_some() {
+      focus_trace::message(hwnd, msg, wparam, "parent");
+    }
     match msg {
       WM_SIZE => {
         if wparam.0 != SIZE_MINIMIZED as usize {
-          let controller = dwrefdata as *mut ICoreWebView2Controller;
-
           let Ok(PhysicalSize { width, height }) = Self::parent_bounds(hwnd) else {
             return DefSubclassProc(hwnd, msg, wparam, lparam);
           };
-
-          let _ = (*controller).SetBounds(RECT {
+          let _ = controller.SetBounds(RECT {
             left: 0,
             top: 0,
             right: width,
             bottom: height,
           });
-
-          let mut hwnd = HWND::default();
-          if (*controller).ParentWindow(&mut hwnd).is_ok() {
+          // Composition owns a separate input child; the ordinary windowed
+          // path retains its existing controller-parent resize behavior.
+          let resize_hwnd = container.or_else(|| {
+            let mut parent = HWND::default();
+            controller.ParentWindow(&mut parent).ok().map(|()| parent)
+          });
+          if let Some(resize_hwnd) = resize_hwnd {
             let _ = SetWindowPos(
-              hwnd,
+              resize_hwnd,
               None,
               0,
               0,
@@ -1261,46 +1289,50 @@ impl InnerWebView {
           }
         }
       }
-
       WM_SETFOCUS | WM_ENTERSIZEMOVE => {
-        let controller = dwrefdata as *mut ICoreWebView2Controller;
-        let _ = (*controller).MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+        let _ = if let Some(input) = container {
+          focus_trace::move_focus(&controller, input, "parent-focus-or-size")
+        } else {
+          controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)
+        };
       }
-
       msg if msg == WM_MOVE || msg == WM_MOVING => {
-        let controller = dwrefdata as *mut ICoreWebView2Controller;
-        let _ = (*controller).NotifyParentWindowPositionChanged();
+        let _ = controller.NotifyParentWindowPositionChanged();
       }
-
       msg if msg == WM_DESTROY || msg == PARENT_DESTROY_MESSAGE => {
-        // check if `dwrefdata` is null to avoid double-freeing the controller
-        if !(dwrefdata as *mut ()).is_null() {
-          drop(Box::from_raw(dwrefdata as *mut ICoreWebView2Controller));
-
-          // update `dwrefdata` to null to avoid double-freeing the controller
-          let _ = SetWindowSubclass(
-            hwnd,
-            Some(Self::parent_subclass_proc),
-            PARENT_SUBCLASS_ID as _,
-            std::ptr::null::<()>() as _,
-          );
-        }
+        let _ = SetWindowSubclass(
+          hwnd,
+          Some(Self::parent_subclass_proc),
+          PARENT_SUBCLASS_ID as _,
+          0,
+        );
+        drop(Box::from_raw(dwrefdata as *mut ParentSubclassData));
       }
-
       _ => (),
     }
-
     DefSubclassProc(hwnd, msg, wparam, lparam)
   }
 
   #[inline]
-  unsafe fn attach_parent_subclass(parent: HWND, controller: &ICoreWebView2Controller) {
-    let _ = SetWindowSubclass(
+  unsafe fn attach_parent_subclass(
+    parent: HWND,
+    container: Option<HWND>,
+    controller: &ICoreWebView2Controller,
+  ) {
+    let state = Box::into_raw(Box::new(ParentSubclassData {
+      controller: controller.clone(),
+      container,
+    }));
+    if !SetWindowSubclass(
       parent,
       Some(Self::parent_subclass_proc),
       PARENT_SUBCLASS_ID as _,
-      Box::into_raw(Box::new(controller.clone())) as _,
-    );
+      state as _,
+    )
+    .as_bool()
+    {
+      drop(Box::from_raw(state));
+    }
   }
 
   #[inline]
@@ -1707,7 +1739,7 @@ impl InnerWebView {
 
       if !self.is_child {
         Self::dettach_parent_subclass(*self.parent.borrow());
-        Self::attach_parent_subclass(parent, &self.controller);
+        Self::attach_parent_subclass(parent, None, &self.controller);
 
         *self.parent.borrow_mut() = parent;
 

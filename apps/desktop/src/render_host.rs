@@ -18,8 +18,10 @@ use crate::{
 
 const ACTIVATION_CAPACITY: usize = 8;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Geometry {
+    pub origin: [i32; 2],
+    pub visible: bool,
     pub width: u32,
     pub height: u32,
     pub scale: f64,
@@ -29,6 +31,8 @@ pub(crate) struct Geometry {
 impl Default for Geometry {
     fn default() -> Self {
         Self {
+            origin: [0, 0],
+            visible: false,
             width: 1,
             height: 1,
             scale: 1.0,

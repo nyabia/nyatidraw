@@ -77,6 +77,7 @@ pub fn adjust_raster_colors(
         let mut pixels = source.pixels().to_vec();
         let (left, top) = key.pixel_origin();
         for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+            let mut coverage = 255;
             if let Some(mask) = selection {
                 let index = u32::try_from(index).map_err(|_| EditError::LimitExceeded)?;
                 let [Ok(x), Ok(y)] = [
@@ -86,12 +87,13 @@ pub fn adjust_raster_colors(
                 .map(i32::try_from) else {
                     continue;
                 };
-                if !mask.contains_signed(x, y) {
+                coverage = mask.coverage_signed(x, y);
+                if coverage == 0 {
                     continue;
                 }
             }
             let original = [pixel[0], pixel[1], pixel[2], pixel[3]];
-            pixel.copy_from_slice(&adjust_pixel(original, adjustment));
+            pixel.copy_from_slice(&adjust_selected_pixel(original, adjustment, coverage));
         }
         if pixels != source.pixels() {
             replacements.push((key, pixels));
@@ -105,6 +107,21 @@ pub fn adjust_raster_colors(
         after,
         changed_tiles,
     })
+}
+
+fn adjust_selected_pixel(original: [u8; 4], adjustment: ColorAdjustment, coverage: u8) -> [u8; 4] {
+    let adjusted = adjust_pixel(original, adjustment);
+    let mut result = original;
+    for channel in 0..3 {
+        result[channel] = u8::try_from(
+            (u32::from(original[channel]) * u32::from(255 - coverage)
+                + u32::from(adjusted[channel]) * u32::from(coverage)
+                + 127)
+                / 255,
+        )
+        .expect("weighted channels retain the original alpha bound");
+    }
+    result
 }
 
 fn tile_intersects(key: TileKey, origin: [i32; 2], size: [u32; 2]) -> bool {
@@ -201,6 +218,7 @@ mod tests {
             clip_to_below: false,
             blend_mode: LayerBlendMode::Normal,
             children: vec![LayerTreeNode::Raster(LayerNode {
+                mask: None,
                 id: LayerId(1),
                 name: "Paint".into(),
                 visible: true,
@@ -378,5 +396,41 @@ mod tests {
             ),
             Err(EditError::InvalidPaint)
         ));
+    }
+    #[test]
+    fn fractional_correction_retains_alpha_and_unselected_pixels() {
+        let key = TileKey {
+            layer: LayerId(1),
+            mip: 0,
+            x: -1,
+            y: -1,
+        };
+        let mut pixels = vec![0; TILE_BYTE_LEN];
+        for pixel in pixels[..24].chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[32, 16, 8, 128]);
+        }
+        let before = TileSnapshot::from_tiles([(key, pixels)]).unwrap();
+        let coverage = [0, 1, 64, 128, 254, 255];
+        let mask = SelectionMask::from_coverage_at([-128, -128], [6, 1], &coverage).unwrap();
+        let result = adjust_raster_colors(
+            &before,
+            &tree(false),
+            LayerId(1),
+            Some(&mask),
+            ColorAdjustment {
+                brightness_percent: 100,
+                ..Default::default()
+            },
+            EditLimits::default(),
+        )
+        .unwrap();
+        let pixels = result.after.get(key).unwrap().pixels();
+        assert_eq!(&pixels[..4], &[32, 16, 8, 128]);
+        assert_eq!(&pixels[12..16], &[80, 72, 68, 128]);
+        assert_eq!(&pixels[20..24], &[128; 4]);
+        for pixel in pixels[..24].chunks_exact(4) {
+            assert_eq!(pixel[3], 128);
+        }
+        assert_eq!(&pixels[24..], &before.get(key).unwrap().pixels()[24..]);
     }
 }

@@ -59,6 +59,7 @@ pub struct History {
     head: Option<HistoryNodeId>,
     nodes: BTreeMap<HistoryNodeId, HistoryNode>,
     children: BTreeMap<Option<HistoryNodeId>, BTreeSet<HistoryNodeId>>,
+    preferred_redo: BTreeMap<Option<HistoryNodeId>, HistoryNodeId>,
 }
 
 impl History {
@@ -113,6 +114,11 @@ impl History {
                 .or_default()
                 .insert(node.id);
         }
+        self.preferred_redo.retain(|parent, child| {
+            self.children
+                .get(parent)
+                .is_some_and(|children| children.contains(child))
+        });
         baseline
     }
 
@@ -128,6 +134,7 @@ impl History {
             head: None,
             nodes: BTreeMap::new(),
             children: BTreeMap::new(),
+            preferred_redo: BTreeMap::new(),
         }
     }
 
@@ -201,6 +208,7 @@ impl History {
             head,
             nodes: node_map,
             children,
+            preferred_redo: BTreeMap::new(),
         })
     }
 
@@ -226,6 +234,7 @@ impl History {
         self.head = Some(id);
         self.nodes.insert(id, node);
         self.children.entry(parent).or_default().insert(id);
+        self.preferred_redo.insert(parent, id);
         Ok(())
     }
 
@@ -240,6 +249,7 @@ impl History {
         let node = self.nodes.get(&head).ok_or(HistoryError::CorruptCursor)?;
         self.current_root = node.before_root;
         self.head = node.parent;
+        self.preferred_redo.insert(self.head, head);
         Ok(self.current_root)
     }
 
@@ -267,13 +277,17 @@ impl History {
             .copied()
     }
 
-    /// Reapplies the only available child branch.
+    /// Reapplies the last visited child, or the only available child branch.
+    /// Preferences are session navigation state, not persisted artwork history.
     ///
     /// # Errors
     ///
     /// Returns `NothingToRedo` when no child exists and `AmbiguousRedo` when
-    /// branch selection must be made explicitly with `redo_to`.
+    /// no child has been visited in this session and selection must be explicit.
     pub fn redo(&mut self) -> Result<ContentRootId, HistoryError> {
+        if let Some(candidate) = self.preferred_redo.get(&self.head).copied() {
+            return self.redo_to(candidate);
+        }
         let candidates = self.redo_candidates();
         match candidates.as_slice() {
             [] => Err(HistoryError::NothingToRedo),
@@ -306,6 +320,7 @@ impl History {
             return Err(HistoryError::RedoBranchMismatch);
         }
         self.current_root = node.after_root;
+        self.preferred_redo.insert(self.head, candidate);
         self.head = Some(candidate);
         Ok(self.current_root)
     }
@@ -368,10 +383,8 @@ mod tests {
             vec![HistoryNodeId(2), HistoryNodeId(3)],
             "caller-provided IDs define deterministic branch order"
         );
-        assert_eq!(
-            history.redo(),
-            Err(HistoryError::AmbiguousRedo { candidates: 2 })
-        );
+        assert_eq!(history.redo(), Ok(ContentRootId(40)));
+        assert_eq!(history.undo(), Ok(ContentRootId(20)));
         assert_eq!(history.redo_to(HistoryNodeId(2)), Ok(ContentRootId(30)));
         assert_eq!(history.undo(), Ok(ContentRootId(20)));
         assert_eq!(history.redo_to(HistoryNodeId(3)), Ok(ContentRootId(40)));
@@ -389,5 +402,65 @@ mod tests {
             history.append(node(4, Some(3), 999, 50)),
             Err(HistoryError::BeforeRootMismatch)
         );
+    }
+
+    #[test]
+    fn repeated_undo_redo_preserves_branch_choices_even_for_equal_roots() {
+        let nodes = [
+            node(1, None, 10, 10),
+            node(2, Some(1), 10, 10),
+            node(3, Some(1), 10, 10),
+            node(4, Some(3), 10, 10),
+            node(5, Some(3), 10, 10),
+        ];
+        let mut history =
+            History::from_persisted(ContentRootId(10), Some(HistoryNodeId(5)), nodes.clone())
+                .expect("reopened metadata branches");
+        for expected in [Some(3), Some(1), None] {
+            history.undo().unwrap();
+            assert_eq!(history.head(), expected.map(HistoryNodeId));
+        }
+        for expected in [1, 3, 5] {
+            assert_eq!(history.redo(), Ok(ContentRootId(10)));
+            assert_eq!(history.head(), Some(HistoryNodeId(expected)));
+        }
+        history.undo().unwrap();
+        history.redo_to(HistoryNodeId(4)).unwrap();
+        history.undo().unwrap();
+        history.redo().unwrap();
+        assert_eq!(history.head(), Some(HistoryNodeId(4)));
+        assert_eq!(history.nodes().cloned().collect::<Vec<_>>(), nodes);
+
+        let mut reopened =
+            History::from_persisted(ContentRootId(10), Some(HistoryNodeId(1)), nodes).unwrap();
+        assert_eq!(
+            reopened.redo(),
+            Err(HistoryError::AmbiguousRedo { candidates: 2 })
+        );
+    }
+
+    #[test]
+    fn retention_removes_navigation_preferences_to_discarded_nodes() {
+        let mut history = History::new(ContentRootId(10));
+        for id in 1..=130 {
+            history
+                .append(node(id, history.head().map(|head| head.0), 10, 10))
+                .unwrap();
+        }
+        assert_eq!(history.enforce_limit(), Some(HistoryNodeId(2)));
+        assert_eq!(history.node_count(), HISTORY_LIMIT);
+        assert!(history.preferred_redo.iter().all(|(parent, child)| {
+            history
+                .children
+                .get(parent)
+                .is_some_and(|children| children.contains(child))
+        }));
+        for _ in 0..HISTORY_LIMIT {
+            history.undo().unwrap();
+        }
+        for expected in 3..=130 {
+            history.redo().unwrap();
+            assert_eq!(history.head(), Some(HistoryNodeId(expected)));
+        }
     }
 }

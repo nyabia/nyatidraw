@@ -87,19 +87,22 @@ fn pencil_coverage(input: VertexOutput) -> f32 {
 }
 
 fn shade_dab(input: VertexOutput) -> vec4<f32> {
+    var selected = 1.0;
     if selection.dimensions.x != 0u {
         let document = vec2<i32>(floor(input.position.xy)) + selection.origin.xy;
         if any(document < selection.origin.zw) { discard; }
         let point = vec2<u32>(document) - vec2<u32>(selection.origin.zw);
         if any(point >= selection.dimensions.yz) { discard; }
         let index = point.y * selection.dimensions.y + point.x;
-        if ((selection_bits[index / 32u] >> (index % 32u)) & 1u) == 0u { discard; }
+        selected = f32((selection_bits[index / 4u] >> ((index % 4u) * 8u)) & 255u) / 255.0;
+        if selected == 0.0 { discard; }
     }
     if input.grain.x != 0u {
         let coverage = pencil_coverage(input);
         if coverage == 0.0 { discard; }
         let minimum = select(0.0, f32(input.grain.x >> 16u), input.opacity > 0.0);
-        let dab_alpha = max(floor(coverage * input.opacity * 255.0 + 0.5), minimum) / 255.0;
+        let pigment = max(floor(coverage * input.opacity * 255.0 + 0.5), minimum);
+        let dab_alpha = floor(pigment * selected + 0.5) / 255.0;
         return vec4<f32>(brush_color.rgb, brush_color.a * dab_alpha);
     }
     let pixel_origin = input.position.xy - vec2<f32>(0.5, 0.5);
@@ -128,7 +131,7 @@ fn shade_dab(input: VertexOutput) -> vec4<f32> {
 
     return vec4<f32>(
         brush_color.rgb,
-        brush_color.a * input.opacity * coverage,
+        brush_color.a * input.opacity * coverage * selected,
     );
 }
 

@@ -52,8 +52,17 @@ pub(super) fn FillProperties(ui_projection: Signal<UiProjection>) -> Element {
     let hidden = target.is_some_and(|layer| {
         layer_path(&projection.layers, layer).any(|ancestor| !ancestor.visible)
     });
-    let blocked = projection.edit.busy || hidden || target.is_none_or(|layer| layer.locked);
-    let alpha_locked = target.is_some_and(|layer| layer.alpha_locked);
+    let mask_selected = matches!(
+        projection.raster_target,
+        Some(nyatidraw_api::RasterEditTarget::Mask { .. })
+    );
+    let blocked = projection.edit.busy
+        || projection.animation.playing
+        || projection.edit.transform.is_some()
+        || projection.edit.color_adjustment.is_some()
+        || hidden
+        || target.is_none_or(|layer| layer.locked);
+    let alpha_locked = !mask_selected && target.is_some_and(|layer| layer.alpha_locked);
     let target_name = target
         .map_or("레이어를 선택하세요", |layer| layer.name.as_str())
         .to_owned();
@@ -67,7 +76,8 @@ pub(super) fn FillProperties(ui_projection: Signal<UiProjection>) -> Element {
         layer_path(&projection.layers, layer).any(|ancestor| ancestor.opacity_u16 == 0)
     }) {
         Some("레이어나 상위 그룹의 불투명도가 0%여서 칠한 색이 보이지 않습니다.")
-    } else if settings.fill_source == EditSource::ReferenceLayers
+    } else if !mask_selected
+        && settings.fill_source == EditSource::ReferenceLayers
         && !projection.layers.iter().any(|layer| {
             layer.reference
                 && layer_path(&projection.layers, layer).all(|ancestor| {
@@ -85,6 +95,7 @@ pub(super) fn FillProperties(ui_projection: Signal<UiProjection>) -> Element {
     };
     rsx! {
         div { class: "fill-properties", onkeydown: move |event| { if event.key() != Key::Escape { event.stop_propagation(); } },
+            if mask_selected { crate::layer_mask::MaskImageTargetSwitch { ui_projection, selection_fill: true } }
             div { class: "fill-target", title: "현재 색으로 칠할 레이어: {target_name}",
                 span { class: "fill-color", style: "background:rgb({red},{green},{blue})" }
                 span { class: "fill-target-name", "{target_name}" }
@@ -95,6 +106,7 @@ pub(super) fn FillProperties(ui_projection: Signal<UiProjection>) -> Element {
             if has_selection {
                 p { class: "fill-selection-note", "선택 영역 안에서만 채웁니다." }
             }
+            if !mask_selected {
             FillSlider {
                 label: "허용 오차", value: settings.fill_tolerance, max: 255, unit: "",
                 hint: "클릭한 색과 얼마나 달라도 같은 영역으로 볼지 정합니다. 높이면 경계를 넘어갈 수 있습니다.",
@@ -120,9 +132,10 @@ pub(super) fn FillProperties(ui_projection: Signal<UiProjection>) -> Element {
                     span { "최소 1px 빈틈 보정" }
                 }
             }
+            }
             div { class: "fill-selection-actions",
                 button { disabled: blocked || !has_selection,
-                    title: "선 경계와 관계없이 선택 전체를 현재 색으로 채웁니다. 되돌리기 한 번으로 취소합니다.",
+                    title: if mask_selected { "선택한 마스크에 현재 명도 채우기 · 검정은 숨김, 흰색은 표시 · 부드러운 선택 유지 · Undo로 복원" } else { "선 경계와 관계없이 선택 전체를 현재 색으로 채웁니다. 되돌리기 한 번으로 취소합니다." },
                     onclick: move |_| send_editor_command(&selection_host, EditorCommand::Edit(EditCommand::FillSelection { color }), error),
                     UiIcon { name: "bucket" }
                     span { "선택 전체 채우기" }

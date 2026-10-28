@@ -2,9 +2,14 @@
 
 use std::collections::BTreeMap;
 
+pub mod animation;
+pub mod animation_display;
+pub mod animation_export;
 pub mod color_adjustment;
+pub mod frame_preview;
 pub mod gesture;
 pub mod layer_edit;
+pub mod masks;
 pub mod pixel_edit;
 mod projection;
 pub mod transform;
@@ -421,7 +426,7 @@ impl HeadlessStrokeSession {
         })
     }
 
-    /// Prepares redo when the current cursor has exactly one child branch.
+    /// Prepares redo along the session's preferred or sole child branch.
     ///
     /// # Errors
     ///
@@ -593,5 +598,42 @@ mod tests {
             .prepare_redo_to_cursor(HistoryNodeId(1))
             .expect("first edit branch retained");
         assert_eq!(redo.target().root, painted.root());
+    }
+
+    #[test]
+    fn rejected_or_uncommitted_navigation_preserves_just_undone_metadata_branch() {
+        let initial = TileSnapshot::empty();
+        let mut session = HeadlessStrokeSession::new(SnapshotId(0), initial.clone());
+        for id in 1..=3 {
+            let batch = session
+                .prepare_structural_change(SnapshotId(id), HistoryNodeId(id), 0, initial.clone())
+                .unwrap();
+            session.accept_structural_change(&batch).unwrap();
+            let undo = session.prepare_undo_cursor().unwrap();
+            session
+                .accept_history_cursor_move(undo, initial.clone())
+                .unwrap();
+        }
+        let other_branch = session.prepare_redo_to_cursor(HistoryNodeId(1)).unwrap();
+        let wrong_tiles = TileSnapshot::from_tiles([(
+            TileKey {
+                layer: LayerId(1),
+                mip: 0,
+                x: 0,
+                y: 0,
+            },
+            vec![255; TILE_BYTE_LEN],
+        )])
+        .unwrap();
+        assert!(matches!(
+            session.accept_history_cursor_move(other_branch, wrong_tiles),
+            Err(HeadlessStrokeError::CursorTilesChanged)
+        ));
+        let redo = session.prepare_redo_cursor().unwrap();
+        assert_eq!(redo.target().history_head, Some(HistoryNodeId(3)));
+        assert_eq!(session.history().head(), None);
+        session.accept_history_cursor_move(redo, initial).unwrap();
+        assert_eq!(session.history().head(), Some(HistoryNodeId(3)));
+        assert_eq!(session.history().node_count(), 3);
     }
 }

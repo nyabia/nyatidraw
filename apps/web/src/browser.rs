@@ -34,6 +34,16 @@ extern "C" {
     pub fn load_workspace() -> Promise;
     #[wasm_bindgen(js_name = saveInWorker)]
     pub fn save_in_worker(bytes: &Uint8Array, download: bool) -> Promise;
+    #[wasm_bindgen(js_name = exportPngInWorker)]
+    pub fn export_png_in_worker(
+        pixels: &Uint8Array,
+        width: u32,
+        height: u32,
+        output_width: u32,
+        output_height: u32,
+    ) -> Promise;
+    #[wasm_bindgen(js_name = exportSpriteSheetInWorker)]
+    pub fn export_sprite_sheet_in_worker(packet: &Uint8Array, columns: Option<u32>) -> Promise;
     #[wasm_bindgen(js_name = setUnsaved)]
     pub fn set_unsaved(unsaved: bool);
     #[wasm_bindgen(js_name = downloadBytes)]

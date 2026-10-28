@@ -399,6 +399,7 @@ fn fixture() -> (Vec<u8>, TileSnapshot, LayerTree, ProjectToolState) {
             .into_iter()
             .map(|id| {
                 LayerTreeNode::Raster(LayerNode {
+                    mask: None,
                     color_effect: if id.0 == 19 {
                         Some(nyatidraw_api::LayerColorEffect {
                             enabled: false,
@@ -538,6 +539,120 @@ fn editing_an_undone_native_project_preserves_redo_branch_and_exact_new_pixels()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn blend_modes_survive_native_web_native_process_restart_without_repainting() {
+    const REOPEN: &str = "NYATIDRAW_BLEND_MODES_REOPEN";
+    if let Some(path) = std::env::var_os(REOPEN) {
+        let path = std::path::PathBuf::from(path);
+        let bytes = std::fs::read(&path).unwrap();
+        let web = WebProject::decode_ntdr(&bytes).unwrap();
+        let native = ProjectDb::open(&path).unwrap();
+        assert_eq!(
+            native.load_layer_tree().unwrap().as_ref(),
+            Some(web.layers())
+        );
+        assert_eq!(
+            native.load_reopened().unwrap().unwrap().current_tiles(),
+            web.snapshot()
+        );
+        assert_eq!(
+            web.snapshot().root().hash.0.as_slice(),
+            std::fs::read(path.with_extension("root")).unwrap()
+        );
+        assert_eq!(
+            web.export_rgba8().unwrap(),
+            std::fs::read(path.with_extension("rgba")).unwrap()
+        );
+        assert_eq!(
+            nyatidraw_project::encode_layer_tree(web.layers()).unwrap(),
+            std::fs::read(path.with_extension("layers")).unwrap()
+        );
+        return;
+    }
+    for mode in [
+        LayerBlendMode::Screen,
+        LayerBlendMode::Add,
+        LayerBlendMode::Overlay,
+    ] {
+        let (original, tiles, mut layers, _) = fixture();
+        for id in [LayerId(19), LayerId(23)] {
+            layers
+                .set_blend_mode(LayerTreeNodeId::Raster(id), mode)
+                .unwrap();
+        }
+        let root = layers.root().clone();
+        let layers = LayerTree::new(GroupNode {
+            children: vec![LayerTreeNode::Group(GroupNode {
+                id: GroupId(88),
+                name: "Light group".into(),
+                visible: true,
+                opacity_u16: 50_000,
+                clip_to_below: false,
+                blend_mode: mode,
+                children: root.children.clone(),
+            })],
+            ..root
+        })
+        .unwrap();
+        let mut light = vec![0; TILE_BYTE_LEN];
+        light[..4].copy_from_slice(&[64, 16, 32, 128]);
+        let tiles = tiles
+            .with_replacements([(
+                TileKey {
+                    layer: LayerId(23),
+                    mip: 0,
+                    x: 0,
+                    y: 0,
+                },
+                light,
+            )])
+            .unwrap();
+        let memory = MemoryProjectDb::open(&original, MAX_NTDR_BYTES).unwrap();
+        let session =
+            HeadlessStrokeSession::from_reopened(memory.db().load_reopened().unwrap().unwrap());
+        let batch = session
+            .prepare_structural_change(SnapshotId(3), HistoryNodeId(3), 0, tiles.clone())
+            .unwrap();
+        memory
+            .db()
+            .commit_structural_with_layer_tree(&batch, &layers)
+            .unwrap();
+        let native_bytes = memory.into_bytes().unwrap();
+        let mut web = WebProject::decode_ntdr(&native_bytes).unwrap();
+        assert_eq!(web.layers(), &layers);
+        assert_eq!(web.snapshot(), &tiles);
+        let expected = web.export_rgba8().unwrap();
+        let output = web.encode_ntdr().unwrap();
+        assert_eq!(
+            web.snapshot(),
+            &tiles,
+            "saving blend modes must not bake raw artwork"
+        );
+        let path = scratch_path("blend-process-reopen");
+        std::fs::write(&path, output).unwrap();
+        std::fs::write(path.with_extension("rgba"), expected).unwrap();
+        std::fs::write(path.with_extension("root"), tiles.root().hash.0).unwrap();
+        std::fs::write(
+            path.with_extension("layers"),
+            nyatidraw_project::encode_layer_tree(&layers).unwrap(),
+        )
+        .unwrap();
+        assert!(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::blend_modes_survive_native_web_native_process_restart_without_repainting"])
+            .env(REOPEN, &path)
+            .status().unwrap().success());
+        for file in [
+            path.with_extension("rgba"),
+            path.with_extension("layers"),
+            path.with_extension("root"),
+            path,
+        ] {
+            std::fs::remove_file(file).unwrap();
+        }
+    }
+}
+
+#[test]
 fn groups_roundtrip_and_invalid_data_never_replace_source_artwork() {
     let (original, tiles, layers, _) = fixture();
     let memory = MemoryProjectDb::open(&original, MAX_NTDR_BYTES).unwrap();
@@ -615,6 +730,113 @@ fn groups_roundtrip_and_invalid_data_never_replace_source_artwork() {
         )
         .is_err()
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn group_transform_commit_survives_native_process_restart_with_exact_raw_tiles() {
+    use nyatidraw_api::{AffineTransform, EditCommand as E, TransformCommand as T};
+    const REOPEN: &str = "NYATIDRAW_GROUP_TRANSFORM_REOPEN";
+    if let Some(path) = std::env::var_os(REOPEN) {
+        let path = std::path::PathBuf::from(path);
+        let saved_bytes = std::fs::read(&path).unwrap();
+        let native = ProjectDb::open(&path).unwrap();
+        let reopened = native.load_reopened().unwrap().unwrap();
+        assert_eq!(
+            reopened.current_tiles().root().hash.0.as_slice(),
+            std::fs::read(path.with_extension("root")).unwrap()
+        );
+        let tree = native.load_layer_tree().unwrap().unwrap();
+        assert_eq!(
+            nyatidraw_project::encode_layer_tree(&tree).unwrap(),
+            std::fs::read(path.with_extension("layers")).unwrap()
+        );
+        let web = WebProject::decode_ntdr(&saved_bytes).unwrap();
+        assert_eq!(
+            web.export_rgba8().unwrap(),
+            std::fs::read(path.with_extension("rgba")).unwrap()
+        );
+        let session = HeadlessStrokeSession::from_reopened(reopened);
+        let undo = session.prepare_undo_cursor().unwrap();
+        let before = native.load_cursor_tiles(undo.target()).unwrap();
+        assert_eq!(
+            before.root().hash.0.as_slice(),
+            std::fs::read(path.with_extension("before")).unwrap()
+        );
+        return;
+    }
+    let (original, _, mut layers, _) = fixture();
+    layers.set_alpha_locked(LayerId(19), false).unwrap();
+    let root = layers.root().clone();
+    let layers = LayerTree::new(GroupNode {
+        children: vec![LayerTreeNode::Group(GroupNode {
+            id: GroupId(88),
+            name: "transform subject".into(),
+            visible: true,
+            opacity_u16: 40000,
+            clip_to_below: false,
+            blend_mode: LayerBlendMode::Screen,
+            children: root.children.clone(),
+        })],
+        ..root
+    })
+    .unwrap();
+    let memory = MemoryProjectDb::open(&original, MAX_NTDR_BYTES).unwrap();
+    let session =
+        HeadlessStrokeSession::from_reopened(memory.db().load_reopened().unwrap().unwrap());
+    let group_batch = session
+        .prepare_structural_change(SnapshotId(3), HistoryNodeId(3), 0, session.tiles().clone())
+        .unwrap();
+    memory
+        .db()
+        .commit_structural_with_layer_tree(&group_batch, &layers)
+        .unwrap();
+    let mut web = WebProject::decode_ntdr(&memory.into_bytes().unwrap()).unwrap();
+    let before = web.snapshot().clone();
+    web.apply_edit(E::FreeTransform(T::BeginGroup(GroupId(88))))
+        .unwrap();
+    web.apply_edit(E::FreeTransform(T::Preview(AffineTransform {
+        offset_milli: [2000, 3000],
+        ..AffineTransform::default()
+    })))
+    .unwrap();
+    assert_eq!(web.snapshot(), &before);
+    let generation = web.transform_projection().unwrap().generation;
+    web.apply_edit(E::FreeTransform(T::Commit { generation }))
+        .unwrap();
+    let after = web.snapshot().clone();
+    assert_ne!(after, before);
+    assert_eq!(web.layers(), &layers);
+    let path = scratch_path("group-transform-process-reopen");
+    std::fs::write(path.with_extension("root"), after.root().hash.0).unwrap();
+    std::fs::write(path.with_extension("before"), before.root().hash.0).unwrap();
+    std::fs::write(
+        path.with_extension("layers"),
+        nyatidraw_project::encode_layer_tree(&layers).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(path.with_extension("rgba"), web.export_rgba8().unwrap()).unwrap();
+    std::fs::write(&path, web.encode_ntdr().unwrap()).unwrap();
+    assert!(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::group_transform_commit_survives_native_process_restart_with_exact_raw_tiles"
+            ])
+            .env(REOPEN, &path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    for file in [
+        path.with_extension("root"),
+        path.with_extension("before"),
+        path.with_extension("layers"),
+        path.with_extension("rgba"),
+        path,
+    ] {
+        std::fs::remove_file(file).unwrap();
+    }
 }
 
 #[test]

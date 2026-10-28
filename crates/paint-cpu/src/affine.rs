@@ -170,6 +170,19 @@ pub fn transform_selection_affine(
     transform: &AffineTransform,
     limits: EditLimits,
 ) -> Result<AffineResult, EditError> {
+    transform_selection_affine_with_pivot(snapshot, tree, target, mask, transform, limits, None)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) fn transform_selection_affine_with_pivot(
+    snapshot: &TileSnapshot,
+    tree: &LayerTree,
+    target: LayerId,
+    mask: &SelectionMask,
+    transform: &AffineTransform,
+    limits: EditLimits,
+    pivot: Option<([i32; 2], [u32; 2])>,
+) -> Result<AffineResult, EditError> {
     let limits = limits.bounded();
     let layer = tree.raster(target).ok_or(EditError::UnknownLayer)?;
     if layer.locked {
@@ -197,7 +210,8 @@ pub fn transform_selection_affine(
     }
     let (origin, size) = mask.bounds_signed().ok_or(EditError::InvalidMask)?;
     let source = Region { origin, size };
-    let mapping = Mapping::new(origin, size, transform)?;
+    let (pivot_origin, pivot_size) = pivot.unwrap_or((origin, size));
+    let mapping = Mapping::new(pivot_origin, pivot_size, transform)?;
     let corners = mapping.corners(origin, size, 0.0);
     if *transform == AffineTransform::default() {
         return Ok(AffineResult {
@@ -240,7 +254,7 @@ pub fn transform_selection_affine(
     };
     let source_has_ink = cut_source(&mut replacements, source, target, mask)?;
     let pixel_count = usize::try_from(output.pixels()).map_err(|_| EditError::LimitExceeded)?;
-    let mut packed = vec![0_u8; pixel_count.div_ceil(8)];
+    let mut coverage = vec![0_u8; pixel_count];
     let mut output_has_ink = false;
     for y in 0..output.size[1] {
         for x in 0..output.size[0] {
@@ -248,22 +262,30 @@ pub fn transform_selection_affine(
             #[allow(clippy::cast_precision_loss)]
             let sample = mapping.inverse(point.map(|p| p as f64 + 0.5));
             let (color, selected) = bilinear(snapshot, target, mask, sample);
-            if selected {
-                let index = y as usize * output.size[0] as usize + x as usize;
-                packed[index / 8] |= 1 << (index % 8);
-            }
+            let index = y as usize * output.size[0] as usize + x as usize;
+            coverage[index] = selected;
             if color[3] != 0 {
                 output_has_ink = true;
                 let (key, offset) = pixel_address(target, point);
-                composite_surface(
-                    &mut replacements.tile(key)?[offset..offset + 4],
-                    &color,
-                    u16::MAX,
-                );
+                #[allow(clippy::cast_precision_loss)]
+                let stationary =
+                    (0..2).all(|axis| (sample[axis] - (point[axis] as f64 + 0.5)).abs() < 1e-12);
+                if stationary {
+                    let original = snapshot.get(key).map_or([0; 4], |tile| {
+                        tile.pixels()[offset..offset + 4].try_into().expect("pixel")
+                    });
+                    replacements.tile(key)?[offset..offset + 4].copy_from_slice(&original);
+                } else {
+                    composite_surface(
+                        &mut replacements.tile(key)?[offset..offset + 4],
+                        &color,
+                        u16::MAX,
+                    );
+                }
             }
         }
     }
-    let selection = SelectionMask::from_packed_bits_at(output.origin, output.size, &packed)?;
+    let selection = SelectionMask::from_coverage_at(output.origin, output.size, &coverage)?;
     // Transparent selected pixels cannot make an empty cut result safe.
     if selection.selected_pixels() == 0 || (source_has_ink && !output_has_ink) {
         return Err(EditError::InvalidTransform);
@@ -286,13 +308,22 @@ fn cut_source(
         for x in 0..source.size[0] {
             let point = source.point(x, y);
             let [px, py] = point.map(|p| i32::try_from(p).expect("checked source"));
-            if mask.contains_signed(px, py) {
+            let coverage = mask.coverage_signed(px, py);
+            if coverage != 0 {
                 let (key, offset) = pixel_address(target, point);
                 if let Some(tile) = replacements.before.get(key)
                     && tile.pixels()[offset..offset + 4] != [0; 4]
                 {
-                    has_ink |= tile.pixels()[offset + 3] != 0;
-                    replacements.tile(key)?[offset..offset + 4].fill(0);
+                    let original: [u8; 4] =
+                        tile.pixels()[offset..offset + 4].try_into().expect("pixel");
+                    let removed = original.map(|value| {
+                        u8::try_from((u16::from(value) * u16::from(coverage) + 127) / 255)
+                            .expect("coverage product")
+                    });
+                    has_ink |= removed[3] != 0;
+                    let remaining: [u8; 4] =
+                        std::array::from_fn(|channel| original[channel] - removed[channel]);
+                    replacements.tile(key)?[offset..offset + 4].copy_from_slice(&remaining);
                 }
             }
         }
@@ -305,7 +336,7 @@ fn bilinear(
     layer: LayerId,
     mask: &SelectionMask,
     point: [f64; 2],
-) -> ([u8; 4], bool) {
+) -> ([u8; 4], u8) {
     let base = point.map(|v| (v - 0.5).floor());
     let frac: [f64; 2] =
         std::array::from_fn(|axis| (point[axis] - 0.5 - base[axis]).clamp(0.0, 1.0));
@@ -326,14 +357,18 @@ fn bilinear(
             }
             #[allow(clippy::cast_possible_truncation)]
             let p = p.map(|v| v as i32);
-            if !mask.contains_signed(p[0], p[1]) {
+            let selected = mask.coverage_signed(p[0], p[1]);
+            if selected == 0 {
                 continue;
             }
-            coverage += weight;
+            coverage += weight * f64::from(selected);
             let (key, offset) = pixel_address(layer, p.map(i64::from));
             if let Some(tile) = snapshot.get(key) {
                 for (channel, value) in color.iter_mut().enumerate() {
-                    *value += f64::from(tile.pixels()[offset + channel]) * weight;
+                    let selected_value =
+                        (u16::from(tile.pixels()[offset + channel]) * u16::from(selected) + 127)
+                            / 255;
+                    *value += f64::from(selected_value) * weight;
                 }
             }
         }
@@ -341,7 +376,7 @@ fn bilinear(
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     (
         color.map(|v| v.round().clamp(0.0, 255.0) as u8),
-        coverage > 1e-12,
+        coverage.round().clamp(0.0, 255.0) as u8,
     )
 }
 
@@ -363,6 +398,7 @@ mod tests {
             children: [1, 2]
                 .map(|id| {
                     LayerTreeNode::Raster(LayerNode {
+                        mask: None,
                         alpha_locked: false,
                         clip_to_below: false,
                         blend_mode: nyatidraw_api::LayerBlendMode::Normal,
@@ -396,6 +432,99 @@ mod tests {
         snapshot
             .get(key)
             .map_or([0; 4], |tile| tile.pixels()[at..at + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn group_affine_keeps_one_pivot_and_rejects_partial_or_over_budget_candidates() {
+        let tree = tree();
+        let source = fixture(&[
+            (LayerId(1), [10, 10], [128, 0, 0, 128]),
+            (LayerId(2), [11, 10], [0, 64, 0, 64]),
+            (LayerId(1), [25, 10], [0, 0, 255, 255]),
+        ]);
+        let mask = crate::selection_all([10, 10], [2, 1], EditLimits::default()).unwrap();
+        let mut draft = crate::AffineDraft::new_layers(
+            nyatidraw_api::SnapshotId(1),
+            &source,
+            &tree,
+            &[LayerId(1), LayerId(2)],
+            &mask,
+        )
+        .unwrap();
+        let rotated = draft
+            .preview(
+                1,
+                &AffineTransform {
+                    rotation_millidegrees: 180_000,
+                    ..AffineTransform::default()
+                },
+                EditLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            pixel(&rotated.paint.after, LayerId(1), [11, 10]),
+            [128, 0, 0, 128]
+        );
+        assert_eq!(
+            pixel(&rotated.paint.after, LayerId(2), [10, 10]),
+            [0, 64, 0, 64]
+        );
+        assert_eq!(
+            pixel(&rotated.paint.after, LayerId(1), [25, 10]),
+            [0, 0, 255, 255]
+        );
+        draft
+            .preview(2, &AffineTransform::default(), EditLimits::default())
+            .unwrap();
+        let shift = AffineTransform {
+            offset_milli: [1000, 0],
+            ..AffineTransform::default()
+        };
+        let limit = EditLimits {
+            max_workspace_bytes: 350_000,
+            ..EditLimits::default()
+        };
+        assert!(
+            transform_selection_affine(&source, &tree, LayerId(1), &mask, &shift, limit).is_ok()
+        );
+        assert!(matches!(
+            draft.preview(3, &shift, limit),
+            Err(crate::AffineDraftError::Edit(EditError::LimitExceeded))
+        ));
+        assert!(
+            draft
+                .prepare_commit(
+                    2,
+                    nyatidraw_api::SnapshotId(1),
+                    &source,
+                    &tree,
+                    LayerId(1),
+                    &mask
+                )
+                .is_err()
+        );
+        assert!(
+            draft
+                .prepare_commit(
+                    3,
+                    nyatidraw_api::SnapshotId(1),
+                    &source,
+                    &tree,
+                    LayerId(1),
+                    &mask
+                )
+                .is_err()
+        );
+        let repeated = draft.preview(4, &shift, EditLimits::default()).unwrap();
+        assert_eq!(
+            pixel(&repeated.paint.after, LayerId(1), [11, 10]),
+            [128, 0, 0, 128]
+        );
+        assert_eq!(
+            pixel(&repeated.paint.after, LayerId(2), [12, 10]),
+            [0, 64, 0, 64]
+        );
+        assert_eq!(pixel(&source, LayerId(1), [10, 10]), [128, 0, 0, 128]);
     }
 
     #[test]
@@ -462,6 +591,51 @@ mod tests {
         assert_eq!(repeated.paint.after, result.paint.after);
         assert_eq!(repeated.selection, result.selection);
         assert_eq!(pixel(&before, layer, [-2, -1]), [128, 0, 0, 128]);
+    }
+
+    #[test]
+    fn soft_affine_preserves_fractional_selection_and_exact_stationary_pixels() {
+        let layer = LayerId(1);
+        let tree = tree();
+        let source = fixture(&[
+            (layer, [-1, 0], [128, 64, 0, 128]),
+            (LayerId(2), [-1, 0], [255; 4]),
+        ]);
+        let mask = SelectionMask::from_coverage_at([-1, 0], [1, 1], &[128]).unwrap();
+        let limits = EditLimits::default();
+        for transform in [
+            AffineTransform::default(),
+            AffineTransform {
+                rotation_millidegrees: 180_000,
+                ..AffineTransform::default()
+            },
+        ] {
+            let result =
+                transform_selection_affine(&source, &tree, layer, &mask, &transform, limits)
+                    .unwrap();
+            assert_eq!(
+                result.paint.after, source,
+                "identity or fixed center must not fade selected pixels"
+            );
+            assert_eq!(result.selection.coverage_signed(-1, 0), 128);
+        }
+        let result = transform_selection_affine(
+            &source,
+            &tree,
+            layer,
+            &mask,
+            &AffineTransform {
+                offset_milli: [3000, -2000],
+                ..AffineTransform::default()
+            },
+            limits,
+        )
+        .unwrap();
+        assert_eq!(pixel(&result.paint.after, layer, [-1, 0]), [64, 32, 0, 64]);
+        assert_eq!(pixel(&result.paint.after, layer, [2, -2]), [64, 32, 0, 64]);
+        assert_eq!(pixel(&result.paint.after, LayerId(2), [-1, 0]), [255; 4]);
+        assert_eq!(result.selection.coverage_signed(2, -2), 128);
+        assert_eq!(pixel(&source, layer, [-1, 0]), [128, 64, 0, 128]);
     }
 
     #[test]

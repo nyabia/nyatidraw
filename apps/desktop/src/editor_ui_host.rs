@@ -72,6 +72,12 @@ impl UiBackend for DesktopUiBackend {
     fn layer_thumbnail_snapshot(&self) -> nyatidraw_editor_ui::preview::LayerThumbnailSnapshot {
         self.live_ink.layer_thumbnail_snapshot()
     }
+    fn frame_thumbnail_snapshot(&self) -> nyatidraw_editor_ui::preview::FrameThumbnailSnapshot {
+        self.live_ink.frame_thumbnail_snapshot()
+    }
+    fn request_frame_thumbnails(&self, frames: &[nyatidraw_api::FrameId]) {
+        self.live_ink.request_frame_thumbnails(frames);
+    }
 
     fn panel_heights(&self) -> nyatidraw_editor_ui::layout_store::PanelHeights {
         let mut result = nyatidraw_editor_ui::layout_store::PanelHeights::default();

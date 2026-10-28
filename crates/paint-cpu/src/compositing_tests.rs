@@ -5,6 +5,7 @@ use nyatidraw_document::{LayerNode, LayerTree};
 
 fn raster(id: u128, clip: bool, opacity: u16, mode: LayerBlendMode) -> LayerTreeNode {
     LayerTreeNode::Raster(LayerNode {
+        mask: None,
         id: LayerId(id),
         name: id.to_string(),
         visible: true,
@@ -239,12 +240,30 @@ fn byte_blends_preserve_transparent_backdrops_and_atop_alpha() {
         (32768, LayerBlendMode::Multiply, false, [33, 73, 35, 160]),
         (32768, LayerBlendMode::Normal, true, [31, 68, 34, 128]),
         (32768, LayerBlendMode::Multiply, true, [17, 65, 31, 128]),
+        (65535, LayerBlendMode::Screen, false, [79, 102, 53, 192]),
+        (65535, LayerBlendMode::Screen, true, [47, 86, 46, 128]),
+        (65535, LayerBlendMode::Add, false, [84, 112, 56, 192]),
+        (65535, LayerBlendMode::Add, true, [52, 96, 48, 128]),
+        (65535, LayerBlendMode::Overlay, false, [52, 84, 33, 192]),
+        (65535, LayerBlendMode::Overlay, true, [20, 68, 25, 128]),
+        (32768, LayerBlendMode::Screen, false, [49, 91, 47, 160]),
+        (32768, LayerBlendMode::Screen, true, [34, 83, 43, 128]),
+        (32768, LayerBlendMode::Add, false, [52, 96, 48, 160]),
+        (32768, LayerBlendMode::Add, true, [36, 88, 44, 128]),
+        (32768, LayerBlendMode::Overlay, false, [36, 82, 36, 160]),
+        (32768, LayerBlendMode::Overlay, true, [20, 74, 32, 128]),
     ] {
         let mut destination = [20, 80, 40, 128];
         blend_pixel(&mut destination, &source, opacity, mode, atop);
         assert_eq!(destination, expected, "{opacity} {mode:?} atop={atop}");
     }
-    for mode in [LayerBlendMode::Normal, LayerBlendMode::Multiply] {
+    for mode in [
+        LayerBlendMode::Normal,
+        LayerBlendMode::Multiply,
+        LayerBlendMode::Screen,
+        LayerBlendMode::Add,
+        LayerBlendMode::Overlay,
+    ] {
         let mut empty = [0; 4];
         blend_pixel(&mut empty, &source, u16::MAX, mode, false);
         assert_eq!(empty, source);
@@ -255,6 +274,15 @@ fn byte_blends_preserve_transparent_backdrops_and_atop_alpha() {
         blend_pixel(&mut empty, &source, u16::MAX, mode, true);
         assert_eq!(empty, [0; 4]);
     }
+    let mut saturated = [100, 200, 230, 255];
+    blend_pixel(
+        &mut saturated,
+        &[200, 10, 80, 255],
+        u16::MAX,
+        LayerBlendMode::Add,
+        false,
+    );
+    assert_eq!(saturated, [255, 210, 255, 255]);
 }
 
 #[test]

@@ -1,16 +1,23 @@
-use nyatidraw_api::{CanvasSpec, DrawingTool, LayerId};
-use nyatidraw_project::{decode_layer_tree, encode_layer_tree};
-use nyatidraw_tiles::{TILE_BYTE_LEN, TileKey, TileObject, TileSnapshot};
+use nyatidraw_api::{CanvasSpec, DrawingTool, LayerId, MaskId};
+use nyatidraw_project::{
+    decode_animation_timeline, decode_layer_tree, encode_animation_timeline, encode_layer_tree,
+};
+use nyatidraw_tiles::{
+    COVERAGE_TILE_BYTE_LEN, CoverageTileKey, CoverageTileObject, TILE_BYTE_LEN, TileKey,
+    TileObject, TileSnapshot,
+};
 use nyatidraw_web_core::{BrushSettings, MAX_RESIDENT_TILES, WebDocument, WebPreferences, WebTool};
 
 use crate::{MAX_NTDR_BYTES, WebProject, message};
 
 const LEGACY_MAGIC: &[u8; 8] = b"NYWORK03";
 const FILL_MAGIC: &[u8; 8] = b"NYWORK04";
-const MAGIC: &[u8; 8] = b"NYWORK05";
+const GRADIENT_MAGIC: &[u8; 8] = b"NYWORK05";
+const ANIMATION_MAGIC: &[u8; 8] = b"NYWORK06";
+const MAGIC: &[u8; 8] = b"NYWORK07";
 const MAX_METADATA_BYTES: usize = 128 * 1024;
 const MAX_REQUEST_BYTES: usize =
-    MAX_NTDR_BYTES + MAX_RESIDENT_TILES * (TILE_BYTE_LEN + 25) + MAX_METADATA_BYTES + 512;
+    MAX_NTDR_BYTES + MAX_RESIDENT_TILES * (TILE_BYTE_LEN + 25) + 2 * MAX_METADATA_BYTES + 512;
 const TOOLS: [DrawingTool; 13] = [
     DrawingTool::Move,
     DrawingTool::MoveSelection,
@@ -73,11 +80,23 @@ impl WebProject {
             MAX_METADATA_BYTES,
         )?;
         bytes.extend_from_slice(&self.active_layer().0.to_le_bytes());
+        put_blob(
+            &mut bytes,
+            &encode_animation_timeline(self.animation_timeline()).map_err(message)?,
+            MAX_METADATA_BYTES,
+        )?;
+        bytes.push(u8::from(self.active_frame().is_some()));
+        if let Some(frame) = self.active_frame() {
+            bytes.extend_from_slice(&frame.0.to_le_bytes());
+        }
         put_preferences(&mut bytes, self.preferences(), self.selected_tool)?;
         bytes.push(match self.pencil_template {
             nyatidraw_api::PencilTemplate::Mechanical2H => 0,
             nyatidraw_api::PencilTemplate::Graphite2B => 1,
         });
+        if self.snapshot().total_len() > MAX_RESIDENT_TILES {
+            return Err("Recovery planes exceed tile budget".into());
+        }
         let count = u32::try_from(self.snapshot().len()).map_err(message)?;
         bytes.extend_from_slice(&count.to_le_bytes());
         for (key, tile) in self.snapshot().iter() {
@@ -89,6 +108,20 @@ impl WebProject {
             bytes.extend_from_slice(&key.y.to_le_bytes());
             let unchanged = previous
                 .and_then(|old| old.tiles.get(key))
+                .is_some_and(|old| old.hash() == tile.hash());
+            bytes.push(u8::from(!unchanged));
+            if !unchanged {
+                bytes.extend_from_slice(tile.pixels());
+            }
+        }
+        let coverage_count = u32::try_from(self.snapshot().coverage_len()).map_err(message)?;
+        bytes.extend_from_slice(&coverage_count.to_le_bytes());
+        for (key, tile) in self.snapshot().coverage_iter() {
+            bytes.extend_from_slice(&key.mask.0.to_le_bytes());
+            bytes.extend_from_slice(&key.x.to_le_bytes());
+            bytes.extend_from_slice(&key.y.to_le_bytes());
+            let unchanged = previous
+                .and_then(|old| old.tiles.get_coverage(key))
                 .is_some_and(|old| old.hash() == tile.hash());
             bytes.push(u8::from(!unchanged));
             if !unchanged {
@@ -156,6 +189,17 @@ impl RecoveryWriter {
     }
 }
 
+/// Decodes an independent, complete checkpoint without accepting or storing recovery state.
+/// # Errors
+/// Rejects incremental checkpoints and malformed or unsupported document data.
+pub fn decode_export_checkpoint(packet: &[u8]) -> Result<WebProject, String> {
+    read_request(packet, None).map(|state| state.project)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "packet validation remains one atomic adoption boundary"
+)]
 fn read_request(
     packet: &[u8],
     accepted: Option<&StoredRecovery>,
@@ -167,7 +211,9 @@ fn read_request(
     let version = match reader.take(8)? {
         bytes if bytes == LEGACY_MAGIC => 3,
         bytes if bytes == FILL_MAGIC => 4,
-        bytes if bytes == MAGIC => 5,
+        bytes if bytes == GRADIENT_MAGIC => 5,
+        bytes if bytes == ANIMATION_MAGIC => 6,
+        bytes if bytes == MAGIC => 7,
         _ => return Err("Unknown recovery protocol".into()),
     };
     let epoch = u64::from_le_bytes(reader.array()?);
@@ -204,6 +250,7 @@ fn read_request(
     };
     let layers = decode_layer_tree(reader.blob(MAX_METADATA_BYTES)?).map_err(message)?;
     let active = LayerId(u128::from_le_bytes(reader.array()?));
+    let (timeline, active_frame) = read_animation_state(&mut reader, version, &layers, previous)?;
     let (preferences, selected) = read_preferences(&mut reader, version)?;
     let pencil_template = match reader.byte()? {
         0 => nyatidraw_api::PencilTemplate::Mechanical2H,
@@ -233,13 +280,15 @@ fn read_request(
         };
         tiles.push((key, tile));
     }
+    let coverage = read_coverage(&mut reader, version, count, base, &layers, previous)?;
     if !reader.0.is_empty() {
         return Err("Trailing recovery bytes".into());
     }
-    let tiles = TileSnapshot::from_objects(tiles)
+    let tiles = TileSnapshot::from_planes(tiles, coverage)
         .map_err(|error| format!("Invalid recovery tiles: {error:?}"))?;
     let mut document =
-        WebDocument::from_snapshot(canvas, tiles, layers, active).map_err(message)?;
+        WebDocument::from_animation_snapshot(canvas, tiles, layers, active, timeline, active_frame)
+            .map_err(message)?;
     document.restore_preferences(preferences).map_err(message)?;
     let mut project = WebProject::from_document(document);
     if let Some(previous) = previous {
@@ -256,6 +305,87 @@ fn read_request(
         revision,
         project,
     })
+}
+
+fn read_coverage(
+    reader: &mut Reader<'_>,
+    version: u8,
+    count: usize,
+    base: u64,
+    layers: &nyatidraw_document::LayerTree,
+    previous: Option<&WebProject>,
+) -> Result<Vec<(CoverageTileKey, CoverageTileObject)>, String> {
+    if version < 7
+        && (layers.has_masks()
+            || previous.is_some_and(|project| {
+                project.layers().has_masks() || project.snapshot().coverage_len() != 0
+            }))
+    {
+        return Err("Old recovery protocol cannot preserve layer masks".into());
+    }
+    let mut coverage = Vec::new();
+    if version >= 7 {
+        let coverage_count = usize::try_from(reader.u32()?).map_err(message)?;
+        if coverage_count > MAX_RESIDENT_TILES.saturating_sub(count) {
+            return Err("Recovery planes exceed tile budget".into());
+        }
+        coverage.reserve(coverage_count);
+        for _ in 0..coverage_count {
+            let key = CoverageTileKey {
+                mask: MaskId(u128::from_le_bytes(reader.array()?)),
+                mip: 0,
+                x: i32::from_le_bytes(reader.array()?),
+                y: i32::from_le_bytes(reader.array()?),
+            };
+            let tile = match reader.byte()? {
+                0 if base != 0 => previous
+                    .and_then(|old| old.snapshot().get_coverage(key))
+                    .cloned()
+                    .ok_or("Missing unchanged coverage tile")?,
+                1 => CoverageTileObject::new(reader.take(COVERAGE_TILE_BYTE_LEN)?.to_vec())
+                    .map_err(|error| format!("Invalid recovery coverage: {error:?}"))?,
+                _ => return Err("Invalid recovery coverage encoding".into()),
+            };
+            coverage.push((key, tile));
+        }
+    }
+    Ok(coverage)
+}
+
+fn read_animation_state(
+    reader: &mut Reader<'_>,
+    version: u8,
+    layers: &nyatidraw_document::LayerTree,
+    previous: Option<&WebProject>,
+) -> Result<
+    (
+        Option<nyatidraw_document::AnimationTimeline>,
+        Option<nyatidraw_api::FrameId>,
+    ),
+    String,
+> {
+    if version < 6 && previous.is_some_and(|old| old.animation_timeline().is_some()) {
+        return Err("Animation recovery cannot use an older protocol".into());
+    }
+    if version >= 6 {
+        let timeline =
+            decode_animation_timeline(reader.blob(MAX_METADATA_BYTES)?, layers).map_err(message)?;
+        let active_frame = if reader.boolean()? {
+            Some(nyatidraw_api::FrameId(u128::from_le_bytes(reader.array()?)))
+        } else {
+            None
+        };
+        if active_frame.is_some_and(|frame| {
+            timeline
+                .as_ref()
+                .is_none_or(|value| value.cel_for_frame(frame).is_none())
+        }) {
+            return Err("Invalid recovery active frame".into());
+        }
+        Ok((timeline, active_frame))
+    } else {
+        Ok((None, None))
+    }
 }
 
 fn put_blob(bytes: &mut Vec<u8>, value: &[u8], limit: usize) -> Result<(), String> {

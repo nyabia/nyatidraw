@@ -17,7 +17,7 @@ impl WebDocument {
         }
         let mut adjustment = std::mem::take(&mut self.color_adjustment);
         let mut next = self.next_layer_id;
-        let tree = self.layers().clone();
+        let tree = self.edit_tree()?;
         let selection = self.selection.clone();
         let target = self.active_layer();
         let result = adjustment.execute(

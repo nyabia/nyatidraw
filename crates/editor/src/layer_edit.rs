@@ -179,6 +179,7 @@ pub fn prepare_layer_edit(
 #[must_use]
 pub fn empty_raster(id: LayerId, name: String) -> LayerNode {
     LayerNode {
+        mask: None,
         color_effect: None,
         alpha_locked: false,
         clip_to_below: false,
@@ -231,7 +232,7 @@ pub fn next_layer_node_id(tree: &LayerTree) -> Result<u128, String> {
         }
     }
 
-    let mut maximum = 0;
+    let mut maximum = tree.mask_ids().iter().map(|id| id.0).max().unwrap_or(0);
     visit(tree.root(), &mut maximum);
     maximum
         .checked_add(1)
@@ -301,6 +302,60 @@ pub enum LayerPixelChange {
 }
 
 impl LayerPixelChange {
+    /// Copies coverage identities together with duplicated image owners.
+    /// # Errors
+    /// Rejects collisions and malformed typed coverage objects before mutation.
+    pub fn apply_to_tree(
+        self,
+        tiles: &TileSnapshot,
+        canvas: CanvasSpec,
+        before: &LayerTree,
+        after: &LayerTree,
+    ) -> Result<TileSnapshot, String> {
+        let mapping = match &self {
+            Self::Duplicate {
+                source,
+                destination,
+            } => vec![(*source, *destination)],
+            Self::DuplicateMany(mapping) => mapping.clone(),
+            Self::White(_) => Vec::new(),
+        };
+        let images = self.apply(tiles, canvas)?;
+        let masks: Vec<_> = mapping
+            .into_iter()
+            .filter_map(|(source, destination)| {
+                Some((
+                    before.raster(source)?.mask?.id,
+                    after.raster(destination)?.mask?.id,
+                ))
+            })
+            .collect();
+        if masks
+            .iter()
+            .any(|(_, id)| tiles.coverage_iter().any(|(key, _)| key.mask == *id))
+        {
+            return Err("duplicate mask destination already contains artwork".into());
+        }
+        TileSnapshot::from_planes(
+            images.iter().map(|(key, tile)| (key, tile.clone())),
+            images
+                .coverage_iter()
+                .map(|(key, tile)| (key, tile.clone()))
+                .chain(tiles.coverage_iter().filter_map(|(key, tile)| {
+                    masks
+                        .iter()
+                        .find(|(source, _)| *source == key.mask)
+                        .map(|(_, id)| {
+                            (
+                                nyatidraw_tiles::CoverageTileKey { mask: *id, ..key },
+                                tile.clone(),
+                            )
+                        })
+                })),
+        )
+        .map_err(|error| format!("duplicate coverage: {error:?}"))
+    }
+
     /// # Errors
     /// Rejects occupied duplicate destinations or invalid tile replacements.
     pub fn apply(self, tiles: &TileSnapshot, canvas: CanvasSpec) -> Result<TileSnapshot, String> {
@@ -332,7 +387,7 @@ impl LayerPixelChange {
                     return Err("duplicate destination already contains artwork".into());
                 }
                 // Keep signed off-page coordinates and shared immutable pixel objects.
-                TileSnapshot::from_objects(
+                TileSnapshot::from_planes(
                     tiles.iter().map(|(key, tile)| (key, tile.clone())).chain(
                         tiles.iter().filter_map(|(key, tile)| {
                             mapping.iter().find(|(source, _)| *source == key.layer).map(
@@ -348,6 +403,7 @@ impl LayerPixelChange {
                             )
                         }),
                     ),
+                    tiles.coverage_iter().map(|(key, tile)| (key, tile.clone())),
                 )
                 .map_err(|error| format!("duplicate tiles: {error:?}"))
             }

@@ -245,7 +245,7 @@ impl WebUiBackend {
                     ]
                 }),
             };
-            let frames = nyatidraw_editor::layer_edit::raster_layer_ids(document.layers())
+            let frames = nyatidraw_editor::layer_edit::raster_layer_ids(document.render_layers())
                 .into_iter()
                 .filter_map(|id| {
                     crate::preview::layer_thumbnail(document, id).map(|frame| (id, Arc::new(frame)))
@@ -627,6 +627,35 @@ impl WebUiBackend {
         self.editor.redraw();
     }
 
+    fn project_command(&self, command: &nyatidraw_api::ProjectCommand) -> Result<(), String> {
+        use nyatidraw_api::ProjectCommand as P;
+        match command {
+            P::Save => self.editor.download_project(),
+            P::CopyPng => self.editor.copy_png(),
+            P::ExportScaledPng {
+                size,
+                project_epoch,
+                ..
+            } => {
+                if *project_epoch != self.project_epoch() {
+                    return Err("그림이 바뀌었습니다. 다시 내보내주세요.".into());
+                }
+                self.editor.download_scaled_png(*size);
+            }
+            P::ExportSpriteSheet {
+                columns,
+                project_epoch,
+                ..
+            } => {
+                if *project_epoch != self.project_epoch() {
+                    return Err("그림이 바뀌었습니다. 다시 내보내주세요.".into());
+                }
+                crate::sprite_export::download(self.editor, *columns);
+            }
+        }
+        Ok(())
+    }
+
     fn layer_command(&self, command: LayerCommand) -> Result<(), String> {
         self.editor
             .try_edit(|document| document.apply_layer_command(command))
@@ -684,7 +713,9 @@ impl UiBackend for WebUiBackend {
             let preset = document.brush_preset();
             projection.workspace = WorkspaceProjection::Ready;
             projection.canvas = document.canvas();
+            projection.animation = runtime.animation_projection();
             projection.active_layer = Some(document.display_active_layer());
+            projection.raster_target = Some(document.raster_target());
             projection.drawing_tool = runtime.selected_tool;
             projection.brush_size_tenths = ratio_u16(settings.size_px * 10.0);
             projection.brush_opacity_u16 = ratio_u16(settings.opacity * 65535.0);
@@ -715,11 +746,11 @@ impl UiBackend for WebUiBackend {
                 .map_or(0, |mask| mask.selected_pixels());
             projection.edit_settings = document.edit_settings;
             projection.solo_node = document.solo_node();
-            nyatidraw_editor::project_children(
-                document.display_layers().root(),
-                1,
-                &mut projection.layers,
-            );
+            let edit_tree = document.layer_panel_tree();
+            let layer_root = edit_tree
+                .as_ref()
+                .map_or(document.render_layers().root(), |tree| tree.root());
+            nyatidraw_editor::project_children(layer_root, 1, &mut projection.layers);
             projection.history.entries = (0..document.undo_len())
                 .map(|_| HistoryEntryProjection {
                     operation: HistoryOperationLabel::Structural,
@@ -756,13 +787,22 @@ impl UiBackend for WebUiBackend {
             C::History(HistoryCommand::Redo) => {
                 self.editor.read(|r| r.document.can_redo()).unwrap_or(false)
             }
-            C::Project(_) | C::Viewport(_) | C::Tool(_) | C::Layer(_) | C::Dock(_) | C::Edit(_) => {
-                true
-            }
+            C::Project(_)
+            | C::Viewport(_)
+            | C::Tool(_)
+            | C::Layer(_)
+            | C::Dock(_)
+            | C::Edit(_)
+            | C::Animation(_)
+            | C::Mask(_) => true,
             C::History(_) => false,
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bounded semantic command dispatch"
+    )]
     fn push_editor_command(
         &self,
         based_on: Revision,
@@ -794,12 +834,9 @@ impl UiBackend for WebUiBackend {
         }
         let save_dock = matches!(command, EditorCommand::Dock(_));
         match command {
-            EditorCommand::Project(nyatidraw_api::ProjectCommand::Save) => {
-                self.editor.download_project();
-            }
-            EditorCommand::Project(nyatidraw_api::ProjectCommand::CopyPng) => {
-                self.editor.copy_png();
-            }
+            EditorCommand::Project(command) => return self.project_command(&command),
+            EditorCommand::Animation(command) => return self.editor.animation_command(command),
+            EditorCommand::Mask(command) => self.editor.edit(|doc| doc.apply_mask_command(command)),
             EditorCommand::Tool(command) => return self.tool_command(command),
             EditorCommand::Layer(command) => return self.layer_command(command),
             EditorCommand::Viewport(command) => self.viewport_command(command),
@@ -810,9 +847,27 @@ impl UiBackend for WebUiBackend {
                 return self.editor.try_edit(WebDocument::redo);
             }
             EditorCommand::Edit(command) => {
-                return self
-                    .editor
-                    .try_edit(|document| document.apply_edit(command));
+                let begin_group = matches!(
+                    command,
+                    nyatidraw_api::EditCommand::FreeTransform(
+                        nyatidraw_api::TransformCommand::BeginGroup(_)
+                    )
+                );
+                self.editor
+                    .try_edit(|document| document.apply_edit(command))?;
+                if begin_group {
+                    if let Some(runtime) = self.editor.runtime.peek().borrow_mut().as_mut() {
+                        runtime.selected_tool = DrawingTool::MoveSelection;
+                        runtime
+                            .document
+                            .set_project_tool(DrawingTool::MoveSelection);
+                    }
+                    browser::set_canvas_tool(crate::runtime::canvas_input_mode(
+                        DrawingTool::MoveSelection,
+                    ));
+                    self.editor.refresh();
+                }
+                return Ok(());
             }
             EditorCommand::Dock(DockCommand::ActivatePanel(panel)) => {
                 self.preferences.borrow_mut().dock.activate_panel(panel);
@@ -896,6 +951,12 @@ impl UiBackend for WebUiBackend {
     fn layer_thumbnail_snapshot(&self) -> LayerThumbnailSnapshot {
         self.update_previews();
         self.previews.borrow().2.clone()
+    }
+    fn frame_thumbnail_snapshot(&self) -> nyatidraw_editor_ui::preview::FrameThumbnailSnapshot {
+        self.editor.frame_thumbnail_snapshot()
+    }
+    fn request_frame_thumbnails(&self, frames: &[nyatidraw_api::FrameId]) {
+        self.editor.request_frame_thumbnails(frames);
     }
     fn panel_heights(&self) -> PanelHeights {
         self.preferences.borrow().heights.clone()

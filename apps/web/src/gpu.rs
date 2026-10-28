@@ -104,7 +104,7 @@ impl WebRenderer {
         surface.configure(&device, &config);
         let presenter = TexturePresenter::new(&device, view_format);
         let scene_result =
-            GpuCompositeScene::new(&device, &queue, document_size, doc.layers().clone());
+            GpuCompositeScene::new(&device, &queue, document_size, doc.display_layers().clone());
         let validation_error = device.pop_error_scope().await;
         let memory_error = device.pop_error_scope().await;
         if let Some(error) = validation_error.or(memory_error) {
@@ -131,6 +131,19 @@ impl WebRenderer {
         Ok(renderer)
     }
 
+    pub fn validate_document(
+        &self,
+        canvas: nyatidraw_api::CanvasSpec,
+        tree: &nyatidraw_document::LayerTree,
+    ) -> Result<(), String> {
+        self.check_device()?;
+        let size = [canvas.width_px, canvas.height_px];
+        validate_texture_size(&self.device, size)?;
+        self.scene
+            .validate_document_replacement(size, tree)
+            .map_err(|error| format!("Canvas resource limit: {error:?}"))
+    }
+
     pub fn sync_document(&mut self, doc: &WebDocument) -> Result<(), String> {
         self.check_device()?;
         let size = document_size(doc);
@@ -155,11 +168,11 @@ impl WebRenderer {
             let mask = doc
                 .selection()
                 .map(|mask| {
-                    nyatidraw_paint_gpu::GpuSelectionMask::new(
+                    nyatidraw_paint_gpu::GpuSelectionMask::from_coverage(
                         &self.device,
                         mask.origin(),
                         mask.dimensions(),
-                        &mask.packed_bits(),
+                        mask.coverage_bytes(),
                     )
                 })
                 .transpose()
@@ -196,6 +209,9 @@ impl WebRenderer {
     pub fn upload_dirty(&mut self, doc: &WebDocument, keys: &[TileKey]) -> Result<(), String> {
         self.check_device()?;
         for key in keys {
+            if doc.display_layers().raster(key.layer).is_none() {
+                continue;
+            }
             let pixels = doc
                 .snapshot()
                 .get(*key)
@@ -203,6 +219,30 @@ impl WebRenderer {
             self.scene
                 .upload_closed_tile(*key, pixels)
                 .map_err(|error| format!("Upload changed canvas tile: {error:?}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn upload_dirty_masks(
+        &mut self,
+        doc: &WebDocument,
+        keys: &[nyatidraw_tiles::CoverageTileKey],
+    ) -> Result<(), String> {
+        let ids = doc.display_layers().mask_ids();
+        for &key in keys {
+            if !ids.contains(&key.mask) {
+                continue;
+            }
+            if let Some(tile) = doc.snapshot().get_coverage(key) {
+                self.scene
+                    .upload_mask_tile(key, tile.pixels())
+                    .map_err(|error| format!("Upload mask: {error:?}"))?;
+            } else {
+                self.scene
+                    .replace_mask_tiles(doc.display_snapshot())
+                    .map_err(|error| format!("Restore mask: {error:?}"))?;
+                break;
+            }
         }
         Ok(())
     }
@@ -286,7 +326,13 @@ fn validate_texture_size(device: &wgpu::Device, size: [u32; 2]) -> Result<(), St
 }
 
 fn upload_snapshot(scene: &mut GpuCompositeScene, doc: &WebDocument) -> Result<(), String> {
+    scene
+        .replace_mask_tiles(doc.display_snapshot())
+        .map_err(|error| format!("Upload masks: {error:?}"))?;
     for (key, tile) in doc.display_snapshot().iter() {
+        if doc.display_layers().raster(key.layer).is_none() {
+            continue;
+        }
         scene
             .upload_closed_tile(key, tile.pixels())
             .map_err(|error| format!("Upload canvas snapshot: {error:?}"))?;

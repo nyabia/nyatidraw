@@ -13,6 +13,7 @@ const ROOT: GroupId = GroupId(100);
 
 fn raster(id: u128, clip: bool, mode: LayerBlendMode, opacity: u16) -> LayerTreeNode {
     LayerTreeNode::Raster(LayerNode {
+        mask: None,
         id: LayerId(id),
         name: format!("Layer{id}"),
         visible: true,

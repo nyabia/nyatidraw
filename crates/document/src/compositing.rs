@@ -180,6 +180,7 @@ mod tests {
 
     fn raster(id: u128, clip: bool, visible: bool, reference: bool) -> LayerTreeNode {
         LayerTreeNode::Raster(LayerNode {
+            mask: None,
             color_effect: None,
             id: LayerId(id),
             name: id.to_string(),

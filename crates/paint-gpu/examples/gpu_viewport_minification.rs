@@ -418,6 +418,7 @@ fn tree() -> ProbeResult<LayerTree> {
         clip_to_below: false,
         blend_mode: LayerBlendMode::Normal,
         children: vec![LayerTreeNode::Raster(LayerNode {
+            mask: None,
             id: LAYER,
             name: "Synthetic ink".into(),
             visible: true,

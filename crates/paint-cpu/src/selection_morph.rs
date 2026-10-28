@@ -36,6 +36,9 @@ fn morphology(
     if radius > 64 {
         return Err(EditError::InvalidMask);
     }
+    if !mask.is_binary() {
+        return grayscale_morphology(mask, radius, grow, limits);
+    }
     let input_len = region_len(mask.origin(), mask.dimensions(), limits)?;
     if radius == 0 || mask.selected_pixels() == 0 {
         require_workspace(input_len as u64 * 2, limits)?;
@@ -86,7 +89,7 @@ fn morphology(
             }
             let near_seed = distance <= i64::from(r * r);
             let value = u8::from(if grow { near_seed } else { !near_seed });
-            selected[y * width + x] = value;
+            selected[y * width + x] = value * 255;
             count += u64::from(value);
         }
     }
@@ -105,6 +108,89 @@ fn require_work(work: u64, limits: EditLimits) -> Result<(), EditError> {
     } else {
         Ok(())
     }
+}
+
+fn grayscale_morphology(
+    mask: &SelectionMask,
+    radius: u8,
+    grow: bool,
+    limits: EditLimits,
+) -> Result<SelectionMask, EditError> {
+    let pad = if grow { u32::from(radius) } else { 0 };
+    let mut origin = mask.origin();
+    let mut size = mask.dimensions();
+    for axis in 0..2 {
+        origin[axis] = i32::try_from(i64::from(origin[axis]) - i64::from(pad))
+            .map_err(|_| EditError::CoordinateOutOfRange)?;
+        size[axis] = size[axis]
+            .checked_add(pad * 2)
+            .ok_or(EditError::LimitExceeded)?;
+    }
+    let len = region_len(origin, size, limits)?;
+    let r = i64::from(radius);
+    require_workspace(mask.selected.len() as u64 + len as u64 + 4096, limits)?;
+    require_work(
+        (u64::from(size[0]) + u64::from(radius) * 2)
+            * u64::from(size[1])
+            * (u64::from(radius) * 2 + 1)
+            * 3,
+        limits,
+    )?;
+    let mut selected = vec![if grow { 0 } else { 255 }; len];
+    let mut window =
+        std::collections::VecDeque::<(i64, u8)>::with_capacity(usize::from(radius) * 2 + 1);
+    for dy in -r..=r {
+        let mut half = r;
+        while half * half + dy * dy > r * r {
+            half -= 1;
+        }
+        for y in 0..size[1] {
+            window.clear();
+            for x in -half..i64::from(size[0]) + half {
+                let point = [
+                    i64::from(origin[0]) + x,
+                    i64::from(origin[1]) + i64::from(y) + dy,
+                ]
+                .map(i32::try_from);
+                let value = match point {
+                    [Ok(x), Ok(y)] => mask.coverage_signed(x, y),
+                    _ => 0,
+                };
+                while window
+                    .back()
+                    .is_some_and(|&(_, old)| if grow { old <= value } else { old >= value })
+                {
+                    window.pop_back();
+                }
+                window.push_back((x, value));
+                while window
+                    .front()
+                    .is_some_and(|&(index, _)| index < x - half * 2)
+                {
+                    window.pop_front();
+                }
+                let center = x - half;
+                if (0..i64::from(size[0])).contains(&center) {
+                    let index = y as usize * size[0] as usize
+                        + usize::try_from(center).expect("bounded selection index");
+                    let value = window.front().expect("nonempty morphology window").1;
+                    selected[index] = if grow {
+                        selected[index].max(value)
+                    } else {
+                        selected[index].min(value)
+                    };
+                }
+            }
+        }
+    }
+    let count = selected.iter().filter(|&&value| value != 0).count() as u64;
+    Ok(SelectionMask {
+        origin,
+        width: size[0],
+        height: size[1],
+        selected,
+        count,
+    })
 }
 
 fn preflight_morphology(
@@ -200,7 +286,7 @@ pub fn select_layer_alpha(
     limits: EditLimits,
 ) -> Result<SelectionMask, EditError> {
     let limits = limits.bounded();
-    tree.raster(target).ok_or(EditError::UnknownLayer)?;
+    let layer = tree.raster(target).ok_or(EditError::UnknownLayer)?;
     require_work(snapshot.len() as u64, limits)?;
     let mut scan_pixels = 0_u64;
     for (key, _) in snapshot.iter().filter(|(key, _)| key.layer == target) {
@@ -221,7 +307,7 @@ pub fn select_layer_alpha(
     let mut min = [i32::MAX; 2];
     let mut max = [i32::MIN; 2];
     let mut count = 0_u64;
-    visit_alpha(snapshot, target, |point| {
+    visit_alpha(snapshot, target, layer.mask, |point, _| {
         for axis in 0..2 {
             min[axis] = min[axis].min(point[axis]);
             max[axis] = max[axis].max(point[axis]);
@@ -244,14 +330,14 @@ pub fn select_layer_alpha(
         limits,
     )?;
     let mut selected = vec![0; len];
-    visit_alpha(snapshot, target, |point| {
+    visit_alpha(snapshot, target, layer.mask, |point, alpha| {
         // The two scans inspect the same immutable snapshot, so every point
         // lies inside the preflighted (usize-sized) tight alpha rectangle.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let x = (i64::from(point[0]) - i64::from(origin[0])) as usize;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let y = (i64::from(point[1]) - i64::from(origin[1])) as usize;
-        selected[y * size[0] as usize + x] = 1;
+        selected[y * size[0] as usize + x] = alpha;
     });
     Ok(SelectionMask {
         origin,
@@ -262,7 +348,12 @@ pub fn select_layer_alpha(
     })
 }
 
-fn visit_alpha(snapshot: &TileSnapshot, target: LayerId, mut visit: impl FnMut([i32; 2])) {
+fn visit_alpha(
+    snapshot: &TileSnapshot,
+    target: LayerId,
+    mask: Option<nyatidraw_document::LayerMask>,
+    mut visit: impl FnMut([i32; 2], u8),
+) {
     for (key, tile) in snapshot.iter().filter(|(key, _)| key.layer == target) {
         for (index, pixel) in tile.pixels().chunks_exact(4).enumerate() {
             if pixel[3] != 0 {
@@ -274,7 +365,10 @@ fn visit_alpha(snapshot: &TileSnapshot, target: LayerId, mut visit: impl FnMut([
                     (i64::from(key.y) * i64::from(TILE_EDGE)
                         + bounded_index(index / TILE_EDGE as usize)) as i32,
                 ];
-                visit(point);
+                let alpha = crate::apply_mask_pixel(snapshot, mask, point, [0, 0, 0, pixel[3]])[3];
+                if alpha != 0 {
+                    visit(point, alpha);
+                }
             }
         }
     }
@@ -394,6 +488,7 @@ mod tests {
             children: [1, 2]
                 .map(|id| {
                     LayerTreeNode::Raster(LayerNode {
+                        mask: None,
                         alpha_locked: false,
                         clip_to_below: false,
                         blend_mode: nyatidraw_api::LayerBlendMode::Normal,

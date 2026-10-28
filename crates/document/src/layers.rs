@@ -2,16 +2,24 @@ use std::collections::BTreeSet;
 
 use nyatidraw_api::{
     CompositeInvalidation, ContentRootId, GroupId, LayerBlendMode, LayerColorEffect, LayerId,
-    LayerTreeNodeId, TileCoordinate,
+    LayerTreeNodeId, MaskId, TileCoordinate,
 };
 
 const MAX_LAYER_TREE_DEPTH: usize = 64;
 const MAX_LAYER_NAME_CHARS: usize = 128;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LayerMask {
+    pub id: MaskId,
+    pub enabled: bool,
+    pub default_coverage: u8,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 // Visibility, edit protection, alpha protection and source roles are independent.
 #[allow(clippy::struct_excessive_bools)]
 pub struct LayerNode {
+    pub mask: Option<LayerMask>,
     pub color_effect: Option<LayerColorEffect>,
     /// Preserve stored pixel alpha while recoloring; distinct from edit lock.
     pub alpha_locked: bool,
@@ -68,6 +76,7 @@ pub enum LayerTreeError {
     InvalidName,
     LockedNode(LayerTreeNodeId),
     IdentifierExhausted,
+    InvalidMask(MaskId),
 }
 
 /// Validated raster/group hierarchy in bottom-to-top compositing order.
@@ -96,6 +105,7 @@ impl LayerTree {
         let mut ids = BTreeSet::new();
         ids.insert(LayerTreeNodeId::Group(root.id));
         validate_children(&root, 0, &mut ids)?;
+        validate_masks(&root, &mut BTreeSet::new())?;
         Ok(Self { root })
     }
 
@@ -191,6 +201,9 @@ impl LayerTree {
         };
         let mut copy = layer.clone();
         copy.id = destination;
+        if let Some(mask) = &mut copy.mask {
+            mask.id = MaskId(destination.0);
+        }
         let suffix = " 복사";
         copy.name = layer
             .name
@@ -318,6 +331,54 @@ impl LayerTree {
             return Ok(CompositeInvalidation::empty());
         }
         *slot = value;
+        Ok(invalidate_all(ancestors))
+    }
+
+    #[must_use]
+    pub fn mask_ids(&self) -> BTreeSet<MaskId> {
+        fn collect(group: &GroupNode, ids: &mut BTreeSet<MaskId>) {
+            for node in &group.children {
+                match node {
+                    LayerTreeNode::Raster(layer) => {
+                        if let Some(mask) = layer.mask {
+                            ids.insert(mask.id);
+                        }
+                    }
+                    LayerTreeNode::Group(child) => collect(child, ids),
+                }
+            }
+        }
+        let mut ids = BTreeSet::new();
+        collect(&self.root, &mut ids);
+        ids
+    }
+
+    #[must_use]
+    pub fn has_masks(&self) -> bool {
+        !self.mask_ids().is_empty()
+    }
+
+    /// # Errors
+    /// Rejects locked owners, duplicate identities and missing layers without mutation.
+    pub fn set_mask(
+        &mut self,
+        id: LayerId,
+        mask: Option<LayerMask>,
+    ) -> Result<CompositeInvalidation, LayerTreeError> {
+        let node = LayerTreeNodeId::Raster(id);
+        let ancestors = self.editable_ancestors(node)?;
+        let mut candidate = self.clone();
+        let Some(LayerTreeNode::Raster(layer)) = find_node_mut(&mut candidate.root, node) else {
+            return Err(LayerTreeError::UnknownNode(node));
+        };
+        if layer.locked {
+            return Err(LayerTreeError::LockedNode(node));
+        }
+        if layer.mask == mask {
+            return Ok(CompositeInvalidation::empty());
+        }
+        layer.mask = mask;
+        *self = Self::new(candidate.root)?;
         Ok(invalidate_all(ancestors))
     }
 
@@ -596,10 +657,29 @@ fn remap_group_ids(
             LayerTreeNode::Raster(layer) => {
                 let source = layer.id;
                 layer.id = LayerId(*next);
+                if let Some(mask) = &mut layer.mask {
+                    mask.id = MaskId(layer.id.0);
+                }
                 *next = next
                     .checked_add(1)
                     .ok_or(LayerTreeError::IdentifierExhausted)?;
                 rasters.push((source, layer.id));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_masks(group: &GroupNode, ids: &mut BTreeSet<MaskId>) -> Result<(), LayerTreeError> {
+    for node in &group.children {
+        match node {
+            LayerTreeNode::Group(child) => validate_masks(child, ids)?,
+            LayerTreeNode::Raster(layer) => {
+                if let Some(mask) = layer.mask
+                    && (mask.id.0 == 0 || !ids.insert(mask.id))
+                {
+                    return Err(LayerTreeError::InvalidMask(mask.id));
+                }
             }
         }
     }
@@ -739,6 +819,7 @@ mod tests {
 
     fn raster(id: u128) -> LayerTreeNode {
         LayerTreeNode::Raster(LayerNode {
+            mask: None,
             color_effect: None,
             alpha_locked: false,
             clip_to_below: false,

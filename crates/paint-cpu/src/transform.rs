@@ -42,12 +42,12 @@ fn require_pixels(pixels: u64, limits: EditLimits) -> Result<(), EditError> {
     }
 }
 
-fn selected(mask: Option<&SelectionMask>, point: [i64; 2]) -> bool {
-    mask.is_none_or(|mask| {
+fn coverage_at(mask: Option<&SelectionMask>, point: [i64; 2]) -> u8 {
+    mask.map_or(255, |mask| {
         let [Ok(x), Ok(y)] = point.map(i32::try_from) else {
-            return false;
+            return 0;
         };
-        mask.contains_signed(x, y)
+        mask.coverage_signed(x, y)
     })
 }
 
@@ -285,6 +285,21 @@ pub fn translate_artwork(
     .finish()
 }
 
+/// Rebases both typed artwork planes with every mask's own sparse default.
+/// # Errors
+/// Rejects unknown coverage owners and aggregate coordinate/workspace limits atomically.
+pub fn translate_artwork_with_masks(
+    snapshot: &TileSnapshot,
+    tree: &LayerTree,
+    offset: [i32; 2],
+    limits: EditLimits,
+) -> Result<SelectionPaintResult, EditError> {
+    let mut result = translate_artwork(snapshot, offset, limits)?;
+    result.after =
+        crate::masks_integer::translate_masks(snapshot, &result.after, tree, offset, limits)?;
+    Ok(result)
+}
+
 /// Cuts selected pixels (or all active-layer pixels), applies the integer
 /// transform around the source bounds' top-left and pastes source-over. Reads
 /// always use `snapshot`, so overlapping moves neither smear nor double-blend.
@@ -380,32 +395,21 @@ fn transform_raster_inner(
         });
     let origin: [i64; 2] =
         std::array::from_fn(|axis| bounds.min[axis] + i64::from(transform.offset[axis]));
-    for axis in 0..2 {
-        if i32::try_from(origin[axis]).is_err()
-            || i32::try_from(origin[axis] + i64::from(output[axis]) - 1).is_err()
-        {
-            return Err(EditError::CoordinateOutOfRange);
-        }
-    }
+    validate_destination_extent(origin, output)?;
     let mut replacements = Replacements {
         before: snapshot,
         tiles: BTreeMap::new(),
         baseline_bytes,
         limits,
     };
-    for (key, tile) in snapshot.iter().filter(|(key, _)| key.layer == target) {
-        for (index, color) in tile.pixels().chunks_exact(4).enumerate() {
-            if color != [0; 4] && selected(mask, point_at(key, index)) {
-                replacements.tile(key)?[index * 4..index * 4 + 4].fill(0);
-            }
-        }
-    }
+    cut_selected_source(&mut replacements, target, mask)?;
     for y in 0..output[1] {
         for x in 0..output[0] {
             let source_pixel = inverse_pixel([x, y], source, output, transform);
             let source_point =
                 std::array::from_fn(|axis| bounds.min[axis] + i64::from(source_pixel[axis]));
-            if !selected(mask, source_point) {
+            let coverage = coverage_at(mask, source_point);
+            if coverage == 0 {
                 continue;
             }
             let (key, offset) = pixel_address(target, source_point);
@@ -416,16 +420,69 @@ fn transform_raster_inner(
             if color == [0; 4] {
                 continue;
             }
-            let (key, offset) =
-                pixel_address(target, [origin[0] + i64::from(x), origin[1] + i64::from(y)]);
-            composite_surface(
-                &mut replacements.tile(key)?[offset..offset + 4],
-                color,
-                u16::MAX,
-            );
+            let destination = [origin[0] + i64::from(x), origin[1] + i64::from(y)];
+            let (key, offset) = pixel_address(target, destination);
+            if source_point == destination {
+                // A stationary sample must rejoin its own split exactly, not source-over itself.
+                replacements.tile(key)?[offset..offset + 4].copy_from_slice(color);
+            } else {
+                let selected = crate::fragment::covered_pixel(color, coverage);
+                composite_surface(
+                    &mut replacements.tile(key)?[offset..offset + 4],
+                    &selected,
+                    u16::MAX,
+                );
+            }
         }
     }
-    replacements.finish()
+    let mut result = replacements.finish()?;
+    if let Some(linked) = layer.mask {
+        result.after = crate::masks_integer::transform_mask(
+            snapshot,
+            &result.after,
+            linked,
+            mask,
+            crate::masks_integer::IntegerMaskGeometry {
+                origin: bounds.min,
+                source,
+                output,
+                transform,
+            },
+            limits,
+        )?;
+    }
+    Ok(result)
+}
+
+fn validate_destination_extent(origin: [i64; 2], output: [u32; 2]) -> Result<(), EditError> {
+    for axis in 0..2 {
+        if i32::try_from(origin[axis]).is_err()
+            || i32::try_from(origin[axis] + i64::from(output[axis]) - 1).is_err()
+        {
+            return Err(EditError::CoordinateOutOfRange);
+        }
+    }
+    Ok(())
+}
+
+fn cut_selected_source(
+    replacements: &mut Replacements<'_>,
+    target: LayerId,
+    mask: Option<&SelectionMask>,
+) -> Result<(), EditError> {
+    let snapshot = replacements.before;
+    for (key, tile) in snapshot.iter().filter(|(key, _)| key.layer == target) {
+        for (index, color) in tile.pixels().chunks_exact(4).enumerate() {
+            let removed =
+                crate::fragment::covered_pixel(color, coverage_at(mask, point_at(key, index)));
+            if removed != [0; 4] {
+                let remaining =
+                    std::array::from_fn::<_, 4, _>(|channel| color[channel] - removed[channel]);
+                replacements.tile(key)?[index * 4..index * 4 + 4].copy_from_slice(&remaining);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -445,6 +502,7 @@ mod tests {
             children: [1, 2]
                 .map(|id| {
                     LayerTreeNode::Raster(LayerNode {
+                        mask: None,
                         alpha_locked: false,
                         clip_to_below: false,
                         blend_mode: nyatidraw_api::LayerBlendMode::Normal,
@@ -725,5 +783,238 @@ mod tests {
             transform_raster(&sparse, &tree(false), LayerId(1), None, basic, normal).unwrap_err(),
             EditError::LimitExceeded
         );
+    }
+    #[test]
+    fn soft_move_preserves_exact_remainder_and_stationary_flip_pixels() {
+        let before = fixture([
+            (1, [-1, 0], [128, 0, 0, 128]),
+            (1, [0, 0], [0, 64, 0, 64]),
+            (1, [1, 0], [0, 0, 128, 128]),
+            (2, [0, 0], [0, 0, 255, 255]),
+        ]);
+        let selection = SelectionMask::from_coverage_at([-1, 0], [3, 1], &[128, 128, 128]).unwrap();
+        let moved = move_raster(
+            &before,
+            &tree(false),
+            LayerId(1),
+            Some(&selection),
+            [129, -1],
+            EditLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            moved.after,
+            fixture([
+                (1, [-1, 0], [64, 0, 0, 64]),
+                (1, [0, 0], [0, 32, 0, 32]),
+                (1, [1, 0], [0, 0, 64, 64]),
+                (1, [128, -1], [64, 0, 0, 64]),
+                (1, [129, -1], [0, 32, 0, 32]),
+                (1, [130, -1], [0, 0, 64, 64]),
+                (2, [0, 0], [0, 0, 255, 255])
+            ])
+        );
+        let identity = move_raster(
+            &before,
+            &tree(false),
+            LayerId(1),
+            Some(&selection),
+            [0, 0],
+            EditLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(identity.after, before);
+        assert!(identity.changed_tiles.is_empty());
+        let flipped = transform_raster(
+            &before,
+            &tree(false),
+            LayerId(1),
+            Some(&selection),
+            RasterTransform {
+                flip_x: true,
+                ..Default::default()
+            },
+            EditLimits::default(),
+        )
+        .unwrap();
+        let (key, offset) = pixel_address(LayerId(1), [0, 0]);
+        assert_eq!(
+            &flipped.after.get(key).unwrap().pixels()[offset..offset + 4],
+            &[0, 64, 0, 64]
+        );
+        let (key, offset) = pixel_address(LayerId(1), [-1, 0]);
+        assert_eq!(
+            &flipped.after.get(key).unwrap().pixels()[offset..offset + 4],
+            &[48, 0, 64, 112]
+        );
+        assert_eq!(
+            flipped
+                .after
+                .get(TileKey::from_pixel(LayerId(2), 128, 0, 0)),
+            before.get(TileKey::from_pixel(LayerId(2), 128, 0, 0))
+        );
+    }
+
+    fn masked_fixture(default: u8) -> (LayerTree, TileSnapshot) {
+        use nyatidraw_api::MaskId;
+        use nyatidraw_document::LayerMask;
+        use nyatidraw_tiles::{COVERAGE_TILE_BYTE_LEN, CoverageTileKey};
+        let mut tree = tree(false);
+        for (layer, mask, value) in [(1, 10, default), (2, 20, 255)] {
+            tree.set_mask(
+                LayerId(layer),
+                Some(LayerMask {
+                    id: MaskId(mask),
+                    enabled: true,
+                    default_coverage: value,
+                }),
+            )
+            .unwrap();
+        }
+        let mut coverage = BTreeMap::new();
+        for (mask, point, value, base) in [
+            (10, [-1, 0], 255 - default, default),
+            (10, [130, 3], 64, default),
+            (20, [-130, 2], 0, 255),
+        ] {
+            let key = CoverageTileKey::from_pixel(MaskId(mask), 128, point[0], point[1]);
+            let pixels = coverage
+                .entry(key)
+                .or_insert_with(|| vec![base; COVERAGE_TILE_BYTE_LEN]);
+            pixels[usize::try_from(point[1].rem_euclid(128) * 128 + point[0].rem_euclid(128))
+                .unwrap()] = value;
+        }
+        let snapshot = fixture([
+            (1, [-1, 0], [128, 0, 0, 128]),
+            (1, [1, 0], [0, 0, 255, 255]),
+            (2, [0, 0], [0, 255, 0, 255]),
+        ])
+        .with_coverage_replacements(coverage)
+        .unwrap();
+        (tree, snapshot)
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One default-zero/default-white matrix verifies every linked geometry and page rebase preserves the same owners"
+    )]
+    fn linked_integer_masks_preserve_defaults_off_image_coverage_and_other_owners() {
+        use nyatidraw_api::MaskId;
+        for default in [0, 255] {
+            let (tree, before) = masked_fixture(default);
+            for (transform, selected_destination, far_destination) in [
+                (
+                    RasterTransform {
+                        offset: [129, -1],
+                        ..Default::default()
+                    },
+                    [128, -1],
+                    [259, 2],
+                ),
+                (
+                    RasterTransform {
+                        flip_x: true,
+                        ..Default::default()
+                    },
+                    [1, 0],
+                    [-130, 3],
+                ),
+                (
+                    RasterTransform {
+                        quarter_turns: 1,
+                        ..Default::default()
+                    },
+                    [-1, 0],
+                    [-4, 131],
+                ),
+                (
+                    RasterTransform {
+                        size: Some([6, 2]),
+                        ..Default::default()
+                    },
+                    [-1, 0],
+                    [261, 6],
+                ),
+            ] {
+                let result = transform_raster(
+                    &before,
+                    &tree,
+                    LayerId(1),
+                    None,
+                    transform,
+                    EditLimits::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    result
+                        .after
+                        .coverage_at(MaskId(10), default, selected_destination),
+                    255 - default
+                );
+                assert_eq!(
+                    result
+                        .after
+                        .coverage_at(MaskId(10), default, far_destination),
+                    64
+                );
+                assert_eq!(result.after.coverage_at(MaskId(20), 255, [-130, 2]), 0);
+                if transform.offset != [0, 0] {
+                    assert_eq!(
+                        result.after.coverage_at(MaskId(10), default, [-1, 0]),
+                        default
+                    );
+                }
+            }
+            let selection =
+                SelectionMask::from_coverage_at([-1, 0], [3, 1], &[128, 128, 128]).unwrap();
+            let identity = move_raster(
+                &before,
+                &tree,
+                LayerId(1),
+                Some(&selection),
+                [0, 0],
+                EditLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(identity.after, before);
+            let moved = move_raster(
+                &before,
+                &tree,
+                LayerId(1),
+                Some(&selection),
+                [5, 0],
+                EditLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(moved.after.coverage_at(MaskId(10), default, [130, 3]), 64);
+            let cropped =
+                translate_artwork_with_masks(&before, &tree, [-17, 130], EditLimits::default())
+                    .unwrap();
+            assert_eq!(
+                cropped.after.coverage_at(MaskId(10), default, [-18, 130]),
+                255 - default
+            );
+            assert_eq!(
+                cropped.after.coverage_at(MaskId(10), default, [113, 133]),
+                64
+            );
+            assert_eq!(cropped.after.coverage_at(MaskId(20), 255, [-147, 132]), 0);
+            assert_eq!(
+                translate_artwork_with_masks(
+                    &cropped.after,
+                    &tree,
+                    [17, -130],
+                    EditLimits::default()
+                )
+                .unwrap()
+                .after,
+                before
+            );
+            assert!(
+                translate_artwork_with_masks(&before, &tree, [i32::MAX, 0], EditLimits::default())
+                    .is_err()
+            );
+        }
     }
 }

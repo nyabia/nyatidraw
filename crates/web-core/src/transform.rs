@@ -27,6 +27,9 @@ impl WebDocument {
     }
     #[must_use]
     pub fn display_snapshot(&self) -> &TileSnapshot {
+        if let Some(display) = &self.animation_display {
+            return &display.tiles;
+        }
         if let Some(preview) = &self.color_adjustment_preview {
             return &preview.tiles;
         }
@@ -36,9 +39,18 @@ impl WebDocument {
     }
     #[must_use]
     pub fn display_layers(&self) -> &LayerTree {
+        if let Some(display) = &self.animation_display {
+            return &display.tree;
+        }
+        if let Some(tree) = &self.playback_tree {
+            return tree;
+        }
+        if let Some(tree) = &self.render_preview_tree {
+            return tree;
+        }
         self.transform_preview
             .as_ref()
-            .map_or(self.layers(), |preview| &preview.tree)
+            .map_or(self.render_layers(), |preview| &preview.tree)
     }
     #[must_use]
     pub fn display_active_layer(&self) -> LayerId {
@@ -58,7 +70,7 @@ impl WebDocument {
         let mut clipboard = std::mem::take(&mut self.clipboard);
         let mut selection = self.selection.clone();
         let mut next_id = self.next_layer_id;
-        let tree = self.layers().clone();
+        let tree = self.edit_tree()?;
         let before = self.artwork.clone();
         let target = transform.target().unwrap_or(self.active_layer());
         let result = transform.execute(
@@ -76,11 +88,12 @@ impl WebDocument {
         );
         self.transform = transform;
         self.clipboard = clipboard;
-        let outcome = result.map_err(|error| match error {
+        let mut outcome = result.map_err(|error| match error {
             TransformError::Rejected(message) | TransformError::Fatal(message) => {
                 WebError::EditRejected(message)
             }
         })?;
+        outcome.tree = self.merge_edit_tree(&outcome.tree)?;
         self.next_layer_id = next_id;
         self.selection = selection;
         let update = if outcome.projection.is_some() {
@@ -95,6 +108,7 @@ impl WebDocument {
             update.structure_changed = true;
             update
         };
+        self.refresh_preview_projection()?;
         Ok(update)
     }
 }
@@ -114,15 +128,22 @@ impl TransformStore for BrowserTransform<'_> {
         let artwork = crate::Artwork {
             canvas: self.document.canvas(),
             tiles: tiles.clone(),
-            layers: tree.clone(),
+            layers: self
+                .document
+                .merge_edit_tree(tree)
+                .map_err(|error| error.to_string())?,
             active: self.document.active_layer(),
+            timeline: self.document.animation_timeline().cloned(),
         };
         crate::editing::validate_artwork(&artwork).map_err(|error| error.to_string())
     }
     fn commit(&mut self, _id: u128, tiles: TileSnapshot, tree: &LayerTree) -> Result<(), String> {
         let mut artwork = self.document.artwork.clone();
         artwork.tiles = tiles;
-        artwork.layers = tree.clone();
+        artwork.layers = self
+            .document
+            .merge_edit_tree(tree)
+            .map_err(|error| error.to_string())?;
         artwork.active = self.active;
         crate::editing::validate_artwork(&artwork).map_err(|error| error.to_string())?;
         self.document.commit_artwork(artwork);

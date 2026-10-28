@@ -15,6 +15,7 @@ const MULTIPLY: LayerBlendMode = LayerBlendMode::Multiply;
 
 fn raster(id: u128, clip: bool, blend_mode: LayerBlendMode, opacity_u16: u16) -> LayerTreeNode {
     LayerTreeNode::Raster(LayerNode {
+        mask: None,
         id: LayerId(id),
         name: format!("Raster{id}"),
         visible: true,
@@ -60,6 +61,8 @@ fn rgba(layer: LayerId) -> [u8; 4] {
         2 => [0, 0, 128, 128],
         3 => [0, 128, 0, 128],
         4 => [64, 64, 0, 64],
+        5 => [40, 100, 70, 128],
+        6 => [120, 30, 80, 160],
         _ => [64; 4],
     }
 }
@@ -86,7 +89,19 @@ fn snapshot(tree: &LayerTree, points: &[[i32; 2]]) -> TileSnapshot {
             bytes[offset..offset + 4].copy_from_slice(&rgba(layer));
         }
     }
-    TileSnapshot::from_tiles(tiles).unwrap()
+    let images = TileSnapshot::from_tiles(tiles).unwrap();
+    let coverage = tree.mask_ids().into_iter().flat_map(|mask| {
+        points
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 1)
+            .map(move |(index, &[x, y])| {
+                let key = nyatidraw_tiles::CoverageTileKey::from_pixel(mask, 128, x, y);
+                let value = if index == 0 { 0 } else { 96 };
+                (key, vec![value; nyatidraw_tiles::COVERAGE_TILE_BYTE_LEN])
+            })
+    });
+    images.with_coverage_replacements(coverage).unwrap()
 }
 
 fn view() -> ViewportTransform {
@@ -168,6 +183,97 @@ fn verify(
         }
     }
     maximum
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn verify_cached_fit(device: &wgpu::Device, queue: &wgpu::Queue) -> usize {
+    let mut tree = tree(vec![group(
+        10,
+        false,
+        NORMAL,
+        65535,
+        vec![raster(1, false, NORMAL, 65535)],
+    )]);
+    let mask = nyatidraw_document::LayerMask {
+        id: nyatidraw_api::MaskId(1001),
+        enabled: true,
+        default_coverage: 255,
+    };
+    tree.set_mask(LayerId(1), Some(mask)).unwrap();
+    let key = TileKey::from_pixel(LayerId(1), 128, 0, 0);
+    let mut rgba = vec![0; TILE_BYTE_LEN];
+    for y in 0..32 {
+        for x in 0..32 {
+            let at = (y * 128 + x) * 4;
+            rgba[at..at + 4].copy_from_slice(&[255, 0, 0, 255]);
+        }
+    }
+    let mut values = vec![255; nyatidraw_tiles::COVERAGE_TILE_BYTE_LEN];
+    for y in 6..11 {
+        for x in 6..11 {
+            values[y * 128 + x] = 0;
+        }
+    }
+    let tiles = TileSnapshot::from_tiles([(key, rgba)])
+        .unwrap()
+        .with_coverage_replacements([(
+            nyatidraw_tiles::CoverageTileKey {
+                mask: mask.id,
+                mip: 0,
+                x: 0,
+                y: 0,
+            },
+            values,
+        )])
+        .unwrap();
+    let mut scene = GpuCompositeScene::new(device, queue, [32; 2], tree).unwrap();
+    scene.replace_mask_tiles(&tiles).unwrap();
+    scene
+        .upload_closed_tile(key, tiles.get(key).unwrap().pixels())
+        .unwrap();
+    for (size, zoom) in [
+        ([1238, 953], 26.8),
+        ([1238, 857], 24.1),
+        ([1238, 857], 24.1),
+        ([1240, 859], 24.1),
+    ] {
+        let viewport = ViewportTransform {
+            physical_size: size,
+            pan: Point {
+                x: (f64::from(size[0]) - 32.0 * zoom) / 2.0,
+                y: (f64::from(size[1]) - 32.0 * zoom) / 2.0,
+            },
+            zoom,
+            ..view()
+        };
+        for _ in 0..16 {
+            scene.render_viewport(viewport).unwrap();
+        }
+        let raw = scene
+            .readback_resident_group_tile(ROOT, TileCoordinate { mip: 0, x: 0, y: 0 })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            &raw.pixels[(8 * 128 + 8) * 4..(8 * 128 + 8) * 4 + 4],
+            &[0; 4],
+            "cached high-zoom root lost mask"
+        );
+        let display = scene.readback_display().unwrap().unwrap();
+        let x = (viewport.pan.x + 8.5 * zoom).floor() as usize;
+        let y = (viewport.pan.y + 8.5 * zoom).floor() as usize;
+        let at = (y * size[0] as usize + x) * 4;
+        for (actual, expected) in
+            display.pixels[at..at + 4]
+                .iter()
+                .zip(expected_display([0; 4], [8, 8], 32))
+        {
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "cached high-zoom display lost mask"
+            );
+        }
+    }
+    4
 }
 
 #[allow(clippy::too_many_lines)]
@@ -299,6 +405,76 @@ fn main() {
             Some([0; 4]),
         ),
     ];
+    for mode in [
+        LayerBlendMode::Screen,
+        LayerBlendMode::Add,
+        LayerBlendMode::Overlay,
+    ] {
+        for opacity in [0, 32768, 65535] {
+            for clipped in [false, true] {
+                cases.push((
+                    "extended-raster",
+                    tree(vec![
+                        raster(5, false, NORMAL, 50000),
+                        raster(6, clipped, mode, opacity),
+                    ]),
+                    None,
+                ));
+                cases.push((
+                    "extended-group",
+                    tree(vec![
+                        raster(5, false, NORMAL, 50000),
+                        group(
+                            10,
+                            clipped,
+                            mode,
+                            opacity,
+                            vec![raster(6, false, NORMAL, 65535)],
+                        ),
+                    ]),
+                    None,
+                ));
+            }
+        }
+    }
+    for default_coverage in [0, 255] {
+        for enabled in [false, true] {
+            for mode in [
+                NORMAL,
+                MULTIPLY,
+                LayerBlendMode::Screen,
+                LayerBlendMode::Add,
+                LayerBlendMode::Overlay,
+            ] {
+                let mut masked = tree(vec![
+                    raster(1, false, NORMAL, 65535),
+                    group(
+                        10,
+                        false,
+                        mode,
+                        40000,
+                        vec![
+                            raster(5, false, NORMAL, 55000),
+                            raster(6, true, mode, 50000),
+                        ],
+                    ),
+                ]);
+                for layer in [5, 6] {
+                    masked
+                        .set_mask(
+                            LayerId(layer),
+                            Some(nyatidraw_document::LayerMask {
+                                id: nyatidraw_api::MaskId(layer + 1000),
+                                enabled,
+                                default_coverage,
+                            }),
+                        )
+                        .unwrap();
+                }
+                cases.push(("mask-stack", masked, None));
+            }
+        }
+    }
     let mut hidden = tree(vec![
         raster(1, false, NORMAL, 65535),
         raster(2, true, NORMAL, 65535),
@@ -308,7 +484,7 @@ fn main() {
         .unwrap();
     cases.push(("hidden-base", hidden, Some([0; 4])));
     let mut maximum = 0;
-    let mut checks = 0;
+    let mut checks = verify_cached_fit(&device, &queue);
     for page in [32, 128] {
         let points = [[8, 8], [i32::try_from(page).unwrap() + 8, 8], [-8, 8]];
         for (label, tree, oracle) in &cases {
@@ -318,10 +494,86 @@ fn main() {
             for (key, tile) in tiles.iter() {
                 scene.upload_closed_tile(key, tile.pixels()).unwrap();
             }
+            scene.replace_mask_tiles(&tiles).unwrap();
             maximum = maximum.max(verify(
                 &mut scene, &tiles, &points, page, None, *oracle, label,
             ));
             checks += 1;
+            if *label == "mask-stack" {
+                for _ in 0..3 {
+                    maximum = maximum.max(verify(
+                        &mut scene,
+                        &tiles,
+                        &points,
+                        page,
+                        None,
+                        None,
+                        "mask-unchanged-redraw",
+                    ));
+                    checks += 1;
+                }
+                let changed = tiles
+                    .with_coverage_replacements(tiles.coverage_iter().map(|(key, tile)| {
+                        (key, tile.pixels().iter().map(|value| 255 - value).collect())
+                    }))
+                    .unwrap();
+                for (key, tile) in changed.coverage_iter() {
+                    scene.upload_mask_tile(key, tile.pixels()).unwrap();
+                }
+                maximum = maximum.max(verify(
+                    &mut scene,
+                    &changed,
+                    &points,
+                    page,
+                    Some(LayerTreeNodeId::Raster(LayerId(6))),
+                    None,
+                    "mask-dirty-solo",
+                ));
+                scene.replace_mask_tiles(&tiles).unwrap();
+                let mut toggled = tree.clone();
+                for layer in [5, 6] {
+                    let mut mask = toggled.raster(LayerId(layer)).unwrap().mask.unwrap();
+                    mask.enabled = !mask.enabled;
+                    toggled.set_mask(LayerId(layer), Some(mask)).unwrap();
+                }
+                scene.replace_tree(toggled).unwrap();
+                maximum = maximum.max(verify(
+                    &mut scene,
+                    &tiles,
+                    &points,
+                    page,
+                    None,
+                    None,
+                    "mask-toggle-cached",
+                ));
+                let mut unmasked = tree.clone();
+                for layer in [5, 6] {
+                    unmasked.set_mask(LayerId(layer), None).unwrap();
+                }
+                scene.replace_tree(unmasked).unwrap();
+                maximum = maximum.max(verify(
+                    &mut scene,
+                    &tiles,
+                    &points,
+                    page,
+                    None,
+                    None,
+                    "mask-remove-originals",
+                ));
+                checks += 3;
+            }
+            if label.starts_with("extended-") {
+                maximum = maximum.max(verify(
+                    &mut scene,
+                    &tiles,
+                    &points,
+                    page,
+                    Some(LayerTreeNodeId::Raster(LayerId(6))),
+                    None,
+                    label,
+                ));
+                checks += 1;
+            }
             if *label == "group-base-clipped-group" {
                 maximum = maximum.max(verify(
                     &mut scene,

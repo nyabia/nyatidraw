@@ -14,7 +14,8 @@ use nyatidraw_document::{
 };
 use nyatidraw_input::{Point, ViewportTransform, ViewportValidationError};
 use nyatidraw_tiles::{CompositeCache, TILE_BYTE_LEN, TILE_EDGE, TileKey};
-use wgpu::util::DeviceExt;
+#[path = "compositor_masks.rs"]
+mod masks;
 
 use crate::presentation::{self, AreaReducer};
 use crate::{
@@ -23,6 +24,8 @@ use crate::{
 };
 
 const INITIAL_COMPOSITE_CHILD_CAPACITY: usize = 32;
+const STACK_SOURCE_ATOP: u32 = 16;
+const STACK_COPY: u32 = 256;
 const UNIFORM_VALUE_BYTES: usize = 32;
 const WORKSPACE_TILE_UNIFORM_BYTES: usize = 64;
 const VIEWPORT_UNIFORM_BYTES: u64 = 80;
@@ -331,6 +334,9 @@ fn blend_operation(node: &LayerTreeNode) -> u32 {
     match mode {
         LayerBlendMode::Normal => 0,
         LayerBlendMode::Multiply => 1,
+        LayerBlendMode::Screen => 2,
+        LayerBlendMode::Add => 3,
+        LayerBlendMode::Overlay => 4,
     }
 }
 struct DynamicOpacityBuffer {
@@ -513,7 +519,8 @@ pub struct GpuCompositeScene {
     source_layout: wgpu::BindGroupLayout,
     opacity_layout: wgpu::BindGroupLayout,
     composite_pipeline: wgpu::RenderPipeline,
-    color_transfer_bind_group: wgpu::BindGroup,
+    mask_buffers: masks::MaskBuffers,
+    mask_tiles: BTreeMap<nyatidraw_tiles::CoverageTileKey, Vec<u8>>,
     composite_scratch: [CompositeSurface; 4],
     opacity: DynamicOpacityBuffer,
     viewport_pipeline: wgpu::RenderPipeline,
@@ -624,6 +631,7 @@ impl GpuCompositeScene {
         self.rasters.clear();
         self.groups.clear();
         self.sparse_closed_tiles.clear();
+        self.mask_tiles.clear();
         self.sparse_preview_tiles.clear();
         self.sparse_coordinates.clear();
         self.document_size = size;
@@ -686,6 +694,8 @@ impl GpuCompositeScene {
                 )
             });
         }
+        let masks = tree.mask_ids();
+        self.mask_tiles.retain(|key, _| masks.contains(&key.mask));
         self.tree = tree;
         if self
             .solo_node
@@ -766,13 +776,12 @@ impl GpuCompositeScene {
         validate_presentation_mips(document_size, atlas_slots as usize)?;
         let source_layout = create_source_layout(device);
         let opacity_layout = create_opacity_layout(device);
-        let (color_transfer_layout, color_transfer_bind_group) =
-            create_color_transfer_binding(device);
+        let mask_buffers = masks::MaskBuffers::new(device);
         let composite_pipeline = create_composite_pipeline(
             device,
             &source_layout,
             &opacity_layout,
-            &color_transfer_layout,
+            &mask_buffers.layout,
         );
         let composite_scratch = std::array::from_fn(|_| {
             CompositeSurface::new(
@@ -874,7 +883,8 @@ impl GpuCompositeScene {
             source_layout,
             opacity_layout,
             composite_pipeline,
-            color_transfer_bind_group,
+            mask_buffers,
+            mask_tiles: BTreeMap::new(),
             composite_scratch,
             opacity,
             viewport_pipeline,
@@ -1584,6 +1594,68 @@ impl GpuCompositeScene {
 
     /// Uploads a tightly packed full-document raster snapshot.
     ///
+    /// Uploads disposable R8 coverage; source RGBA surfaces remain untouched.
+    /// # Errors
+    /// Rejects unknown masks, malformed tiles and bounded coverage residency.
+    pub fn upload_mask_tile(
+        &mut self,
+        key: nyatidraw_tiles::CoverageTileKey,
+        pixels: &[u8],
+    ) -> Result<(), LayerUploadError> {
+        let owner = mask_owner(self.tree.root(), key.mask)
+            .ok_or(LayerUploadError::UnknownLayer(LayerId(key.mask.0)))?;
+        if key.mip != 0 {
+            return Err(LayerUploadError::UnsupportedMip(key.mip));
+        }
+        if pixels.len() != nyatidraw_tiles::COVERAGE_TILE_BYTE_LEN {
+            return Err(LayerUploadError::InvalidByteLength {
+                expected: nyatidraw_tiles::COVERAGE_TILE_BYTE_LEN,
+                actual: pixels.len(),
+            });
+        }
+        if !self.mask_tiles.contains_key(&key)
+            && (self.mask_tiles.len() + 1).saturating_mul(pixels.len()) > masks::MAX_MASK_BYTES
+        {
+            return Err(LayerUploadError::SparseAtlasExhausted);
+        }
+        self.mask_tiles.insert(key, pixels.to_vec());
+        self.invalidate_raster_tile(owner, key.coordinate())
+    }
+
+    /// Replaces all disposable coverage after history/frame adoption.
+    /// # Errors
+    /// Applies the same residency and ownership checks as tile upload.
+    pub fn replace_mask_tiles(
+        &mut self,
+        snapshot: &nyatidraw_tiles::TileSnapshot,
+    ) -> Result<(), LayerUploadError> {
+        let owned = self.tree.mask_ids();
+        let count = snapshot
+            .coverage_iter()
+            .filter(|(key, _)| owned.contains(&key.mask))
+            .count();
+        if count.saturating_mul(nyatidraw_tiles::COVERAGE_TILE_BYTE_LEN) > masks::MAX_MASK_BYTES {
+            return Err(LayerUploadError::SparseAtlasExhausted);
+        }
+        if let Some((key, _)) = snapshot
+            .coverage_iter()
+            .find(|(key, _)| owned.contains(&key.mask) && key.mip != 0)
+        {
+            return Err(LayerUploadError::UnsupportedMip(key.mip));
+        }
+        self.mask_tiles.clear();
+        for (key, tile) in snapshot
+            .coverage_iter()
+            .filter(|(key, _)| owned.contains(&key.mask))
+        {
+            self.upload_mask_tile(key, tile.pixels())?;
+        }
+        self.page_cache.clear();
+        self.sparse_cache.clear();
+        self.page_mips_dirty = true;
+        Ok(())
+    }
+
     /// # Errors
     ///
     /// Rejects an unknown raster, a byte-length mismatch, or a layer-tree
@@ -2587,7 +2659,10 @@ impl GpuCompositeScene {
                 input,
                 backdrop: 3,
                 target: 2,
-                params: stack_parameters(Some(stack.base), [65535, 4, origin[0], origin[1]]),
+                params: stack_parameters(
+                    Some(stack.base),
+                    [65535, STACK_COPY, origin[0], origin[1]],
+                ),
             });
             let mut current_stack = 2;
             for clip in stack.clips {
@@ -2607,7 +2682,7 @@ impl GpuCompositeScene {
                         Some(clip),
                         [
                             u32::from(node_opacity(clip)),
-                            blend_operation(clip) + 2,
+                            blend_operation(clip) | STACK_SOURCE_ATOP,
                             origin[0],
                             origin[1],
                         ],
@@ -2632,6 +2707,43 @@ impl GpuCompositeScene {
             });
             accumulated = next;
         }
+        let mut coverage = Vec::new();
+        for operation in &mut passes {
+            let owner = match operation.input {
+                StackInput::Page(LayerTreeNodeId::Raster(layer))
+                | StackInput::Sparse(SparseSurfaceKey::Raster(TileKey { layer, .. })) => {
+                    Some(layer)
+                }
+                _ => None,
+            };
+            let Some(mask) = owner
+                .and_then(|layer| self.tree.raster(layer))
+                .and_then(|layer| layer.mask)
+                .filter(|mask| mask.enabled)
+            else {
+                continue;
+            };
+            operation.params[7] = 0x8000_0000 | u32::from(mask.default_coverage);
+            if let Some(tile) = self.mask_tiles.get(&nyatidraw_tiles::CoverageTileKey {
+                mask: mask.id,
+                mip: 0,
+                x: coordinate.x,
+                y: coordinate.y,
+            }) {
+                if coverage.len().saturating_add(tile.len()) > masks::MAX_MASK_BYTES {
+                    return Err(CompositeRenderError::TooManyChildren);
+                }
+                let offset = u32::try_from(coverage.len() / 4)
+                    .map_err(|_| CompositeRenderError::TooManyChildren)?;
+                if offset > 0x003f_ffff {
+                    return Err(CompositeRenderError::TooManyChildren);
+                }
+                operation.params[7] |= 0x4000_0000 | (offset << 8);
+                coverage.extend_from_slice(tile);
+            }
+        }
+        self.mask_buffers
+            .write(&self.device, &self.queue, &coverage)?;
         self.opacity
             .ensure_capacity(&self.device, &self.opacity_layout, passes.len());
         self.opacity.write(
@@ -2677,7 +2789,7 @@ impl GpuCompositeScene {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.composite_pipeline);
-            pass.set_bind_group(3, &self.color_transfer_bind_group, &[]);
+            pass.set_bind_group(3, &self.mask_buffers.binding, &[]);
             pass.set_bind_group(0, self.stack_source(operation.input)?, &[]);
             pass.set_bind_group(
                 1,
@@ -2790,42 +2902,6 @@ fn create_source_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             count: None,
         }],
     })
-}
-
-fn create_color_transfer_binding(
-    device: &wgpu::Device,
-) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
-    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("nyatidraw-layer-color-transfer-layout"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
-    let bytes: Vec<u8> = nyatidraw_tiles::color::layer_color_transfer_tables()
-        .iter()
-        .flat_map(|value| value.to_ne_bytes())
-        .collect();
-    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("nyatidraw-layer-color-transfer-tables"),
-        contents: &bytes,
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("nyatidraw-layer-color-transfer-binding"),
-        layout: &layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: buffer.as_entire_binding(),
-        }],
-    });
-    (layout, binding)
 }
 
 fn create_opacity_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -3513,6 +3589,16 @@ fn encode_f32s(values: &[f32]) -> Vec<u8> {
         bytes.extend_from_slice(&value.to_ne_bytes());
     }
     bytes
+}
+
+fn mask_owner(group: &GroupNode, id: nyatidraw_api::MaskId) -> Option<LayerId> {
+    group.children.iter().find_map(|node| match node {
+        LayerTreeNode::Raster(layer) if layer.mask.is_some_and(|mask| mask.id == id) => {
+            Some(layer.id)
+        }
+        LayerTreeNode::Group(group) => mask_owner(group, id),
+        LayerTreeNode::Raster(_) => None,
+    })
 }
 
 #[cfg(test)]

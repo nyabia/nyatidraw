@@ -5,6 +5,7 @@
 struct StackParameters { blend: vec4<u32>, effect: vec4<u32>, }
 @group(2) @binding(0) var<uniform> parameters: StackParameters;
 @group(3) @binding(0) var<storage, read> color_transfer: array<u32>;
+@group(3) @binding(1) var<storage, read> mask_coverage: array<u32>;
 
 fn unpack_rgb(value: u32) -> vec3<u32> {
     return vec3<u32>(value & 255u, (value >> 8u) & 255u, (value >> 16u) & 255u);
@@ -36,30 +37,48 @@ fn source_bytes(at: vec2<u32>) -> vec4<u32> {
     return vec4<u32>(round(textureLoad(source_texture, vec2<i32>(at), 0) * 255.0));
 }
 
+fn blend_overlap(s: u32, d: u32, a: u32, b: u32, mode: u32) -> u32 {
+    switch mode {
+        case 0u: { return s * b; }
+        case 1u: { return s * d; }
+        case 2u: { return s * b + d * a - s * d; }
+        case 3u: { return min(s * b + d * a, a * b); }
+        case 4u: {
+            if 2u * d <= b { return 2u * s * d; }
+            return a * b - 2u * (a - s) * (b - d);
+        }
+        default: { return s * b; }
+    }
+}
+
 @fragment
 fn fragment_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let params = parameters.blend;
-    // A missing sparse source is explicit transparent, never another tile.
-    if params.y == 5u { return vec4<f32>(0.0); }
     let local = vec2<u32>(position.xy);
-    let raw = layer_color(source_bytes(local + params.zw));
-    if params.y == 4u { return vec4<f32>(raw) / 255.0; }
+    var raw = layer_color(source_bytes(local + params.zw));
+    let mask = parameters.effect.w;
+    if (mask & 0x80000000u) != 0u {
+        var coverage = mask & 255u;
+        if (mask & 0x40000000u) != 0u {
+            let pixel = local.y * 128u + local.x;
+            let offset = (mask & 0x3fffff00u) >> 8u;
+            coverage = (mask_coverage[offset + pixel / 4u] >> ((pixel % 4u) * 8u)) & 255u;
+        }
+        raw = (raw * coverage + vec4<u32>(127u)) / 255u;
+    }
+    if params.y == 256u { return vec4<f32>(raw) / 255.0; }
     let s = (raw * params.x + vec4<u32>(32767u)) / 65535u;
     let d = vec4<u32>(round(textureLoad(backdrop_texture, vec2<i32>(local), 0) * 255.0));
     let inverse = 255u - s.a;
-    var rgb: vec3<u32>;
+    let atop = (params.y & 16u) != 0u;
+    let mode = params.y & 15u;
+    let overlap = vec3<u32>(
+        blend_overlap(s.r, d.r, s.a, d.a, mode),
+        blend_overlap(s.g, d.g, s.a, d.a, mode),
+        blend_overlap(s.b, d.b, s.a, d.a, mode));
+    let outside = select(s.rgb * (255u - d.a), vec3<u32>(0u), atop);
+    let rgb = (outside + d.rgb * inverse + overlap + vec3<u32>(127u)) / 255u;
     var alpha = s.a + (d.a * inverse + 127u) / 255u;
-    switch params.y {
-        case 0u: { rgb = s.rgb + (d.rgb * inverse + vec3<u32>(127u)) / 255u; }
-        case 1u: { rgb = (s.rgb * (255u - d.a) + d.rgb * inverse + s.rgb * d.rgb + vec3<u32>(127u)) / 255u; }
-        case 2u: {
-            rgb = (s.rgb * d.a + d.rgb * inverse + vec3<u32>(127u)) / 255u;
-            alpha = d.a;
-        }
-        default: {
-            rgb = (d.rgb * (vec3<u32>(inverse) + s.rgb) + vec3<u32>(127u)) / 255u;
-            alpha = d.a;
-        }
-    }
+    if atop { alpha = d.a; }
     return vec4<f32>(vec4<u32>(min(rgb, vec3<u32>(alpha)), alpha)) / 255.0;
 }

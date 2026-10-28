@@ -188,8 +188,15 @@ pub(crate) fn preset_for_ui_preview(projection: &nyatidraw_api::UiProjection) ->
     DrawingConfig::from_projection(projection).preset()
 }
 
+mod animation;
+mod animation_probe;
 mod color_adjustment;
 mod export_receipt;
+mod frame_previews;
+mod mask_probe;
+mod masks;
+mod scaled_export;
+mod sprite_export;
 mod tool_state;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1055,6 +1062,18 @@ impl SharedGpuCanvas {
     /// A child-HWND host presents the returned texture to its own surface. The
     /// origin is intentionally `(0, 0)`: Win32 input delivered to that child is
     /// relative to the child, not to the `WebView` parent.
+    pub(crate) fn mask_render_trace_authorized(&self) -> bool {
+        matches!(&self.state, CanvasState::Active(canvas) if canvas.mask_trace.present || canvas.mask_trace.remaining > 0)
+    }
+
+    pub(crate) fn mask_render_trace_page_size(&self) -> Option<[u32; 2]> {
+        let CanvasState::Active(canvas) = &self.state else {
+            return None;
+        };
+        self.mask_render_trace_authorized()
+            .then_some([canvas.canvas_spec.width_px, canvas.canvas_spec.height_px])
+    }
+
     pub(crate) fn render(&mut self, width: u32, height: u32, scale: f64) -> Option<RenderedCanvas> {
         let CanvasState::Active(canvas) = &mut self.state else {
             return None;
@@ -1098,12 +1117,22 @@ enum CanvasRetirement {
     Close,
 }
 
+#[derive(Default)]
+struct InitialLayoutFit {
+    command: Option<nyatidraw_api::CommandId>,
+    geometry: Option<(u32, u32, u64)>,
+}
+
 struct ActiveCanvas {
     painter: GpuRoundDabPainter,
     alpha_painter: GpuRoundDabPainter,
     eraser: GpuRoundDabPainter,
     background_painter: GpuRoundDabPainter,
     scene: GpuCompositeScene,
+    authoritative_tree: LayerTree,
+    animation: animation::Runtime,
+    animation_probe: Option<animation_probe::Probe>,
+    transform_tree: Option<LayerTree>,
     stroke: StrokePipeline,
     commands: Vec<crate::live_ink::CanvasCommand>,
     view: RendererView,
@@ -1112,9 +1141,11 @@ struct ActiveCanvas {
     project_title: String,
     project_export_path: Option<PathBuf>,
     pending_initial_viewport: Option<ViewportCommand>,
+    initial_layout_fit: Option<InitialLayoutFit>,
     pending_save: Option<u64>,
     retirement: CanvasRetirement,
     artwork_job: Option<ArtworkJob>,
+    frame_preview_job: Option<frame_previews::Job>,
     selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     canvas_spec: CanvasSpec,
     drawing: DrawingConfig,
@@ -1122,6 +1153,9 @@ struct ActiveCanvas {
     brush_presets: tool_state::PresetLibrary,
     color_adjustment: color_adjustment::Runtime,
     cpu_tiles: BTreeMap<TileKey, Vec<u8>>,
+    mask_state: masks::CanvasState,
+    mask_probe: Option<mask_probe::Probe>,
+    mask_trace: mask_probe::Trace,
     transform_display: Option<TileSnapshot>,
     latest_preview_generation: BTreeMap<TileKey, u64>,
     deferred_uploads: Vec<DeferredTileUpload>,
@@ -1153,12 +1187,37 @@ impl ActiveCanvas {
         let initial_active_layer = materialization.initial_active_layer;
         let canvas_spec = materialization.initial_canvas;
         let initial_history = materialization.initial_history.clone();
+        let animation = animation::Runtime::new(materialization.initial_animation.clone());
+        let edit_tree = animation.state.edit_tree(&tree);
+        let render_tree = animation.render_tree(&tree)?;
+        let animation_probe = animation_probe::Probe::open(
+            project_location,
+            materialization.initial_tiles.is_empty(),
+            animation.state.timeline.is_some(),
+        )?;
         let document_size = [canvas_spec.width_px, canvas_spec.height_px];
-        let mut scene = GpuCompositeScene::new(device, queue, document_size, tree.clone())
+        let mut scene = GpuCompositeScene::new(device, queue, document_size, render_tree)
             .map_err(|error| format!("layer-scene:{error:?}"))?;
+        scene
+            .replace_mask_tiles(&materialization.initial_tiles)
+            .map_err(|error| format!("reopened-masks:{error:?}"))?;
+        let mask_state = masks::CanvasState::new(&materialization.initial_tiles);
+        let mask_probe =
+            mask_probe::Probe::open(project_location, materialization.initial_tiles.is_empty())?;
+        let mask_trace_remaining =
+            if mask_probe.is_some() && std::env::var_os("NAYATI_MASK_RENDER_TRACE").is_some() {
+                32
+            } else {
+                0
+            };
+        let mask_present_trace_authorized =
+            mask_probe.is_some() && std::env::var_os("NAYATI_MASK_PRESENT_TRACE").is_some();
         let reopened_root = materialization.initial_tiles.root();
         let reopened_tile_count = materialization.initial_tiles.len();
         for (key, tile) in materialization.initial_tiles.iter() {
+            if scene.tree().raster(key.layer).is_none() {
+                continue;
+            }
             scene
                 .upload_closed_tile(key, tile.pixels())
                 .map_err(|error| format!("reopened-tile:{key:?}:{error:?}"))?;
@@ -1194,7 +1253,8 @@ impl ActiveCanvas {
             let active_layer = authoritative
                 .active_layer
                 .filter(|layer| {
-                    tree.ancestors(nyatidraw_api::LayerTreeNodeId::Raster(*layer))
+                    edit_tree
+                        .ancestors(nyatidraw_api::LayerTreeNodeId::Raster(*layer))
                         .is_some()
                 })
                 .unwrap_or(initial_active_layer);
@@ -1220,7 +1280,7 @@ impl ActiveCanvas {
                     project_location.title(),
                     false,
                     Some(initial_active_layer),
-                    &tree,
+                    &edit_tree,
                     session_dock,
                     ViewportProjection {
                         zoom_ppm: 1_000_000,
@@ -1239,11 +1299,20 @@ impl ActiveCanvas {
 
         let drawing = materialization.initial_drawing;
         drawing.stage_projection(&mut projection);
+        if projection
+            .current()
+            .solo_node
+            .is_some_and(|node| edit_tree.ancestors(node).is_none())
+        {
+            projection.stage_solo(None);
+        }
         scene
             .set_solo(projection.current().solo_node)
             .map_err(|error| format!("restored-solo:{error:?}"))?;
         let next_layer_node_id = next_layer_node_id(&tree)?;
         live_ink.set_navigation_tool(drawing.tool == DrawingTool::Move);
+        let initial_layout_fit = (!restoring_projection && animation.state.timeline.is_some())
+            .then(InitialLayoutFit::default);
         let mut canvas = Self {
             painter: GpuRoundDabPainter::new(device, queue, [0.10, 0.78, 0.91, 1.0]),
             alpha_painter: GpuRoundDabPainter::new_alpha_locked(
@@ -1254,6 +1323,10 @@ impl ActiveCanvas {
             eraser: GpuRoundDabPainter::new_eraser(device, queue),
             background_painter: GpuRoundDabPainter::new(device, queue, [0.50, 0.20, 0.84, 1.0]),
             scene,
+            authoritative_tree: tree,
+            animation,
+            animation_probe,
+            transform_tree: None,
             stroke,
             commands: Vec::with_capacity(64),
             view,
@@ -1263,9 +1336,11 @@ impl ActiveCanvas {
             project_export_path: project_location.export_path(),
             pending_initial_viewport: (!restoring_projection)
                 .then_some(ViewportCommand::FitDocument),
+            initial_layout_fit,
             pending_save: None,
             retirement: CanvasRetirement::Recreate,
             artwork_job: None,
+            frame_preview_job: None,
             selection: None,
             canvas_spec,
             drawing,
@@ -1273,6 +1348,12 @@ impl ActiveCanvas {
             brush_presets: tool_state::PresetLibrary::load(live_ink),
             color_adjustment: color_adjustment::Runtime::default(),
             cpu_tiles,
+            mask_state,
+            mask_probe,
+            mask_trace: mask_probe::Trace {
+                remaining: mask_trace_remaining,
+                present: mask_present_trace_authorized,
+            },
             transform_display: None,
             latest_preview_generation: BTreeMap::new(),
             deferred_uploads: Vec::new(),
@@ -1318,10 +1399,10 @@ impl ActiveCanvas {
             return;
         }
         let based_on = self.projection.current().revision;
-        if live_ink
-            .push_editor_command(based_on, EditorCommand::Viewport(command))
-            .is_ok()
-        {
+        if let Ok(id) = live_ink.push_editor_command(based_on, EditorCommand::Viewport(command)) {
+            if let Some(initial) = &mut self.initial_layout_fit {
+                initial.command = Some(id);
+            }
             self.pending_initial_viewport = None;
             println!("native-canvas event=initial-fit-queued");
         } else if !live_ink.workspace_failed() {
@@ -1329,6 +1410,30 @@ impl ActiveCanvas {
             // full. A later frame retries after the ordinary command drain.
             live_ink.request_redraw();
         }
+    }
+
+    fn correct_initial_layout_fit(&mut self, width: u32, height: u32, scale: f64) {
+        let Some(initial) = &mut self.initial_layout_fit else {
+            return;
+        };
+        let geometry = (width, height, scale.to_bits());
+        let Some(previous) = initial.geometry.replace(geometry) else {
+            return;
+        };
+        if previous == geometry {
+            return;
+        }
+        self.initial_layout_fit = None;
+        self.view.fit(
+            width,
+            height,
+            scale,
+            [self.canvas_spec.width_px, self.canvas_spec.height_px],
+        );
+        self.publish_current_projection();
+        println!(
+            "native-canvas event=initial-animation-layout-fit width={width} height={height} scale={scale}"
+        );
     }
 
     fn advance_protocol_probe(&mut self) {
@@ -1806,13 +1911,18 @@ impl ActiveCanvas {
             .tree()
             .raster(self.active_layer)
             .is_none_or(|layer| layer.locked);
+        self.synchronize_mask_target();
         self.stroke.selected_layer_alpha_locked = self
             .scene
             .tree()
             .raster(self.active_layer)
-            .is_some_and(|layer| layer.alpha_locked);
+            .is_some_and(|layer| layer.alpha_locked)
+            && self.stroke.selected_mask.is_none();
         self.stroke.picker_solo = self.projection.current().solo_node;
         let drained = self.stroke.drain(self.active_layer, self.drawing);
+        if drained.samples != 0 {
+            self.initial_layout_fit = None;
+        }
         self.execute_gpu_ops(drained.samples);
         let previous_cancel = self.projection.current().edit.can_cancel;
         self.stage_cancel_availability();
@@ -1847,7 +1957,9 @@ impl ActiveCanvas {
         self.flush_transform_preview();
         self.flush_color_adjustment();
         self.apply_commands(width, height, scale);
+        self.correct_initial_layout_fit(width, height, scale);
         self.update_picker_preview();
+        self.poll_frame_previews();
         if self
             .artwork_job
             .as_ref()
@@ -1858,6 +1970,7 @@ impl ActiveCanvas {
         if self.synchronize_workspace_failure() {
             return None;
         }
+        self.advance_mask_probe();
         self.advance_save_probe();
         self.flush_pending_save();
         // Advance only after startup's queued Fit and the previous probe
@@ -1865,6 +1978,18 @@ impl ActiveCanvas {
         self.advance_protocol_probe();
         self.advance_history_probe();
         self.advance_edit_probe();
+        if let Some(mut probe) = self.animation_probe.take() {
+            match probe.advance(self) {
+                Ok(false) => self.animation_probe = Some(probe),
+                Ok(true) => {}
+                Err(error) => {
+                    self.stroke
+                        .live_ink
+                        .publish_workspace_error(format!("Animation scratch probe: {error}"));
+                    eprintln!("native-animation-probe failed={error}");
+                }
+            }
+        }
         if self.advance_input_safety_probe_before_drain() {
             return None;
         }
@@ -1965,6 +2090,7 @@ impl ActiveCanvas {
             }
         };
         drop(composite_timing);
+        self.trace_mask_render(viewport);
         if stats.group_tiles_rebuilt > 0 && self.gpu_batch_logs_remaining > 0 {
             println!(
                 "native-canvas event=composite-cache-update rebuilt={} resident={} viewport_passes={}",
@@ -2004,10 +2130,23 @@ impl ActiveCanvas {
         // native stroke closure or async edit publication. Later commands must
         // observe the new semantic revision normally.
         self.async_publication_base_revision = None;
+        if let Err(error) = self.tick_animation() {
+            self.stroke
+                .live_ink
+                .publish_workspace_error(format!("Animation display failed: {error:?}"));
+        }
     }
 
     fn apply_command(&mut self, envelope: CommandEnvelope, width: u32, height: u32, scale: f64) {
         let command_id = envelope.id;
+        let explicit_view = matches!(
+            &envelope.command,
+            EditorCommand::Viewport(_) | EditorCommand::Dock(_)
+        ) && self
+            .initial_layout_fit
+            .as_ref()
+            .and_then(|initial| initial.command)
+            != Some(command_id);
         let persist_dock = matches!(&envelope.command, EditorCommand::Dock(_));
         if self.synchronize_workspace_failure() {
             self.reject_command(command_id, CommandRejectReason::WorkspaceFailed);
@@ -2027,8 +2166,12 @@ impl ActiveCanvas {
                     && DrawingConfig::painting_slot(*tool).is_some()
                     && envelope.based_on <= self.projection.current().revision
         );
+        let playback_stop = matches!(
+            &envelope.command,
+            EditorCommand::Animation(nyatidraw_api::AnimationCommand::Stop)
+        ) && envelope.based_on <= self.projection.current().revision;
         let revision_validation =
-            if save_queued_before_publication || relative_size_for_current_tool {
+            if save_queued_before_publication || relative_size_for_current_tool || playback_stop {
                 Ok(())
             } else {
                 self.projection.validate_command_revision(envelope.based_on)
@@ -2046,12 +2189,20 @@ impl ActiveCanvas {
 
         match result {
             Ok(artwork_changed) => {
+                if explicit_view {
+                    self.initial_layout_fit = None;
+                }
+                self.stage_animation();
                 let dirty = self.projection.current().dirty || artwork_changed;
                 let publish = self.projection.publish_editor_state(
                     self.project_title.clone(),
                     dirty,
                     Some(self.active_layer),
-                    self.scene.tree(),
+                    &self.animation.state.edit_tree(
+                        self.transform_tree
+                            .as_ref()
+                            .unwrap_or(&self.authoritative_tree),
+                    ),
                     self.projection.current().dock.clone(),
                     self.view.projection(),
                 );
@@ -2090,6 +2241,25 @@ impl ActiveCanvas {
         height: u32,
         scale: f64,
     ) -> Result<bool, CommandRejectReason> {
+        if self.animation.playing.is_some()
+            && !matches!(
+                &command,
+                EditorCommand::Animation(_) | EditorCommand::Viewport(_) | EditorCommand::Dock(_)
+            )
+        {
+            return Err(CommandRejectReason::CommandQueueBusy);
+        }
+        if self.animation.state.timeline.is_some()
+            && matches!(
+                &command,
+                EditorCommand::Edit(EditCommand::CropPageToSelection)
+            )
+        {
+            self.stroke.live_ink.publish_activation_notice(
+                "Crop is unavailable for animation; resize the page to preserve every cel.".into(),
+            );
+            return Err(CommandRejectReason::UnsupportedCommand);
+        }
         if self
             .stroke
             .picker
@@ -2165,6 +2335,8 @@ impl ActiveCanvas {
             return Err(CommandRejectReason::CommandQueueBusy);
         }
         match command {
+            EditorCommand::Mask(command) => self.enqueue_mask(command),
+            EditorCommand::Animation(command) => self.apply_animation_command(command),
             EditorCommand::Edit(command) => self.enqueue_edit(command),
             EditorCommand::Viewport(command) => {
                 let previous = self.view;
@@ -2317,19 +2489,31 @@ impl ActiveCanvas {
                     return Err(CommandRejectReason::CommandQueueBusy);
                 }
                 if self
-                    .scene
-                    .tree()
+                    .animation
+                    .state
+                    .edit_tree(&self.authoritative_tree)
                     .ancestors(nyatidraw_api::LayerTreeNodeId::Raster(layer))
                     .is_none()
                 {
                     return Err(CommandRejectReason::UnknownLayer);
                 }
                 self.active_layer = layer;
+                self.projection
+                    .stage_raster_target(Some(nyatidraw_api::RasterEditTarget::Image(layer)));
                 self.stroke.materializer.persist_active_layer(layer);
                 self.stroke.live_ink.set_admission_layer(layer);
                 Ok(false)
             }
             EditorCommand::Layer(LayerCommand::ToggleSolo(node)) => {
+                if self
+                    .animation
+                    .state
+                    .edit_tree(&self.authoritative_tree)
+                    .ancestors(node)
+                    .is_none()
+                {
+                    return Err(CommandRejectReason::UnknownLayer);
+                }
                 let next = (self.projection.current().solo_node != Some(node)).then_some(node);
                 self.scene
                     .set_solo(next)
@@ -2392,6 +2576,77 @@ impl ActiveCanvas {
                 Ok(false)
             }
             EditorCommand::Project(ProjectCommand::CopyPng) => self.enqueue_page_clipboard(),
+            EditorCommand::Project(ProjectCommand::ExportScaledPng {
+                path,
+                size,
+                project_epoch,
+            }) => {
+                self.ensure_pixel_state_idle()?;
+                if project_epoch != self.stroke.live_ink.project_epoch()
+                    || size[0] == 0
+                    || size[1] == 0
+                    || size[0] > self.canvas_spec.width_px
+                    || size[1] > self.canvas_spec.height_px
+                {
+                    self.stroke.live_ink.publish_activation_notice(
+                        "그림 또는 출력 크기가 바뀌었습니다. 다시 내보내주세요.".into(),
+                    );
+                    return Err(CommandRejectReason::UnsupportedCommand);
+                }
+                let result = self
+                    .stroke
+                    .materializer
+                    .scaled_export
+                    .reserve(path, size)
+                    .and_then(|request| {
+                        self.stroke
+                            .materializer
+                            .sender
+                            .as_ref()
+                            .ok_or_else(|| "그림 저장기가 종료되었습니다.".to_owned())?
+                            .try_send(WorkerRequest::ExportReducedPng(request))
+                            .map_err(|_| "자동 저장을 마친 뒤 다시 내보내주세요.".to_owned())
+                    });
+                if let Err(error) = result {
+                    self.stroke.live_ink.publish_activation_notice(error);
+                    return Err(CommandRejectReason::CommandQueueBusy);
+                }
+                Ok(false)
+            }
+            EditorCommand::Project(ProjectCommand::ExportSpriteSheet {
+                directory,
+                columns,
+                project_epoch,
+            }) => {
+                self.ensure_pixel_state_idle()?;
+                if project_epoch != self.stroke.live_ink.project_epoch()
+                    || self.animation.state.timeline.is_none()
+                {
+                    self.stroke.live_ink.publish_activation_notice(
+                        "애니메이션 그림이 바뀌었습니다. 다시 내보내주세요.".into(),
+                    );
+                    return Err(CommandRejectReason::UnsupportedCommand);
+                }
+                let result = self
+                    .stroke
+                    .materializer
+                    .sprite_export
+                    .reserve(directory, columns)
+                    .and_then(|request| {
+                        self.stroke
+                            .materializer
+                            .sender
+                            .as_ref()
+                            .ok_or_else(|| "그림 저장기가 종료되었습니다.".to_owned())?
+                            .try_send(WorkerRequest::ExportSpriteSheet(request))
+                            .map_err(|_| "자동 저장을 마친 뒤 다시 내보내주세요.".to_owned())
+                    });
+                if let Err(error) = result {
+                    self.stroke.live_ink.publish_activation_notice(error);
+                    return Err(CommandRejectReason::CommandQueueBusy);
+                }
+                Ok(false)
+            }
             EditorCommand::Tool(ToolCommand::CancelGesture) => {
                 if self.stroke.cancel_native_gesture() {
                     self.execute_gpu_ops(0);
@@ -2625,20 +2880,32 @@ impl ActiveCanvas {
 
     #[allow(clippy::too_many_lines)]
     fn apply_layer_command(&mut self, command: LayerCommand) -> Result<bool, CommandRejectReason> {
+        let editable = self.animation.state.edit_tree(&self.authoritative_tree);
         let prepared = nyatidraw_editor::layer_edit::prepare_layer_edit(
-            self.scene.tree(),
+            &editable,
             self.active_layer,
             self.next_layer_node_id,
             command,
         )?;
-        let tree = prepared.tree;
+        let tree = nyatidraw_editor::animation::merge_active_edit_tree(
+            &self.authoritative_tree,
+            self.animation.state.timeline.as_ref(),
+            self.animation.state.editing_frame,
+            &prepared.tree,
+        )
+        .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
         let active = prepared.active;
         let pixel_change = prepared.pixels;
-        if &tree == self.scene.tree() && pixel_change.is_none() {
+        if tree == self.authoritative_tree && pixel_change.is_none() {
             return Ok(false);
         }
         self.scene
-            .validate_tree_replacement(&tree)
+            .validate_tree_replacement(
+                &self
+                    .animation
+                    .render_tree(&tree)
+                    .map_err(|_| CommandRejectReason::UnknownLayer)?,
+            )
             .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
         let (reply, received) = sync_channel(1);
         self.enqueue_artwork(
@@ -2667,7 +2934,8 @@ impl ActiveCanvas {
         }
         let result = self.stroke.materializer.clipboard.start(
             &self.cpu_tiles,
-            self.scene.tree().clone(),
+            &self.mask_state.authoritative,
+            self.animation.state.edit_tree(&self.authoritative_tree),
             self.canvas_spec,
             self.stroke.live_ink.clone(),
         );
@@ -2720,6 +2988,10 @@ impl ActiveCanvas {
         result
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Adopt the authoritative tree and both pixel planes before releasing input"
+    )]
     fn install_history_move_inner(
         &mut self,
         moved: HistoryMove,
@@ -2730,11 +3002,17 @@ impl ActiveCanvas {
             return Ok(());
         };
         let clear_selection = moved.tree.is_some() || moved.canvas.is_some();
-        let tree = moved.tree.unwrap_or_else(|| self.scene.tree().clone());
+        let tree = moved
+            .tree
+            .unwrap_or_else(|| self.authoritative_tree.clone());
+        let render_tree = self
+            .animation
+            .render_tree(&tree)
+            .map_err(|_| CommandRejectReason::UnknownLayer)?;
         // Only reuse closed pixels while their disposable surfaces survive.
         // Tree/page changes keep the conservative full upload path, including
         // restored layers and artwork that becomes visible after page growth.
-        let rebuild_surfaces = tree != *self.scene.tree()
+        let rebuild_surfaces = render_tree != *self.scene.tree()
             || moved.canvas.is_some_and(|canvas| {
                 [canvas.width_px, canvas.height_px] != self.scene.document_size()
             });
@@ -2742,11 +3020,11 @@ impl ActiveCanvas {
             let size = [canvas.width_px, canvas.height_px];
             if size != self.scene.document_size() {
                 self.scene
-                    .replace_document(size, tree)
+                    .replace_document(size, render_tree)
                     .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
             } else if rebuild_surfaces {
                 self.scene
-                    .replace_tree(tree)
+                    .replace_tree(render_tree)
                     .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
             }
             self.canvas_spec = canvas;
@@ -2755,23 +3033,18 @@ impl ActiveCanvas {
             self.projection.install_authoritative(current);
         } else if rebuild_surfaces {
             self.scene
-                .replace_tree(tree)
+                .replace_tree(render_tree)
                 .map_err(|_| CommandRejectReason::WorkspaceFailed)?;
         }
+        self.authoritative_tree = tree;
+        self.animation.refresh_onion = self.animation.onion_skin;
         if clear_selection {
-            self.selection = None;
-            self.stroke.selection = None;
-            self.painter.set_selection_mask(None);
-            self.alpha_painter.set_selection_mask(None);
-            self.eraser.set_selection_mask(None);
-            self.scene.set_selection_overlay(None);
-            self.projection
-                .stage_edit(nyatidraw_api::EditProjection::default());
+            self.clear_history_selection();
         }
         self.active_layer = valid_active_layer(self.scene.tree(), self.active_layer);
         self.stroke.live_ink.set_admission_layer(self.active_layer);
         self.next_layer_node_id = self.next_layer_node_id.max(
-            next_layer_node_id(self.scene.tree())
+            next_layer_node_id(&self.authoritative_tree)
                 .map_err(|_| CommandRejectReason::RevisionExhausted)?,
         );
         if self
@@ -2782,6 +3055,13 @@ impl ActiveCanvas {
         {
             self.projection.stage_solo(None);
         }
+        self.adopt_mask_snapshot(&snapshot)?;
+        self.projection
+            .stage_raster_target(Some(nyatidraw_editor::masks::valid_raster_target(
+                &self.authoritative_tree,
+                self.active_layer,
+                self.projection.current().raster_target,
+            )));
         let adoption = CpuSnapshotAdoption::new(&mut self.cpu_tiles, &snapshot);
         let retained = if rebuild_surfaces {
             0
@@ -2818,16 +3098,36 @@ impl ActiveCanvas {
         }
         adoption.apply();
         self.latest_preview_generation.clear();
-        if self.artwork_job.is_none() {
+        if self.artwork_job.is_none() && self.animation.playing.is_none() {
             self.stroke.live_ink.resume_after_edit();
         }
         Ok(())
+    }
+
+    fn clear_history_selection(&mut self) {
+        self.selection = None;
+        self.stroke.selection = None;
+        self.painter.set_selection_mask(None);
+        self.alpha_painter.set_selection_mask(None);
+        self.eraser.set_selection_mask(None);
+        self.scene.set_selection_overlay(None);
+        self.projection
+            .stage_edit(nyatidraw_api::EditProjection::default());
     }
 
     fn enqueue_edit(
         &mut self,
         command: nyatidraw_api::EditCommand,
     ) -> Result<bool, CommandRejectReason> {
+        let target = nyatidraw_editor::masks::valid_raster_target(
+            &self.authoritative_tree,
+            self.active_layer,
+            self.projection.current().raster_target,
+        );
+        if let Some(mask_command) = nyatidraw_editor::masks::mask_edit_command(&command, target) {
+            return self.enqueue_mask(mask_command);
+        }
+        self.guard_mask_edit(&command)?;
         if let EditCommand::ColorAdjustment(command) = command {
             return self.enqueue_color_adjustment(command);
         }
@@ -2867,7 +3167,9 @@ impl ActiveCanvas {
         let kind = match &request {
             WorkerRequest::Edit { .. } => "edit",
             WorkerRequest::MoveHistory { .. } => "history",
+            WorkerRequest::Animation { .. } | WorkerRequest::AnimationDisplay { .. } => "animation",
             WorkerRequest::CommitLayerTree { .. } => "layer",
+            WorkerRequest::Mask { .. } => "mask",
             _ => unreachable!("only artwork requests use the artwork job"),
         };
         let temporary_picker = match &request {
@@ -2891,6 +3193,11 @@ impl ActiveCanvas {
             } => Some(command.clone()),
             _ => None,
         };
+        let animation_display = matches!(&request, WorkerRequest::AnimationDisplay { .. });
+        if !animation_display && let Err(error) = self.discard_onion_display() {
+            self.stroke.live_ink.resume_after_edit();
+            return Err(error);
+        }
         let queued = self
             .stroke
             .materializer
@@ -2904,6 +3211,7 @@ impl ActiveCanvas {
             return Err(CommandRejectReason::CommandQueueBusy);
         }
         self.artwork_job = Some(ArtworkJob {
+            animation_display,
             color_adjustment: color_adjustment.clone(),
             transform: transform.clone(),
             temporary_picker,
@@ -2924,6 +3232,7 @@ impl ActiveCanvas {
             transform,
             Some(
                 nyatidraw_api::TransformCommand::Begin
+                    | nyatidraw_api::TransformCommand::BeginGroup(_)
                     | nyatidraw_api::TransformCommand::Paste
                     | nyatidraw_api::TransformCommand::ImportRaster(_)
                     | nyatidraw_api::TransformCommand::Preview(_)
@@ -3045,6 +3354,7 @@ impl ActiveCanvas {
                 Err(EditFailure::Fatal("Artwork worker disconnected".into()))
             }
         };
+        let animation_display = job.animation_display;
         let active_layer = job.active_layer;
         let temporary_picker = job.temporary_picker;
         let picker_token = job.picker_token;
@@ -3056,6 +3366,39 @@ impl ActiveCanvas {
         let mut history_changed = false;
         let mut error = None;
         match result {
+            Ok(ArtworkOutcome::Mask {
+                moved,
+                target,
+                changed,
+            }) => {
+                history_changed = changed;
+                self.active_layer = target.layer();
+                if self.install_history_move(moved).is_err() {
+                    return None;
+                }
+                self.projection.stage_raster_target(Some(target));
+                self.stroke.live_ink.set_admission_layer(self.active_layer);
+                if changed {
+                    let mut current = self.projection.current().clone();
+                    current.dirty = true;
+                    self.projection.install_authoritative(current);
+                }
+            }
+            Ok(ArtworkOutcome::AnimationDisplay(display)) => {
+                if let Err(reason) = self.install_onion_display(display) {
+                    self.animation.onion_skin = false;
+                    error = Some(reason);
+                }
+            }
+            Ok(ArtworkOutcome::Animation(outcome)) => {
+                if let Some(timing) = &mut history_timing {
+                    timing.received(outcome.moved.worker_timing);
+                }
+                history_changed = outcome.artwork_changed;
+                if self.install_animation(outcome).is_err() {
+                    return None;
+                }
+            }
             Ok(ArtworkOutcome::ColorAdjustment(outcome)) => {
                 if let Err(reason) = self.install_color_adjustment(outcome) {
                     self.stroke.live_ink.publish_workspace_error(reason);
@@ -3127,6 +3470,10 @@ impl ActiveCanvas {
                 }
             }
             Err(EditFailure::Rejected(reason)) => {
+                if animation_display {
+                    self.animation.onion_skin = false;
+                    self.animation.refresh_onion = false;
+                }
                 self.reject_color_adjustment(color_command.as_ref());
                 self.reject_transform_outcome(transform_command.as_ref());
                 if let Some(transform) = &mut self.stroke.transform_projection {
@@ -3160,7 +3507,7 @@ impl ActiveCanvas {
             transform: self.stroke.transform_projection.clone(),
             color_adjustment: self.color_adjustment.projection.clone(),
         });
-        if !self.color_adjustment_active() {
+        if !self.color_adjustment_active() && self.animation.playing.is_none() {
             self.stroke.live_ink.resume_after_edit();
         }
         self.async_publication_base_revision
@@ -3187,10 +3534,10 @@ impl ActiveCanvas {
             let mask = selection
                 .as_ref()
                 .map(|mask| {
-                    self.painter.create_selection_mask_at(
+                    self.painter.create_selection_coverage_at(
                         mask.origin(),
                         mask.dimensions(),
-                        &mask.packed_bits(),
+                        mask.coverage_bytes(),
                     )
                 })
                 .transpose()
@@ -3302,7 +3649,11 @@ impl ActiveCanvas {
             self.project_title.clone(),
             true,
             Some(self.active_layer),
-            self.scene.tree(),
+            &self.animation.state.edit_tree(
+                self.transform_tree
+                    .as_ref()
+                    .unwrap_or(&self.authoritative_tree),
+            ),
             self.projection.current().dock.clone(),
             self.view.projection(),
         );
@@ -3330,6 +3681,15 @@ impl ActiveCanvas {
         let mut completed = Vec::new();
         self.stroke.materializer.drain_completed(&mut completed);
         trace.add_completed(completed.len());
+        for completion in &completed {
+            if let Some(snapshot) = &completion.coverage
+                && let Err(error) =
+                    self.adopt_mask_completion(snapshot, completion.stroke_generation)
+            {
+                self.stroke.live_ink.publish_workspace_error(error);
+                return;
+            }
+        }
         let latest_history = adopt_materialized_completions(
             &mut self.cpu_tiles,
             &mut self.deferred_uploads,
@@ -3351,6 +3711,9 @@ impl ActiveCanvas {
                 if active_layer == Some(key.layer) {
                     trace.add_deferred();
                     remaining.push((key, pixels));
+                    continue;
+                }
+                if self.scene.tree().raster(key.layer).is_none() {
                     continue;
                 }
                 trace.add_upload_attempt();
@@ -3392,6 +3755,7 @@ impl ActiveCanvas {
     /// History is staged separately after writer confirmation; a usage-only
     /// publication must not claim an active stroke is durably committed.
     fn publish_current_projection(&mut self) {
+        self.stage_animation();
         self.projection
             .stage_brush_presets(&self.brush_presets.entries, self.brush_presets.writable);
         self.stroke
@@ -3403,7 +3767,11 @@ impl ActiveCanvas {
             self.project_title.clone(),
             self.projection.current().dirty,
             Some(self.active_layer),
-            self.scene.tree(),
+            &self.animation.state.edit_tree(
+                self.transform_tree
+                    .as_ref()
+                    .unwrap_or(&self.authoritative_tree),
+            ),
             self.projection.current().dock.clone(),
             self.view.projection(),
         );
@@ -3435,7 +3803,20 @@ impl ActiveCanvas {
                     color,
                     eraser,
                     alpha_locked,
+                    mask,
+                    mask_color,
+                    mask_selection,
                 } => {
+                    if let Some(mask) = mask {
+                        self.begin_mask_preview(
+                            generation,
+                            mask,
+                            mask_color,
+                            eraser,
+                            mask_selection,
+                        );
+                        continue;
+                    }
                     if !eraser {
                         self.painter.set_brush_rgba(color);
                         self.alpha_painter.set_brush_rgba(color);
@@ -3462,6 +3843,19 @@ impl ActiveCanvas {
                     }
                 }
                 GpuStrokeOp::Dabs { generation, dabs } => {
+                    if self
+                        .mask_state
+                        .preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.generation == generation)
+                    {
+                        if let Err(error) = self.apply_mask_preview(&dabs) {
+                            self.stroke.live_ink.publish_workspace_error(error);
+                            self.stroke.fail_closed("mask-preview-failed");
+                            break;
+                        }
+                        continue;
+                    }
                     let Some((active_generation, token, eraser, alpha_locked)) =
                         self.gpu_live_generation
                     else {
@@ -3511,6 +3905,9 @@ impl ActiveCanvas {
                     generation,
                     disposition,
                 } => {
+                    if self.finish_mask_preview(generation, disposition) {
+                        continue;
+                    }
                     let Some((active_generation, token, eraser, alpha_locked)) =
                         self.gpu_live_generation.take()
                     else {
@@ -3854,6 +4251,7 @@ pub(crate) fn default_layer_tree() -> LayerTree {
 pub(crate) fn legacy_layer_tree() -> LayerTree {
     let raster = |id, name: &str| {
         LayerTreeNode::Raster(LayerNode {
+            mask: None,
             color_effect: None,
             alpha_locked: false,
             clip_to_below: false,
@@ -3994,6 +4392,7 @@ struct StrokePipeline {
     selected_layer: LayerId,
     selected_layer_locked: bool,
     selected_layer_alpha_locked: bool,
+    selected_mask: Option<nyatidraw_document::LayerMask>,
     drawing: DrawingConfig,
     closed_strokes: u64,
     awaiting_clean_begin: bool,
@@ -4070,6 +4469,7 @@ impl StrokePipeline {
             selected_layer: LIVE_LAYER,
             selected_layer_locked: false,
             selected_layer_alpha_locked: false,
+            selected_mask: None,
             drawing: DrawingConfig::from_projection(&nyatidraw_api::UiProjection::empty()),
             closed_strokes: 0,
             awaiting_clean_begin: false,
@@ -4167,6 +4567,21 @@ impl StrokePipeline {
                 if temporary_picker && sample.phase == PointerPhase::End {
                     self.live_ink
                         .complete_temporary_pick((sample.device_id, sample.sequence));
+                }
+                continue;
+            }
+            if self.selected_mask.is_some()
+                && matches!(
+                    gesture_tool,
+                    DrawingTool::MoveSelection
+                        | DrawingTool::MoveArtwork
+                        | DrawingTool::Fill
+                        | DrawingTool::Gradient
+                )
+            {
+                if sample.phase == PointerPhase::Begin {
+                    self.completed_edit =
+                        Some(Err("이 도구는 이미지 대상을 선택한 뒤 사용하세요.".into()));
                 }
                 continue;
             }
@@ -4311,6 +4726,17 @@ impl StrokePipeline {
                         );
                     }
                     self.scratch_dabs.clear();
+                    if self.selected_mask.is_some()
+                        && admitted
+                            .begin_layer
+                            .is_some_and(|layer| layer != active_layer)
+                    {
+                        self.completed_edit = Some(Err(
+                            "마스크 대상 레이어가 변경되어 획을 취소했습니다.".into(),
+                        ));
+                        self.awaiting_clean_begin = true;
+                        continue;
+                    }
                     let eraser = drawing.tool == DrawingTool::Eraser || sample.eraser;
                     if self.selected_layer_alpha_locked && eraser {
                         self.completed_edit = Some(Err(
@@ -4329,6 +4755,14 @@ impl StrokePipeline {
                         sample,
                         &mut self.scratch_dabs,
                     );
+                    let mut mask_work = nyatidraw_paint_cpu::MaskStrokeBudget::default();
+                    if self.selected_mask.is_some() && mask_work.admit(&self.scratch_dabs).is_err()
+                    {
+                        let _ = self.evaluator.end(token, &mut self.scratch_dabs);
+                        self.scratch_dabs.clear();
+                        self.cancel_mask_work_limit(sample.sequence, None);
+                        continue;
+                    }
                     let generation = self.next_generation;
                     self.next_generation = self.next_generation.saturating_add(1);
                     let layer = admitted.begin_layer.unwrap_or(active_layer);
@@ -4339,9 +4773,14 @@ impl StrokePipeline {
                         color: gpu_color,
                         eraser,
                         alpha_locked: self.selected_layer_alpha_locked,
+                        mask: self.selected_mask,
+                        mask_color: color,
+                        mask_selection: self.selection.clone(),
                     });
                     append_gpu_dabs(&mut self.gpu_ops, generation, &mut self.scratch_dabs);
                     self.active = Some(LiveStroke {
+                        mask_work,
+                        mask: self.selected_mask,
                         token,
                         smoother: begin_smoother.expect("Begin owns a fresh smoother"),
                         generation,
@@ -4391,6 +4830,12 @@ impl StrokePipeline {
                             );
                             continue;
                         }
+                        if active.mask.is_some()
+                            && active.mask_work.admit(&self.scratch_dabs).is_err()
+                        {
+                            self.cancel_mask_work_limit(sample.sequence, None);
+                            continue;
+                        }
                         append_gpu_dabs(
                             &mut self.gpu_ops,
                             active.generation,
@@ -4418,13 +4863,16 @@ impl StrokePipeline {
                             );
                             continue;
                         }
-                        append_gpu_dabs(
-                            &mut self.gpu_ops,
-                            active.generation,
-                            &mut self.scratch_dabs,
-                        );
-                        self.scratch_dabs.clear();
                         let record = self.evaluator.end(active.token, &mut self.scratch_dabs);
+                        if active.mask.is_some()
+                            && active.mask_work.admit(&self.scratch_dabs).is_err()
+                        {
+                            self.cancel_mask_work_limit(
+                                sample.sequence,
+                                Some((active.generation, active.gpu_op_start)),
+                            );
+                            continue;
+                        }
                         append_gpu_dabs(
                             &mut self.gpu_ops,
                             active.generation,
@@ -4454,6 +4902,7 @@ impl StrokePipeline {
                                 disposition: LiveStrokeDisposition::Commit,
                             });
                             let request = ClosedStrokeRequest {
+                                mask: active.mask,
                                 ordinal: self.closed_strokes,
                                 stroke_generation: active.generation,
                                 layer: active.layer,
@@ -4512,6 +4961,22 @@ impl StrokePipeline {
             sequence,
             "invalid-smoothing-position",
             "잘못된 입력 좌표로 현재 선을 취소했습니다. 다시 그려주세요.",
+        );
+    }
+
+    fn cancel_mask_work_limit(&mut self, sequence: u64, ended: Option<(u64, usize)>) {
+        if let Some((generation, gpu_op_start)) = ended {
+            self.gpu_ops.truncate(gpu_op_start);
+            self.scratch_dabs.clear();
+            self.gpu_ops.push(GpuStrokeOp::Finish {
+                generation,
+                disposition: LiveStrokeDisposition::Cancel,
+            });
+        }
+        self.cancel_native_brush_discontinuity(
+            sequence,
+            "mask-replay-work-budget",
+            "마스크 획의 안전한 작업 한도를 넘어 현재 선을 취소했습니다. 더 짧게 나누어 그려주세요.",
         );
     }
 
@@ -4703,10 +5168,18 @@ impl StrokePipeline {
             return;
         }
         let recorded = self.evaluator.end(active.token, &mut self.scratch_dabs);
+        if active.mask.is_some() && active.mask_work.admit(&self.scratch_dabs).is_err() {
+            self.cancel_mask_work_limit(
+                end.sequence,
+                Some((active.generation, active.gpu_op_start)),
+            );
+            return;
+        }
         self.scratch_dabs.clear();
         self.closed_strokes = self.closed_strokes.saturating_add(1);
         let sample_count = recorded.sample_count;
         let request = ClosedStrokeRequest {
+            mask: active.mask,
             ordinal: self.closed_strokes,
             stroke_generation: active.generation,
             layer: active.layer,
@@ -4792,11 +5265,13 @@ impl Drop for ActiveCanvas {
             .tree()
             .raster(self.active_layer)
             .is_none_or(|layer| layer.locked);
+        self.synchronize_mask_target();
         self.stroke.selected_layer_alpha_locked = self
             .scene
             .tree()
             .raster(self.active_layer)
-            .is_some_and(|layer| layer.alpha_locked);
+            .is_some_and(|layer| layer.alpha_locked)
+            && self.stroke.selected_mask.is_none();
         self.stroke.drawing = self.drawing;
         self.stroke.prepare_shutdown();
         // Temporary sampling changes UI color only. A transparent read cannot
@@ -4873,6 +5348,8 @@ impl Drop for ActiveCanvas {
 }
 
 struct LiveStroke {
+    mask_work: nyatidraw_paint_cpu::MaskStrokeBudget,
+    mask: Option<nyatidraw_document::LayerMask>,
     alpha_locked: bool,
     selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     token: RoundBrushStroke,
@@ -4889,6 +5366,9 @@ struct LiveStroke {
 
 enum GpuStrokeOp {
     Replace {
+        mask: Option<nyatidraw_document::LayerMask>,
+        mask_color: StrokeColor,
+        mask_selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
         generation: u64,
         layer: LayerId,
         color: [f32; 4],
@@ -4958,6 +5438,7 @@ impl LiveStroke {
 }
 
 struct ClosedStrokeRequest {
+    mask: Option<nyatidraw_document::LayerMask>,
     alpha_locked: bool,
     selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     ordinal: u64,
@@ -4989,6 +5470,8 @@ struct MaterializationWorker {
     pending: Arc<AtomicUsize>,
     display_retired: Arc<AtomicBool>,
     export_generations: Arc<Mutex<ExportGenerationGate>>,
+    scaled_export: scaled_export::Lane,
+    sprite_export: sprite_export::Lane,
     tool_state: tool_state::Pending,
     clipboard: crate::artwork_clipboard::PageCopyWorker,
     live_ink: LiveInkBridge,
@@ -5040,11 +5523,28 @@ struct MaterializationBootstrap {
     initial_history: HistoryProjection,
     initial_drawing: DrawingConfig,
     initial_active_layer: LayerId,
+    initial_animation: animation::State,
 }
 
 use nyatidraw_editor::layer_edit::LayerPixelChange;
 
 enum WorkerRequest {
+    FrameThumbnail {
+        request: nyatidraw_editor_ui::preview::FrameThumbnailRequest,
+        reply: SyncSender<frame_previews::Result>,
+    },
+    Mask {
+        command: nyatidraw_api::MaskCommand,
+        reply: SyncSender<Result<ArtworkOutcome, EditFailure>>,
+    },
+    AnimationDisplay {
+        reply: SyncSender<Result<ArtworkOutcome, EditFailure>>,
+    },
+    Animation {
+        command: nyatidraw_api::AnimationCommand,
+        active: LayerId,
+        reply: SyncSender<Result<ArtworkOutcome, EditFailure>>,
+    },
     FlushToolState,
     #[cfg(windows)]
     RememberProject(PathBuf),
@@ -5068,6 +5568,8 @@ enum WorkerRequest {
         path: PathBuf,
         reuse_current: bool,
     },
+    ExportReducedPng(scaled_export::Request),
+    ExportSpriteSheet(sprite_export::Request),
     MoveHistory {
         command: nyatidraw_api::HistoryCommand,
         reply: SyncSender<Result<ArtworkOutcome, EditFailure>>,
@@ -5075,6 +5577,13 @@ enum WorkerRequest {
 }
 
 enum ArtworkOutcome {
+    Mask {
+        moved: HistoryMove,
+        target: nyatidraw_api::RasterEditTarget,
+        changed: bool,
+    },
+    AnimationDisplay(nyatidraw_editor::animation_display::FrameDisplay),
+    Animation(animation::Outcome),
     ColorAdjustment(color_adjustment::Outcome),
     Edit(EditOutcome),
     Transform(crate::transform_worker::TransformOutcome),
@@ -5082,6 +5591,7 @@ enum ArtworkOutcome {
 }
 
 struct ArtworkJob {
+    animation_display: bool,
     color_adjustment: Option<nyatidraw_api::ColorAdjustmentCommand>,
     transform: Option<nyatidraw_api::TransformCommand>,
     temporary_picker: Option<(u64, u64)>,
@@ -5305,6 +5815,42 @@ fn next_project_id(reopened: &ReopenedProject) -> Result<u128, String> {
         .ok_or_else(|| "project identifier space is exhausted".to_owned())
 }
 
+fn publish_frame_previews(
+    live_ink: &LiveInkBridge,
+    tiles: &TileSnapshot,
+    tree: &LayerTree,
+    canvas: CanvasSpec,
+    generation: u64,
+) {
+    publish_navigator_frame(live_ink, tiles, tree, canvas);
+    publish_layer_thumbnail_frames(
+        live_ink,
+        generation,
+        tiles,
+        tree,
+        raster_layer_ids(tree),
+        canvas,
+    );
+}
+
+fn finish_materialization_worker(
+    exit: &std::thread::Result<WorkerExit>,
+    worker_live_ink: &LiveInkBridge,
+) -> WorkerExit {
+    match exit {
+        Ok(WorkerExit::Drained) => WorkerExit::Drained,
+        Ok(WorkerExit::FailStop) => {
+            worker_live_ink.fail_incomplete_export();
+            WorkerExit::FailStop
+        }
+        Ok(WorkerExit::Panicked) => unreachable!("worker loop cannot return panic"),
+        Err(_) => {
+            worker_live_ink.fail_incomplete_export();
+            WorkerExit::Panicked
+        }
+    }
+}
+
 impl MaterializationWorker {
     fn start(
         live_ink: LiveInkBridge,
@@ -5322,19 +5868,26 @@ impl MaterializationWorker {
             &initial_tree,
             tool_preferences.active_layer().unwrap_or(LIVE_LAYER),
         );
+        let initial_animation = animation::State::restored(
+            db.load_animation_timeline()
+                .map_err(|error| format!("animation-load:{error}"))?,
+            &initial_tree,
+            initial_active_layer,
+        );
+        let initial_edit_tree = initial_animation.edit_tree(&initial_tree);
+        let initial_active_layer = valid_active_layer(&initial_edit_tree, initial_active_layer);
         let initial_drawing = initial_drawing.unwrap_or_else(|| {
             DrawingConfig::from_projection(&nyatidraw_api::UiProjection::empty())
         });
         let tool_state = tool_state::Pending::default();
         let worker_tool_state = tool_state.clone();
         let initial_history = session.history_projection();
-        publish_navigator_frame(&live_ink, &initial_tiles, &initial_tree, initial_canvas);
-        publish_layer_thumbnail_frames(
+        publish_frame_previews(
             &live_ink,
-            1,
             &initial_tiles,
-            raster_layer_ids(&initial_tree),
+            &initial_edit_tree,
             initial_canvas,
+            1,
         );
         let (sender, receiver) = sync_channel(MATERIALIZATION_QUEUE_CAPACITY);
         let (completed_sender, completed) = sync_channel(CLOSED_STROKE_COMPLETION_QUEUE_CAPACITY);
@@ -5345,6 +5898,7 @@ impl MaterializationWorker {
         let export_generations = Arc::new(Mutex::new(ExportGenerationGate::default()));
         let worker_export_generations = Arc::clone(&export_generations);
         let worker_preview_tree = initial_tree.clone();
+        let worker_animation = initial_animation.clone();
         let worker_live_ink = live_ink.clone();
         let handle = thread::Builder::new()
             .name("nyatidraw-project-writer".into())
@@ -5362,6 +5916,7 @@ impl MaterializationWorker {
                         worker_pending.as_ref(),
                         session,
                         worker_preview_tree,
+                        worker_animation,
                         initial_canvas,
                         next_id,
                         &sink,
@@ -5371,18 +5926,7 @@ impl MaterializationWorker {
                         &mut tool_preferences,
                     )
                 }));
-                match exit {
-                    Ok(WorkerExit::Drained) => WorkerExit::Drained,
-                    Ok(WorkerExit::FailStop) => {
-                        worker_live_ink.fail_incomplete_export();
-                        WorkerExit::FailStop
-                    }
-                    Ok(WorkerExit::Panicked) => unreachable!("worker loop cannot return panic"),
-                    Err(_) => {
-                        worker_live_ink.fail_incomplete_export();
-                        WorkerExit::Panicked
-                    }
-                }
+                finish_materialization_worker(&exit, &worker_live_ink)
             })
             .map_err(|error| format!("project-writer-thread:{error}"))?;
         Ok(MaterializationBootstrap {
@@ -5393,6 +5937,8 @@ impl MaterializationWorker {
                 pending,
                 display_retired,
                 export_generations,
+                scaled_export: scaled_export::Lane::default(),
+                sprite_export: sprite_export::Lane::default(),
                 tool_state,
                 clipboard: crate::artwork_clipboard::PageCopyWorker::default(),
                 live_ink,
@@ -5403,6 +5949,7 @@ impl MaterializationWorker {
             initial_history,
             initial_drawing,
             initial_active_layer,
+            initial_animation,
         })
     }
 
@@ -5556,6 +6103,7 @@ impl Drop for MaterializationWorker {
 }
 
 struct ClosedStrokeCompletion {
+    coverage: Option<TileSnapshot>,
     ordinal: u64,
     stroke_generation: u64,
     tiles: Vec<(TileKey, Vec<u8>)>,
@@ -5660,6 +6208,7 @@ fn materialization_loop(
     pending: &AtomicUsize,
     mut session: HeadlessStrokeSession,
     mut preview_tree: LayerTree,
+    mut animation_state: animation::State,
     mut preview_canvas: CanvasSpec,
     mut next_id: u128,
     sink: &ProjectSink,
@@ -5703,7 +6252,74 @@ fn materialization_loop(
             live_ink.request_redraw();
             continue;
         }
+        let edit_tree = animation_state.edit_tree(&preview_tree);
         let request = match work {
+            WorkerRequest::FrameThumbnail { request, reply } => {
+                let result = frame_previews::render(
+                    &request,
+                    &preview_tree,
+                    session.tiles(),
+                    animation_state.timeline.as_ref(),
+                    preview_canvas,
+                );
+                let _ = reply.send(result);
+                live_ink.request_redraw();
+                continue;
+            }
+            WorkerRequest::AnimationDisplay { reply } => {
+                let result = nyatidraw_editor::animation_display::build_frame_display(
+                    &preview_tree,
+                    session.tiles(),
+                    animation_state.timeline.as_ref(),
+                    animation_state.editing_frame,
+                    preview_canvas,
+                    true,
+                    128 * 1024 * 1024,
+                )
+                .map_err(EditFailure::Rejected);
+                let _ = reply.send(result.map(ArtworkOutcome::AnimationDisplay));
+                live_ink.request_redraw();
+                continue;
+            }
+            WorkerRequest::Animation {
+                command,
+                active,
+                reply,
+            } => {
+                let result = animation::execute(
+                    command,
+                    &mut animation_state,
+                    &mut preview_tree,
+                    active,
+                    preview_canvas,
+                    &mut session,
+                    &mut next_id,
+                    db,
+                );
+                let failed = matches!(result, Err(EditFailure::Fatal(_)));
+                if result.is_ok() {
+                    selection = None;
+                    last_export = None;
+                    let edit_tree = animation_state.edit_tree(&preview_tree);
+                    publish_navigator_frame(live_ink, session.tiles(), &edit_tree, preview_canvas);
+                    thumbnail_generation = thumbnail_generation.saturating_add(1);
+                    publish_layer_thumbnail_frames(
+                        live_ink,
+                        thumbnail_generation,
+                        session.tiles(),
+                        &preview_tree,
+                        raster_layer_ids(&edit_tree),
+                        preview_canvas,
+                    );
+                }
+                let _ = reply.send(result.map(ArtworkOutcome::Animation));
+                live_ink.request_redraw();
+                if failed {
+                    exit = WorkerExit::FailStop;
+                    break;
+                }
+                continue;
+            }
             WorkerRequest::FlushToolState => continue,
             #[cfg(windows)]
             WorkerRequest::RememberProject(path) => {
@@ -5715,9 +6331,55 @@ fn materialization_loop(
                 continue;
             }
             WorkerRequest::PickerPreview { request, reply } => {
-                let result = picker_preview::sample_patch(request, session.tiles(), &preview_tree);
+                let result = picker_preview::sample_patch(request, session.tiles(), &edit_tree);
                 let _ = reply.send(result);
                 live_ink.request_redraw();
+                continue;
+            }
+            WorkerRequest::Mask { command, reply } => {
+                let result = masks::execute(
+                    command,
+                    &mut preview_tree,
+                    &animation_state,
+                    &mut session,
+                    selection.as_deref(),
+                    &mut next_id,
+                    db,
+                );
+                let failed = matches!(result, Err(EditFailure::Fatal(_)));
+                if matches!(
+                    &result,
+                    Ok(ArtworkOutcome::Mask {
+                        moved: HistoryMove { tree: Some(_), .. },
+                        ..
+                    })
+                ) {
+                    selection = None;
+                }
+                if result.is_ok() {
+                    last_export = None;
+                    publish_navigator_frame(
+                        live_ink,
+                        session.tiles(),
+                        &animation_state.edit_tree(&preview_tree),
+                        preview_canvas,
+                    );
+                    thumbnail_generation = thumbnail_generation.saturating_add(1);
+                    publish_layer_thumbnail_frames(
+                        live_ink,
+                        thumbnail_generation,
+                        session.tiles(),
+                        &preview_tree,
+                        [command.layer()],
+                        preview_canvas,
+                    );
+                }
+                let _ = reply.send(result);
+                live_ink.request_redraw();
+                if failed {
+                    exit = WorkerExit::FailStop;
+                    break;
+                }
                 continue;
             }
             WorkerRequest::Stroke(request) => request,
@@ -5726,6 +6388,31 @@ fn materialization_loop(
                 target,
                 reply,
             } => {
+                if edit_tree.raster(target).is_none()
+                    || (animation_state.timeline.is_some()
+                        && matches!(
+                            &command,
+                            EditCommand::CropPageToSelection | EditCommand::PasteSelection
+                        ))
+                {
+                    let _ = reply.send(Err(EditFailure::Rejected("Edit target is outside the current frame or requires a document-wide transaction".into())));
+                    live_ink.request_redraw();
+                    continue;
+                }
+                if let EditCommand::FreeTransform(nyatidraw_api::TransformCommand::BeginGroup(
+                    group,
+                )) = &command
+                    && (*group == edit_tree.root().id
+                        || edit_tree
+                            .ancestors(nyatidraw_api::LayerTreeNodeId::Group(*group))
+                            .is_none())
+                {
+                    let _ = reply.send(Err(EditFailure::Rejected(
+                        "Group is outside the current frame".into(),
+                    )));
+                    live_ink.request_redraw();
+                    continue;
+                }
                 let started = Instant::now();
                 let db = match sink {
                     ProjectSink::UntitledRecovery { db, .. }
@@ -5747,7 +6434,7 @@ fn materialization_loop(
                         publish_navigator_frame(
                             live_ink,
                             session.tiles(),
-                            &preview_tree,
+                            &animation_state.edit_tree(&preview_tree),
                             preview_canvas,
                         );
                         thumbnail_generation = thumbnail_generation.saturating_add(1);
@@ -5755,7 +6442,8 @@ fn materialization_loop(
                             live_ink,
                             thumbnail_generation,
                             session.tiles(),
-                            raster_layer_ids(&preview_tree),
+                            &preview_tree,
+                            raster_layer_ids(&animation_state.edit_tree(&preview_tree)),
                             preview_canvas,
                         );
                     }
@@ -5796,7 +6484,7 @@ fn materialization_loop(
                         publish_navigator_frame(
                             live_ink,
                             session.tiles(),
-                            &preview_tree,
+                            &animation_state.edit_tree(&preview_tree),
                             preview_canvas,
                         );
                         thumbnail_generation = thumbnail_generation.saturating_add(1);
@@ -5804,7 +6492,8 @@ fn materialization_loop(
                             live_ink,
                             thumbnail_generation,
                             session.tiles(),
-                            raster_layer_ids(&preview_tree),
+                            &preview_tree,
+                            raster_layer_ids(&animation_state.edit_tree(&preview_tree)),
                             preview_canvas,
                         );
                     }
@@ -5824,7 +6513,7 @@ fn materialization_loop(
                     command,
                     target,
                     preview_canvas,
-                    &preview_tree,
+                    &edit_tree,
                     &mut selection,
                     &mut session,
                     &mut next_id,
@@ -5842,7 +6531,7 @@ fn materialization_loop(
                         publish_navigator_frame(
                             live_ink,
                             session.tiles(),
-                            &preview_tree,
+                            &animation_state.edit_tree(&preview_tree),
                             preview_canvas,
                         );
                         thumbnail_generation = thumbnail_generation.saturating_add(1);
@@ -5850,7 +6539,8 @@ fn materialization_loop(
                             live_ink,
                             thumbnail_generation,
                             session.tiles(),
-                            raster_layer_ids(&preview_tree),
+                            &preview_tree,
+                            raster_layer_ids(&animation_state.edit_tree(&preview_tree)),
                             preview_canvas,
                         );
                     }
@@ -5873,6 +6563,20 @@ fn materialization_loop(
                     exit = WorkerExit::FailStop;
                     break;
                 }
+                continue;
+            }
+            WorkerRequest::ExportSpriteSheet(request) => {
+                request.run(
+                    session.tiles(),
+                    &preview_tree,
+                    animation_state.timeline.as_ref(),
+                    preview_canvas,
+                    live_ink,
+                );
+                continue;
+            }
+            WorkerRequest::ExportReducedPng(request) => {
+                request.run(session.tiles(), &edit_tree, preview_canvas, live_ink);
                 continue;
             }
             WorkerRequest::ExportPng {
@@ -5912,7 +6616,7 @@ fn materialization_loop(
                 match export_current_png(
                     &path,
                     session.tiles(),
-                    &preview_tree,
+                    &edit_tree,
                     preview_canvas,
                     generation,
                     export_generations,
@@ -5947,6 +6651,9 @@ fn materialization_loop(
                             error,
                         );
                     }
+                }
+                if std::env::var_os("NAYATI_ANIMATION_PROBE").is_some() {
+                    live_ink.request_redraw();
                 }
                 continue;
             }
@@ -6002,6 +6709,10 @@ fn materialization_loop(
                                 EditFailure::Fatal(format!("history-tree-load:{error}"))
                             })?
                             .unwrap_or_else(legacy_layer_tree);
+                        let timeline =
+                            db.load_cursor_animation_timeline(target).map_err(|error| {
+                                EditFailure::Fatal(format!("history-animation-load:{error}"))
+                            })?;
                         let canvas = db.load_cursor_canvas_spec(target).map_err(|error| {
                             EditFailure::Fatal(format!("history-page-load:{error}"))
                         })?;
@@ -6025,8 +6736,14 @@ fn materialization_loop(
                             &mut worker_timing,
                             HistoryWorkerStep::SessionAccepted,
                         );
+                        animation_state = animation::State::restored(
+                            timeline,
+                            &tree,
+                            tool_preferences.active_layer().unwrap_or(LIVE_LAYER),
+                        );
                         preview_tree = tree.clone();
                         preview_canvas = canvas;
+                        last_export = None;
                         selection = None;
                         Ok(HistoryMove {
                             tiles: Some(tiles),
@@ -6046,7 +6763,7 @@ fn materialization_loop(
                     publish_navigator_frame(
                         live_ink,
                         session.tiles(),
-                        &preview_tree,
+                        &animation_state.edit_tree(&preview_tree),
                         preview_canvas,
                     );
                     thumbnail_generation = thumbnail_generation.saturating_add(1);
@@ -6054,7 +6771,8 @@ fn materialization_loop(
                         live_ink,
                         thumbnail_generation,
                         session.tiles(),
-                        raster_layer_ids(&preview_tree),
+                        &preview_tree,
+                        raster_layer_ids(&animation_state.edit_tree(&preview_tree)),
                         preview_canvas,
                     );
                 }
@@ -6062,7 +6780,17 @@ fn materialization_loop(
                 if let Ok(moved) = &mut result {
                     moved.worker_timing = worker_timing;
                 }
-                let _ = reply.send(result.map(ArtworkOutcome::History));
+                let _ = reply.send(result.map(|moved| {
+                    ArtworkOutcome::Animation(animation::Outcome {
+                        state: animation_state.clone(),
+                        active_layer: valid_active_layer(
+                            &animation_state.edit_tree(&preview_tree),
+                            tool_preferences.active_layer().unwrap_or(LIVE_LAYER),
+                        ),
+                        artwork_changed: moved.tiles.is_some(),
+                        moved,
+                    })
+                }));
                 live_ink.request_redraw();
                 if failed {
                     exit = WorkerExit::FailStop;
@@ -6106,8 +6834,11 @@ fn materialization_loop(
                             .map_err(|error| format!("subtree tiles: {error:?}"))?
                     };
                     if let Some(change) = pixel_change {
-                        after = change.apply(&after, preview_canvas)?;
+                        after =
+                            change.apply_to_tree(&after, preview_canvas, &preview_tree, &tree)?;
                     }
+                    after = nyatidraw_paint_cpu::retain_owned_masks(&after, &tree)
+                        .map_err(|error| format!("retained masks: {error:?}"))?;
                     let batch = session
                         .prepare_structural_change(
                             SnapshotId(next_id),
@@ -6144,7 +6875,7 @@ fn materialization_loop(
                     publish_navigator_frame(
                         live_ink,
                         session.tiles(),
-                        &preview_tree,
+                        &animation_state.edit_tree(&preview_tree),
                         preview_canvas,
                     );
                     thumbnail_generation = thumbnail_generation.saturating_add(1);
@@ -6152,7 +6883,8 @@ fn materialization_loop(
                         live_ink,
                         thumbnail_generation,
                         session.tiles(),
-                        raster_layer_ids(&preview_tree),
+                        &preview_tree,
+                        raster_layer_ids(&animation_state.edit_tree(&preview_tree)),
                         preview_canvas,
                     );
                     println!(
@@ -6176,6 +6908,44 @@ fn materialization_loop(
             }
         };
         let started_at = Instant::now();
+        if request.mask.is_some() {
+            let result = masks::commit_stroke(
+                &request,
+                &preview_tree,
+                &edit_tree,
+                &mut session,
+                &mut next_id,
+                db,
+            );
+            let keep_running = match result {
+                Ok(completion) => {
+                    last_export = None;
+                    publish_navigator_frame(live_ink, session.tiles(), &edit_tree, preview_canvas);
+                    thumbnail_generation = thumbnail_generation.saturating_add(1);
+                    publish_layer_thumbnail_frames(
+                        live_ink,
+                        thumbnail_generation,
+                        session.tiles(),
+                        &preview_tree,
+                        [request.layer],
+                        preview_canvas,
+                    );
+                    publish_closed_completion(completed, display_retired, live_ink, completion)
+                }
+                Err(error) => {
+                    live_ink.publish_workspace_error(format!(
+                        "Mask stroke could not be saved: {error}"
+                    ));
+                    false
+                }
+            };
+            pending.fetch_sub(1, Ordering::Release);
+            if !keep_running {
+                exit = WorkerExit::FailStop;
+                break;
+            }
+            continue;
+        }
         if preview_tree
             .raster(request.layer)
             .is_none_or(|layer| layer.locked || layer.alpha_locked != request.alpha_locked)
@@ -6238,7 +7008,7 @@ fn materialization_loop(
                         publish_navigator_frame(
                             live_ink,
                             session.tiles(),
-                            &preview_tree,
+                            &animation_state.edit_tree(&preview_tree),
                             preview_canvas,
                         );
                         let changed_thumbnail_layers: BTreeSet<_> = batch
@@ -6252,6 +7022,7 @@ fn materialization_loop(
                             live_ink,
                             thumbnail_generation,
                             session.tiles(),
+                            &preview_tree,
                             changed_thumbnail_layers,
                             preview_canvas,
                         );
@@ -6277,6 +7048,7 @@ fn materialization_loop(
                             display_retired,
                             live_ink,
                             ClosedStrokeCompletion {
+                                coverage: None,
                                 ordinal: request.ordinal,
                                 stroke_generation: request.stroke_generation,
                                 tiles: closed_tiles,
@@ -6321,6 +7093,7 @@ fn materialization_loop(
                     display_retired,
                     live_ink,
                     ClosedStrokeCompletion {
+                        coverage: None,
                         ordinal: request.ordinal,
                         stroke_generation: request.stroke_generation,
                         tiles: Vec::new(),
@@ -6373,6 +7146,7 @@ fn publish_navigator_frame(
     tree: &LayerTree,
     canvas: CanvasSpec,
 ) {
+    live_ink.invalidate_frame_thumbnails();
     let _timing = Span::new(Stage::Navigator);
     let frame = render_page_preview_rgba8(
         tiles,
@@ -6398,6 +7172,7 @@ fn publish_layer_thumbnail_frames(
     live_ink: &LiveInkBridge,
     generation: u64,
     tiles: &TileSnapshot,
+    tree: &LayerTree,
     layers: impl IntoIterator<Item = LayerId>,
     canvas: CanvasSpec,
 ) {
@@ -6414,7 +7189,19 @@ fn publish_layer_thumbnail_frames(
                 LAYER_THUMBNAIL_MAX_HEIGHT,
             )
             .map_err(|error| format!("layer-thumbnail-render:{error:?}"))
-            .and_then(|surface| layer_thumbnail_frame(layer, &surface))
+            .and_then(|surface| {
+                let mut frame = layer_thumbnail_frame(layer, &surface)?;
+                if let Some(mask) = tree.raster(layer).and_then(|node| node.mask) {
+                    frame.mask = Some(Arc::new(crate::preview::mask_thumbnail_frame(
+                        mask.id,
+                        mask.default_coverage,
+                        tiles,
+                        canvas,
+                        [frame.width, frame.height],
+                    )?));
+                }
+                Ok(frame)
+            })
             .map_err(|error| {
                 eprintln!(
                     "native-canvas event=layer-thumbnail-skipped layer={} generation={} error={} prior-frame-retained=true",
@@ -6442,6 +7229,18 @@ fn export_current_png(
     generation: u64,
     generations: &Mutex<ExportGenerationGate>,
 ) -> Result<ExportPngOutcome, String> {
+    export_current_png_sized(path, tiles, tree, canvas, generation, generations, None)
+}
+
+fn export_current_png_sized(
+    path: &std::path::Path,
+    tiles: &TileSnapshot,
+    tree: &LayerTree,
+    canvas: CanvasSpec,
+    generation: u64,
+    generations: &Mutex<ExportGenerationGate>,
+    size: Option<[u32; 2]>,
+) -> Result<ExportPngOutcome, String> {
     let _export_interval = crate::performance::ExportInterval::enter();
     let composite_timing = Span::new(Stage::ExportComposite);
     let surface = flatten_layer_tree_rgba8(tiles, tree, canvas)
@@ -6458,8 +7257,15 @@ fn export_current_png(
         std::process::id()
     ));
     let encode_timing = Span::new(Stage::ExportEncode);
-    if let Err(error) = nyatidraw_png_io::encode_png(&temporary, &surface) {
-        let _ = std::fs::remove_file(&temporary);
+    let encoded = if let Some(size) = size {
+        nyatidraw_png_io::encode_png_reduced(&temporary, &surface, size)
+    } else {
+        nyatidraw_png_io::encode_png(&temporary, &surface)
+    };
+    if let Err(error) = encoded {
+        if size.is_none() {
+            let _ = std::fs::remove_file(&temporary);
+        }
         return Err(format!("encode:{error}"));
     }
     drop(encode_timing);
@@ -6487,9 +7293,23 @@ fn export_current_png(
         return Ok(ExportPngOutcome::Superseded { latest });
     }
     export_probe_boundary(path, "before-replace");
-    if let Err(error) = replace_file(&temporary, path) {
+    if size.is_some()
+        && let Err(error) = crate::scaled_export::validate_target(path)
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    let replaced = if size.is_some() {
+        std::fs::hard_link(&temporary, path)
+    } else {
+        replace_file(&temporary, path)
+    };
+    if let Err(error) = replaced {
         let _ = std::fs::remove_file(&temporary);
         return Err(format!("replace:{}:{error}", path.display()));
+    }
+    if size.is_some() {
+        let _ = std::fs::remove_file(&temporary);
     }
     export_probe_boundary(path, "after-replace");
     Ok(ExportPngOutcome::Replaced)
@@ -6717,6 +7537,7 @@ mod tests {
                 let mut history = HistoryProjection::initial();
                 history.has_older_entries = generation == 3;
                 ClosedStrokeCompletion {
+                    coverage: None,
                     ordinal: generation,
                     stroke_generation: generation,
                     tiles: vec![(key, vec![u8::try_from(generation).unwrap(); TILE_BYTE_LEN])],
@@ -8496,6 +9317,7 @@ mod tests {
         let (sender, receiver) = sync_channel(1);
         sender
             .try_send(ClosedStrokeCompletion {
+                coverage: None,
                 ordinal: 1,
                 stroke_generation: 1,
                 tiles: Vec::new(),
@@ -8508,6 +9330,7 @@ mod tests {
             &AtomicBool::new(false),
             &live_ink,
             ClosedStrokeCompletion {
+                coverage: None,
                 ordinal: 2,
                 stroke_generation: 2,
                 tiles: Vec::new(),
@@ -8663,6 +9486,83 @@ mod tests {
     }
 
     #[test]
+    fn mask_work_limit_cancels_before_durability_without_poisoning_the_workspace() {
+        for case in ["move", "end", "close"] {
+            let phase = if case == "end" {
+                PointerPhase::End
+            } else {
+                PointerPhase::Move
+            };
+            let live_ink = LiveInkBridge::with_capacity(4, LIVE_LAYER);
+            let (sender, receiver) = sync_channel(2);
+            let (_completed_sender, completed) = sync_channel(2);
+            let worker = MaterializationWorker {
+                sender: Some(sender),
+                completed,
+                handle: None,
+                pending: Arc::new(AtomicUsize::new(0)),
+                display_retired: Arc::new(AtomicBool::new(false)),
+                export_generations: Arc::new(Mutex::new(ExportGenerationGate::default())),
+                scaled_export: scaled_export::Lane::default(),
+                sprite_export: sprite_export::Lane::default(),
+                tool_state: tool_state::Pending::default(),
+                clipboard: crate::artwork_clipboard::PageCopyWorker::default(),
+                live_ink: live_ink.clone(),
+            };
+            let mut pipeline = StrokePipeline::new(live_ink.clone(), worker);
+            pipeline.selected_mask = Some(nyatidraw_document::LayerMask {
+                id: nyatidraw_api::MaskId(3),
+                enabled: true,
+                default_coverage: 255,
+            });
+            let drawing = pipeline.drawing;
+            live_ink
+                .push(sample(1, PointerPhase::Begin, 32.0, 32.0))
+                .unwrap();
+            pipeline.drain(LIVE_LAYER, drawing);
+            let generation = pipeline.active.as_ref().unwrap().generation;
+            pipeline.active.as_mut().unwrap().mask_work =
+                nyatidraw_paint_cpu::MaskStrokeBudget::new(nyatidraw_paint_cpu::EditLimits {
+                    max_filter_work: 0,
+                    ..Default::default()
+                });
+            pipeline.gpu_ops.clear();
+            live_ink.push(sample(2, phase, 64.0, 32.0)).unwrap();
+            assert!(!pipeline.drain(LIVE_LAYER, drawing).artwork_closed);
+            assert!(pipeline.active.is_none() && pipeline.awaiting_clean_begin);
+            assert!(!pipeline.fatal && !live_ink.workspace_failed());
+            assert_eq!(pipeline.closed_strokes, 0);
+            assert!(pipeline.gpu_ops.iter().any(|op| matches!(op,
+                GpuStrokeOp::Finish { generation: actual, disposition: LiveStrokeDisposition::Cancel }
+                if *actual == generation)));
+            if case == "close" {
+                pipeline.seal_active_for_shutdown();
+            }
+            assert!(
+                receiver.try_recv().is_err(),
+                "close must not resurrect cancelled mask artwork"
+            );
+            live_ink
+                .push(sample(3, PointerPhase::End, 64.0, 32.0))
+                .unwrap();
+            pipeline.drain(LIVE_LAYER, drawing);
+            assert!(
+                receiver.try_recv().is_err(),
+                "late End must not save the rejected partial stroke"
+            );
+            live_ink
+                .push(sample(4, PointerPhase::Begin, 32.0, 32.0))
+                .unwrap();
+            pipeline.drain(LIVE_LAYER, drawing);
+            assert!(pipeline.active.is_some() && !pipeline.awaiting_clean_begin);
+            live_ink
+                .push(sample(5, PointerPhase::Cancel, 32.0, 32.0))
+                .unwrap();
+            pipeline.drain(LIVE_LAYER, drawing);
+        }
+    }
+
+    #[test]
     fn freed_writer_capacity_cannot_reorder_closed_strokes_ahead_of_the_semantic_backlog() {
         // Product risk: swapping queued paint/erase operations changes artwork.
         // The real bounded channel is empty, but an older semantic request
@@ -8675,6 +9575,7 @@ mod tests {
             let mut token = begin_round_stroke(&mut evaluator, &LIVE_BRUSH, begin, &mut dabs);
             evaluator.push(&mut token, &[end], &mut dabs);
             ClosedStrokeRequest {
+                mask: None,
                 selection: None,
                 alpha_locked: false,
                 ordinal,
@@ -8698,6 +9599,8 @@ mod tests {
             pending: Arc::new(AtomicUsize::new(0)),
             display_retired: Arc::new(AtomicBool::new(false)),
             export_generations: Arc::new(Mutex::new(ExportGenerationGate::default())),
+            scaled_export: scaled_export::Lane::default(),
+            sprite_export: sprite_export::Lane::default(),
             tool_state: tool_state::Pending::default(),
             clipboard: crate::artwork_clipboard::PageCopyWorker::default(),
             live_ink: live_ink.clone(),

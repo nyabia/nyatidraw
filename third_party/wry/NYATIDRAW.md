@@ -37,6 +37,17 @@ above child HWNDs. The existing WRY HWND remains the focus/input sink;
 `composition_input_hwnd()` exposes it so NyatiDraw can shape its input region
 without clipping the independently hosted visual. The host must use a
 transparent HTML canvas area and transparent WebView background.
+The composition controller's `ParentWindow` is the same top-level HWND that
+owns its DirectComposition target. This follows the documented visual-host
+contract; the region-shaped WRY child is only the input sink. Parent resize
+handling retains that child HWND separately instead of deriving it from
+`controller.ParentWindow`, which would otherwise resize the top-level window.
+Mouse/pen forwarding and their input-child coordinate origin remain unchanged.
+This contract correction does not by itself prove that the observed stale
+underlay presentation issue is resolved; native menu/resize/reopen acceptance
+is still required. See Microsoft's
+[composition controller parent-window contract](https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/icorewebview2environment3?view=webview2-1.0.4129.50).
+
 The composition-only input sink uses `WS_EX_NOREDIRECTIONBITMAP`, because
 all visual content is supplied by the parent's composition target. The input
 HWND intentionally owns no visual pixels. This flag expresses that ownership;

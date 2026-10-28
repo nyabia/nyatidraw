@@ -30,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         visible: true,
         opacity_u16: u16::MAX,
         children: vec![LayerTreeNode::Raster(LayerNode {
+            mask: None,
             alpha_locked: false,
             clip_to_below: false,
             blend_mode: nyatidraw_api::LayerBlendMode::Normal,

@@ -9,6 +9,10 @@ use std::collections::VecDeque;
 mod morphology;
 pub use morphology::{grow_selection, select_layer_alpha, shrink_selection};
 
+#[path = "selection_feather.rs"]
+mod feather;
+pub use feather::feather_selection;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EditLimits {
     pub max_pixels: u64,
@@ -79,8 +83,7 @@ pub enum EditError {
     Tiles(TileSnapshotError),
 }
 
-/// Binary pixel-center coverage in a bounded signed document rectangle.
-/// Bytes are currently 0/1, not fractional antialias coverage.
+/// Immutable 0–255 coverage in a bounded signed document rectangle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectionMask {
     origin: [i32; 2],
@@ -93,13 +96,49 @@ pub struct SelectionMask {
 impl SelectionMask {
     /// Canonical row-major, least-significant-bit-first coverage. Unused tail
     /// bits are zero; this representation is bounded to 2 MiB.
+    /// # Panics
+    /// Panics if fractional coverage would be lost. Use `coverage_bytes` instead.
     #[must_use]
     pub fn packed_bits(&self) -> Vec<u8> {
+        assert!(
+            self.is_binary(),
+            "fractional coverage requires its own encoding"
+        );
         let mut packed = vec![0; self.selected.len().div_ceil(8)];
         for (index, selected) in self.selected.iter().enumerate() {
-            packed[index / 8] |= selected << (index % 8);
+            packed[index / 8] |= u8::from(*selected != 0) << (index % 8);
         }
         packed
+    }
+
+    #[must_use]
+    pub fn is_binary(&self) -> bool {
+        self.selected.iter().all(|value| matches!(value, 0 | 255))
+    }
+
+    #[must_use]
+    pub fn coverage_bytes(&self) -> &[u8] {
+        &self.selected
+    }
+
+    /// # Errors
+    /// Rejects invalid extents and lengths before copying untrusted coverage.
+    pub fn from_coverage_at(
+        origin: [i32; 2],
+        dimensions: [u32; 2],
+        coverage: &[u8],
+    ) -> Result<Self, EditError> {
+        let len = region_len(origin, dimensions, EditLimits::default())?;
+        if coverage.len() != len {
+            return Err(EditError::InvalidMask);
+        }
+        Ok(Self {
+            origin,
+            width: dimensions[0],
+            height: dimensions[1],
+            selected: coverage.to_vec(),
+            count: coverage.iter().filter(|&&value| value != 0).count() as u64,
+        })
     }
 
     /// Restores canonical binary coverage without trusting a serialized count.
@@ -127,9 +166,9 @@ impl SelectionMask {
             return Err(EditError::InvalidMask);
         }
         let selected: Vec<_> = (0..count)
-            .map(|index| (packed[index / 8] >> (index % 8)) & 1)
+            .map(|index| ((packed[index / 8] >> (index % 8)) & 1) * 255)
             .collect();
-        let count = selected.iter().map(|&value| u64::from(value)).sum();
+        let count = selected.iter().filter(|&&value| value != 0).count() as u64;
         Ok(Self {
             origin,
             width,
@@ -164,14 +203,23 @@ impl SelectionMask {
 
     #[must_use]
     pub fn contains_signed(&self, x: i32, y: i32) -> bool {
+        self.coverage_signed(x, y) != 0
+    }
+
+    #[must_use]
+    pub fn coverage_signed(&self, x: i32, y: i32) -> u8 {
         let [Ok(x), Ok(y)] = [
             i64::from(x) - i64::from(self.origin[0]),
             i64::from(y) - i64::from(self.origin[1]),
         ]
         .map(u32::try_from) else {
-            return false;
+            return 0;
         };
-        x < self.width && y < self.height && self.selected[pixel_index(self.width, x, y)] != 0
+        if x < self.width && y < self.height {
+            self.selected[pixel_index(self.width, x, y)]
+        } else {
+            0
+        }
     }
 
     /// Computes the selected pixel rectangle on the CPU editing worker.
@@ -232,7 +280,7 @@ fn region_len(origin: [i32; 2], size: [u32; 2], limits: EditLimits) -> Result<us
     usize::try_from(count).map_err(|_| EditError::LimitExceeded)
 }
 
-/// Selection boolean operations on document pixels, not mask-local indices.
+/// Selection coverage operations on document pixels, not mask-local indices.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SelectionCombine {
     Replace,
@@ -253,7 +301,7 @@ pub fn selection_all(
         origin,
         width: size[0],
         height: size[1],
-        selected: vec![1; count],
+        selected: vec![255; count],
         count: count as u64,
     })
 }
@@ -313,15 +361,15 @@ pub fn combine_selection(
                 .map_err(|_| EditError::CoordinateOutOfRange)?;
             let py = i32::try_from(i64::from(origin[1]) + i64::from(y))
                 .map_err(|_| EditError::CoordinateOutOfRange)?;
-            let a = current.contains_signed(px, py);
-            let b = incoming.contains_signed(px, py);
+            let a = current.coverage_signed(px, py);
+            let b = incoming.coverage_signed(px, py);
             let selected = match operation {
                 SelectionCombine::Replace => b,
-                SelectionCombine::Add => a || b,
-                SelectionCombine::Subtract => a && !b,
+                SelectionCombine::Add => a.max(b),
+                SelectionCombine::Subtract => a.saturating_sub(b),
             };
-            mask.selected[pixel_index(size[0], x, y)] = u8::from(selected);
-            mask.count += u64::from(selected);
+            mask.selected[pixel_index(size[0], x, y)] = selected;
+            mask.count += u64::from(selected != 0);
         }
     }
     Ok(mask)
@@ -441,8 +489,13 @@ pub fn sample_artwork_pixel(
     source: SelectionSource,
 ) -> Result<[u8; 4], EditError> {
     if source == SelectionSource::ActiveLayer {
-        tree.raster(active).ok_or(EditError::UnknownLayer)?;
-        return Ok(raster_pixel(snapshot, active, point));
+        let layer = tree.raster(active).ok_or(EditError::UnknownLayer)?;
+        return Ok(crate::apply_mask_pixel(
+            snapshot,
+            layer.mask,
+            point,
+            raster_pixel(snapshot, active, point),
+        ));
     }
     if source == SelectionSource::ReferenceLayers {
         let nodes = nyatidraw_document::composition_scope_nodes(
@@ -553,15 +606,7 @@ pub fn wand_selection(
         limits,
     )?;
     let source = if request.source == SelectionSource::ActiveLayer {
-        if tree
-            .ancestors(LayerTreeNodeId::Raster(request.active))
-            .is_none()
-        {
-            return Err(EditError::UnknownLayer);
-        }
-        snapshot
-            .crop_base_layer_rgba8_to_canvas(request.active, request.canvas)
-            .map_err(|error| EditError::Composite(CpuCompositeError::Flatten(error)))?
+        masked_layer_surface(snapshot, &source_tree, request.active, request.canvas)?
     } else {
         flatten_layer_tree_rgba8(snapshot, &source_tree, request.canvas)
             .map_err(EditError::Composite)?
@@ -612,9 +657,32 @@ pub fn wand_selection(
         }
     }
     for selected in &mut mask.selected {
-        *selected = u8::from(*selected == 1);
+        *selected = u8::from(*selected == 1) * 255;
     }
     Ok(mask)
+}
+
+fn masked_layer_surface(
+    snapshot: &TileSnapshot,
+    tree: &LayerTree,
+    target: LayerId,
+    canvas: CanvasSpec,
+) -> Result<nyatidraw_tiles::FlattenedRgba8, EditError> {
+    let layer = tree.raster(target).ok_or(EditError::UnknownLayer)?;
+    let mut image = snapshot
+        .crop_base_layer_rgba8_to_canvas(target, canvas)
+        .map_err(|error| EditError::Composite(CpuCompositeError::Flatten(error)))?;
+    if layer.mask.is_some_and(|mask| mask.enabled) {
+        for (index, pixel) in image.pixels.chunks_exact_mut(4).enumerate() {
+            let x = i32::try_from(index % canvas.width_px as usize)
+                .map_err(|_| EditError::CoordinateOutOfRange)?;
+            let y = i32::try_from(index / canvas.width_px as usize)
+                .map_err(|_| EditError::CoordinateOutOfRange)?;
+            let raw = [pixel[0], pixel[1], pixel[2], pixel[3]];
+            pixel.copy_from_slice(&crate::apply_mask_pixel(snapshot, layer.mask, [x, y], raw));
+        }
+    }
+    Ok(image)
 }
 
 /// Selects an even-odd polygon at pixel centers, clipped to the finite page.
@@ -697,7 +765,7 @@ pub fn lasso_selection(
             let start = boundary(pair[0]);
             let end = boundary(pair[1]);
             for x in start..end {
-                mask.selected[pixel_index(canvas.width_px, x, y)] = 1;
+                mask.selected[pixel_index(canvas.width_px, x, y)] = 255;
                 mask.count += 1;
             }
         }
@@ -872,7 +940,8 @@ pub fn paint_selection(
                 else {
                     continue;
                 };
-                if !mask.contains_signed(x, y) {
+                let coverage = mask.coverage_signed(x, y);
+                if coverage == 0 {
                     continue;
                 }
                 let offset = (row * TILE_EDGE + column) as usize * 4;
@@ -881,10 +950,14 @@ pub fn paint_selection(
                     crate::composite_source_atop(
                         &mut pixels[offset..offset + 4],
                         PremultipliedRgba8(source),
-                        1.0,
+                        f32::from(coverage) / 255.0,
                     );
                 } else {
-                    composite_surface(&mut pixels[offset..offset + 4], &source, u16::MAX);
+                    composite_surface(
+                        &mut pixels[offset..offset + 4],
+                        &source,
+                        u16::from(coverage) * 257,
+                    );
                 }
             }
         }
@@ -983,6 +1056,7 @@ mod tests {
 
     fn raster(id: u128, reference: bool, locked: bool) -> LayerTreeNode {
         LayerTreeNode::Raster(LayerNode {
+            mask: None,
             alpha_locked: false,
             clip_to_below: false,
             blend_mode: nyatidraw_api::LayerBlendMode::Normal,

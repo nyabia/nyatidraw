@@ -148,6 +148,9 @@ impl ActiveCanvas {
         &mut self,
         command: ColorAdjustmentCommand,
     ) -> Result<bool, CommandRejectReason> {
+        self.guard_mask_edit(&nyatidraw_api::EditCommand::ColorAdjustment(
+            command.clone(),
+        ))?;
         if self.transform_active() {
             return Err(CommandRejectReason::CommandQueueBusy);
         }
@@ -292,7 +295,13 @@ impl ActiveCanvas {
             keys.extend(previous.iter().map(|(key, _)| key));
         }
         keys.extend(outcome.tiles.iter().map(|(key, _)| key));
+        self.scene
+            .replace_mask_tiles(&outcome.tiles)
+            .map_err(|error| format!("Color adjustment masks: {error:?}"))?;
         for key in keys {
+            if self.scene.tree().raster(key.layer).is_none() {
+                continue;
+            }
             let pixels = outcome.tiles.get(key).map_or(
                 &TRANSPARENT_HISTORY_TILE[..],
                 nyatidraw_tiles::TileObject::pixels,
@@ -302,6 +311,8 @@ impl ActiveCanvas {
                 .map_err(|e| format!("색 보정 표시 실패: {e:?}"))?;
         }
         if outcome.committed {
+            self.adopt_mask_snapshot(&outcome.tiles)
+                .map_err(|error| format!("Color mask adoption: {error:?}"))?;
             CpuSnapshotAdoption::new(&mut self.cpu_tiles, &outcome.tiles).apply();
             self.projection.stage_history(outcome.history);
             let mut current = self.projection.current().clone();

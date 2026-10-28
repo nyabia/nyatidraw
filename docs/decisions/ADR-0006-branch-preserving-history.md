@@ -25,8 +25,12 @@ optional head ID and current immutable `ContentRootId`.
   order. This order is stable regardless of insertion and traversal history.
 - `redo_to` requires explicit direct-child selection and validates the stored
   parent/before-root transition before moving the cursor.
-- Convenience `redo` succeeds only for exactly one child. Multiple children
-  return `AmbiguousRedo`; it never guesses the last visited branch.
+- Convenience `redo` follows the child last visited in this session, including
+  the edit just undone. Without a session preference it succeeds only for one
+  child; multiple children still return `AmbiguousRedo`. Explicit selection
+  remains available and no branch is deleted. Preferences are not persisted;
+  reopening preserves the full graph and requires selection at an ambiguous
+  cursor until navigation establishes a preferred child.
 - Appending a new child after undo adds it to the parent child set and preserves
   all existing redo branches.
 - Reopen decodes the full persisted `history` table into the same ordered maps,

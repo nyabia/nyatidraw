@@ -166,6 +166,7 @@ fn tree() -> Result<LayerTree, nyatidraw_document::LayerTreeError> {
 
 fn raster(id: LayerId, name: &str) -> LayerTreeNode {
     LayerTreeNode::Raster(LayerNode {
+        mask: None,
         alpha_locked: false,
         clip_to_below: false,
         blend_mode: nyatidraw_api::LayerBlendMode::Normal,

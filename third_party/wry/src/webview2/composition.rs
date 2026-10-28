@@ -81,7 +81,9 @@ impl CompositionHost {
           B: 0,
         })?;
       }
-      env10.CreateCoreWebView2CompositionControllerWithOptions(hwnd, &options, &handler)?;
+      // WebView's parent must be the HWND containing its visual tree, not
+      // the independently region-shaped input sink.
+      env10.CreateCoreWebView2CompositionControllerWithOptions(parent, &options, &handler)?;
     }
     let controller = webview2_com::wait_with_pump(rx)??;
     let mut pending = PendingController(Some(controller.cast::<ICoreWebView2Controller>()?));
@@ -156,6 +158,7 @@ unsafe extern "system" fn input_proc(
   let ptr = data as *const Input;
   Rc::increment_strong_count(ptr);
   let state = Rc::from_raw(ptr);
+  super::focus_trace::message(hwnd, msg, wp, "input");
   if msg == WM_NCDESTROY {
     let _ = RemoveWindowSubclass(hwnd, Some(input_proc), SUBCLASS);
     return DefSubclassProc(hwnd, msg, wp, lp);
@@ -180,10 +183,9 @@ impl Input {
   ) -> windows::core::Result<Option<LRESULT>> {
     match msg {
       WM_SETFOCUS => {
-        self
-          .controller
-          .cast::<ICoreWebView2Controller>()?
-          .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)?;
+        super::focus_trace::move_focus(
+          &self.controller.cast::<ICoreWebView2Controller>()?, self.hwnd, "input-set-focus",
+        )?;
         return Ok(Some(LRESULT(0)));
       }
       WM_SETCURSOR if (lp.0 as u32 & 0xffff) == HTCLIENT => {
@@ -326,10 +328,9 @@ impl Input {
       self.buttons.set(self.buttons.get() | mask);
       SetCapture(self.hwnd);
       let _ = SetFocus(Some(self.hwnd));
-      self
-        .controller
-        .cast::<ICoreWebView2Controller>()?
-        .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)?;
+      super::focus_trace::move_focus(
+        &self.controller.cast::<ICoreWebView2Controller>()?, self.hwnd, "mouse-down",
+      )?;
     }
     if msg == WM_MOUSEMOVE && !self.tracking.get() {
       let mut track = TRACKMOUSEEVENT {
@@ -392,10 +393,9 @@ impl Input {
     let _ = ScreenToClient(self.hwnd, &mut native.ptPixelLocationRaw);
     if msg == WM_POINTERDOWN {
       let _ = SetFocus(Some(self.hwnd));
-      self
-        .controller
-        .cast::<ICoreWebView2Controller>()?
-        .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)?;
+      super::focus_trace::move_focus(
+        &self.controller.cast::<ICoreWebView2Controller>()?, self.hwnd, "pointer-down",
+      )?;
     }
     let info = self.environment.CreateCoreWebView2PointerInfo()?;
     info.SetPointerKind(native.pointerType.0 as u32)?;

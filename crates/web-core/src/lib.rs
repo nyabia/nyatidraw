@@ -18,13 +18,17 @@ use nyatidraw_paint_cpu::flatten_layer_tree_rgba8;
 use nyatidraw_tiles::color::{linear_premultiplied_to_srgb8, srgb8_to_linear_premultiplied};
 pub use nyatidraw_tiles::{TILE_BYTE_LEN, TILE_EDGE, TileKey, TileSnapshot};
 
+mod animation;
 mod codec;
 mod color_adjustment;
 mod drawing;
 mod editing;
 mod interchange;
+mod masks;
 mod transform;
 pub use interchange::WebPreferences;
+#[cfg(test)]
+mod animation_tests;
 #[cfg(test)]
 mod tests;
 
@@ -150,6 +154,7 @@ pub struct StrokePoint {
 pub struct CanvasUpdate {
     /// Includes removed keys: a missing snapshot entry means erase that GPU tile.
     pub dirty_tiles: Vec<TileKey>,
+    pub dirty_masks: Vec<nyatidraw_tiles::CoverageTileKey>,
     pub changed: bool,
     /// A completed artwork edit, not a transient brush preview or tool setting.
     pub committed: bool,
@@ -206,6 +211,7 @@ struct Artwork {
     tiles: TileSnapshot,
     layers: LayerTree,
     active: LayerId,
+    timeline: Option<nyatidraw_document::AnimationTimeline>,
 }
 
 /// Tool preferences are outside artwork history. Undo never changes brush/color.
@@ -220,6 +226,7 @@ pub struct WebDocument {
     evaluator: RoundBrushEvaluator,
     stroke: Option<drawing::ActiveStroke>,
     next_layer_id: u128,
+    raster_target: Option<nyatidraw_api::RasterEditTarget>,
     selection: Option<std::sync::Arc<nyatidraw_paint_cpu::SelectionMask>>,
     clipboard: nyatidraw_editor::pixel_edit::MemoryArtworkClipboard,
     pub edit_settings: nyatidraw_api::EditSettings,
@@ -229,6 +236,12 @@ pub struct WebDocument {
     color_adjustment: nyatidraw_editor::color_adjustment::ColorAdjustmentSession,
     color_adjustment_preview: Option<nyatidraw_editor::color_adjustment::ColorAdjustmentOutcome>,
     revision: u128,
+    active_frame: Option<nyatidraw_api::FrameId>,
+    playback_frame: Option<nyatidraw_api::FrameId>,
+    playback_tree: Option<LayerTree>,
+    animation_display: Option<nyatidraw_editor::animation_display::FrameDisplay>,
+    render_tree: Option<LayerTree>,
+    render_preview_tree: Option<LayerTree>,
 }
 
 impl Default for WebDocument {
@@ -262,6 +275,7 @@ impl WebDocument {
                     children: vec![LayerTreeNode::Raster(new_layer(LayerId(1), "Layer 1"))],
                 })?,
                 active: LayerId(1),
+                timeline: None,
             },
             undo: VecDeque::new(),
             redo: Vec::new(),
@@ -272,6 +286,7 @@ impl WebDocument {
             evaluator: RoundBrushEvaluator::default(),
             stroke: None,
             next_layer_id: 2,
+            raster_target: None,
             selection: None,
             clipboard: nyatidraw_editor::pixel_edit::MemoryArtworkClipboard::default(),
             edit_settings: nyatidraw_api::EditSettings::default(),
@@ -281,6 +296,12 @@ impl WebDocument {
             color_adjustment: nyatidraw_editor::color_adjustment::ColorAdjustmentSession::default(),
             color_adjustment_preview: None,
             revision: 1,
+            active_frame: None,
+            playback_frame: None,
+            playback_tree: None,
+            animation_display: None,
+            render_tree: None,
+            render_preview_tree: None,
         })
     }
 
@@ -374,11 +395,11 @@ impl WebDocument {
     /// Rejects unknown layers or changing the drawing target mid-stroke.
     pub fn set_active_layer(&mut self, layer: LayerId) -> Result<(), WebError> {
         self.require_idle()?;
-        self.artwork
-            .layers
+        self.render_layers()
             .raster(layer)
             .ok_or(WebError::InvalidLayer)?;
         self.artwork.active = layer;
+        self.raster_target = Some(nyatidraw_api::RasterEditTarget::Image(layer));
         Ok(())
     }
 
@@ -390,7 +411,8 @@ impl WebDocument {
         if name.trim().is_empty() || name.chars().count() > 128 {
             return Err(WebError::InvalidLayer);
         }
-        if self.layers().root().children.len() >= MAX_LAYERS {
+        let mut tree = self.edit_tree()?;
+        if crate::editing::node_count(&tree) >= MAX_LAYERS {
             return Err(WebError::LimitExceeded);
         }
         let id = LayerId(self.next_layer_id);
@@ -399,12 +421,14 @@ impl WebDocument {
             .checked_add(1)
             .ok_or(WebError::LimitExceeded)?;
         let mut artwork = self.artwork.clone();
-        artwork.layers.insert(
-            artwork.layers.root_id(),
-            artwork.layers.root().children.len(),
+        tree.insert(
+            tree.root_id(),
+            tree.root().children.len(),
             LayerTreeNode::Raster(new_layer(id, name.trim())),
         )?;
+        artwork.layers = self.merge_edit_tree(&tree)?;
         artwork.active = id;
+        crate::editing::validate_artwork(&artwork)?;
         let update = self.commit_artwork(artwork);
         self.next_layer_id = next;
         Ok(update)
@@ -414,25 +438,28 @@ impl WebDocument {
     /// Rejects deleting the final layer, a live stroke, or unknown layer IDs.
     pub fn delete_layer(&mut self, layer: LayerId) -> Result<CanvasUpdate, WebError> {
         self.require_idle()?;
-        if self.layers().root().children.len() <= 1 {
+        let mut tree = self.edit_tree()?;
+        if nyatidraw_editor::layer_edit::raster_layer_ids(&tree).len() <= 1 {
             return Err(WebError::InvalidLayer);
         }
         let mut artwork = self.artwork.clone();
-        artwork.layers.remove(LayerTreeNodeId::Raster(layer))?;
-        artwork.tiles = TileSnapshot::from_objects(
+        tree.remove(LayerTreeNodeId::Raster(layer))?;
+        artwork.layers = self.merge_edit_tree(&tree)?;
+        artwork.tiles = TileSnapshot::from_planes(
             artwork
                 .tiles
                 .iter()
                 .filter(|(key, _)| key.layer != layer)
                 .map(|(key, tile)| (key, tile.clone())),
+            artwork
+                .tiles
+                .coverage_iter()
+                .filter(|(key, _)| artwork.layers.mask_ids().contains(&key.mask))
+                .map(|(key, tile)| (key, tile.clone())),
         )
         .map_err(|_| WebError::InvalidPixels)?;
-        if artwork.active == layer {
-            let Some(LayerTreeNode::Raster(first)) = artwork.layers.root().children.last() else {
-                return Err(WebError::InvalidLayer);
-            };
-            artwork.active = first.id;
-        }
+        artwork.active = nyatidraw_editor::layer_edit::valid_active_layer(&tree, artwork.active);
+        crate::editing::validate_artwork(&artwork)?;
         Ok(self.commit_artwork(artwork))
     }
 
@@ -536,11 +563,16 @@ impl WebDocument {
             return Err(WebError::LayerUnavailable);
         }
         let mut artwork = self.artwork.clone();
-        artwork.tiles = TileSnapshot::from_objects(
+        artwork.tiles = TileSnapshot::from_planes(
             artwork
                 .tiles
                 .iter()
                 .filter(|(key, _)| key.layer != artwork.active)
+                .map(|(key, tile)| (key, tile.clone())),
+            artwork
+                .tiles
+                .coverage_iter()
+                .filter(|(key, _)| artwork.layers.mask_ids().contains(&key.mask))
                 .map(|(key, tile)| (key, tile.clone())),
         )
         .map_err(|_| WebError::InvalidPixels)?;
@@ -559,6 +591,7 @@ impl WebDocument {
         let update = difference(&self.artwork, &previous, true);
         self.redo
             .push(std::mem::replace(&mut self.artwork, previous));
+        self.refresh_frame_projection();
         Ok(update)
     }
 
@@ -574,6 +607,7 @@ impl WebDocument {
         let update = difference(&self.artwork, &next, true);
         self.undo
             .push_back(std::mem::replace(&mut self.artwork, next));
+        self.refresh_frame_projection();
         Ok(update)
     }
 
@@ -593,9 +627,10 @@ impl WebDocument {
     /// Rejects an active stroke or invalid composite data.
     pub fn export_rgba8(&self) -> Result<Vec<u8>, WebError> {
         self.require_idle()?;
-        let mut image = flatten_layer_tree_rgba8(self.snapshot(), self.layers(), self.canvas())
-            .map_err(|_| WebError::InvalidPixels)?
-            .pixels;
+        let mut image =
+            flatten_layer_tree_rgba8(self.snapshot(), self.render_layers(), self.canvas())
+                .map_err(|_| WebError::InvalidPixels)?
+                .pixels;
         for pixel in image.chunks_exact_mut(4) {
             let rgba = [pixel[0], pixel[1], pixel[2], pixel[3]];
             pixel.copy_from_slice(&linear_premultiplied_to_srgb8(rgba).unwrap_or([0; 4]));
@@ -654,7 +689,10 @@ impl WebDocument {
     ) -> Result<CanvasUpdate, WebError> {
         self.require_idle()?;
         let mut artwork = self.artwork.clone();
-        edit(&mut artwork.layers)?;
+        let mut tree = self.edit_tree()?;
+        edit(&mut tree)?;
+        artwork.layers = self.merge_edit_tree(&tree)?;
+        editing::validate_artwork(&artwork)?;
         Ok(self.commit_artwork(artwork))
     }
 
@@ -677,6 +715,7 @@ impl WebDocument {
             self.undo
                 .push_back(std::mem::replace(&mut self.artwork, next));
             self.trim_history();
+            self.refresh_frame_projection();
         }
         update
     }
@@ -696,18 +735,27 @@ impl WebDocument {
 
     fn resident_bytes(&self) -> usize {
         let mut pixels = BTreeSet::new();
+        let mut coverage = BTreeSet::new();
         let mut metadata = 0;
         for state in std::iter::once(&self.artwork)
             .chain(self.undo.iter())
             .chain(self.redo.iter())
             .chain(self.stroke.iter().map(|stroke| &stroke.before))
         {
-            metadata += state.tiles.len() * 256 + state.layers.root().children.len() * 1024;
+            metadata += state.tiles.total_len() * 256 + editing::node_count(&state.layers) * 1024;
+            metadata += state.timeline.as_ref().map_or(0, |timeline| {
+                timeline.frames().len() * 64 + timeline.cels().len() * 64
+            });
             for (_, tile) in state.tiles.iter() {
                 pixels.insert(tile.pixels().as_ptr() as usize);
             }
+            for (_, tile) in state.tiles.coverage_iter() {
+                coverage.insert(tile.hash());
+            }
         }
-        pixels.len() * TILE_BYTE_LEN + metadata
+        pixels.len() * TILE_BYTE_LEN
+            + coverage.len() * nyatidraw_tiles::COVERAGE_TILE_BYTE_LEN
+            + metadata
     }
 }
 
@@ -724,6 +772,7 @@ fn validate_canvas(canvas: CanvasSpec) -> Result<(), WebError> {
 
 fn new_layer(id: LayerId, name: &str) -> LayerNode {
     LayerNode {
+        mask: None,
         id,
         name: name.to_owned(),
         visible: true,
@@ -745,7 +794,9 @@ fn difference(before: &Artwork, after: &Artwork, committed: bool) -> CanvasUpdat
         .chain(after.tiles.iter())
         .map(|(key, _)| key)
         .collect();
-    let layout_changed = before.layers != after.layers || before.canvas != after.canvas;
+    let layout_changed = before.layers != after.layers
+        || before.canvas != after.canvas
+        || before.timeline != after.timeline;
     if !layout_changed {
         keys.retain(|key| {
             before
@@ -755,9 +806,27 @@ fn difference(before: &Artwork, after: &Artwork, committed: bool) -> CanvasUpdat
                 != after.tiles.get(*key).map(nyatidraw_tiles::TileObject::hash)
         });
     }
-    let changed = !keys.is_empty() || layout_changed || before.active != after.active;
+    let mut masks: BTreeSet<_> = before
+        .tiles
+        .coverage_iter()
+        .chain(after.tiles.coverage_iter())
+        .map(|(key, _)| key)
+        .collect();
+    masks.retain(|key| {
+        before
+            .tiles
+            .get_coverage(*key)
+            .map(nyatidraw_tiles::CoverageTileObject::hash)
+            != after
+                .tiles
+                .get_coverage(*key)
+                .map(nyatidraw_tiles::CoverageTileObject::hash)
+    });
+    let changed =
+        !keys.is_empty() || !masks.is_empty() || layout_changed || before.active != after.active;
     CanvasUpdate {
         dirty_tiles: keys.into_iter().collect(),
+        dirty_masks: masks.into_iter().collect(),
         changed,
         committed: committed && changed,
         structure_changed: layout_changed,

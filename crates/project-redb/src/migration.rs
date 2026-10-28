@@ -8,9 +8,7 @@ use std::{
 
 use redb::ReadableDatabase;
 
-use super::{
-    COMPRESSED_TILE_SCHEMA_FLAG, Envelope, ProjectDb, ProjectOpenError, RecordKind, root_codec,
-};
+use super::{COMPRESSED_TILE_SCHEMA_FLAG, Envelope, ProjectDb, ProjectOpenError, root_codec};
 
 const STORAGE_REVISION: &str = "tile_storage_revision";
 
@@ -221,7 +219,7 @@ fn rebuild_storage(source: &redb::Database, target: &Path) -> Result<(), String>
                     let mut dest = write.open_table(super::OBJECTS)?;
                     for entry in table.iter()? {
                         let (key, value) = entry?;
-                        let tile = Envelope::decode(value.value(), RecordKind::Tile)?;
+                        let tile = Envelope::decode_tile_object(value.value())?;
                         let encoded = tile.encode_for_storage();
                         dest.insert(key.value(), encoded.as_slice())?;
                     }
@@ -236,7 +234,8 @@ fn rebuild_storage(source: &redb::Database, target: &Path) -> Result<(), String>
                         dest.insert(key.value(), encoded.as_slice())?;
                     }
                 }
-                "history" | "snapshots" | "strokes" | "snapshot_layers" | "snapshot_canvas" => {
+                "history" | "snapshots" | "strokes" | "snapshot_layers" | "snapshot_canvas"
+                | "snapshot_animation" => {
                     copy_table!(&[u8], &[u8]);
                 }
                 _ => return Err(format!("unknown project table {name}").into()),
@@ -329,7 +328,7 @@ macro_rules! record_digest {
                     }
                 }
                 "objects" | "roots" | "history" | "snapshots" | "strokes" | "snapshot_layers"
-                | "snapshot_canvas" => {
+                | "snapshot_canvas" | "snapshot_animation" => {
                     let table = tx
                         .open_table(TableDefinition::<&[u8], &[u8]>::new(&name))
                         .map_err(|e| e.to_string())?;
@@ -337,7 +336,7 @@ macro_rules! record_digest {
                         let (k, v) = entry.map_err(|e| e.to_string())?;
                         if name == "objects" {
                             // Canonical decoded pixels/checksum, independent of codec.
-                            let tile = Envelope::decode(v.value(), RecordKind::Tile)
+                            let tile = Envelope::decode_tile_object(v.value())
                                 .map_err(|e| e.to_string())?;
                             row(k.value(), &tile.encode());
                         } else if name == "roots" {
@@ -412,7 +411,7 @@ pub(super) mod tests {
                         .unwrap();
                     for entry in table.iter().unwrap() {
                         let (key, value) = entry.unwrap();
-                        let raw = Envelope::decode(value.value(), RecordKind::Tile)
+                        let raw = Envelope::decode_tile_object(value.value())
                             .unwrap()
                             .encode();
                         dest.insert(key.value(), raw.as_slice()).unwrap();

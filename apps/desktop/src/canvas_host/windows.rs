@@ -33,6 +33,7 @@ use windows::Win32::{
 struct Region(HRGN);
 pub(crate) fn restore_input(router: &CanvasInputRouter) {
     // Restore the full input sink when the canvas observer stops.
+    router.installed_region.set(None);
     if router.input_live.get() {
         unsafe { SetWindowRgn(router.input, None, true) };
     }
@@ -76,15 +77,7 @@ pub(crate) fn apply_input_layout(
     let hwnd = HWND(input_hwnd as *mut core::ffi::c_void);
     let mut client = RECT::default();
     unsafe { GetClientRect(hwnd, &raw mut client) }.map_err(|error| error.to_string())?;
-    let outer = rect_region([client.left, client.top, client.right, client.bottom])?;
-    let input = rect_region([client.left, client.top, client.right, client.bottom])?;
     let [x, y, width, height, scale] = layout.canvas;
-    let canvas = rect_region(physical([x, y, width, height], scale))?;
-    // SAFETY: all handles are owned valid GDI regions. An empty region is valid;
-    // ERROR (zero) is not confused with NULLREGION (one).
-    if unsafe { CombineRgn(Some(input.0), Some(outer.0), Some(canvas.0), RGN_DIFF) }.0 == 0 {
-        return Err("subtract native canvas input region".into());
-    }
     // No input-only HWND overlaps the canvas, even under a full-screen modal.
     // The canvas subclass forwards only UI-owned events using these rectangles.
     router.state.borrow_mut().regions = layout
@@ -92,9 +85,27 @@ pub(crate) fn apply_input_layout(
         .iter()
         .map(|rect| physical(*rect, scale))
         .collect();
+    let region = InputRegionGeometry {
+        client: [client.left, client.top, client.right, client.bottom],
+        canvas: physical([x, y, width, height], scale),
+    };
+    // Popup hit regions change without changing the HWND's canvas cutout.
+    // Reinstalling that same cutout needlessly invalidates native presentation.
+    if router.installed_region.get() == Some(region) {
+        return Ok(());
+    }
+    let outer = rect_region(region.client)?;
+    let input = rect_region(region.client)?;
+    let canvas = rect_region(region.canvas)?;
+    // SAFETY: all handles are owned valid GDI regions. An empty region is valid;
+    // ERROR (zero) is not confused with NULLREGION (one).
+    if unsafe { CombineRgn(Some(input.0), Some(outer.0), Some(canvas.0), RGN_DIFF) }.0 == 0 {
+        return Err("subtract native canvas input region".into());
+    }
     if unsafe { CombineRgn(Some(input.0), Some(input.0), Some(outer.0), RGN_AND) }.0 == 0 {
         return Err("bound UI input region".into());
     }
+    router.installed_region.set(None);
     if unsafe { SetWindowRgn(hwnd, Some(input.0), true) } == 0 {
         return Err("install UI input region".into());
     }
@@ -115,6 +126,7 @@ pub(crate) fn apply_input_layout(
         )
     }
     .map_err(|error| error.to_string())?;
+    router.installed_region.set(Some(region));
     Ok(())
 }
 
@@ -123,6 +135,11 @@ const ROUTER_SUBCLASS: usize = 0x4e59_5254;
 enum Owner {
     Canvas,
     Ui,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct InputRegionGeometry {
+    client: [i32; 4],
+    canvas: [i32; 4],
 }
 #[derive(Default)]
 struct RoutingState {
@@ -138,6 +155,7 @@ pub(crate) struct CanvasInputRouter {
     input: HWND,
     canvas_live: Cell<bool>,
     input_live: Cell<bool>,
+    installed_region: Cell<Option<InputRegionGeometry>>,
     state: RefCell<RoutingState>,
     on_canvas_focus: Rc<dyn Fn()>,
 }
@@ -168,6 +186,7 @@ impl CanvasInputRouter {
             input: HWND(input as _),
             canvas_live: Cell::new(true),
             input_live: Cell::new(true),
+            installed_region: Cell::new(None),
             state: RefCell::new(RoutingState::default()),
             on_canvas_focus,
         });

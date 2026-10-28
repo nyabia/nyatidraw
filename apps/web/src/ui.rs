@@ -30,6 +30,7 @@ pub fn App() -> Element {
         integration_busy: use_signal(|| false),
         integration_closed: use_signal(|| false),
         copying_png: use_signal(|| false),
+        exporting_png: use_signal(|| false),
     };
     use_context_provider(|| editor);
     let backend = use_hook(|| WebUiBackend::new(&editor));
@@ -75,7 +76,8 @@ pub fn App() -> Element {
         document::Link { rel: "stylesheet", href: HOST_STYLE }
         document::Meta { name: "theme-color", content: "#242424" }
         div { class: "browser-editor-root", "inert": if modal.is_some() || (editor.integration_busy)() || (editor.integration_closed)() { Some("") } else { None },
-            EditorChrome { ui_projection: projection, export_status: ExportStatus::Idle, overlays: rsx! { BrowserNotice {} BrowserPicker {} } }
+            EditorChrome { ui_projection: projection, export_status: ExportStatus::Idle,
+                host_update: (editor.revision)(), overlays: rsx! { BrowserNotice {} BrowserPicker {} } }
         }
         if crate::browser::is_hosted() {
             nav { class: "browser-integration-bar", aria_label: "호스트 편집 명령",
@@ -119,6 +121,9 @@ fn BrowserCanvas() -> Element {
 #[component]
 fn BrowserFileButtons(extended: bool) -> Element {
     let editor = use_context::<Editor>();
+    let host = use_context::<UiHost>();
+    let projection = host.protocol_snapshot().0;
+    let canvas = projection.canvas;
     let mut importing = use_signal(|| false);
     let ready = (editor.ready)();
     rsx! {
@@ -141,6 +146,12 @@ fn BrowserFileButtons(extended: bool) -> Element {
             }
             button { class: "command", disabled: !ready, onclick: move |_| editor.download_project(), "작업 파일 저장" }
             button { class: "command", disabled: !ready, onclick: move |_| editor.download_png(), "PNG 내보내기" }
+            crate::sprite_export::SpriteExportButton {}
+            nyatidraw_editor_ui::scaled_export::ScaledExportButton {
+                source: [canvas.width_px, canvas.height_px],
+                disabled: !ready || (editor.exporting_png)() || projection.edit.busy || projection.edit.transform.is_some() || projection.edit.color_adjustment.is_some(),
+                onexport: move |size| editor.download_scaled_png(size),
+            }
         }
         button { class: if extended { "command" } else { "command compact" }, title: "그림 전체를 PNG로 복사", aria_label: "PNG 복사", disabled: !ready || (editor.copying_png)(),
             onclick: move |_| editor.copy_png(),

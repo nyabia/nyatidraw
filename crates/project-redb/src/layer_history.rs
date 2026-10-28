@@ -317,7 +317,7 @@ impl ProjectDb {
             .map_or(0, |value| value.value());
         let envelope =
             decode_envelope(RecordKind::LayerTree, record).map_err(|error| self.io(error))?;
-        let color_flag = if envelope.payload.get(..2) == Some(&[4, 0]) {
+        let color_flag = if matches!(envelope.payload.get(..2), Some([4 | 5, 0])) {
             LAYER_COLOR_EFFECT_SCHEMA_FLAG
         } else {
             0
@@ -325,7 +325,14 @@ impl ProjectDb {
         metadata
             .insert(
                 "schema_version",
-                schema | LAYER_COMPOSITING_SCHEMA_FLAG | color_flag,
+                schema
+                    | LAYER_COMPOSITING_SCHEMA_FLAG
+                    | color_flag
+                    | if envelope.payload.get(..2) == Some(&[5, 0]) {
+                        nyatidraw_project::MASK_SCHEMA_FLAG
+                    } else {
+                        0
+                    },
             )
             .map_err(|error| self.io(error))?;
         Ok(())
@@ -347,6 +354,11 @@ impl ProjectDb {
         let required = match payload.get(..2) {
             Some([3, 0]) => LAYER_COMPOSITING_SCHEMA_FLAG,
             Some([4, 0]) => LAYER_COMPOSITING_SCHEMA_FLAG | LAYER_COLOR_EFFECT_SCHEMA_FLAG,
+            Some([5, 0]) => {
+                LAYER_COMPOSITING_SCHEMA_FLAG
+                    | LAYER_COLOR_EFFECT_SCHEMA_FLAG
+                    | nyatidraw_project::MASK_SCHEMA_FLAG
+            }
             _ => 0,
         };
         if required == 0 {

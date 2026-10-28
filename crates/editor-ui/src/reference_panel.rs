@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use dioxus::prelude::*;
-use nyatidraw_api::LayerId;
+use nyatidraw_api::{EditorCommand, LayerId, ToolCommand, UiProjection};
 
 pub const MAX_REFERENCE_BYTES: usize = 72 * 1024 * 1024;
 const MAX_REFERENCE_EDGE: u32 = 4096;
@@ -19,6 +19,7 @@ struct ReferenceSession {
     active_load: Option<u64>,
     error: Option<String>,
     show_reference: bool,
+    pick_color: bool,
     zoom: f64,
     pan: [f64; 2],
 }
@@ -142,13 +143,75 @@ pub fn decode_reference_png(bytes: &[u8], name: String) -> Result<Arc<ReferenceF
 }
 
 #[component]
-pub(crate) fn ReferencePanel() -> Element {
+pub(crate) fn ReferencePanel(ui_projection: Signal<UiProjection>) -> Element {
     let mut reference = use_context::<ReferenceState>();
+    let live_ink = use_context::<crate::UiHost>();
     let loader = use_context::<crate::UiSlots>().reference_loader;
     let mut drag = use_signal(|| None::<(i32, [f64; 2], [f64; 2])>);
+    let mut command_error = use_signal(|| Option::<String>::None);
+    let rgba = ui_projection
+        .read()
+        .brush_color
+        .map(|channel| channel.to_string())
+        .join(",");
+    let epoch = live_ink.project_epoch();
+    use_effect(move || {
+        let live_ink = live_ink.clone();
+        spawn(async move {
+            let mut events = document::eval(include_str!("reference_picker.js"));
+            while let Ok([value, epoch, previous_color, generation]) =
+                events.recv::<[String; 4]>().await
+            {
+                let Some(values) = value
+                    .split(',')
+                    .map(|part| part.parse::<u8>().ok())
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                let (Ok(color), Ok(epoch), Ok(generation)) = (
+                    <[u8; 4]>::try_from(values),
+                    epoch.parse::<u64>(),
+                    generation.parse::<u64>(),
+                ) else {
+                    continue;
+                };
+                let state = reference.0.read();
+                if !state.show_reference
+                    || !state.pick_color
+                    || state.frame.is_none()
+                    || generation != state.generation
+                {
+                    continue;
+                }
+                drop(state);
+                let projection = live_ink.protocol_snapshot().0;
+                let current_color = projection
+                    .brush_color
+                    .map(|channel| channel.to_string())
+                    .join(",");
+                if color[3] != 255
+                    || epoch != live_ink.project_epoch()
+                    || previous_color != current_color
+                {
+                    continue;
+                }
+                command_error.set(
+                    live_ink
+                        .push_editor_command(
+                            projection.revision,
+                            EditorCommand::Tool(ToolCommand::SetColor(color)),
+                        )
+                        .err(),
+                );
+            }
+        });
+    });
     let state = reference.0.read();
     let frame = state.frame.clone();
     let error = state.error.clone();
+    let generation = state.generation;
+    let pick_color = state.pick_color;
     let image_style = format!(
         "transform:translate({}px,{}px) scale({});",
         state.pan[0], state.pan[1], state.zoom
@@ -156,13 +219,23 @@ pub(crate) fn ReferencePanel() -> Element {
     let percent = format!("{:.0}%", state.zoom * 100.0);
     drop(state);
     rsx! {
-        div { class: "reference-panel",
+        div { id: "reference-panel", class: "reference-panel",
+            "data-color-rgba": "{rgba}", "data-color-epoch": "{epoch}",
+            "data-reference-generation": "{generation}", "data-reference-pick": "{pick_color}",
             div { class: "reference-actions",
                 {loader(reference)}
+                button { class: "command compact", title: "참조 색 채취: 누른 채 미리 보고 놓아서 확정 · Esc 취소", aria_label: "참조 색 채취", aria_pressed: pick_color,
+                    onclick: move |_| {
+                        drag.set(None);
+                        reference.0.write().pick_color = !pick_color;
+                    },
+                    crate::UiIcon { name: "eyedropper" }
+                }
                 button { class: "command compact", title: "참조 이미지 비우기", onclick: move |_| reference.clear(), "×" }
             }
             div { class: "reference-view", aria_label: "참조 이미지 보기",
                 onpointerdown: move |event| {
+                    if reference.0.read().pick_color { return; }
                     if event.data().trigger_button() != Some(dioxus::html::input_data::MouseButton::Primary) { return; }
                     event.prevent_default();
                     event.stop_propagation();
@@ -186,6 +259,7 @@ pub(crate) fn ReferencePanel() -> Element {
                 } else {
                     span { class: "reference-empty", "PNG 참조 이미지" }
                 }
+                span { class: "reference-color-preview", hidden: true, aria_hidden: "true" }
             }
             div { class: "reference-actions",
                 button { class: "command compact", title: "참조 이미지 맞춤", onclick: move |_| reference.fit(), crate::UiIcon { name: "fit" } }
@@ -194,6 +268,7 @@ pub(crate) fn ReferencePanel() -> Element {
                 button { class: "command compact", title: "참조 이미지 확대", onclick: move |_| reference.zoom_by(1.25), crate::UiIcon { name: "plus" } }
             }
             if let Some(error) = error { p { class: "reference-error", role: "alert", "{error}" } }
+            if let Some(error) = command_error() { p { class: "reference-error", role: "alert", "{error}" } }
         }
     }
 }

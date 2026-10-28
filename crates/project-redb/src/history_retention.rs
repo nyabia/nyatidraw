@@ -130,6 +130,7 @@ impl ProjectDb {
         for definition in [
             layer_history::SNAPSHOT_LAYERS,
             canvas_history::SNAPSHOT_CANVAS,
+            super::animation_history::SNAPSHOT_ANIMATION,
         ] {
             // Opening a missing table would falsely enable metadata history.
             if tx.list_tables().map_err(|e| self.io(e))?.any(|handle| {

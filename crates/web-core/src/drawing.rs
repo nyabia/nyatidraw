@@ -18,13 +18,16 @@ const MAX_UPDATE_TILES: usize = 128;
 
 pub(super) struct ActiveStroke {
     pub(super) before: Artwork,
-    token: RoundBrushStroke,
+    token: Option<RoundBrushStroke>,
     preset: BrushPreset,
     smoother: StrokeSmoother,
     last: StylusSample,
     color: PremultipliedRgba8,
     erase: bool,
     alpha_locked: bool,
+    mask: Option<nyatidraw_document::LayerMask>,
+    mask_work: nyatidraw_paint_cpu::MaskStrokeBudget,
+    selection: Option<std::sync::Arc<nyatidraw_paint_cpu::SelectionMask>>,
     dabs: usize,
 }
 
@@ -56,23 +59,32 @@ impl WebDocument {
         self.require_idle()?;
         let mut sample = make_sample(point, 1, PointerPhase::Begin)?;
         let layer = self
-            .layers()
+            .render_layers()
             .raster(self.active_layer())
             .ok_or(WebError::InvalidLayer)?;
-        if !layer.visible || layer.locked || (layer.alpha_locked && self.tool == WebTool::Eraser) {
+        let mask = matches!(
+            self.raster_target(),
+            nyatidraw_api::RasterEditTarget::Mask { .. }
+        )
+        .then_some(layer.mask)
+        .flatten();
+        if !layer.visible
+            || layer.locked
+            || (mask.is_none() && layer.alpha_locked && self.tool == WebTool::Eraser)
+        {
             return Err(WebError::LayerUnavailable);
         }
         let visible = nyatidraw_document::composition_scope_nodes(
-            self.layers().root(),
+            self.render_layers().root(),
             nyatidraw_document::CompositionScope::Solo(self.solo.unwrap_or(
-                nyatidraw_api::LayerTreeNodeId::Group(self.layers().root_id()),
+                nyatidraw_api::LayerTreeNodeId::Group(self.render_layers().root_id()),
             )),
         );
         if !visible.contains(&nyatidraw_api::LayerTreeNodeId::Raster(self.active_layer())) {
             return Err(WebError::LayerUnavailable);
         }
         sample.eraser = self.tool == WebTool::Eraser;
-        let alpha_locked = layer.alpha_locked;
+        let alpha_locked = mask.is_none() && layer.alpha_locked;
         let preset = self.brush_preset();
         let mut smoother = StrokeSmoother::new(self.brush_settings().smoothing);
         let sample = smoother
@@ -82,13 +94,16 @@ impl WebDocument {
         let token = begin_round_stroke(&mut self.evaluator, &preset, sample, &mut dabs);
         self.stroke = Some(ActiveStroke {
             before: self.artwork.clone(),
-            token,
+            token: Some(token),
             preset,
             smoother,
             last: sample,
             color: PremultipliedRgba8(srgb8_to_linear_premultiplied(self.foreground)),
             erase: sample.eraser,
             alpha_locked,
+            mask,
+            mask_work: nyatidraw_paint_cpu::MaskStrokeBudget::default(),
+            selection: self.selection.clone(),
             dabs: 1,
         });
         self.paint_or_cancel(&dabs)
@@ -106,8 +121,17 @@ impl WebDocument {
     /// Invalid input or exhausted work bounds cancel the stroke. No-op paint is not an error.
     pub fn end_stroke(&mut self, point: StrokePoint) -> Result<CanvasUpdate, WebError> {
         self.advance_stroke(point, PointerPhase::End)?;
+        let token = self
+            .stroke
+            .as_mut()
+            .and_then(|stroke| stroke.token.take())
+            .ok_or(WebError::NoStroke)?;
+        let mut dabs = Vec::new();
+        self.evaluator.end(token, &mut dabs);
+        if !dabs.is_empty() {
+            self.paint_or_cancel(&dabs)?;
+        }
         let stroke = self.stroke.take().ok_or(WebError::NoStroke)?;
-        self.evaluator.end(stroke.token, &mut Vec::new());
         let update = difference(&stroke.before, &self.artwork, true);
         if update.changed {
             self.redo.clear();
@@ -136,7 +160,7 @@ impl WebDocument {
         }
         let pixel = nyatidraw_paint_cpu::sample_display_pixel(
             self.snapshot(),
-            self.layers(),
+            self.render_layers(),
             [x, y],
             self.solo,
         )
@@ -181,9 +205,10 @@ impl WebDocument {
             return Err(WebError::LimitExceeded);
         }
         let mut dabs = Vec::new();
-        self.evaluator.push(&mut stroke.token, &[sample], &mut dabs);
+        let token = stroke.token.as_mut().ok_or(WebError::NoStroke)?;
+        self.evaluator.push(token, &[sample], &mut dabs);
         stroke.dabs += dabs.len();
-        if stroke.token.is_discontinuous() || stroke.dabs > MAX_DABS_PER_STROKE {
+        if token.is_discontinuous() || stroke.dabs > MAX_DABS_PER_STROKE {
             return Err(WebError::LimitExceeded);
         }
         stroke.last = sample;
@@ -200,9 +225,37 @@ impl WebDocument {
         }
     }
 
+    fn paint_mask_dabs(&mut self, dabs: &[BrushDab]) -> Result<CanvasUpdate, WebError> {
+        let stroke = self.stroke.as_mut().ok_or(WebError::NoStroke)?;
+        let mask = stroke.mask.ok_or(WebError::InvalidLayer)?;
+        stroke.mask_work.admit(dabs).map_err(|_| WebError::EditRejected(
+            "마스크 획의 안전한 작업 한도를 넘어 현재 선을 취소했습니다. 더 짧게 나누어 그려주세요.".into()
+        ))?;
+        let mut next = self.artwork.clone();
+        next.tiles = nyatidraw_paint_cpu::paint_mask_dabs(
+            &next.tiles,
+            mask,
+            dabs,
+            stroke.color,
+            stroke.erase,
+            stroke.selection.as_deref(),
+            nyatidraw_paint_cpu::EditLimits::default(),
+        )
+        .map_err(|error| WebError::EditRejected(format!("마스크 획: {error:?}")))?;
+        if next.tiles.total_len() > MAX_RESIDENT_TILES {
+            return Err(WebError::LimitExceeded);
+        }
+        let update = difference(&self.artwork, &next, false);
+        self.artwork = next;
+        Ok(update)
+    }
+
     #[allow(clippy::cast_possible_truncation)]
     fn paint_dabs(&mut self, dabs: &[BrushDab]) -> Result<CanvasUpdate, WebError> {
         let stroke = self.stroke.as_ref().ok_or(WebError::NoStroke)?;
+        if stroke.mask.is_some() {
+            return self.paint_mask_dabs(dabs);
+        }
         let mut work = 0.0;
         let mut tiles: BTreeMap<TileKey, CpuCanvas> = BTreeMap::new();
         for &dab in dabs {
@@ -243,15 +296,7 @@ impl WebDocument {
                         );
                     }
                     let canvas = tiles.get_mut(&key).ok_or(WebError::InvalidPixels)?;
-                    let (ox, oy) = key.pixel_origin();
-                    let local = dab.to_local(ox, oy);
-                    if stroke.erase {
-                        canvas.erase_dab(local);
-                    } else if stroke.alpha_locked {
-                        canvas.apply_dab_alpha_locked(local, stroke.color);
-                    } else {
-                        canvas.apply_dab(local, stroke.color);
-                    }
+                    apply_image_dab(canvas, stroke, key, dab);
                 }
             }
         }
@@ -259,28 +304,15 @@ impl WebDocument {
             return Ok(CanvasUpdate::default());
         }
         let mut next = self.artwork.clone();
-        next.tiles =
-            self.artwork
-                .tiles
-                .with_replacements(tiles.into_iter().map(|(key, canvas)| {
-                    let mut pixels = canvas.pixels_rgba8_premultiplied().to_vec();
-                    if let Some(mask) = &self.selection {
-                        let original = self.artwork.tiles.get(key);
-                        let (ox, oy) = key.pixel_origin();
-                        for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
-                            let x = ox + i64::from((index % TILE_EDGE as usize) as u32);
-                            let y = oy + i64::from((index / TILE_EDGE as usize) as u32);
-                            if !mask.contains_signed(x as i32, y as i32) {
-                                pixel.copy_from_slice(original.map_or(&[0; 4], |tile| {
-                                    &tile.pixels()[index * 4..index * 4 + 4]
-                                }));
-                            }
-                        }
-                    }
-                    (key, pixels)
-                }))
-                .map_err(|_| WebError::InvalidPixels)?;
-        if next.tiles.len() > MAX_RESIDENT_TILES {
+        next.tiles = self
+            .artwork
+            .tiles
+            .with_replacements(tiles.into_iter().map(|(key, canvas)| {
+                let pixels = canvas.pixels_rgba8_premultiplied().to_vec();
+                (key, pixels)
+            }))
+            .map_err(|_| WebError::InvalidPixels)?;
+        if next.tiles.total_len() > MAX_RESIDENT_TILES {
             return Err(WebError::LimitExceeded);
         }
         let update = difference(&self.artwork, &next, false);
@@ -288,6 +320,32 @@ impl WebDocument {
             self.artwork = next;
         }
         Ok(update)
+    }
+}
+
+fn apply_image_dab(canvas: &mut CpuCanvas, stroke: &ActiveStroke, key: TileKey, dab: BrushDab) {
+    let (ox, oy) = key.pixel_origin();
+    let local = dab.to_local(ox, oy);
+    if let Some(selection) = &stroke.selection {
+        let operation = if stroke.erase {
+            nyatidraw_paint_cpu::DabOperation::Erase
+        } else if stroke.alpha_locked {
+            nyatidraw_paint_cpu::DabOperation::Recolor(stroke.color)
+        } else {
+            nyatidraw_paint_cpu::DabOperation::Paint(stroke.color)
+        };
+        canvas.apply_dab_with_coverage(local, operation, |x, y| {
+            match [ox + i64::from(x), oy + i64::from(y)].map(i32::try_from) {
+                [Ok(x), Ok(y)] => selection.coverage_signed(x, y),
+                _ => 0,
+            }
+        });
+    } else if stroke.erase {
+        canvas.erase_dab(local);
+    } else if stroke.alpha_locked {
+        canvas.apply_dab_alpha_locked(local, stroke.color);
+    } else {
+        canvas.apply_dab(local, stroke.color);
     }
 }
 
@@ -325,4 +383,54 @@ fn make_sample(
         eraser: false,
         viewport_revision: 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_work_rejection_restores_original_and_keeps_history_usable() {
+        for end in [false, true] {
+            let mut doc = WebDocument::import_rgba8(16, 16, &[255; 16 * 16 * 4]).unwrap();
+            doc.apply_mask_command(nyatidraw_api::MaskCommand::AddRevealAll(doc.active_layer()))
+                .unwrap();
+            doc.select_tool(WebTool::Pen).unwrap();
+            doc.set_foreground([0, 0, 0, 255]);
+            let before = doc.snapshot().clone();
+            let history = doc.undo.len();
+            let point = StrokePoint {
+                x: 8.0,
+                y: 8.0,
+                pressure: 1.0,
+                time_ms: 1.0,
+            };
+            doc.begin_stroke(point).unwrap();
+            assert_ne!(doc.snapshot(), &before);
+            doc.stroke.as_mut().unwrap().mask_work =
+                nyatidraw_paint_cpu::MaskStrokeBudget::new(nyatidraw_paint_cpu::EditLimits {
+                    max_filter_work: 0,
+                    ..Default::default()
+                });
+            let next = StrokePoint {
+                x: 24.0,
+                time_ms: 2.0,
+                ..point
+            };
+            let result = if end {
+                doc.end_stroke(next)
+            } else {
+                doc.move_stroke(next)
+            };
+            assert!(matches!(result, Err(WebError::EditRejected(_))));
+            assert_eq!(doc.snapshot(), &before);
+            assert_eq!(doc.undo.len(), history);
+            assert!(doc.stroke.is_none());
+            assert!(matches!(doc.end_stroke(next), Err(WebError::NoStroke)));
+            doc.begin_stroke(point).unwrap();
+            assert!(doc.end_stroke(next).unwrap().committed);
+            doc.undo().unwrap();
+            assert_eq!(doc.snapshot(), &before);
+        }
+    }
 }

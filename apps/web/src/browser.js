@@ -258,6 +258,47 @@ export async function saveInWorker(packet, download) {
     catch (error) { breakRecovery(error); }
   });
 }
+let imageExportRunning = false;
+async function runImageExport(payload, transfer) {
+  if (imageExportRunning) throw new Error("이미지 내보내기가 이미 진행 중입니다.");
+  imageExportRunning = true;
+  let worker;
+  try {
+    const assets = await recoveryAssets();
+    worker = new Worker(new URL(`./worker/${assets.entry}`, document.baseURI), {
+      type: "module", name: "NyatiDraw image export",
+    });
+    return await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => finish(new Error("이미지 내보내기 시간이 초과되었습니다.")), 120000);
+      const finish = (error, data) => {
+        clearTimeout(timeout);
+        if (error) reject(error); else resolve(data);
+      };
+      worker.onerror = (event) => finish(new Error(event.message || "Export Worker 실행 실패"));
+      worker.onmessageerror = () => finish(new Error("Export Worker 응답 오류"));
+      worker.onmessage = ({ data }) => {
+        if (data.id !== 1) finish(new Error("Export Worker 응답 번호 오류"));
+        else finish(data.error ? new Error(data.error) : null, data);
+      };
+      worker.postMessage({ id: 1, ...payload }, transfer);
+    });
+  } finally {
+    worker?.terminate();
+    imageExportRunning = false;
+  }
+}
+export async function exportPngInWorker(pixels, width, height, outputWidth, outputHeight) {
+  return (await runImageExport({ kind: "export-png", pixels, width, height, outputWidth, outputHeight }, [pixels.buffer])).bytes;
+}
+export async function exportSpriteSheetInWorker(packet, columns) {
+  const files = (await runImageExport({ kind: "export-spritesheet", packet, columns }, [packet.buffer])).files;
+  if (!Array.isArray(files) || files.length !== 2) throw new Error("스프라이트 시트 응답 오류");
+  const basename = `sheet-${crypto.randomUUID()}`;
+  const manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(files[1]));
+  manifest.image = `${basename}.png`;
+  return [files[0], new TextEncoder().encode(JSON.stringify(manifest, null, 2) + "\n"), `${basename}.png`, `${basename}.json`];
+}
+
 export function downloadBytes(bytes, filename, mime) {
   const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
   const link = document.createElement("a");

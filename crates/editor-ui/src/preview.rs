@@ -1,7 +1,15 @@
 use std::sync::Arc;
 
-use nyatidraw_api::{ContentRootId, LayerId};
+use nyatidraw_api::{ContentRootId, LayerId, MaskId};
 use nyatidraw_tiles::FlattenedRgba8;
+
+pub use crate::mask_preview::mask_thumbnail_frame;
+#[path = "frame_preview.rs"]
+mod frames;
+pub use frames::{
+    FrameThumbnailCache, FrameThumbnailFrame, FrameThumbnailRequest, FrameThumbnailSnapshot,
+    frame_thumbnail_frame,
+};
 
 /// The navigator is a small, disposable UI artifact, never a second document
 /// representation.
@@ -43,6 +51,16 @@ pub struct NavigatorSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LayerThumbnailFrame {
     pub layer: LayerId,
+    pub width: u16,
+    pub height: u16,
+    pub data_uri: Arc<str>,
+    pub mask: Option<Arc<MaskThumbnailFrame>>,
+}
+
+/// Coverage encoded as white alpha, displayed on black to preserve scalar gray.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaskThumbnailFrame {
+    pub mask: MaskId,
     pub width: u16,
     pub height: u16,
     pub data_uri: Arc<str>,
@@ -98,6 +116,7 @@ pub fn layer_thumbnail_frame(
         width,
         height,
         data_uri: png_data_uri(&png, MAX_LAYER_THUMBNAIL_DATA_URI_BYTES, "layer-thumbnail")?,
+        mask: None,
     })
 }
 

@@ -102,6 +102,14 @@ impl ProjectionState {
         self.current.history = history;
     }
 
+    pub fn stage_animation(&mut self, animation: nyatidraw_api::AnimationProjection) {
+        self.current.animation = animation;
+    }
+
+    pub fn stage_raster_target(&mut self, target: Option<nyatidraw_api::RasterEditTarget>) {
+        self.current.raster_target = target;
+    }
+
     pub fn stage_edit(&mut self, edit: nyatidraw_api::EditProjection) {
         self.current.edit = edit;
     }
@@ -183,6 +191,18 @@ impl ProjectionState {
         self.current.dirty = dirty;
         self.current.workspace = WorkspaceProjection::Ready;
         self.current.active_layer = active_layer;
+        self.current.raster_target = active_layer.map(|layer| match self.current.raster_target {
+            Some(nyatidraw_api::RasterEditTarget::Mask { layer: owner, mask })
+                if owner == layer
+                    && layers
+                        .raster(layer)
+                        .and_then(|node| node.mask)
+                        .is_some_and(|value| value.id == mask) =>
+            {
+                nyatidraw_api::RasterEditTarget::Mask { layer, mask }
+            }
+            _ => nyatidraw_api::RasterEditTarget::Image(layer),
+        });
         self.current.layers = projected_layers;
         self.current.dock = dock;
         self.current.viewport = viewport;
@@ -250,6 +270,11 @@ pub fn project_children(group: &GroupNode, depth: u16, out: &mut Vec<LayerProjec
     for (index, child) in group.children.iter().enumerate().rev() {
         match child {
             LayerTreeNode::Raster(layer) => out.push(LayerProjection {
+                mask: layer.mask.map(|mask| nyatidraw_api::LayerMaskProjection {
+                    id: mask.id,
+                    enabled: mask.enabled,
+                    default_coverage: mask.default_coverage,
+                }),
                 color_effect: layer.color_effect,
                 alpha_locked: layer.alpha_locked,
                 clip_to_below: layer.clip_to_below,
@@ -267,6 +292,7 @@ pub fn project_children(group: &GroupNode, depth: u16, out: &mut Vec<LayerProjec
             }),
             LayerTreeNode::Group(child_group) => {
                 out.push(LayerProjection {
+                    mask: None,
                     color_effect: None,
                     alpha_locked: false,
                     clip_to_below: child_group.clip_to_below,

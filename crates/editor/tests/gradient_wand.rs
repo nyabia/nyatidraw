@@ -23,6 +23,7 @@ fn fixture() -> (LayerTree, TileSnapshot) {
         clip_to_below: false,
         blend_mode: nyatidraw_api::LayerBlendMode::default(),
         children: vec![LayerTreeNode::Raster(LayerNode {
+            mask: None,
             id: LAYER,
             name: "Paint".into(),
             visible: true,

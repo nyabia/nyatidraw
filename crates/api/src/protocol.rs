@@ -13,6 +13,8 @@ pub struct CommandEnvelope {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EditorCommand {
+    Mask(crate::MaskCommand),
+    Animation(crate::AnimationCommand),
     History(HistoryCommand),
     Edit(EditCommand),
     Project(ProjectCommand),
@@ -110,6 +112,9 @@ pub enum EditCommand {
     ShrinkSelection {
         radius: u8,
     },
+    FeatherSelection {
+        radius: u8,
+    },
     SelectLayerAlpha,
     ClearSelection,
     /// Colors are premultiplied linear RGBA8, matching durable tile pixels.
@@ -180,6 +185,7 @@ impl Default for AffineTransform {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransformCommand {
     Begin,
+    BeginGroup(GroupId),
     Paste,
     ImportRaster(RasterImport),
     Preview(AffineTransform),
@@ -479,10 +485,21 @@ pub enum HistoryCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProjectCommand {
+    ExportSpriteSheet {
+        directory: std::path::PathBuf,
+        columns: Option<u32>,
+        project_epoch: u64,
+    },
     Save,
     CopyPng,
+    /// Explicit export copy; canvas metadata and project history stay unchanged.
+    ExportScaledPng {
+        path: std::path::PathBuf,
+        size: [u32; 2],
+        project_epoch: u64,
+    },
 }
 
 /// Raster/group composition over a premultiplied linear-light backdrop.
@@ -491,6 +508,9 @@ pub enum LayerBlendMode {
     #[default]
     Normal,
     Multiply,
+    Screen,
+    Add,
+    Overlay,
 }
 
 /// Maps straight sRGB luminance between two display colors, preserving alpha.
@@ -646,6 +666,7 @@ pub enum LayerProjectionKind {
 // Orthogonal user layer toggles, not states of one state machine.
 #[allow(clippy::struct_excessive_bools)]
 pub struct LayerProjection {
+    pub mask: Option<crate::LayerMaskProjection>,
     pub color_effect: Option<LayerColorEffect>,
     pub alpha_locked: bool,
     pub clip_to_below: bool,
@@ -732,8 +753,10 @@ impl HistoryProjection {
 /// representable in this protocol.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UiProjection {
+    pub raster_target: Option<crate::RasterEditTarget>,
     pub revision: Revision,
     pub canvas: crate::CanvasSpec,
+    pub animation: crate::AnimationProjection,
     pub document_title: String,
     pub dirty: bool,
     pub workspace: WorkspaceProjection,
@@ -778,8 +801,10 @@ impl UiProjection {
     #[must_use]
     pub fn empty() -> Self {
         Self {
+            raster_target: None,
             revision: Revision::default(),
             canvas: crate::CanvasSpec::DEFAULT,
+            animation: crate::AnimationProjection::default(),
             document_title: String::new(),
             dirty: false,
             workspace: WorkspaceProjection::Empty,

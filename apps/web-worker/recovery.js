@@ -1,4 +1,4 @@
-import init, { RecoveryEngine } from "./ntdr.js";
+import init, { RecoveryEngine, export_reduced_png, export_sprite_sheet } from "./ntdr.js";
 import { storeWorkspace } from "./storage.js";
 
 const ready = init().then(() => new RecoveryEngine());
@@ -13,6 +13,20 @@ self.onmessage = async ({ data }) => {
   let engine;
   try {
     engine = await ready;
+    if (data.kind === "export-png") {
+      const bytes = export_reduced_png(data.pixels, data.width, data.height, data.outputWidth, data.outputHeight);
+      self.postMessage({ id, bytes }, [bytes.buffer]);
+      return;
+    }
+    if (data.kind === "export-spritesheet") {
+      const output = export_sprite_sheet(packet, data.columns);
+      try {
+        const png = output.take_png();
+        const manifest = new TextEncoder().encode(output.take_manifest());
+        self.postMessage({ id, files: [png, manifest] }, [png.buffer, manifest.buffer]);
+      } finally { output.free(); }
+      return;
+    }
     const started = performance.now();
     const encodeStart = performance.timeOrigin + started;
     const bytes = engine.stage(packet);

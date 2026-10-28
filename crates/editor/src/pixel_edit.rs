@@ -3,7 +3,7 @@ use nyatidraw_document::LayerTree;
 use nyatidraw_paint_cpu::{
     EditLimits, PremultipliedRgba8, RasterFragment, SelectionMask, SelectionPaint, SelectionSource,
     WandRequest, lasso_selection_signed, movable_bounds, move_raster, paint_selection,
-    transform_raster, translate_artwork, wand_selection,
+    transform_raster, translate_artwork_with_masks, wand_selection,
 };
 use nyatidraw_tiles::TileSnapshot;
 use std::sync::Arc;
@@ -203,6 +203,7 @@ pub fn execute_pixel_edit(
                     parent,
                     index + 1,
                     nyatidraw_document::LayerTreeNode::Raster(nyatidraw_document::LayerNode {
+                        mask: None,
                         color_effect: None,
                         alpha_locked: false,
                         clip_to_below: false,
@@ -254,7 +255,8 @@ pub fn execute_pixel_edit(
             None
         }
         EditCommand::SelectAll | EditCommand::InvertSelection => {
-            let (origin, size) = selection_domain(canvas, tiles, target, selection.as_deref())?;
+            let (origin, size) =
+                selection_domain(canvas, tiles, target, selection.as_deref(), limits)?;
             let mask = match (command, selection.as_deref()) {
                 (EditCommand::InvertSelection, Some(mask)) => {
                     nyatidraw_paint_cpu::invert_selection(mask, origin, size, limits)
@@ -265,14 +267,20 @@ pub fn execute_pixel_edit(
             *selection = Some(Arc::new(mask));
             None
         }
-        EditCommand::GrowSelection { radius } | EditCommand::ShrinkSelection { radius } => {
+        EditCommand::GrowSelection { radius }
+        | EditCommand::ShrinkSelection { radius }
+        | EditCommand::FeatherSelection { radius } => {
             let mask = selection
                 .as_deref()
                 .ok_or_else(|| PixelEditError("먼저 영역을 선택하세요.".into()))?;
-            let updated = if matches!(command, EditCommand::GrowSelection { .. }) {
-                nyatidraw_paint_cpu::grow_selection(mask, radius, limits)
-            } else {
-                nyatidraw_paint_cpu::shrink_selection(mask, radius, limits)
+            let updated = match command {
+                EditCommand::GrowSelection { .. } => {
+                    nyatidraw_paint_cpu::grow_selection(mask, radius, limits)
+                }
+                EditCommand::ShrinkSelection { .. } => {
+                    nyatidraw_paint_cpu::shrink_selection(mask, radius, limits)
+                }
+                _ => nyatidraw_paint_cpu::feather_selection(mask, radius, limits),
             }
             .map_err(reject)?;
             *selection = Some(Arc::new(updated));
@@ -325,7 +333,8 @@ pub fn execute_pixel_edit(
             let [Some(x), Some(y)] = offset else {
                 return Err(PixelEditError("Crop coordinate overflow".into()));
             };
-            transformed = Some(translate_artwork(tiles, [x, y], limits).map_err(reject)?);
+            transformed =
+                Some(translate_artwork_with_masks(tiles, tree, [x, y], limits).map_err(reject)?);
             if next != canvas {
                 changed_canvas = Some(next);
             }
@@ -543,7 +552,7 @@ pub fn execute_pixel_edit(
 
     let tiles = transformed
         .filter(|painted| {
-            !painted.changed_tiles.is_empty() || changed_canvas.is_some() || changed_tree.is_some()
+            painted.after != *tiles || changed_canvas.is_some() || changed_tree.is_some()
         })
         .map(|painted| painted.after);
     if clear_after_transform {
@@ -618,7 +627,7 @@ fn translated_selection(
                     "선택 영역 이동 좌표가 허용 범위를 벗어났습니다.".into(),
                 ));
             };
-            SelectionMask::from_packed_bits_at([x, y], mask.dimensions(), &mask.packed_bits())
+            SelectionMask::from_coverage_at([x, y], mask.dimensions(), mask.coverage_bytes())
                 .map(Arc::new)
                 .map_err(|error| PixelEditError(format!("{error:?}")))
         })
@@ -626,23 +635,23 @@ fn translated_selection(
 }
 
 // All/invert have an explicit finite document domain, not the current viewport.
-// Include active artwork's stored tile extents so off-page anatomy is reachable.
+// Include occupied signed pixels, never transparent tile allocation padding.
 fn selection_domain(
     canvas: CanvasSpec,
     tiles: &TileSnapshot,
     target: LayerId,
     selection: Option<&SelectionMask>,
+    limits: EditLimits,
 ) -> Result<([i32; 2], [u32; 2]), PixelEditError> {
     let mut min = [0_i64; 2];
     let mut max = [i64::from(canvas.width_px), i64::from(canvas.height_px)];
-    for (key, _) in tiles
-        .iter()
-        .filter(|(key, _)| key.layer == target && key.mip == 0)
+    if let Some(bounds) = movable_bounds(tiles, target, None, limits)
+        .map_err(|error| PixelEditError(format!("Selection bounds: {error:?}")))?
     {
-        let (x, y) = key.pixel_origin();
-        for (axis, value) in [x, y].into_iter().enumerate() {
-            min[axis] = min[axis].min(value);
-            max[axis] = max[axis].max(value + i64::from(nyatidraw_tiles::TILE_EDGE));
+        for axis in 0..2 {
+            min[axis] = min[axis].min(i64::from(bounds.origin[axis]));
+            max[axis] =
+                max[axis].max(i64::from(bounds.origin[axis]) + i64::from(bounds.size[axis]));
         }
     }
     if let Some((origin, size)) = selection.and_then(SelectionMask::bounds_signed) {
@@ -678,3 +687,7 @@ fn validate_page(canvas: CanvasSpec) -> Result<(), PixelEditError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "pixel_edit_selection_tests.rs"]
+mod selection_tests;

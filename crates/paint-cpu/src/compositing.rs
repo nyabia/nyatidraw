@@ -11,6 +11,10 @@ use crate::CpuCompositeError;
 #[path = "compositing_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "sparse_compositing_tests.rs"]
+mod sparse_tests;
+
 pub(crate) fn blend_pixel(
     destination: &mut [u8],
     source: &[u8],
@@ -26,17 +30,34 @@ pub(crate) fn blend_pixel(
     } else {
         a + (b * (255 - a) + 127) / 255
     };
+    if mode == LayerBlendMode::Normal {
+        for (channel, destination) in destination.iter_mut().take(3).enumerate() {
+            let s = scaled(channel);
+            let d = u32::from(*destination);
+            let value = if atop {
+                (s * b + d * (255 - a) + 127) / 255
+            } else {
+                s + (d * (255 - a) + 127) / 255
+            };
+            *destination = u8::try_from(value.min(alpha)).expect("channel bounded by alpha");
+        }
+        destination[3] = u8::try_from(alpha).expect("over/atop alpha is at most 255");
+        return;
+    }
     for (channel, destination) in destination.iter_mut().take(3).enumerate() {
         let s = scaled(channel);
         let d = u32::from(*destination);
-        let value = match (mode, atop) {
-            (LayerBlendMode::Normal, false) => s + (d * (255 - a) + 127) / 255,
-            (LayerBlendMode::Multiply, false) => {
-                (s * (255 - b) + d * (255 - a) + s * d + 127) / 255
-            }
-            (LayerBlendMode::Normal, true) => (s * b + d * (255 - a) + 127) / 255,
-            (LayerBlendMode::Multiply, true) => (d * (255 - a + s) + 127) / 255,
+        // Alpha-weighted overlap avoids dividing antialiased colors by alpha.
+        let overlap = match mode {
+            LayerBlendMode::Normal => s * b,
+            LayerBlendMode::Multiply => s * d,
+            LayerBlendMode::Screen => s * b + d * a - s * d,
+            LayerBlendMode::Add => (s * b + d * a).min(a * b),
+            LayerBlendMode::Overlay if 2 * d <= b => 2 * s * d,
+            LayerBlendMode::Overlay => a * b - 2 * (a - s) * (b - d),
         };
+        let source_outside = if atop { 0 } else { s * (255 - b) };
+        let value = (source_outside + d * (255 - a) + overlap + 127) / 255;
         *destination =
             u8::try_from(value.min(alpha)).expect("premultiplied channel bounded by alpha");
     }
@@ -61,9 +82,14 @@ pub(crate) fn group_pixel(
     scope: Option<&BTreeSet<LayerTreeNodeId>>,
 ) -> [u8; 4] {
     let raw = |node: &LayerTreeNode| match node {
-        LayerTreeNode::Raster(layer) => nyatidraw_tiles::color::apply_layer_color_effect(
-            crate::selection::raster_pixel(snapshot, layer.id, point),
-            layer.color_effect,
+        LayerTreeNode::Raster(layer) => crate::apply_mask_pixel(
+            snapshot,
+            layer.mask,
+            point,
+            nyatidraw_tiles::color::apply_layer_color_effect(
+                crate::selection::raster_pixel(snapshot, layer.id, point),
+                layer.color_effect,
+            ),
         ),
         LayerTreeNode::Group(group) => group_pixel(snapshot, group, point, scope),
     };
@@ -85,17 +111,20 @@ pub(crate) fn group_pixel(
     output
 }
 
-fn raw_tile(snapshot: &TileSnapshot, node: &LayerTreeNode, coordinate: TileCoordinate) -> Vec<u8> {
+fn raw_tile(
+    snapshot: &TileSnapshot,
+    node: &LayerTreeNode,
+    coordinate: TileCoordinate,
+) -> Option<Vec<u8>> {
     match node {
         LayerTreeNode::Raster(layer) => {
-            let mut pixels = snapshot
-                .get(TileKey {
-                    layer: layer.id,
-                    mip: 0,
-                    x: coordinate.x,
-                    y: coordinate.y,
-                })
-                .map_or_else(|| vec![0; TILE_BYTE_LEN], |tile| tile.pixels().to_vec());
+            let tile = snapshot.get(TileKey {
+                layer: layer.id,
+                mip: 0,
+                x: coordinate.x,
+                y: coordinate.y,
+            })?;
+            let mut pixels = tile.pixels().to_vec();
             if layer.color_effect.is_some_and(|effect| effect.enabled) {
                 for pixel in pixels.chunks_exact_mut(4) {
                     let mapped = nyatidraw_tiles::color::apply_layer_color_effect(
@@ -105,33 +134,76 @@ fn raw_tile(snapshot: &TileSnapshot, node: &LayerTreeNode, coordinate: TileCoord
                     pixel.copy_from_slice(&mapped);
                 }
             }
-            pixels
+            if let Some(mask) = layer.mask.filter(|mask| mask.enabled) {
+                let coverage = snapshot.get_coverage(nyatidraw_tiles::CoverageTileKey {
+                    mask: mask.id,
+                    mip: 0,
+                    x: coordinate.x,
+                    y: coordinate.y,
+                });
+                for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+                    let value = u32::from(
+                        coverage.map_or(mask.default_coverage, |tile| tile.pixels()[index]),
+                    );
+                    for channel in pixel {
+                        *channel = u8::try_from((u32::from(*channel) * value + 127) / 255)
+                            .expect("coverage byte");
+                    }
+                }
+            }
+            Some(pixels)
         }
         LayerTreeNode::Group(group) => group_tile(snapshot, group, coordinate),
     }
 }
 
-fn group_tile(snapshot: &TileSnapshot, group: &GroupNode, coordinate: TileCoordinate) -> Vec<u8> {
-    let mut output = vec![0; TILE_BYTE_LEN];
+fn blend_tile(
+    destination: &mut [u8],
+    source: &[u8],
+    opacity: u16,
+    mode: LayerBlendMode,
+    atop: bool,
+) {
+    let blend = |destination: &mut [u8], mode| {
+        for (destination, source) in destination.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+            blend_pixel(destination, source, opacity, mode, atop);
+        }
+    };
+    match mode {
+        LayerBlendMode::Normal => blend(destination, LayerBlendMode::Normal),
+        LayerBlendMode::Multiply => blend(destination, LayerBlendMode::Multiply),
+        LayerBlendMode::Screen => blend(destination, LayerBlendMode::Screen),
+        LayerBlendMode::Add => blend(destination, LayerBlendMode::Add),
+        LayerBlendMode::Overlay => blend(destination, LayerBlendMode::Overlay),
+    }
+}
+
+fn group_tile(
+    snapshot: &TileSnapshot,
+    group: &GroupNode,
+    coordinate: TileCoordinate,
+) -> Option<Vec<u8>> {
+    let mut output = None;
     for stack in layer_stacks(group) {
         let (visible, opacity, mode) = properties(stack.base);
         if !visible || opacity == 0 {
             continue;
         }
-        let mut pixels = raw_tile(snapshot, stack.base, coordinate);
+        let Some(mut pixels) = raw_tile(snapshot, stack.base, coordinate) else {
+            continue;
+        };
         for clip in stack.clips {
             let (visible, opacity, mode) = properties(clip);
             if !visible || opacity == 0 {
                 continue;
             }
-            let source = raw_tile(snapshot, clip, coordinate);
-            for (destination, source) in pixels.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
-                blend_pixel(destination, source, opacity, mode, true);
-            }
+            let Some(source) = raw_tile(snapshot, clip, coordinate) else {
+                continue;
+            };
+            blend_tile(&mut pixels, &source, opacity, mode, true);
         }
-        for (destination, source) in output.chunks_exact_mut(4).zip(pixels.chunks_exact(4)) {
-            blend_pixel(destination, source, opacity, mode, false);
-        }
+        let destination = output.get_or_insert_with(|| vec![0; TILE_BYTE_LEN]);
+        blend_tile(destination, &pixels, opacity, mode, false);
     }
     output
 }
@@ -183,7 +255,9 @@ pub(crate) fn flatten_group(
     // Memory is bounded by one tile per active stack/group depth, rather than
     // allocating a full-page intermediate for each isolated layer or group.
     for coordinate in coordinates {
-        let pixels = group_tile(snapshot, group, coordinate);
+        let Some(pixels) = group_tile(snapshot, group, coordinate) else {
+            continue;
+        };
         let left = u32::try_from(i64::from(coordinate.x) * i64::from(TILE_EDGE))
             .map_err(|_| CpuCompositeError::InvalidCanvas)?;
         let top = u32::try_from(i64::from(coordinate.y) * i64::from(TILE_EDGE))

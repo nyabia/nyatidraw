@@ -58,6 +58,7 @@ fn key(layer: u128, x: i32) -> TileKey {
 fn fixture_tree() -> LayerTree {
     let raster = |id, reference| {
         LayerTreeNode::Raster(LayerNode {
+            mask: None,
             alpha_locked: false,
             color_effect: None,
             clip_to_below: false,

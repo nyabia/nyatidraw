@@ -121,6 +121,7 @@ mod windows_probe {
         let rasters = (1..=20)
             .map(|id| {
                 LayerTreeNode::Raster(LayerNode {
+                    mask: None,
                     alpha_locked: false,
                     color_effect: None,
                     clip_to_below: false,

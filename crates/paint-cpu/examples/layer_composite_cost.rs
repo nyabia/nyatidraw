@@ -6,18 +6,24 @@ use nyatidraw_tiles::{TILE_BYTE_LEN, TileKey, TileSnapshot};
 use std::{hint::black_box, time::Instant};
 
 fn main() {
+    let output_directory = output_directory();
     let canvas = CanvasSpec {
         width_px: 3840,
         height_px: 2160,
         pixels_per_inch: 96,
     };
-    for (name, layers, dense) in [("sparse8", 8_u8, false), ("dense2", 2, true)] {
+    for (name, layers, dense, clipped) in [
+        ("sparse8", 8_u8, false, false),
+        ("dense2", 2, true, false),
+        ("sparse-clipped8", 8, false, true),
+    ] {
         let mut tiles = Vec::new();
         let mut children = Vec::new();
         for layer in 1..=layers {
             children.push(LayerTreeNode::Raster(LayerNode {
+                mask: None,
                 alpha_locked: false,
-                clip_to_below: false,
+                clip_to_below: clipped && layer % 2 == 0,
                 blend_mode: nyatidraw_api::LayerBlendMode::Normal,
                 id: LayerId(u128::from(layer)),
                 name: format!("Layer{layer}"),
@@ -64,6 +70,10 @@ fn main() {
         .unwrap();
         let snapshot = TileSnapshot::from_tiles(tiles).unwrap();
         let expected = flatten_layer_tree_rgba8(&snapshot, &tree, canvas).unwrap();
+        if let Some(directory) = &output_directory {
+            std::fs::write(directory.join(format!("{name}.rgba")), &expected.pixels)
+                .expect("benchmark reference pixels");
+        }
         let checksum = expected
             .pixels
             .iter()
@@ -96,4 +106,12 @@ fn main() {
             samples[19]
         );
     }
+}
+
+fn output_directory() -> Option<std::path::PathBuf> {
+    let directory = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    if let Some(directory) = &directory {
+        std::fs::create_dir_all(directory).expect("benchmark output directory");
+    }
+    directory
 }

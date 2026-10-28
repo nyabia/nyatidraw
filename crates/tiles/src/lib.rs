@@ -3,6 +3,8 @@
 //! Immutable, content-addressed RGBA8 tiles.
 
 pub mod color;
+mod coverage;
+pub use coverage::{COVERAGE_TILE_BYTE_LEN, CoverageTileKey, CoverageTileObject};
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -181,6 +183,8 @@ impl TileBounds {
 pub enum TileSnapshotError {
     InvalidByteLength { actual: usize },
     DuplicateKey(TileKey),
+    DuplicateCoverageKey(CoverageTileKey),
+    InvalidCoverageKey(CoverageTileKey),
 }
 
 /// A finite, tightly packed RGBA8 export surface assembled from one base-mip layer.
@@ -266,6 +270,7 @@ impl TileObject {
 pub struct TileSnapshot {
     root: ContentRoot,
     tiles: BTreeMap<TileKey, Arc<TileObject>>,
+    coverage: BTreeMap<CoverageTileKey, Arc<CoverageTileObject>>,
 }
 
 impl TileSnapshot {
@@ -335,7 +340,7 @@ impl TileSnapshot {
                 tiles.insert(key, Arc::new(TileObject::new(pixels)?));
             }
         }
-        Ok(Self::from_canonical_tiles(tiles))
+        Ok(Self::from_canonical_planes(tiles, self.coverage.clone()))
     }
 
     #[must_use]
@@ -361,7 +366,7 @@ impl TileSnapshot {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tiles.is_empty()
+        self.tiles.is_empty() && self.coverage.is_empty()
     }
 
     /// Flattens one mip-zero layer into its finite signed-tile bounds.
@@ -571,13 +576,21 @@ impl TileSnapshot {
     }
 
     fn from_canonical_tiles(tiles: BTreeMap<TileKey, Arc<TileObject>>) -> Self {
-        let hash = hash_root(&tiles);
+        Self::from_canonical_planes(tiles, BTreeMap::new())
+    }
+
+    fn from_canonical_planes(
+        tiles: BTreeMap<TileKey, Arc<TileObject>>,
+        coverage: BTreeMap<CoverageTileKey, Arc<CoverageTileObject>>,
+    ) -> Self {
+        let hash = hash_root(&tiles, &coverage);
         Self {
             root: ContentRoot {
                 id: hash.content_root_id(),
                 hash,
             },
             tiles,
+            coverage,
         }
     }
 }
@@ -588,7 +601,10 @@ impl Default for TileSnapshot {
     }
 }
 
-fn hash_root(tiles: &BTreeMap<TileKey, Arc<TileObject>>) -> ObjectHash {
+fn hash_root(
+    tiles: &BTreeMap<TileKey, Arc<TileObject>>,
+    coverage: &BTreeMap<CoverageTileKey, Arc<CoverageTileObject>>,
+) -> ObjectHash {
     let mut payload = Vec::with_capacity(tiles.len().saturating_mul(57).saturating_add(8));
     payload.extend_from_slice(&TILE_EDGE.to_le_bytes());
     payload.extend_from_slice(&(tiles.len() as u64).to_le_bytes());
@@ -599,7 +615,19 @@ fn hash_root(tiles: &BTreeMap<TileKey, Arc<TileObject>>) -> ObjectHash {
         payload.extend_from_slice(&key.y.to_le_bytes());
         payload.extend_from_slice(&object.hash.0);
     }
-    ObjectHash::digest_tagged(b"nyatidraw-content-root-v1", &payload)
+    if coverage.is_empty() {
+        return ObjectHash::digest_tagged(b"nyatidraw-content-root-v1", &payload);
+    }
+    payload.extend_from_slice(b"NYMASK01");
+    payload.extend_from_slice(&(coverage.len() as u64).to_le_bytes());
+    for (key, object) in coverage {
+        payload.extend_from_slice(&key.mask.0.to_le_bytes());
+        payload.push(key.mip);
+        payload.extend_from_slice(&key.x.to_le_bytes());
+        payload.extend_from_slice(&key.y.to_le_bytes());
+        payload.extend_from_slice(&object.hash().0);
+    }
+    ObjectHash::digest_tagged(b"nyatidraw-content-root-planes-v2", &payload)
 }
 
 #[cfg(test)]

@@ -17,6 +17,8 @@ use crate::preview::{
     NavigatorViewport,
 };
 
+mod frame_previews;
+
 /// Canvas geometry shared between the compositor callback and native input.
 ///
 /// The custom-paint callback owns the physical surface metrics. The app-owned
@@ -175,6 +177,7 @@ struct LiveInkInner {
     export: Mutex<ExportMailbox>,
     navigator: Mutex<NavigatorSnapshot>,
     layer_thumbnails: Mutex<LayerThumbnailSnapshot>,
+    frame_thumbnails: Mutex<nyatidraw_editor_ui::preview::FrameThumbnailCache>,
     picker: Mutex<Option<PickerSnapshot>>,
     picker_epoch: AtomicU64,
     project_epoch: AtomicU64,
@@ -420,6 +423,9 @@ impl LiveInkBridge {
                 }),
                 navigator: Mutex::new(NavigatorSnapshot::default()),
                 layer_thumbnails: Mutex::new(LayerThumbnailSnapshot::default()),
+                frame_thumbnails: Mutex::new(
+                    nyatidraw_editor_ui::preview::FrameThumbnailCache::default(),
+                ),
                 picker: Mutex::new(None),
                 picker_epoch: AtomicU64::new(0),
                 project_epoch: AtomicU64::new(0),
@@ -875,6 +881,12 @@ impl LiveInkBridge {
             .layer_thumbnails
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = LayerThumbnailSnapshot::default();
+        *self
+            .inner
+            .frame_thumbnails
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            nyatidraw_editor_ui::preview::FrameThumbnailCache::default();
         *self
             .inner
             .activation_notice

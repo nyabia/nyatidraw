@@ -15,7 +15,7 @@ fn covered(document: vec2<f32>) -> bool {
     if any(local < vec2<f32>(0.0)) || any(local >= vec2<f32>(selection.dimensions.yz)) { return false; }
     let pixel = vec2<u32>(floor(local));
     let index = pixel.y * selection.dimensions.y + pixel.x;
-    return (bits[index / 32u] & (1u << (index % 32u))) != 0u;
+    return ((bits[index / 4u] >> ((index % 4u) * 8u)) & 255u) >= 128u;
 }
 
 @fragment

@@ -6,6 +6,11 @@
 //! with straight 16-bit channels to preserve existing tile values on import.
 //! Disposable previews use tagged 8-bit sRGB. Alpha always stays linear.
 
+mod resample;
+mod sprite_sheet;
+pub use resample::{encode_png_reduced, encode_png_reduced_bytes};
+pub use sprite_sheet::publish_sprite_sheet_new;
+
 use std::{
     fs::File,
     io::{BufReader, BufWriter, Write},

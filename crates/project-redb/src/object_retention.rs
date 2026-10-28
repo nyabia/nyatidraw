@@ -40,7 +40,7 @@ impl ProjectDb {
                 .is_some();
             if indexed && !exists {
                 let mut refs = tx.open_table(TILE_ROOT_REFS).map_err(|e| self.io(e))?;
-                let hashes: BTreeSet<_> = snapshot.iter().map(|(_, tile)| tile.hash()).collect();
+                let hashes: BTreeSet<_> = snapshot.object_hashes().collect();
                 for hash in hashes {
                     let count = refs
                         .get(hash.0.as_slice())
@@ -84,7 +84,12 @@ impl ProjectDb {
             if manifest.root.hash != *hash {
                 return Err(self.corrupt("evicted root hash mismatch"));
             }
-            let hashes: BTreeSet<_> = manifest.tiles.into_iter().map(|(_, hash)| hash).collect();
+            let hashes: BTreeSet<_> = manifest
+                .tiles
+                .into_iter()
+                .map(|(_, hash)| hash)
+                .chain(manifest.coverage.into_iter().map(|(_, hash)| hash))
+                .collect();
             for object in hashes {
                 let count = refs
                     .get(object.0.as_slice())

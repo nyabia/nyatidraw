@@ -87,20 +87,29 @@ pub fn copy_selection(
                 i64::from(origin[0]) + i64::from(x),
                 i64::from(origin[1]) + i64::from(y),
             ];
-            if !mask.contains_signed(
+            let coverage = mask.coverage_signed(
                 i32::try_from(point[0]).map_err(|_| EditError::CoordinateOutOfRange)?,
                 i32::try_from(point[1]).map_err(|_| EditError::CoordinateOutOfRange)?,
-            ) {
+            );
+            if coverage == 0 {
                 continue;
             }
             let (key, offset) = pixel_address(layer, point);
             if let Some(tile) = snapshot.get(key) {
                 let to = (y as usize * width as usize + x as usize) * 4;
-                pixels[to..to + 4].copy_from_slice(&tile.pixels()[offset..offset + 4]);
+                pixels[to..to + 4]
+                    .copy_from_slice(&covered_pixel(&tile.pixels()[offset..offset + 4], coverage));
             }
         }
     }
     RasterFragment::new(origin, [width, height], pixels)
+}
+
+pub(crate) fn covered_pixel(pixel: &[u8], coverage: u8) -> [u8; 4] {
+    std::array::from_fn(|channel| {
+        u8::try_from((u32::from(pixel[channel]) * u32::from(coverage) + 127) / 255)
+            .expect("coverage cannot increase a channel")
+    })
 }
 
 /// Computes a cut without publishing it; the caller must successfully place
@@ -141,18 +150,23 @@ pub fn cut_selection(
                 i64::from(origin[0]) + i64::from(x),
                 i64::from(origin[1]) + i64::from(y),
             ];
-            if !mask.contains_signed(
+            let coverage = mask.coverage_signed(
                 i32::try_from(point[0]).map_err(|_| EditError::CoordinateOutOfRange)?,
                 i32::try_from(point[1]).map_err(|_| EditError::CoordinateOutOfRange)?,
-            ) {
+            );
+            if coverage == 0 {
                 continue;
             }
             let (key, offset) = pixel_address(layer, point);
-            if snapshot
-                .get(key)
-                .is_some_and(|tile| tile.pixels()[offset..offset + 4] != [0; 4])
-            {
-                replacements.tile(key)?[offset..offset + 4].fill(0);
+            if let Some(tile) = snapshot.get(key) {
+                let original = &tile.pixels()[offset..offset + 4];
+                let removed = covered_pixel(original, coverage);
+                if removed != [0; 4] {
+                    let remaining = std::array::from_fn::<_, 4, _>(|channel| {
+                        original[channel] - removed[channel]
+                    });
+                    replacements.tile(key)?[offset..offset + 4].copy_from_slice(&remaining);
+                }
             }
         }
     }
@@ -219,7 +233,7 @@ mod tests {
     use nyatidraw_tiles::{TILE_BYTE_LEN, TileKey};
 
     #[test]
-    fn fragments_preserve_holes_alpha_other_artwork_and_fail_atomically() {
+    fn fragments_preserve_soft_coverage_holes_alpha_other_artwork_and_fail_atomically() {
         // Product risk: cut/paste must not clear mask holes, clip signed pixels,
         // corrupt alpha, mutate locked layers or expose partial limited edits.
         let mut tree = LayerTree::new(GroupNode {
@@ -232,6 +246,7 @@ mod tests {
             children: [1, 2]
                 .map(|id| {
                     LayerTreeNode::Raster(LayerNode {
+                        mask: None,
                         alpha_locked: false,
                         clip_to_below: false,
                         blend_mode: nyatidraw_api::LayerBlendMode::Normal,
@@ -282,6 +297,24 @@ mod tests {
             &outside.after.get(key(1, -1)).unwrap().pixels()[508..512],
             &[128, 0, 0, 128]
         );
+        for coverage in [1, 64, 128, 254, 255] {
+            let mask =
+                SelectionMask::from_coverage_at([0, 0], [3, 1], &[coverage, 0, coverage]).unwrap();
+            let copied = copy_selection(&before, &tree, LayerId(1), &mask, limits).unwrap();
+            let cut = cut_selection(&before, &tree, LayerId(1), &mask, limits).unwrap();
+            let remaining = cut.after.get(key(1, 0)).unwrap().pixels();
+            let original = before.get(key(1, 0)).unwrap().pixels();
+            for index in 0..12 {
+                assert_eq!(
+                    u16::from(copied.pixels()[index]) + u16::from(remaining[index]),
+                    u16::from(original[index])
+                );
+            }
+            assert_eq!(cut.after.get(key(2, 0)), before.get(key(2, 0)));
+            if coverage == 128 {
+                assert_eq!(&copied.pixels()[..4], &[64, 0, 0, 64]);
+            }
+        }
         for locked in [false, true] {
             tree.set_locked(LayerId(1), locked).unwrap();
             let tiny = EditLimits {

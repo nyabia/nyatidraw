@@ -10,7 +10,7 @@ use nyatidraw_brush::{
 };
 use nyatidraw_input::{PointerPhase, StylusSample};
 pub use nyatidraw_paint_cpu::SelectionMask as StrokeSelection;
-use nyatidraw_paint_cpu::{CpuCanvas, CpuCanvasError, PremultipliedRgba8};
+use nyatidraw_paint_cpu::{CpuCanvas, CpuCanvasError, DabOperation, PremultipliedRgba8};
 use nyatidraw_tiles::{
     ContentRoot, ObjectHash, TILE_BYTE_LEN, TILE_EDGE, TileBounds, TileKey, TileSnapshot,
     TileSnapshotError,
@@ -294,7 +294,22 @@ impl StrokeMaterializer for CpuReplayMaterializer {
                     continue;
                 }
                 let dab = tile_local_dab(*dab, origin_x, origin_y);
-                if commit.samples()[0].eraser {
+                if let Some(selection) = commit.selection() {
+                    let operation = if commit.samples()[0].eraser {
+                        DabOperation::Erase
+                    } else if commit.alpha_locked() {
+                        DabOperation::Recolor(color)
+                    } else {
+                        DabOperation::Paint(color)
+                    };
+                    canvas.apply_dab_with_coverage(dab, operation, |x, y| {
+                        match [origin_x + i64::from(x), origin_y + i64::from(y)].map(i32::try_from)
+                        {
+                            [Ok(x), Ok(y)] => selection.coverage_signed(x, y),
+                            _ => 0,
+                        }
+                    });
+                } else if commit.samples()[0].eraser {
                     canvas.erase_dab(dab);
                 } else if commit.alpha_locked() {
                     canvas.apply_dab_alpha_locked(dab, color);
@@ -302,28 +317,7 @@ impl StrokeMaterializer for CpuReplayMaterializer {
                     canvas.apply_dab(dab, color);
                 }
             }
-            let mut pixels = canvas.pixels_rgba8_premultiplied().to_vec();
-            if let Some(selection) = commit.selection() {
-                for y in 0..TILE_EDGE {
-                    for x in 0..TILE_EDGE {
-                        let document_x = origin_x + i64::from(x);
-                        let document_y = origin_y + i64::from(y);
-                        let selected = match (i32::try_from(document_x), i32::try_from(document_y))
-                        {
-                            (Ok(x), Ok(y)) => selection.contains_signed(x, y),
-                            _ => false,
-                        };
-                        if !selected {
-                            let offset = usize::try_from((y * TILE_EDGE + x) * 4)
-                                .expect("tile offset fits usize");
-                            let original = before
-                                .get(*key)
-                                .map_or(&[0; 4][..], |tile| &tile.pixels()[offset..offset + 4]);
-                            pixels[offset..offset + 4].copy_from_slice(original);
-                        }
-                    }
-                }
-            }
+            let pixels = canvas.pixels_rgba8_premultiplied().to_vec();
             replacements.push((*key, pixels));
         }
 
@@ -568,16 +562,23 @@ fn hash_legacy_commit(commit: &StrokeCommit) -> ObjectHash {
     }
     if let Some(selection) = commit.selection() {
         let origin = selection.origin();
-        if origin != [0, 0] {
+        let fractional = !selection.is_binary();
+        if origin != [0, 0] || fractional {
             payload.extend_from_slice(&origin[0].to_le_bytes());
             payload.extend_from_slice(&origin[1].to_le_bytes());
         }
         let [width, height] = selection.dimensions();
         payload.extend_from_slice(&width.to_le_bytes());
         payload.extend_from_slice(&height.to_le_bytes());
-        payload.extend_from_slice(&selection.packed_bits());
+        if fractional {
+            payload.extend_from_slice(selection.coverage_bytes());
+        } else {
+            payload.extend_from_slice(&selection.packed_bits());
+        }
         ObjectHash::digest_tagged(
-            if origin == [0, 0] {
+            if fractional {
+                b"nyatidraw-stroke-commit-selected-v3"
+            } else if origin == [0, 0] {
                 b"nyatidraw-stroke-commit-selected-v1"
             } else {
                 b"nyatidraw-stroke-commit-selected-v2"
@@ -927,6 +928,80 @@ mod tests {
                         "selected area was actually painted"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn soft_selection_replay_has_monotonic_coverage_and_preserves_zero_and_locked_alpha() {
+        let before = TileSnapshot::from_tiles([-1, 0, 1].map(|x| {
+            (
+                TileKey {
+                    layer: LayerId(8),
+                    mip: 0,
+                    x,
+                    y: 0,
+                },
+                [80, 60, 40, 160].repeat(TILE_BYTE_LEN / 4),
+            )
+        }))
+        .unwrap();
+        let template = sealed_commit(&before);
+        for (eraser, alpha_locked) in [(false, false), (true, false), (false, true)] {
+            let mut previous: Option<TileSnapshot> = None;
+            let mut identities = BTreeSet::new();
+            for coverage in [0, 64, 128, 255] {
+                let selection = Arc::new(
+                    StrokeSelection::from_coverage_at(
+                        [-16, -16],
+                        [192, 80],
+                        &vec![coverage; 192 * 80],
+                    )
+                    .unwrap(),
+                );
+                let mut samples = template.samples().to_vec();
+                for sample in &mut samples {
+                    sample.eraser = eraser;
+                }
+                let commit = StrokeCommit::seal_with_options(
+                    template.parent_snapshot,
+                    template.layer,
+                    &before,
+                    template.brush,
+                    template.recorded.clone(),
+                    template.color,
+                    samples,
+                    Some(selection),
+                    alpha_locked,
+                )
+                .unwrap();
+                assert!(identities.insert(commit.id.0));
+                let output = CpuReplayMaterializer.materialize(&commit, &before).unwrap();
+                assert_eq!(
+                    output,
+                    CpuReplayMaterializer.materialize(&commit, &before).unwrap()
+                );
+                if coverage == 0 {
+                    assert_eq!(output.after, before);
+                }
+                for (key, original) in before.iter() {
+                    let after = output.after.get(key).unwrap();
+                    for (index, pixel) in after.pixels().chunks_exact(4).enumerate() {
+                        assert!(pixel[..3].iter().all(|&value| value <= pixel[3]));
+                        if alpha_locked {
+                            assert_eq!(pixel[3], original.pixels()[index * 4 + 3]);
+                        }
+                        if let Some(previous) = &previous {
+                            let old_alpha = previous.get(key).unwrap().pixels()[index * 4 + 3];
+                            if eraser {
+                                assert!(pixel[3] <= old_alpha);
+                            } else {
+                                assert!(pixel[3] >= old_alpha);
+                            }
+                        }
+                    }
+                }
+                previous = Some(output.after);
             }
         }
     }

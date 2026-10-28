@@ -35,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         clip_to_below: false,
         blend_mode: LayerBlendMode::Normal,
         children: vec![LayerTreeNode::Raster(LayerNode {
+            mask: None,
             id: LAYER,
             name: "Alpha locked".into(),
             visible: true,

@@ -19,6 +19,7 @@ impl PageCopyWorker {
     pub(crate) fn start(
         &mut self,
         tiles: &std::collections::BTreeMap<nyatidraw_tiles::TileKey, Vec<u8>>,
+        coverage: &nyatidraw_tiles::TileSnapshot,
         tree: nyatidraw_document::LayerTree,
         canvas: nyatidraw_api::CanvasSpec,
         live_ink: crate::live_ink::LiveInkBridge,
@@ -34,6 +35,31 @@ impl PageCopyWorker {
             let _ = handle.join();
         }
         let tiles = page_tiles(tiles, canvas)?;
+        let owned = tree.mask_ids();
+        let columns = i64::from(canvas.width_px.div_ceil(nyatidraw_tiles::TILE_EDGE));
+        let rows = i64::from(canvas.height_px.div_ceil(nyatidraw_tiles::TILE_EDGE));
+        let coverage: Vec<_> = coverage
+            .coverage_iter()
+            .filter(|(key, _)| {
+                owned.contains(&key.mask)
+                    && (0..columns).contains(&i64::from(key.x))
+                    && (0..rows).contains(&i64::from(key.y))
+            })
+            .map(|(key, tile)| (key, tile.clone()))
+            .collect();
+        if tiles
+            .iter()
+            .map(|(_, pixels)| pixels.len())
+            .sum::<usize>()
+            .saturating_add(
+                coverage
+                    .len()
+                    .saturating_mul(nyatidraw_tiles::COVERAGE_TILE_BYTE_LEN),
+            )
+            > MAX_BYTES
+        {
+            return Err("마스크와 이미지가 PNG 복사 메모리 한도(128 MiB)를 넘습니다.".into());
+        }
         live_ink.publish_activation_notice("그림 전체를 PNG로 복사하고 있습니다.".into());
         self.handle = Some(
             std::thread::Builder::new()
@@ -41,6 +67,13 @@ impl PageCopyWorker {
                 .spawn(move || {
                     let result = nyatidraw_tiles::TileSnapshot::from_tiles(tiles)
                         .map_err(|error| format!("복사할 픽셀을 준비하지 못했습니다: {error:?}"))
+                        .and_then(|tiles| {
+                            nyatidraw_tiles::TileSnapshot::from_planes(
+                                tiles.iter().map(|(key, tile)| (key, tile.clone())),
+                                coverage,
+                            )
+                            .map_err(|error| format!("복사 마스크: {error:?}"))
+                        })
                         .and_then(|tiles| copy_page(&tiles, &tree, canvas, &mut SystemClipboard));
                     live_ink.publish_activation_notice(match result {
                         Ok(()) => {

@@ -1,5 +1,9 @@
 //! Project file policy, independent of any storage backend.
+mod animation;
 mod tool_state;
+pub use animation::{
+    MAX_ANIMATION_RECORD_BYTES, decode_animation_timeline, encode_animation_timeline,
+};
 mod wire;
 
 use std::{
@@ -317,6 +321,12 @@ pub const PENCIL_BRUSH_SCHEMA_FLAG: u64 = 0x2000;
 pub const SHORT_STROKE_BRUSH_SCHEMA_FLAG: u64 = 0x8000;
 /// Layer-tree v4 display colors require readers that preserve the effect.
 pub const LAYER_COLOR_EFFECT_SCHEMA_FLAG: u64 = 0x1_0000;
+/// Layered-cel timeline metadata must not be discarded by earlier readers.
+pub const ANIMATION_SCHEMA_FLAG: u64 = 0x2_0000;
+/// Typed R8 mask planes and layer ownership require matching readers.
+pub const MASK_SCHEMA_FLAG: u64 = 0x4_0000;
+/// Fractional selection replay must not fall back to binary coverage.
+pub const FRACTIONAL_SELECTION_SCHEMA_FLAG: u64 = 0x8_0000;
 
 #[must_use]
 pub const fn brush_replay_schema_flags(engine: u32) -> u64 {
@@ -344,4 +354,7 @@ pub const SCHEMA_CAPABILITY_FLAGS: u64 = COMPRESSED_TILE_SCHEMA_FLAG
     | ALPHA_LOCK_STROKE_SCHEMA_FLAG
     | PENCIL_BRUSH_SCHEMA_FLAG
     | SHORT_STROKE_BRUSH_SCHEMA_FLAG
-    | LAYER_COLOR_EFFECT_SCHEMA_FLAG;
+    | LAYER_COLOR_EFFECT_SCHEMA_FLAG
+    | ANIMATION_SCHEMA_FLAG
+    | MASK_SCHEMA_FLAG
+    | FRACTIONAL_SELECTION_SCHEMA_FLAG;

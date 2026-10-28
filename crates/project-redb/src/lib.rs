@@ -4,10 +4,14 @@
 
 use std::path::{Path, PathBuf};
 
+mod animation_history;
 mod canvas_history;
 mod editor_state;
 mod history_retention;
 mod layer_history;
+mod masks;
+#[cfg(test)]
+mod masks_tests;
 mod memory;
 pub use memory::MemoryProjectDb;
 #[cfg(feature = "legacy-migration")]
@@ -42,7 +46,7 @@ use nyatidraw_project::{
     encode_root_manifest, encode_stroke_commit, open_mode,
 };
 use nyatidraw_stroke::{MaterializationStrategy, materialize_with_strategy};
-use nyatidraw_tiles::{ContentRoot, ObjectHash, TileObject, TileSnapshot};
+use nyatidraw_tiles::{ContentRoot, CoverageTileObject, ObjectHash, TileObject, TileSnapshot};
 use redb::{Database, DatabaseError, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
@@ -150,6 +154,21 @@ impl ProjectDatabase {
 }
 
 impl ProjectDb {
+    /// Opens an existing project without repair, migration, retention, or initialization.
+    /// # Errors
+    /// Rejects missing/invalid files and containers requiring a writer's recovery.
+    pub fn open_read_only(path: &Path) -> Result<Self, ProjectOpenError> {
+        let db = redb::ReadOnlyDatabase::open(path).map_err(|error| ProjectOpenError::Io {
+            path: path.to_owned(), message: format!("read-only project open: {error}; reopen in the editor if recovery or migration is needed"),
+        })?;
+        let project = Self {
+            db: ProjectDatabase::Validation(db),
+            path: path.to_owned(),
+        };
+        project.validate_existing()?;
+        Ok(project)
+    }
+
     /// Opens a project, initializing only a missing or exactly empty file.
     /// During alpha, legacy containers are automatically converted through a
     /// validated sibling copy and the old file is retained as a `.bak`.
@@ -286,6 +305,8 @@ impl ProjectDb {
         self.load_reopened()?;
         self.validate_layer_history()?;
         self.validate_canvas_history()?;
+        self.validate_animation_history()?;
+        self.validate_mask_history()?;
         Ok(())
     }
 
@@ -367,7 +388,49 @@ impl ProjectDb {
         canvas: Option<CanvasSpec>,
         control: &CommitControl,
     ) -> Result<(), ProjectOpenError> {
+        self.commit_structural_document_inner(
+            batch,
+            tree,
+            canvas,
+            animation_history::TimelineChange::Inherit,
+            control,
+        )
+    }
+
+    /// Commits timeline, layers, canvas, pixels and history in one transaction.
+    /// `None` explicitly restores static artwork; ordinary commits inherit timeline.
+    /// # Errors
+    /// Rejects invalid cel references, lineage or failed durability without publication.
+    pub fn commit_structural_with_document_metadata(
+        &self,
+        batch: &ProjectStructuralBatch,
+        tree: &LayerTree,
+        canvas: CanvasSpec,
+        timeline: Option<&nyatidraw_document::AnimationTimeline>,
+    ) -> Result<(), ProjectOpenError> {
+        canvas
+            .validate()
+            .map_err(|error| self.io(format!("invalid canvas: {error:?}")))?;
+        self.commit_structural_document_inner(
+            batch,
+            Some(tree),
+            Some(canvas),
+            animation_history::TimelineChange::Replace(timeline),
+            &CommitControl::Normal,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn commit_structural_document_inner(
+        &self,
+        batch: &ProjectStructuralBatch,
+        tree: Option<&LayerTree>,
+        canvas: Option<CanvasSpec>,
+        timeline: animation_history::TimelineChange<'_>,
+        control: &CommitControl,
+    ) -> Result<(), ProjectOpenError> {
         self.validate_structural_lineage(batch)?;
+        self.validate_mask_transition(&batch.before, &batch.after, tree)?;
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
         transaction
             .set_durability(Durability::Immediate)
@@ -380,6 +443,13 @@ impl ProjectDb {
             canvas.is_some(),
         )?;
         self.capture_snapshot_canvas(&transaction, batch.snapshot_id, SnapshotId(0), canvas)?;
+        self.capture_snapshot_animation(
+            &transaction,
+            batch.snapshot_id,
+            SnapshotId(0),
+            tree,
+            timeline,
+        )?;
         {
             let mut objects = transaction
                 .open_table(OBJECTS)
@@ -504,6 +574,7 @@ impl ProjectDb {
         control: &CommitControl,
     ) -> Result<(), ProjectOpenError> {
         self.validate_commit_lineage(batch)?;
+        self.validate_mask_transition(&batch.before, &batch.materialized.after, None)?;
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
         transaction
             .set_durability(Durability::Immediate)
@@ -520,6 +591,13 @@ impl ProjectDb {
             batch.snapshot_id,
             batch.stroke.parent_snapshot,
             None,
+        )?;
+        self.capture_snapshot_animation(
+            &transaction,
+            batch.snapshot_id,
+            batch.stroke.parent_snapshot,
+            None,
+            animation_history::TimelineChange::Inherit,
         )?;
         if batch.stroke.selection().is_some()
             || batch.stroke.brush.preset.engine_version >= 2
@@ -551,6 +629,15 @@ impl ProjectDb {
                             .is_some_and(|selection| selection.origin() != [0, 0])
                         {
                             SIGNED_SELECTION_SCHEMA_FLAG
+                        } else {
+                            0
+                        }
+                        | if batch
+                            .stroke
+                            .selection()
+                            .is_some_and(|selection| !selection.is_binary())
+                        {
+                            nyatidraw_project::FRACTIONAL_SELECTION_SCHEMA_FLAG
                         } else {
                             0
                         }
@@ -880,7 +967,7 @@ impl ProjectDb {
             || stroke.brush.preset.engine_version >= 3
             || stroke
                 .selection()
-                .is_some_and(|selection| selection.origin() != [0, 0])
+                .is_some_and(|selection| selection.origin() != [0, 0] || !selection.is_binary())
         {
             let metadata = transaction
                 .open_table(META)
@@ -897,6 +984,13 @@ impl ProjectDb {
                 return Err(
                     self.corrupt("signed stroke selection lacks required reader capability")
                 );
+            }
+            if stroke
+                .selection()
+                .is_some_and(|selection| !selection.is_binary())
+                && schema & nyatidraw_project::FRACTIONAL_SELECTION_SCHEMA_FLAG == 0
+            {
+                return Err(self.corrupt("fractional selection lacks required reader capability"));
             }
             if stroke.alpha_locked() && schema & ALPHA_LOCK_STROKE_SCHEMA_FLAG == 0 {
                 return Err(self.corrupt("alpha-locked stroke lacks required reader capability"));
@@ -1053,6 +1147,8 @@ impl ProjectDb {
         }
         let layers = self.cursor_layer_record(cursor)?;
         let canvas = self.cursor_canvas_record(cursor)?;
+        self.load_cursor_animation_timeline(cursor)?;
+        let animation = self.cursor_animation_record(cursor)?;
         let mut transaction = self.db.begin_write().map_err(|error| self.io(error))?;
         transaction
             .set_durability(Durability::Immediate)
@@ -1067,6 +1163,11 @@ impl ProjectDb {
             let mut state = transaction
                 .open_table(STATE)
                 .map_err(|error| self.io(error))?;
+            if let Some(animation) = animation {
+                state
+                    .insert(animation_history::CURRENT_ANIMATION, animation.as_slice())
+                    .map_err(|error| self.io(error))?;
+            }
             if let Some(layers) = layers {
                 if layers.is_empty() {
                     state
@@ -1593,6 +1694,11 @@ fn store_tile_objects(
         let envelope = Envelope::new(RecordKind::Tile, tile.pixels().to_vec()).encode_for_storage();
         insert_changed_envelope(table, tile.hash().0.as_slice(), &envelope)?;
     }
+    for (_, tile) in snapshot.coverage_iter() {
+        let envelope =
+            Envelope::new(RecordKind::CoverageTile, tile.pixels().to_vec()).encode_for_storage();
+        insert_changed_envelope(table, tile.hash().0.as_slice(), &envelope)?;
+    }
     Ok(())
 }
 
@@ -1669,7 +1775,31 @@ fn snapshot_from_manifest(
         };
         tiles.push((key, object));
     }
-    let snapshot = TileSnapshot::from_objects(tiles).map_err(|error| format!("{error:?}"))?;
+    let mut coverage = Vec::with_capacity(manifest.coverage.len());
+    let mut validated_coverage =
+        std::collections::BTreeMap::<ObjectHash, CoverageTileObject>::new();
+    for (key, expected_hash) in manifest.coverage {
+        let object = match validated_coverage.entry(expected_hash) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let bytes = get_required(
+                    objects,
+                    expected_hash.0.as_slice(),
+                    "coverage object missing",
+                )?;
+                let envelope = decode_envelope(RecordKind::CoverageTile, &bytes)?;
+                let object = CoverageTileObject::new(envelope.payload)
+                    .map_err(|error| format!("{error:?}"))?;
+                if object.hash() != expected_hash {
+                    return Err("coverage object key/content mismatch".into());
+                }
+                entry.insert(object).clone()
+            }
+        };
+        coverage.push((key, object));
+    }
+    let snapshot =
+        TileSnapshot::from_planes(tiles, coverage).map_err(|error| format!("{error:?}"))?;
     if snapshot.root() != manifest.root {
         return Err("reconstructed tile root mismatch".into());
     }
@@ -1855,6 +1985,7 @@ mod tests {
             clip_to_below: false,
             blend_mode: nyatidraw_api::LayerBlendMode::Normal,
             children: vec![LayerTreeNode::Raster(LayerNode {
+                mask: None,
                 color_effect: None,
                 id: LayerId(4),
                 name: "Sketch".into(),
@@ -3022,6 +3153,7 @@ mod tests {
     fn layer_tree_fixture() -> LayerTree {
         let raster = |id, name: &str| {
             LayerTreeNode::Raster(LayerNode {
+                mask: None,
                 color_effect: None,
                 alpha_locked: false,
                 clip_to_below: false,

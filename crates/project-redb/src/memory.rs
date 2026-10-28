@@ -14,7 +14,7 @@ use crate::{ProjectDatabase, ProjectDb};
 const MEMORY_PROJECT_NAME: &str = "memory.ntdr";
 const MEMORY_CACHE_LIMIT: usize = 8 * 1024 * 1024;
 const MAX_MEMORY_ROOT_TILES: usize = 1024;
-const MAX_MEMORY_ROOT_BYTES: usize = 112 + MAX_MEMORY_ROOT_TILES * 57;
+const MAX_MEMORY_ROOT_BYTES: usize = 128 + MAX_MEMORY_ROOT_TILES * 57;
 const MAX_MEMORY_ROOTS: usize = nyatidraw_history::HISTORY_LIMIT * 2 + 2;
 const MAX_MEMORY_METADATA_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MEMORY_METADATA_RECORD_BYTES: usize = 128 * 1024;
@@ -93,6 +93,10 @@ fn preflight_decode_budget(project: &ProjectDb) -> Result<(), ProjectOpenError> 
     let transaction = project.db.begin_read().map_err(|error| project.io(error))?;
     let mut metadata_bytes = 0_usize;
     for (definition, limit) in [
+        (
+            crate::animation_history::SNAPSHOT_ANIMATION,
+            nyatidraw_history::HISTORY_LIMIT + 1,
+        ),
         (crate::HISTORY, nyatidraw_history::HISTORY_LIMIT),
         (crate::SNAPSHOTS, nyatidraw_history::HISTORY_LIMIT + 1),
         (
@@ -146,7 +150,7 @@ fn preflight_decode_budget(project: &ProjectDb) -> Result<(), ProjectOpenError> 
             .map_err(|error| project.corrupt(error))?;
         let manifest =
             decode_root_manifest(&envelope.payload).map_err(|error| project.corrupt(error))?;
-        if manifest.tiles.len() > MAX_MEMORY_ROOT_TILES
+        if manifest.tiles.len() + manifest.coverage.len() > MAX_MEMORY_ROOT_TILES
             || key.value() != manifest.root.hash.0.as_slice()
         {
             return Err(project.corrupt("project root exceeds browser tile budget or is corrupt"));

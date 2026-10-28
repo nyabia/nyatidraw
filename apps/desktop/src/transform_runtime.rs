@@ -54,6 +54,7 @@ impl ActiveCanvas {
                     job.transform,
                     Some(
                         TransformCommand::Begin
+                            | TransformCommand::BeginGroup(_)
                             | TransformCommand::Paste
                             | TransformCommand::ImportRaster(_)
                             | TransformCommand::Preview(_)
@@ -93,6 +94,7 @@ impl ActiveCanvas {
         &mut self,
         command: TransformCommand,
     ) -> Result<bool, CommandRejectReason> {
+        self.guard_mask_edit(&EditCommand::FreeTransform(command.clone()))?;
         if let TransformCommand::ImportRaster(import) = &command
             && import.project_epoch != self.stroke.live_ink.project_epoch()
         {
@@ -142,12 +144,18 @@ impl ActiveCanvas {
         self.ensure_artwork_command_idle()?;
         if matches!(
             command,
-            TransformCommand::Begin | TransformCommand::Paste | TransformCommand::ImportRaster(_)
+            TransformCommand::Begin
+                | TransformCommand::BeginGroup(_)
+                | TransformCommand::Paste
+                | TransformCommand::ImportRaster(_)
         ) {
             if active || (self.stroke.transform_starting && command != TransformCommand::Begin) {
                 return Err(CommandRejectReason::CommandQueueBusy);
             }
-            if command != TransformCommand::Begin {
+            if matches!(
+                command,
+                TransformCommand::Paste | TransformCommand::ImportRaster(_)
+            ) {
                 self.validate_provisional_layer_capacity()?;
             }
         } else if !active {
@@ -166,7 +174,10 @@ impl ActiveCanvas {
         let (reply, received) = sync_channel(1);
         let starting = matches!(
             command,
-            TransformCommand::Begin | TransformCommand::Paste | TransformCommand::ImportRaster(_)
+            TransformCommand::Begin
+                | TransformCommand::BeginGroup(_)
+                | TransformCommand::Paste
+                | TransformCommand::ImportRaster(_)
         );
         let pasting = matches!(
             command,
@@ -184,23 +195,27 @@ impl ActiveCanvas {
         if result.is_ok() && starting {
             self.stroke.transform_starting = true;
             self.stroke.transform_paste = pasting;
-            // Explicit Begin is one semantic action: select its tool only once
-            // the worker accepts the draft, without a second UI revision race.
-            self.drawing.select_tool(DrawingTool::MoveSelection);
-            self.stroke.live_ink.set_navigation_tool(false);
-            self.projection.stage_drawing_controls(
-                self.drawing.tool,
-                self.drawing.size_tenths,
-                self.drawing.opacity_u16,
-                self.drawing.color,
-                self.drawing.background_color,
-            );
+            self.select_transform_tool();
         }
         result
     }
 
+    fn select_transform_tool(&mut self) {
+        // Explicit Begin is one semantic action: select its tool only once
+        // the worker accepts the draft, without a second UI revision race.
+        self.drawing.select_tool(DrawingTool::MoveSelection);
+        self.stroke.live_ink.set_navigation_tool(false);
+        self.projection.stage_drawing_controls(
+            self.drawing.tool,
+            self.drawing.size_tenths,
+            self.drawing.opacity_u16,
+            self.drawing.color,
+            self.drawing.background_color,
+        );
+    }
+
     fn validate_provisional_layer_capacity(&self) -> Result<(), CommandRejectReason> {
-        let mut candidate = self.scene.tree().clone();
+        let mut candidate = self.authoritative_tree.clone();
         let (parent, index) = candidate
             .insertion_above_clipping_run(nyatidraw_api::LayerTreeNodeId::Raster(self.active_layer))
             .ok_or(CommandRejectReason::UnknownLayer)?;
@@ -214,7 +229,12 @@ impl ActiveCanvas {
             )
             .map_err(|_| CommandRejectReason::InvalidLayerMove)?;
         self.scene
-            .validate_tree_replacement(&candidate)
+            .validate_tree_replacement(
+                &self
+                    .animation
+                    .render_tree(&candidate)
+                    .map_err(|_| CommandRejectReason::UnknownLayer)?,
+            )
             .map_err(|_| CommandRejectReason::WorkspaceFailed)
     }
 
@@ -253,6 +273,7 @@ impl ActiveCanvas {
                 if !matches!(
                     command,
                     TransformCommand::Begin
+                        | TransformCommand::BeginGroup(_)
                         | TransformCommand::Paste
                         | TransformCommand::ImportRaster(_)
                 ) {
@@ -291,6 +312,7 @@ impl ActiveCanvas {
             command,
             Some(
                 TransformCommand::Begin
+                    | TransformCommand::BeginGroup(_)
                     | TransformCommand::Paste
                     | TransformCommand::ImportRaster(_)
             )
@@ -359,11 +381,15 @@ impl ActiveCanvas {
             keys.extend(previous.iter().map(|(key, _)| key));
         }
         keys.extend(outcome.tiles.iter().map(|(key, _)| key));
-        if self.scene.tree() != &outcome.tree {
+        let render_tree = self.animation.render_tree(&outcome.tree)?;
+        if self.scene.tree() != &render_tree {
             self.scene
-                .replace_tree(outcome.tree.clone())
+                .replace_tree(render_tree)
                 .map_err(|e| format!("Transform display tree: {e:?}"))?;
         }
+        self.scene
+            .replace_mask_tiles(&outcome.tiles)
+            .map_err(|error| format!("Transform masks: {error:?}"))?;
         for key in keys {
             if self.scene.tree().raster(key.layer).is_none() {
                 continue;
@@ -381,12 +407,19 @@ impl ActiveCanvas {
         self.install_selection(outcome.selection)?;
         self.projection.stage_history(outcome.history);
         if outcome.committed {
+            self.authoritative_tree = outcome.tree.clone();
+            self.adopt_mask_snapshot(&outcome.tiles)
+                .map_err(|error| format!("Transform mask adoption: {error:?}"))?;
             CpuSnapshotAdoption::new(&mut self.cpu_tiles, &outcome.tiles).apply();
             let mut current = self.projection.current().clone();
             current.dirty = true;
             self.projection.install_authoritative(current);
         }
         let active = outcome.projection.is_some();
+        self.transform_tree = active.then_some(outcome.tree);
+        if !active {
+            self.animation.refresh_onion = self.animation.onion_skin;
+        }
         self.stroke.transform_starting = false;
         self.stroke.revalidating_transform = false;
         self.transform_display = active.then_some(outcome.tiles);

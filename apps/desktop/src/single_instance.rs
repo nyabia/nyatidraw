@@ -94,6 +94,11 @@ pub(crate) fn acquire_or_route() -> Result<InstanceDisposition, String> {
         // SAFETY: this process owns this temporary handle and no further use
         // occurs after closing it.
         let _ = unsafe { CloseHandle(mutex) };
+        if std::env::var_os("NAYATI_ANIMATION_PROBE").is_some()
+            || std::env::var_os("NAYATI_MASK_PROBE").is_some()
+        {
+            return Err("Artwork scratch probe refuses to route into an existing instance".into());
+        }
         // Resolve relative CLI paths in the secondary process. The primary
         // may have a different working directory and must not reinterpret
         // their meaning after IPC transport.

@@ -3644,6 +3644,8 @@ dependencies = [
  "nyatidraw-document",
  "nyatidraw-editor",
  "nyatidraw-input",
+ "nyatidraw-paint-cpu",
+ "nyatidraw-png-io",
  "nyatidraw-project",
  "nyatidraw-project-redb",
  "nyatidraw-stroke",
@@ -3891,7 +3893,10 @@ dependencies = [
 name = "nyatidraw-web-worker"
 version = "0.1.0"
 dependencies = [
+ "nyatidraw-editor",
+ "nyatidraw-png-io",
  "nyatidraw-project-web",
+ "nyatidraw-tiles",
  "wasm-bindgen",
 ]
 

@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+mod animation_export;
+mod scaled_export;
+
 use std::{
     env,
     ffi::OsString,
@@ -38,6 +41,8 @@ fn run() -> Result<(), String> {
         .and_then(|command| command.into_string().ok())
         .ok_or_else(usage)?;
     match command.as_str() {
+        "export-png" => scaled_export::run(&mut args),
+        "export-spritesheet" => animation_export::run(&mut args),
         "migrate-copy" => {
             let source = required_path(&mut args, "legacy project path")?;
             let target = required_path(&mut args, "new .ntdr path")?;
@@ -317,6 +322,8 @@ fn usage() -> String {
     concat!(
         "usage: nyatidraw-cli validate <project.redb> | ",
         "export <project.redb> <output.ppm> <layer-id> | ",
+        "export-png <project.ntdr> <new.png> <width-px> <height-px> | ",
+        "export-spritesheet <project.ntdr> <new-directory> [columns] | ",
         "migrate-copy <source.ntdr> <new.ntdr> | diagnostic-smoke"
     )
     .to_owned()

@@ -215,6 +215,7 @@ mod tests {
         let row = |key, parent, index| {
             let id = node_key(key).unwrap();
             LayerProjection {
+                mask: None,
                 alpha_locked: false,
                 clip_to_below: false,
                 blend_mode: nyatidraw_api::LayerBlendMode::Normal,

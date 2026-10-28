@@ -21,6 +21,16 @@ impl WebDocument {
     /// Rejects a live stroke or exceeding the bounded portable size. Not a `.ntdr` file.
     pub fn encode_portable(&self) -> Result<Vec<u8>, WebError> {
         self.require_idle()?;
+        if self.layers().has_masks() || self.snapshot().coverage_len() != 0 {
+            return Err(WebError::EditRejected(
+                "Layer masks require the native NTDR format".into(),
+            ));
+        }
+        if self.animation_timeline().is_some() {
+            return Err(WebError::EditRejected(
+                "Animation requires the native NTDR format".into(),
+            ));
+        }
         let mut bytes = Vec::with_capacity(32 * 1024);
         bytes.extend_from_slice(MAGIC);
         put_u32(&mut bytes, self.canvas().width_px);
@@ -200,6 +210,9 @@ fn encode_layer(bytes: &mut Vec<u8>, layer: &LayerNode) -> Result<(), WebError> 
     bytes.push(match layer.blend_mode {
         LayerBlendMode::Normal => 0,
         LayerBlendMode::Multiply => 1,
+        LayerBlendMode::Screen => 2,
+        LayerBlendMode::Add => 3,
+        LayerBlendMode::Overlay => 4,
     });
     bytes.extend_from_slice(&layer.opacity_u16.to_le_bytes());
     bytes.extend_from_slice(&layer.content_root.0.to_le_bytes());
@@ -229,6 +242,9 @@ fn decode_layer(reader: &mut Reader<'_>, has_color_effect: bool) -> Result<Layer
     let blend_mode = match reader.byte()? {
         0 => LayerBlendMode::Normal,
         1 => LayerBlendMode::Multiply,
+        2 => LayerBlendMode::Screen,
+        3 => LayerBlendMode::Add,
+        4 => LayerBlendMode::Overlay,
         _ => return Err(WebError::InvalidPortable),
     };
     let opacity_u16 = u16::from_le_bytes(reader.array()?);
@@ -243,6 +259,7 @@ fn decode_layer(reader: &mut Reader<'_>, has_color_effect: bool) -> Result<Layer
         None
     };
     Ok(LayerNode {
+        mask: None,
         id,
         name,
         visible,

@@ -3,6 +3,22 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
+## alpha.20 배포 준비
+
+일러스트 마무리와 게임 아트 제작을 함께 확장하는 알파 릴리즈다.
+
+- 일러스트와 게임 아트 작업, 래스터 애니메이션, 마스크·feather, 그룹 변형,
+  추가 합성 모드, 크기 지정 PNG와 스프라이트 시트 출력을 포함한다.
+- workspace 코어 테스트와 Clippy, Windows·웹 빌드, 실제 웹/Windows 조작과
+  scratch 작품의 저장·별도 프로세스 재열기 결과는
+  [통합 검증](workflow-expansion-validation.md)에 기록했다.
+- Windows에서 메뉴 뒤 마스크가 다르게 보이는 캡처 문제는 원인 미확정이다.
+  파일·PNG 보존과 별개로 최종 표시 gate는 미완료이며 릴리즈 노트에 명시한다.
+- 실제 설치/업데이트·물리 펜·iPad Safari 검증을 통과했다고 주장하지 않는다.
+
+[변경 내용과 호환성 제한](releases/0.1.0-alpha.20.md).
+CI·공개 자산·Pages 완료 여부는 게시 후 별도로 기록한다.
+
 ## alpha.19 배포 검증
 
 사용자가 큰 그림의 축소 표시 수정과 배포를 승인했다. 웹과 Windows의 공용 GPU 표시

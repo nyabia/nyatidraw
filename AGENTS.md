@@ -6,9 +6,13 @@ Follow `docs/illustration-workflow.md` and its W0-W5 illustration workflow
 gates. Preserve the Sprint 1-3 architecture and evidence requirements; do not
 automatically continue feature-count-driven F3b/merge work. Basic brush control,
 shape correction, flat coloring, shading, and finishing take precedence over
-performance optimization and advanced features. Windows remains the current
-implementation target; macOS/Linux, vector/Vello, animation, and advanced
-textured/wet brushes remain deferred.
+performance optimization and advanced features. The current product target is
+both illustration and game-art production; follow `docs/game-and-illustration.md`
+for the expanded scope. Raster frame animation and game export are now in scope,
+not a replacement for illustration workflows. Windows and the shared web editor
+remain the implementation targets; macOS/Linux, vector/Vello, and advanced
+textured/wet brushes remain deferred. Optimize measured bottlenecks while
+preserving artwork, input, and recovery invariants.
 
 Physical-pen, high-refresh display, and backend-specific hardware evidence may
 remain explicitly unverified when the required hardware interaction is not

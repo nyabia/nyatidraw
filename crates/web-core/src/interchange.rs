@@ -22,10 +22,24 @@ impl WebDocument {
         layers: LayerTree,
         active: LayerId,
     ) -> Result<Self, WebError> {
+        Self::from_animation_snapshot(canvas, tiles, layers, active, None, None)
+    }
+
+    /// Restores all cels before deriving the current frame's disposable display tree.
+    /// # Errors
+    /// Rejects malformed animation ownership and resource limits without adopting pixels.
+    pub fn from_animation_snapshot(
+        canvas: CanvasSpec,
+        tiles: TileSnapshot,
+        layers: LayerTree,
+        active: LayerId,
+        timeline: Option<nyatidraw_document::AnimationTimeline>,
+        active_frame: Option<nyatidraw_api::FrameId>,
+    ) -> Result<Self, WebError> {
         let mut document = Self::new(canvas)?;
         if layers.root().children.is_empty()
-            || crate::editing::node_count(&layers) > MAX_LAYERS
-            || tiles.len() > MAX_RESIDENT_TILES
+            || (timeline.is_none() && crate::editing::node_count(&layers) > MAX_LAYERS)
+            || tiles.total_len() > MAX_RESIDENT_TILES
         {
             return Err(WebError::LimitExceeded);
         }
@@ -54,8 +68,12 @@ impl WebDocument {
             tiles,
             layers,
             active,
+            timeline,
         };
+        crate::editing::validate_artwork(&document.artwork)?;
         document.next_layer_id = next;
+        document.active_frame = active_frame;
+        document.refresh_frame_projection();
         Ok(document)
     }
 

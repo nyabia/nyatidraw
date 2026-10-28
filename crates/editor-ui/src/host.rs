@@ -1,6 +1,6 @@
 use crate::{
     layout_store::PanelHeights,
-    preview::{LayerThumbnailSnapshot, NavigatorSnapshot},
+    preview::{FrameThumbnailSnapshot, LayerThumbnailSnapshot, NavigatorSnapshot},
     workspace_appearance::WorkspaceAppearance,
 };
 use dioxus::prelude::*;
@@ -36,6 +36,10 @@ pub trait UiBackend {
     fn layer_thumbnail_snapshot(&self) -> LayerThumbnailSnapshot {
         LayerThumbnailSnapshot::default()
     }
+    fn frame_thumbnail_snapshot(&self) -> FrameThumbnailSnapshot {
+        FrameThumbnailSnapshot::default()
+    }
+    fn request_frame_thumbnails(&self, _frames: &[nyatidraw_api::FrameId]) {}
     fn panel_heights(&self) -> PanelHeights {
         PanelHeights::default()
     }

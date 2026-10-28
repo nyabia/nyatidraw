@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 
+mod animation;
 mod brush_presets;
 mod dock;
+mod masks;
 mod protocol;
+pub use animation::*;
 pub use brush_presets::*;
+pub use masks::*;
 
 use std::collections::BTreeSet;
 
@@ -32,7 +36,10 @@ macro_rules! id_type {
 
 id_type!(DocumentId);
 id_type!(LayerId);
+id_type!(MaskId);
 id_type!(GroupId);
+id_type!(FrameId);
+id_type!(CelId);
 id_type!(ContentRootId);
 id_type!(SnapshotId);
 id_type!(HistoryNodeId);
