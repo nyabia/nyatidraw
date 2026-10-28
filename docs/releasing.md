@@ -3,7 +3,7 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
-## alpha.20 배포 준비
+## alpha.20 배포 검증
 
 일러스트 마무리와 게임 아트 제작을 함께 확장하는 알파 릴리즈다.
 
@@ -17,7 +17,31 @@
 - 실제 설치/업데이트·물리 펜·iPad Safari 검증을 통과했다고 주장하지 않는다.
 
 [변경 내용과 호환성 제한](releases/0.1.0-alpha.20.md).
-CI·공개 자산·Pages 완료 여부는 게시 후 별도로 기록한다.
+
+- 소스 `2db4046`, 태그 `v0.1.0-alpha.20`의
+  [Windows CI](https://github.com/nyabia/nyatidraw/actions/runs/40672956885)가 성공했다.
+  [릴리즈 작업](https://github.com/nyabia/nyatidraw/actions/runs/40672964729)의 검증·
+  Windows release 빌드·패키징·사전 릴리즈 공개·Pages 게시도 성공했다.
+- [공개 릴리즈](https://github.com/nyabia/nyatidraw/releases/tag/v0.1.0-alpha.20)의 자산 7개를
+  내려받아 GitHub 크기·SHA256 digest 7/7, `SHA256SUMS.txt`의 6개 항목을 확인했다.
+  JSON·legacy 업데이트 피드의 제품 ID·버전·Full 타입·크기·SHA1/SHA256이 일치했다.
+  포터블 manifest의 `NyatiDraw` / `0.1.0-alpha.20` / `nyatidraw.exe` /
+  `nyatidraw-alpha` / `win-x64`, 실행 파일 헤더·라이선스 원문·제삼자 고지도 확인했다.
+  설치 파일은 14,778,042 bytes,
+  SHA256 `952179c19ba63100126b1e09454b38b613bcf2ac0626d243d72964a24981aebf`다.
+  설치본은 교체하지 않았다.
+- 격리 Edge에서 실제 공개 웹에 scratch 마스크·2프레임 애니메이션 파일을 열었다.
+  마스크 편집 후 Ctrl+A·Esc, 숫자 입력의 Ctrl+A·Esc 복원을 확인했다.
+  브라우저 프로세스를 종료하고 같은 프로필로 재시작한 뒤 두 프레임과 마스크 상태가
+  복구됐고, 36×36 프레임 미리보기의 데이터 URI 해시는 재시작 전후 일치했다.
+  이는 실제 공개 웹과 복구 Worker 확인이며 물리 펜·iPad·Windows 설치 검증은 아니다.
+
+릴리즈 Pages 완료 직후 기본 공개 `release.json`과 실제 Edge 다운로드 버튼에는
+alpha.19가 남아 있었다. 같은 소스의
+[홈페이지 재게시](https://github.com/nyabia/nyatidraw/actions/runs/40675721594) 성공 후
+기본 `release.json`과 실제 Edge 다운로드 버튼에서 alpha.20 설치 링크를 확인했다.
+재게시 산출물의 웹 본체·복구 Worker 파일 이름도 위 공개 웹 검증 대상과 일치했다.
+Windows 태그와 릴리즈 자산은 교체하지 않았다.
 
 ## alpha.19 배포 검증
 
