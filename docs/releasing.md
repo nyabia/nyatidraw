@@ -30,7 +30,12 @@ GPU 비교 및 미검증 하드웨어 범위를 기록했다. 사용자 요청�
 릴리즈 Pages의 `release.json` 산출물은 alpha.21이었지만 완료 후 기본 공개 URL과
 실제 Edge 다운로드 버튼에는 alpha.20이 남아 있었다. 웹 본체와 Worker 파일은
 이미 확인한 alpha.21과 같았으며 manifest의 바이트 차이는 JSON 키 순서뿐이었다.
-검증 기록 커밋으로 홈페이지를 재게시하고 기본 URL과 버튼의 다운로드 전환을 확인한다.
+검증 기록 커밋 `8c6de80`의
+[홈페이지 재게시](https://github.com/nyabia/nyatidraw/actions/runs/40713662405) 성공 후
+기본 `release.json` URL과 실제 Edge 다운로드 버튼에서 alpha.21 설치 링크를 확인했다.
+최종 공개 파일 11개는 재게시 산출물과 바이트 단위로 일치했다. 웹 본체와 Worker의
+해시는 앞서 공개 웹 조작·복구를 검증한 파일과 같았다. Windows 태그와 자산은
+교체하지 않았다.
 
 ## alpha.20 배포 검증
 
