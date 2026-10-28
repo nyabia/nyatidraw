@@ -66,3 +66,29 @@ GPU 검사는 NVIDIA GeForce RTX 3080 / Windows / Vulkan / release에서 수행�
 테스트용 NTDR/PNG와 `target/ipad-*.log`에 있다. 이 생성 파일들은 Git에 추가하지
 않는다. alpha.21의 게시 상태는 [배포 기록](releasing.md#alpha21-배포)에서 구분한다.
 물리 iPad/Pencil의 필기 감각, Safari 입력 및 Apple Pencil 몸통 제스처는 미검증이다.
+
+## alpha.21 공개 웹 확인
+
+소스 `3c80749`의 [Website 게시](https://github.com/nyabia/nyatidraw/actions/runs/40709309453)
+성공 뒤 기본 공개 URL에서 웹 본체·복구 Worker를 포함한 11개 파일을 CI Pages
+산출물과 비교했으며 모두 일치했다. Windows 릴리즈가 진행 중인 첫 게시의
+`release.json`은 당시 최신 게시판인 alpha.20을 가리켰다. 최종 다운로드 전환은
+[배포 기록](releasing.md#alpha21-배포)에서 별도로 확인한다.
+
+격리된 Edge의 1280×960 터치 화면에서 다음을 다시 확인했다.
+
+- 그림 이동 중 빨간 영역의 화면 경계가 `[129,327,244,442]`에서
+  `[250,390,365,505]`로 바뀌었고, 놓은 뒤에도 같았다. Undo 한 번으로 원위치가 됐다.
+- 손가락 밀기는 레이어 순서 변경 없이 목록을 154px 스크롤했다. 펜 탭은 레이어를
+  선택했고, 점 핸들 드래그만 두 레이어의 순서를 바꿨다.
+- 타임라인 닫기·다시 열기 후 두 프레임과 두 번째 프레임 선택, 100ms 값이 유지됐다.
+- 2H 연필 5px, 크기·불투명도 최소 필압 0%의 합성 입력 0.02와 0.05가 실제
+  저장 PNG에 남았다. PNG/NTDR 저장 후 브라우저 프로세스를 종료하고 다시 열어,
+  두 프레임 복구와 다시 출력한 PNG의 RGBA8 픽셀 완전 일치를 확인했다.
+  테스트 PNG 픽셀 SHA256은
+  `16979ffb7cf970a19aa1635b6af82f794a34e8bf09a5af03c9eb8aa58fc977c9`다.
+
+증거는 로컬 `output/playwright/alpha21-public/`과 `target/alpha21-public-*.json`,
+`target/alpha21-public-*.txt`에 있다. 콘솔에는 사이트 favicon 404와 Chromium의
+Windows GPU powerPreference 안내가 있었으며 앱 오류 알림은 없었다.
+이 결과는 공개 웹 검증이며 iPad Safari·물리 Pencil·Windows 설치 검증이 아니다.

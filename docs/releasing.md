@@ -10,7 +10,27 @@
 [입력·편집 검증](ipad-web-feedback.md)에 저장·프로세스 재시작·별도 네이티브 재열기,
 GPU 비교 및 미검증 하드웨어 범위를 기록했다. 사용자 요청으로 태그 배포를 진행한다.
 실제 iPad Safari/Pencil, 설치 업데이트와 alpha.20의 Windows 마스크 표시 문제는
-검증 완료로 간주하지 않는다. 게시 결과는 CI와 공개 자산 확인 후 추가한다.
+검증 완료로 간주하지 않는다.
+
+- 소스 `3c80749`, 태그 `v0.1.0-alpha.21`의
+  [Windows CI](https://github.com/nyabia/nyatidraw/actions/runs/40709309511)가 성공했다.
+  [릴리즈 작업](https://github.com/nyabia/nyatidraw/actions/runs/40709309222)의 소스 검사·
+  Windows release 빌드·패키징·사전 릴리즈 공개·Pages 게시가 성공했다.
+- [공개 릴리즈](https://github.com/nyabia/nyatidraw/releases/tag/v0.1.0-alpha.21)의
+  자산 7개를 내려받아 GitHub 크기·SHA256 digest 7/7과 `SHA256SUMS.txt`의
+  6개 항목을 확인했다. JSON·legacy 업데이트 피드의 제품 ID·버전·Full 타입·
+  크기·SHA1/SHA256이 일치했다. 포터블 manifest, 실행 파일 헤더와 라이선스·
+  제삼자 고지도 확인했다. 설치 파일은 14,790,068 bytes,
+  SHA256 `bbdab92c1f0d4a55f608a82dc3d58bd00fbe60b30e5615203c2a50cf8506a1bb`다.
+  사용자 설치본은 교체하지 않았다.
+- [최초 웹 게시](https://github.com/nyabia/nyatidraw/actions/runs/40709309453) 후
+  [공개 웹 조작·복구 검사](ipad-web-feedback.md#alpha21-공개-웹-확인)를 통과했다.
+  공개 본체·복구 Worker 등 11개 파일이 해당 Pages 산출물과 일치했다.
+
+릴리즈 Pages의 `release.json` 산출물은 alpha.21이었지만 완료 후 기본 공개 URL과
+실제 Edge 다운로드 버튼에는 alpha.20이 남아 있었다. 웹 본체와 Worker 파일은
+이미 확인한 alpha.21과 같았으며 manifest의 바이트 차이는 JSON 키 순서뿐이었다.
+검증 기록 커밋으로 홈페이지를 재게시하고 기본 URL과 버튼의 다운로드 전환을 확인한다.
 
 ## alpha.20 배포 검증
 
