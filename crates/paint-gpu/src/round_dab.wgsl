@@ -71,7 +71,10 @@ fn pencil_coverage(input: VertexOutput) -> f32 {
     let pixel = vec2<u32>(floor(input.position.xy));
     let tooth = paper_tooth(pixel + input.grain.yz);
     let deposit = (input.grain.x & 65535u) - 1u;
-    let undercoat = input.grain.x >> 16u;
+    if (input.grain.x & 131072u) != 0u {
+        return continuous_pencil_coverage(input, pixel, deposit, tooth);
+    }
+    let undercoat = (input.grain.x >> 16u) & 1u;
     let pigment = max(deposit - min(deposit, tooth), undercoat);
     if pigment == 0u { return 0.0; }
     let center = vec2<i32>(round(input.center_px * 16.0));
@@ -84,6 +87,31 @@ fn pencil_coverage(input: VertexOutput) -> f32 {
         }
     }
     return f32(count * pigment) / 4080.0;
+}
+
+fn continuous_pencil_coverage(input: VertexOutput, pixel: vec2<u32>, deposit: u32, tooth: u32) -> f32 {
+    let pigment = deposit * (255u - tooth / 2u) / 255u;
+    let radius = input.radius_px;
+    let corner = vec2<f32>(pixel) - input.center_px;
+    var area = 0.0;
+    if radius < 1.0 {
+        let low = max(corner.y, -radius);
+        let high = min(corner.y + 1.0, radius);
+        let step = max(high - low, 0.0) / 8.0;
+        for (var index = 0; index < 8; index += 1) {
+            let ordinate = low + (f32(index) + 0.5) * step;
+            let half_width = sqrt(max(radius * radius - ordinate * ordinate, 0.0));
+            area += max(min(corner.x + 1.0, half_width) - max(corner.x, -half_width), 0.0) * step;
+        }
+    } else {
+        for (var y = 0u; y < 4u; y += 1u) {
+            for (var x = 0u; x < 4u; x += 1u) {
+                let delta = corner + vec2<f32>(COVERAGE_OFFSETS[x], COVERAGE_OFFSETS[y]);
+                if dot(delta, delta) <= radius * radius { area += 1.0 / 16.0; }
+            }
+        }
+    }
+    return floor(clamp(area, 0.0, 1.0) * f32(pigment) * 16.0 + 0.5) / 4080.0;
 }
 
 fn shade_dab(input: VertexOutput) -> vec4<f32> {
@@ -100,7 +128,7 @@ fn shade_dab(input: VertexOutput) -> vec4<f32> {
     if input.grain.x != 0u {
         let coverage = pencil_coverage(input);
         if coverage == 0.0 { discard; }
-        let minimum = select(0.0, f32(input.grain.x >> 16u), input.opacity > 0.0);
+        let minimum = select(0.0, f32((input.grain.x >> 16u) & 1u), input.opacity > 0.0);
         let pigment = max(floor(coverage * input.opacity * 255.0 + 0.5), minimum);
         let dab_alpha = floor(pigment * selected + 0.5) / 255.0;
         return vec4<f32>(brush_color.rgb, brush_color.a * dab_alpha);

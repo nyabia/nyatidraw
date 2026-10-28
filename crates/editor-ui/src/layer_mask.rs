@@ -95,7 +95,8 @@ pub fn LayerMaskControls(
                 button { class: "layer-mask-menu-button", aria_label: "{layer.name} {label}", title: label,
                     disabled: busy, aria_expanded: opened(),
                     onclick: move |event| { event.stop_propagation(); opened.set(true); },
-                    if mask.is_some() { "⋯" } else { UiIcon { name: "plus" } span { "마스크" } }
+                    UiIcon { name: "mask" }
+                    if mask.is_none() { span { "마스크 추가" } }
                 }
             }
         }

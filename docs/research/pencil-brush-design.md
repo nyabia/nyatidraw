@@ -14,6 +14,58 @@
 구현으로 진행했다. 구현된 계약과 아직 검증하지 않은 물리 펜 감각을 구분한다.
 이 문서는 연필의 물리 재현을 완료했다는 선언이 아니다.
 
+## 2026-10-28: 낮은 필압의 끊김과 사라지는 접촉 보정
+
+iPad / Apple Pencil 사용자가 기본 획의 줄무늬와 약한 필압에서 보이지 않는 연필을 보고했다.
+코드와 CPU artwork fixture에서 서로 겹치는 원인을 재현했다. 기존 spacing은 필압으로 줄어든
+접촉 지름 대신 최대 지름을 사용했다. 연필은 실제 UI의 최소 크기/불투명도 0 설정에서
+필압을 크기·불투명도·종이 임계 부착량에 각각 적용했다. 5px 연필의 필압 0.05는 반지름
+0.125px가 되어 4×4 sample을 모두 피할 수 있고, 남은 농도도 RGBA8 양자화에서 사라질 수 있었다.
+v5의 1/255 undercoat는 shape sample이 없는 경우를 해결하지 못했다.
+
+신규 획은 round **v6**, pencil **v7 / grain 3**을 사용한다. 저장된 engine 1–5는 기존 재생
+경로를 유지한다. v4의 접촉 시작 보정과 v5의 undercoat도 버전 조건을 명시적으로 보존했다.
+
+- v6/v7 spacing은 segment 양 끝의 작은 접촉 지름을 기준으로 한다. 기존 0.25px 최소 간격,
+  dab/획 예산, 초과 시 명시적 취소는 유지한다. 필압 감소로 간격이 짧아져도 dab를 segment
+  뒤쪽으로 되돌려 찍지 않는다. import preflight도 동일한 spacing 함수를 사용한다.
+- v7은 `sqrt(pressure)`를 size/opacity 설정에 각각 적용한다. opacity의 필압 감쇠를 종이
+  부착 임계값에 다시 곱하지 않는다. 문서 고정 paper hash는 그대로이며, material deposit
+  2H=208 / 2B=255에 `255 - tooth/2`의 결을 곱한다. 두 재질의 flow 차이도 유지한다.
+- 반지름 1px 미만의 v7 접촉은 실제 원과 pixel의 교차 폭을 8개 수평 strip으로 근사 적분한다.
+  sample 사이에 놓였다는 이유로 작은 원 전체가 사라지지 않게 한다. 큰 접촉은 4×4 coverage를
+  사용한다. CPU/WGSL 모두 결과를 기존 4080 분모의 정수 coverage로 맞춘다.
+- 신규 v7에는 undercoat/최소 alpha 강제를 쓰지 않는다. opacity 또는 flow가 0이면 잉크가
+  없다. 극도로 작은 footprint·농도가 8-bit 저장 정밀도 아래인 경우까지 가시성을 보장하지는
+  않는다. 입력 pressure를 전역으로 올리거나 기존 저장 획을 다시 칠하지 않는다.
+- 신규 replay capability `0x10_0000`은 v6/v7 stroke에만 추가한다. v3/grain 1,
+  v5/grain 2의 wire bytes와 기존 capability는 유지하며, 모르는 engine/grain은 거절한다.
+
+검증: focused brush 6 / paint-cpu 50 / project 12개 core 시험과 네 crate의 all-targets Clippy가
+통과했다. 새 작은 artwork table은 round/soft brush 필압 0.002–0.01, 5px 연필 필압
+0.02–0.1, 네 subpixel offset에서 기존 끊김을 재현하고 신규 획의 연속 pixel 열, 작은 tap,
+0 opacity/flow, sealed replay 일치를 확인한다. 기존 v4/v5 fixture는 새 버전으로 바꾸지 않았다.
+
+실제 [gpu_light_pressure](../../crates/paint-gpu/examples/gpu_light_pressure.rs)는 Windows /
+NVIDIA GeForce RTX 3080 / Vulkan / release에서 signed 문서 원점, 낮은/전체 필압,
+subpixel 위치, 기존/신규 연필의 160개 CPU/GPU 비교를 통과했다. 최대 channel 차이는 3/255로
+기존 허용값 4/255 이내였다 (`target/ipad-gpu-pressure.log`). 같은 source의 workspace core
+검사에는 두 pencil의 별도 프로세스 redb 저장/재열기/CPU 재생 시험 통과도 포함된다
+(`target/ipad-workspace-tests.log`, `pencil_reopen_preserves_signed_grain_history_and_atomic_reader_gate`).
+
+[selection coverage probe](../../crates/paint-gpu/examples/gpu_selection_coverage.rs)의 반투명
+유색 반복 합성에서는 신규 grain의 차이 5/255가 발견됐다. 문제 pixel의 다섯 dab alpha
+`[11,11,11,11,11]/255`를 미리 계산해 pencil/selection shader를 거치지 않는 1×1 round
+control로 다시 그려도 CPU `[0,26,15,26]`, GPU `[0,25,10,26]`이 그대로 재현됐다.
+이 차이는 해당 fixture의 framebuffer UNORM 누적 합성 차이이며, 신규 coverage만의 실패로
+분류하거나 전역 허용값을 높이지 않는다 (`target/ipad-gpu-selection-diagnostic.log`).
+probe는 전역 허용값 초과 pixel마다 같은 control 일치를 요구하고, nonzero dab 수 이내의
+차이만 허용하며 case당 control 256개를 상한으로 둔다. coverage 검증과 전역 허용값 통과를
+별도로 출력한다. 같은 RTX 3080 / Vulkan / release 재실행은 18 cases에서 초과 pixel
+82개 전부의 control 일치를 확인했다. 최대 차이 6/255이며 `coverage_contract=PASS`,
+`global_tolerance_passed=false`다 (`target/ipad-gpu-selection.log`). 실제 iPad Apple Pencil
+감각 확인은 아직 별도 gate다.
+
 ## 보이는 결과가 먼저인 두 템플릿
 
 Faber-Castell의 공식 등급 설명은 2B를 부드럽고 검은 쪽, 2H를 더 단단한 쪽으로 구분한다.
@@ -117,7 +169,7 @@ CPU/GPU 타일로 dab를 옮길 때 반드시 `BrushDab::to_local`을 사용한�
 snapshot에서의 참조를 같이 기록해야 한다. 파일 이름만 저장하거나 누락된 asset을 비슷한
 이미지로 조용히 바꾸는 동작은 허용하지 않는다. 이 자원 시스템은 첫 두 연필에 필요하지 않다.
 
-## 버전·저장·CPU/GPU 경계
+## 최초 v3의 버전·저장·CPU/GPU 경계 (과거 계약)
 
 - `ROUND_BRUSH_ENGINE_VERSION = 2`는 그대로 둔다. 기존 engine 1/2 식·wire·hash는 보존한다.
 - `PENCIL_ENGINE_VERSION = 3`, preset schema 3을 별도로 사용한다. 고정된 두 preset ID가
@@ -156,7 +208,7 @@ v3는 지름 200px, segment당 4,096 dab, stroke당 1,048,576 dab를 상한으�
 기존 pixel을 보존하는 규칙으로 확인한다. 자동 시험은 artwork/결정성/history/recovery 위험을
 보호하는 불변식에 한정한다. UI 레이아웃을 위한 mock 시험은 추가하지 않는다.
 
-## 확인된 증거와 남은 범위
+## 최초 v3에서 확인된 증거와 남은 범위
 
 초기 core 검사에서 brush·CPU paint·stroke·project wire·redb 기존 시험과 v3 packet/grade/
 wire 재생 시험이 통과했다. 추가 redb 검사는 두 연필 각각 signed stroke를 저장하고 별도

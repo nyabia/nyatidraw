@@ -3,6 +3,15 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
+## alpha.21 배포
+
+웹의 그림 이동 미리보기, 레이어 터치 구분, 타임라인 닫기, 아이콘과 약한 필압의
+연필·브러시 처리를 수정한다. [릴리즈 노트](releases/0.1.0-alpha.21.md)와
+[입력·편집 검증](ipad-web-feedback.md)에 저장·프로세스 재시작·별도 네이티브 재열기,
+GPU 비교 및 미검증 하드웨어 범위를 기록했다. 사용자 요청으로 태그 배포를 진행한다.
+실제 iPad Safari/Pencil, 설치 업데이트와 alpha.20의 Windows 마스크 표시 문제는
+검증 완료로 간주하지 않는다. 게시 결과는 CI와 공개 자산 확인 후 추가한다.
+
 ## alpha.20 배포 검증
 
 일러스트 마무리와 게임 아트 제작을 함께 확장하는 알파 릴리즈다.

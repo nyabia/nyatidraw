@@ -19,6 +19,7 @@ use nyatidraw_tiles::color::{linear_premultiplied_to_srgb8, srgb8_to_linear_prem
 pub use nyatidraw_tiles::{TILE_BYTE_LEN, TILE_EDGE, TileKey, TileSnapshot};
 
 mod animation;
+mod artwork_move;
 mod codec;
 mod color_adjustment;
 mod drawing;
@@ -26,6 +27,7 @@ mod editing;
 mod interchange;
 mod masks;
 mod transform;
+pub use artwork_move::{ArtworkMoveDraft, ArtworkMovePreview};
 pub use interchange::WebPreferences;
 #[cfg(test)]
 mod animation_tests;

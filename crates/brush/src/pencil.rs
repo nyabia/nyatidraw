@@ -3,9 +3,9 @@
 use crate::{BrushDab, BrushPreset, BrushPresetId, pressure_factor, unit};
 use nyatidraw_input::{Point, StylusSample};
 
-pub const PENCIL_ENGINE_VERSION: u32 = 5;
+pub const PENCIL_ENGINE_VERSION: u32 = 7;
 pub const PENCIL_PRESET_SCHEMA_VERSION: u32 = 3;
-pub const PENCIL_GRAIN_VERSION: u8 = 2;
+pub const PENCIL_GRAIN_VERSION: u8 = 3;
 /// One immutable procedural paper for v3. It does not restart for each stroke.
 pub const PENCIL_PAPER_SEED: u32 = 0x4e59_4154;
 
@@ -13,6 +13,7 @@ pub const PENCIL_PAPER_SEED: u32 = 0x4e59_4154;
 pub const fn pencil_grain_version(engine: u32) -> Option<u8> {
     match engine {
         3 => Some(1),
+        5 => Some(2),
         PENCIL_ENGINE_VERSION => Some(PENCIL_GRAIN_VERSION),
         _ => None,
     }
@@ -77,6 +78,8 @@ pub struct PencilGrain {
     pub origin: [u32; 2],
     /// v5 retains a one-UNORM-step graphite undercoat inside the tip footprint.
     pub undercoat: bool,
+    /// v7 modulates continuous graphite with paper instead of thresholding it.
+    pub continuous: bool,
 }
 
 pub(super) fn valid_preset(preset: &BrushPreset) -> bool {
@@ -99,7 +102,12 @@ pub(super) fn valid_preset(preset: &BrushPreset) -> bool {
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(super) fn dab_for(preset: &BrushPreset, sample: StylusSample) -> BrushDab {
-    let pressure = unit(sample.pressure);
+    let continuous = preset.engine_version >= 7;
+    let pressure = if continuous {
+        unit(sample.pressure).sqrt()
+    } else {
+        unit(sample.pressure)
+    };
     let kind = PencilKind::from_preset_id(preset.id).unwrap_or(PencilKind::Mechanical2H);
     let size = pressure_factor(preset.size_pressure, preset.size_min_ratio, pressure);
     let deposit_pressure =
@@ -117,14 +125,20 @@ pub(super) fn dab_for(preset: &BrushPreset, sample: StylusSample) -> BrushDab {
             x: quantize(sample.position_document.x),
             y: quantize(sample.position_document.y),
         },
-        radius_px: ((preset.size_px * size * 0.5 * 16.0).round() / 16.0).max(0.0),
+        radius_px: if continuous {
+            preset.size_px * size * 0.5
+        } else {
+            ((preset.size_px * size * 0.5 * 16.0).round() / 16.0).max(0.0)
+        },
         opacity: unit(preset.opacity) * deposit_pressure,
         flow: unit(preset.flow),
         hardness: 1.0,
         grain: Some(PencilGrain {
-            deposit: (minimum + range * deposit_pressure).round() as u8,
+            deposit: (minimum + range * if continuous { 1.0 } else { deposit_pressure }).round()
+                as u8,
             origin: [0, 0],
-            undercoat: preset.engine_version == PENCIL_ENGINE_VERSION,
+            undercoat: preset.engine_version == 5,
+            continuous,
         }),
     }
 }
@@ -154,6 +168,9 @@ pub fn pencil_coverage_units(dab: BrushDab, x: u32, y: u32) -> u32 {
         x.wrapping_add(grain.origin[0]),
         y.wrapping_add(grain.origin[1]),
     );
+    if grain.continuous {
+        return continuous_coverage_units(dab, x, y, tooth);
+    }
     let deposit = u32::from(grain.deposit)
         .saturating_sub(tooth)
         .max(u32::from(grain.undercoat));
@@ -174,4 +191,40 @@ pub fn pencil_coverage_units(dab: BrushDab, x: u32, y: u32) -> u32 {
         }
     }
     count * deposit
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn continuous_coverage_units(dab: BrushDab, x: u32, y: u32, tooth: u32) -> u32 {
+    let pigment = u32::from(dab.grain.map_or(0, |grain| grain.deposit)) * (255 - tooth / 2) / 255;
+    let radius = dab.radius_px;
+    let left = x as f32 - dab.center.x as f32;
+    let bottom = y as f32 - dab.center.y as f32;
+    let mut area = 0.0;
+    if radius < 1.0 {
+        // Integrate the actual tiny circle, so a footprint between sample points
+        // cannot disappear. Eight strips remain bounded to at most nine pixels.
+        let low = bottom.max(-radius);
+        let high = (bottom + 1.0).min(radius);
+        let step = (high - low).max(0.0) / 8.0;
+        for index in 0..8 {
+            let ordinate = low + (index as f32 + 0.5) * step;
+            let half_width = (radius * radius - ordinate * ordinate).max(0.0).sqrt();
+            area += ((left + 1.0).min(half_width) - left.max(-half_width)).max(0.0) * step;
+        }
+    } else {
+        for dy in [0.125_f32, 0.375, 0.625, 0.875] {
+            for dx in [0.125_f32, 0.375, 0.625, 0.875] {
+                let dx = left + dx;
+                let dy = bottom + dy;
+                if dx * dx + dy * dy <= radius * radius {
+                    area += 1.0 / 16.0;
+                }
+            }
+        }
+    }
+    (area.clamp(0.0, 1.0) * pigment as f32 * 16.0).round() as u32
 }

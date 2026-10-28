@@ -87,20 +87,23 @@ function tick() {
 document.addEventListener('pointerdown', event => {
     if (drag || !event.isPrimary || event.button !== 0) return;
     const row = event.target.closest('[data-layer-key]');
-    if (!row || event.target.closest('button, input:not([readonly]), textarea, select')) return;
+    const handle = event.target.closest('[data-layer-reorder-handle]');
+    if (!row || (!handle && event.pointerType !== 'mouse')) return;
+    if (!handle && event.target.closest('button, input:not([readonly]), textarea, select')) return;
     const rev = revision();
     if (!rev) return;
     // Capture starts at the movement threshold, preserving ordinary clicks and
     // double-click-to-rename without retargeting them to the row.
     drag = { row, list: row.closest('.layer-list'), source: row.dataset.layerKey,
         revision: rev, id: event.pointerId, x: event.clientX, y: event.clientY,
-        startX: event.clientX, startY: event.clientY, moved: false };
+        startX: event.clientX, startY: event.clientY,
+        threshold: event.pointerType === 'mouse' ? 4 : 8, moved: false };
 }, options);
 document.addEventListener('pointermove', event => {
     if (!drag || event.pointerId !== drag.id) return;
     if (!(event.buttons & 1) || !drag.row.isConnected || revision() !== drag.revision) { finish(); return; }
     drag.x = event.clientX; drag.y = event.clientY;
-    if (!drag.moved && Math.hypot(drag.x - drag.startX, drag.y - drag.startY) >= 4) {
+    if (!drag.moved && Math.hypot(drag.x - drag.startX, drag.y - drag.startY) >= drag.threshold) {
         try {
             drag.row.setPointerCapture(drag.id);
             if (!drag.row.hasPointerCapture(drag.id)) { finish(); return; }
@@ -120,9 +123,13 @@ document.addEventListener('pointerup', event => {
     finish(true);
     if (moved) { event.preventDefault(); event.stopImmediatePropagation(); }
 }, options);
-for (const name of ['pointercancel', 'lostpointercapture']) {
-    document.addEventListener(name, event => { if (drag?.id === event.pointerId) finish(); }, options);
-}
+document.addEventListener('pointercancel', event => {
+    if (drag?.id === event.pointerId) finish();
+}, options);
+document.addEventListener('lostpointercapture', event => {
+    if (drag?.id === event.pointerId && event.target === drag.row &&
+        !drag.row.hasPointerCapture(drag.id)) finish();
+}, options);
 document.addEventListener('keydown', event => {
     if (drag && event.key === 'Escape') { finish(); event.preventDefault(); event.stopImmediatePropagation(); }
 }, options);

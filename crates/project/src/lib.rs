@@ -327,6 +327,8 @@ pub const ANIMATION_SCHEMA_FLAG: u64 = 0x2_0000;
 pub const MASK_SCHEMA_FLAG: u64 = 0x4_0000;
 /// Fractional selection replay must not fall back to binary coverage.
 pub const FRACTIONAL_SELECTION_SCHEMA_FLAG: u64 = 0x8_0000;
+/// Contact-spaced v6/v7 strokes and continuous v7 graphite require matching replay.
+pub const CONTACT_BRUSH_SCHEMA_FLAG: u64 = 0x10_0000;
 
 #[must_use]
 pub const fn brush_replay_schema_flags(engine: u32) -> u64 {
@@ -345,7 +347,12 @@ pub const fn brush_replay_schema_flags(engine: u32) -> u64 {
     } else {
         0
     };
-    configurable | pencil | onset
+    let contact = if engine >= 6 {
+        CONTACT_BRUSH_SCHEMA_FLAG
+    } else {
+        0
+    };
+    configurable | pencil | onset | contact
 }
 pub const SCHEMA_CAPABILITY_FLAGS: u64 = COMPRESSED_TILE_SCHEMA_FLAG
     | CONFIGURABLE_BRUSH_SCHEMA_FLAG
@@ -357,4 +364,5 @@ pub const SCHEMA_CAPABILITY_FLAGS: u64 = COMPRESSED_TILE_SCHEMA_FLAG
     | LAYER_COLOR_EFFECT_SCHEMA_FLAG
     | ANIMATION_SCHEMA_FLAG
     | MASK_SCHEMA_FLAG
-    | FRACTIONAL_SELECTION_SCHEMA_FLAG;
+    | FRACTIONAL_SELECTION_SCHEMA_FLAG
+    | CONTACT_BRUSH_SCHEMA_FLAG;

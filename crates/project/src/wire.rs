@@ -1068,11 +1068,11 @@ pub fn preflight_stroke_decode(bytes: &[u8], max_affected_tiles: usize) -> Resul
 }
 
 struct StrokeReplayBudget {
-    spacing: f64,
+    preset: BrushPreset,
     radius: f64,
     min: Point,
     max: Point,
-    previous: Option<Point>,
+    previous: Option<StylusSample>,
     estimated_dabs: f64,
     max_tiles: u32,
 }
@@ -1087,9 +1087,8 @@ impl StrokeReplayBudget {
         {
             return Err(WireError::InvalidData("unsupported stroke import preset"));
         }
-        let spacing = (preset.size_px.max(0.0) * preset.spacing_ratio.clamp(0.01, 4.0)).max(0.25);
         Ok(Self {
-            spacing: f64::from(spacing),
+            preset,
             // v3 rounds both dab centers and radii to 1/16 document pixels.
             radius: f64::from(preset.size_px.max(0.0)) * 0.5 + 0.125,
             min: Point {
@@ -1131,10 +1130,16 @@ impl StrokeReplayBudget {
             ));
         }
         if let Some(previous) = self.previous {
-            let distance = (point.x - previous.x).hypot(point.y - previous.y);
-            self.estimated_dabs += (distance / self.spacing).ceil() + 1.0;
+            let distance = (point.x - previous.position_document.x)
+                .hypot(point.y - previous.position_document.y);
+            let spacing = f64::from(nyatidraw_brush::segment_spacing_px(
+                &self.preset,
+                previous,
+                sample,
+            ));
+            self.estimated_dabs += (distance / spacing).ceil() + 1.0;
         }
-        self.previous = Some(point);
+        self.previous = Some(sample);
         let dab_edge = (self.radius * 2.0).ceil() + 2.0;
         if self.estimated_dabs > 65_536.0
             || self.estimated_dabs * dab_edge * dab_edge > 134_217_728.0
@@ -1375,6 +1380,12 @@ fn decode_brush_preset(decoder: &mut Decoder<'_>) -> Result<BrushPreset, WireErr
         opacity_min_ratio: 0.0,
         hardness: 1.0,
     };
+    if !matches!(
+        preset.engine_version,
+        1..=nyatidraw_brush::PENCIL_ENGINE_VERSION
+    ) {
+        return Err(WireError::InvalidData("unsupported brush engine version"));
+    }
     if preset.engine_version >= 2 {
         preset.size_pressure = match decoder.array::<1>()?[0] {
             0 => false,
@@ -1833,6 +1844,14 @@ mod project_head_compatibility_tests {
                 engine_version: 4,
                 ..current
             },
+            BrushPreset {
+                engine_version: 5,
+                ..nyatidraw_brush::pencil_preset(nyatidraw_brush::PencilKind::Mechanical2H)
+            },
+            BrushPreset {
+                engine_version: nyatidraw_brush::ROUND_BRUSH_ENGINE_VERSION,
+                ..current
+            },
         ] {
             let mut evaluator = RoundBrushEvaluator::new(12);
             let mut dabs = Vec::new();
@@ -1910,7 +1929,7 @@ mod project_head_compatibility_tests {
             eraser: false,
             viewport_revision: 0,
         };
-        for engine_version in [1, 2, 3, 4, 5] {
+        for engine_version in 1..=nyatidraw_brush::PENCIL_ENGINE_VERSION {
             let preset = if nyatidraw_brush::pencil_grain_version(engine_version).is_some() {
                 BrushPreset {
                     engine_version,

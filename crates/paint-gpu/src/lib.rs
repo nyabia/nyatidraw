@@ -808,7 +808,9 @@ impl PreparedDabs {
             bytes.extend_from_slice(&encode_f32s(&instance));
             let grain = dab.grain.map_or([0; 3], |grain| {
                 [
-                    (u32::from(grain.deposit) + 1) | (u32::from(grain.undercoat) << 16),
+                    (u32::from(grain.deposit) + 1)
+                        | (u32::from(grain.undercoat) << 16)
+                        | (u32::from(grain.continuous) << 17),
                     grain.origin[0],
                     grain.origin[1],
                 ]

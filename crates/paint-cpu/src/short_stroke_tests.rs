@@ -97,7 +97,10 @@ fn pressure_arriving_before_spacing_must_not_erase_short_strokes_or_change_legac
 
 #[test]
 fn tiny_pencil_taps_survive_grain_and_unorm_without_repainting_legacy_artwork() {
-    let pencil = pencil_preset(PencilKind::Mechanical2H);
+    let pencil = BrushPreset {
+        engine_version: 5,
+        ..pencil_preset(PencilKind::Mechanical2H)
+    };
     let mut legacy_empty = [0; 4];
     for (index, pressure) in [0.0, 0.1, 0.5, 1.0].into_iter().enumerate() {
         for offset in [0.0, 0.25, 0.5, 0.75] {
@@ -158,4 +161,128 @@ fn tiny_pencil_taps_survive_grain_and_unorm_without_repainting_legacy_artwork() 
         render(fixed, &[first, later]),
         "disabled pressure must not add a second stationary dab"
     );
+}
+
+#[test]
+fn light_pressure_strokes_cannot_break_into_disconnected_stamps_or_missing_pencil_tips() {
+    let round = BrushPreset {
+        id: BrushPresetId(1),
+        schema_version: ROUND_BRUSH_PRESET_SCHEMA_VERSION,
+        engine_version: ROUND_BRUSH_ENGINE_VERSION,
+        size_px: 20.0,
+        opacity: 1.0,
+        flow: 1.0,
+        spacing_ratio: 0.12,
+        size_pressure: true,
+        opacity_pressure: false,
+        size_min_ratio: 0.0,
+        opacity_min_ratio: 0.0,
+        hardness: 1.0,
+    };
+    let pencils = [PencilKind::Mechanical2H, PencilKind::Graphite2B].map(|kind| BrushPreset {
+        size_px: 5.0,
+        size_min_ratio: 0.0,
+        opacity_min_ratio: 0.0,
+        ..pencil_preset(kind)
+    });
+    for preset in [
+        round,
+        BrushPreset {
+            hardness: 0.0,
+            ..round
+        },
+        pencils[0],
+        pencils[1],
+    ] {
+        let mut legacy_gaps = 0;
+        let pressures = if preset.engine_version == ROUND_BRUSH_ENGINE_VERSION {
+            [0.002, 0.005, 0.01]
+        } else {
+            [0.02, 0.05, 0.1]
+        };
+        for pressure in pressures {
+            for offset in [0.0, 0.25, 0.5, 0.75] {
+                let samples = [
+                    sample(
+                        1,
+                        Point {
+                            x: 4.0,
+                            y: 16.0 + offset,
+                        },
+                        pressure,
+                        PointerPhase::Begin,
+                    ),
+                    sample(
+                        2,
+                        Point {
+                            x: 28.0,
+                            y: 16.0 + offset,
+                        },
+                        pressure,
+                        PointerPhase::Move,
+                    ),
+                ];
+                let pixels = render(preset, &samples);
+                let empty_columns = |pixels: &[u8]| {
+                    (6..26)
+                        .filter(|&x| (0..32).all(|y| pixels[(y * 32 + x) * 4 + 3] == 0))
+                        .count()
+                };
+                assert_eq!(
+                    empty_columns(&pixels),
+                    0,
+                    "{preset:?} pressure={pressure}, offset={offset}"
+                );
+                let old = BrushPreset {
+                    engine_version: if preset.engine_version == ROUND_BRUSH_ENGINE_VERSION {
+                        4
+                    } else {
+                        5
+                    },
+                    ..preset
+                };
+                legacy_gaps += empty_columns(&render(old, &samples));
+            }
+        }
+        assert!(
+            legacy_gaps > 0,
+            "fixture must reproduce the reported lost ink for {preset:?}"
+        );
+    }
+    assert_visible_subpixel_contacts(pencils);
+}
+
+fn assert_visible_subpixel_contacts(pencils: [BrushPreset; 2]) {
+    for pencil in pencils {
+        for offset in [0.0, 0.25, 0.5, 0.75] {
+            let samples = [sample(
+                1,
+                Point {
+                    x: 16.0 + offset,
+                    y: 16.0 + offset,
+                },
+                0.05,
+                PointerPhase::Begin,
+            )];
+            assert!(
+                has_ink(&render(pencil, &samples)),
+                "subpixel contact must survive rasterization"
+            );
+            for invisible in [
+                BrushPreset {
+                    opacity: 0.0,
+                    ..pencil
+                },
+                BrushPreset {
+                    flow: 0.0,
+                    ..pencil
+                },
+            ] {
+                assert!(
+                    !has_ink(&render(invisible, &samples)),
+                    "no artificial alpha floor"
+                );
+            }
+        }
+    }
 }

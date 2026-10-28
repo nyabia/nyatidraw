@@ -15,7 +15,7 @@ pub use pencil::{
     PencilGrain, PencilKind, pencil_coverage_units, pencil_grain_version, pencil_preset,
 };
 
-pub const ROUND_BRUSH_ENGINE_VERSION: u32 = 4;
+pub const ROUND_BRUSH_ENGINE_VERSION: u32 = 6;
 pub const ROUND_BRUSH_PRESET_SCHEMA_VERSION: u32 = 2;
 pub const MAX_PENCIL_DABS_PER_SEGMENT: u64 = 4_096;
 pub const MAX_PENCIL_DABS_PER_STROKE: u64 = 1_048_576;
@@ -40,7 +40,7 @@ pub struct BrushPreset {
     pub opacity: f32,
     /// Per-dab build-up amount, independent from `opacity`.
     pub flow: f32,
-    /// Dab spacing divided by the preset's full diameter.
+    /// Dab spacing divided by contact diameter (full preset diameter before v6).
     pub spacing_ratio: f32,
     pub size_pressure: bool,
     pub opacity_pressure: bool,
@@ -359,7 +359,7 @@ fn resample_segment(
         return;
     }
 
-    let spacing = f64::from(spacing_px(&token.preset));
+    let spacing = f64::from(segment_spacing_px(&token.preset, start, next));
     if let Some(limits) = limits {
         let projected = projected_dabs(remaining, token.distance_since_dab, spacing);
         #[allow(clippy::cast_precision_loss)]
@@ -381,7 +381,11 @@ fn resample_segment(
             token.last_input = next;
             return;
         }
-        let advance = spacing - token.distance_since_dab;
+        let advance = if token.preset.engine_version >= 6 {
+            (spacing - token.distance_since_dab).max(0.0)
+        } else {
+            spacing - token.distance_since_dab
+        };
         let step = if remaining > 0.0 {
             (advance / remaining).clamp(0.0, 1.0)
         } else {
@@ -402,10 +406,7 @@ fn resample_segment(
     }
 
     token.distance_since_dab += remaining.max(0.0);
-    if token.preset.engine_version >= ROUND_BRUSH_ENGINE_VERSION
-        && !token.contact_started
-        && next.pressure > 0.0
-    {
+    if token.preset.engine_version >= 4 && !token.contact_started && next.pressure > 0.0 {
         let fallback_limit = if live_limits.is_some() {
             dab_limit_reached(limits, token.emitted_dabs, segment_dabs)
         } else {
@@ -441,6 +442,19 @@ fn spacing_px(preset: &BrushPreset) -> f32 {
         return 0.25;
     }
     (preset.size_px.max(0.0) * preset.spacing_ratio.clamp(0.01, 4.0)).max(0.25)
+}
+
+/// Smallest contact spacing for a sample segment, also used to bound imported replay.
+#[must_use]
+pub fn segment_spacing_px(preset: &BrushPreset, start: StylusSample, end: StylusSample) -> f32 {
+    if preset.engine_version < 6 {
+        return spacing_px(preset);
+    }
+    let diameter = 2.0
+        * dab_for(preset, start)
+            .radius_px
+            .min(dab_for(preset, end).radius_px);
+    (diameter * preset.spacing_ratio.clamp(0.01, 4.0)).max(0.25)
 }
 
 #[must_use]
@@ -601,6 +615,10 @@ mod tests {
 
     #[test]
     fn arc_length_resampling_is_deterministic_and_preserves_pressure_dynamics() {
+        let preset = BrushPreset {
+            engine_version: 4,
+            ..preset()
+        };
         let first = sample(10, 0.0, 0.25);
         let last = sample(11, 20.0, 1.0);
         let mut left = RoundBrushEvaluator::new(99);
@@ -608,10 +626,10 @@ mod tests {
         let mut left_dabs = Vec::new();
         let mut right_dabs = Vec::new();
 
-        let mut left_token = begin_round_stroke(&mut left, &preset(), first, &mut left_dabs);
+        let mut left_token = begin_round_stroke(&mut left, &preset, first, &mut left_dabs);
         left.push(&mut left_token, &[last], &mut left_dabs);
         let left_record = left.end(left_token, &mut left_dabs);
-        let mut right_token = begin_round_stroke(&mut right, &preset(), first, &mut right_dabs);
+        let mut right_token = begin_round_stroke(&mut right, &preset, first, &mut right_dabs);
         right.push(&mut right_token, &[last], &mut right_dabs);
         let right_record = right.end(right_token, &mut right_dabs);
 

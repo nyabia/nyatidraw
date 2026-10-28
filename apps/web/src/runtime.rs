@@ -13,6 +13,7 @@ use web_sys::HtmlCanvasElement;
 use crate::{browser, gpu::WebRenderer};
 
 mod animation;
+mod artwork_move;
 mod frame_previews;
 
 const RECOVERY_QUIET_MS: f64 = 600.0;
@@ -94,6 +95,7 @@ pub struct Runtime {
     pub recent_sizes: Vec<u16>,
     pub selected_tool: DrawingTool,
     pub gesture: Option<nyatidraw_editor::gesture::EditGesture>,
+    artwork_move: Option<artwork_move::Drag>,
     animation_playback: Option<animation::Playback>,
     animation_loop: bool,
     animation_onion: bool,
@@ -308,6 +310,7 @@ impl Editor {
             if runtime.gpu_failed {
                 return Err("화면이 중단되었습니다. 작업 저장 후 새로고침해주세요.".into());
             }
+            runtime.cancel_artwork_move()?;
             let correction_before = runtime.document.color_adjustment_projection().is_some();
             let edited = operation(&mut runtime.document);
             if correction_before || runtime.document.color_adjustment_projection().is_some() {
@@ -416,6 +419,7 @@ impl Editor {
             let point = Point { x, y };
             match phase {
                 "resize" => {
+                    runtime.cancel_artwork_move()?;
                     runtime.pan_start = None;
                     runtime.rotation_start = None;
                     runtime.pressure_mapper.clear();
@@ -497,6 +501,11 @@ impl Editor {
                     return Ok(());
                 }
                 "cancel" | "overflow" => {
+                    if runtime.artwork_move.is_some() {
+                        runtime.cancel_artwork_move()?;
+                        refresh = true;
+                        return Ok(());
+                    }
                     runtime.rotation_start = None;
                     runtime.pressure_mapper.clear();
                     runtime.transform_drag = None;
@@ -661,6 +670,14 @@ impl Editor {
                     eraser: false,
                     viewport_revision: runtime.viewport.revision,
                 };
+                if runtime.selected_tool == DrawingTool::MoveArtwork {
+                    // A completed CPU edit still needs recovery if GPU restoration fails.
+                    save = phase == "end";
+                    refresh = phase != "move";
+                    let update = runtime.artwork_move_input(phase, sample)?;
+                    save |= update.committed;
+                    return Ok(());
+                }
                 match phase {
                     "begin" => {
                         if runtime.document.transform_projection().is_some() {
@@ -794,12 +811,13 @@ impl Editor {
             runtime.frame_pending = true;
         }
         let callback = Closure::once_into_js(move || {
-            let (result, changed, playing) = {
+            let (result, changed, playing, move_error) = {
                 let mut borrow = cell.borrow_mut();
                 let Some(runtime) = borrow.as_mut() else {
                     return;
                 };
                 runtime.frame_pending = false;
+                let move_error = runtime.flush_artwork_move().err();
                 let advanced = runtime.advance_animation();
                 let changed = advanced.as_ref().is_ok_and(|changed| *changed);
                 let result = advanced.and_then(|_| {
@@ -814,8 +832,16 @@ impl Editor {
                     runtime.gpu_failed = true;
                     runtime.document.cancel_stroke();
                 }
-                (result, changed, runtime.animation_playback.is_some())
+                (
+                    result,
+                    changed,
+                    runtime.animation_playback.is_some(),
+                    move_error,
+                )
             };
+            if let Some(error) = move_error {
+                self.warn(error);
+            }
             if changed {
                 self.refresh();
             }
@@ -1424,6 +1450,7 @@ impl Editor {
                     runtime.animation_onion = false;
                     runtime.document = document;
                     runtime.gesture = None;
+                    runtime.artwork_move = None;
                     runtime.transform_drag = None;
                     runtime.renderer.set_gesture_preview(&[], false);
                     runtime.project_epoch += 1;
@@ -1496,6 +1523,7 @@ impl Runtime {
             animation_loop: true,
             animation_onion: false,
             transform_drag: None,
+            artwork_move: None,
             project_epoch: 1,
             preview_generation: 1,
             preview_dirty: false,

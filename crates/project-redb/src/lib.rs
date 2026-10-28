@@ -2570,17 +2570,17 @@ mod tests {
                 | COMPRESSED_TILE_SCHEMA_FLAG
                 | CONFIGURABLE_BRUSH_SCHEMA_FLAG
                 | nyatidraw_project::SHORT_STROKE_BRUSH_SCHEMA_FLAG
+                | nyatidraw_project::CONTACT_BRUSH_SCHEMA_FLAG
                 | LAYER_COMPOSITING_SCHEMA_FLAG
                 | root_codec::SCHEMA_FLAG
         );
         // The original reader masked compression only; this must not resemble
         // one of its known levels 1..=4.
         assert!(!(1..=4).contains(&(marker & !COMPRESSED_TILE_SCHEMA_FLAG)));
-        let old_flags =
-            SCHEMA_CAPABILITY_FLAGS & !nyatidraw_project::SHORT_STROKE_BRUSH_SCHEMA_FLAG;
+        let old_flags = SCHEMA_CAPABILITY_FLAGS & !nyatidraw_project::CONTACT_BRUSH_SCHEMA_FLAG;
         assert!(
             !(1..=4).contains(&(marker & !old_flags)),
-            "v3 readers must reject the new stroke contract"
+            "v5 readers must reject the new stroke contract"
         );
         drop(tx);
         drop(database);

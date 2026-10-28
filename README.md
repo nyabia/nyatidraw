@@ -4,10 +4,12 @@ NyatiDraw는 Godot 프로젝트의 PNG를 빠르게 열고 수정하기 위한 W
 래스터 드로잉 편집기입니다. 편집 가능한 `.ntdr` 프로젝트를 PNG 옆에 두고,
 저장 시 프로젝트의 내구성 있는 스냅샷과 PNG export를 별도 실패 영역으로 처리합니다.
 
-현재 Windows x64 알파판 **0.1.0-alpha.12**를 배포하고 있습니다.
+Windows x64 알파판을 배포하고 있습니다. 최신 게시 버전은
+[Releases](https://github.com/nyabia/nyatidraw/releases)에서 확인할 수 있습니다.
 [홈페이지](https://nyabia.github.io/nyatidraw/)에서 설치 파일을 받을 수 있습니다.
 별도의 [웹 실험판](https://nyabia.github.io/nyatidraw/draw/)도 제공합니다.
-Linux/macOS 설치판·고급 브러시·애니메이션·벡터 기능은 후속 범위입니다.
+기본 래스터 프레임 애니메이션을 지원합니다.
+Linux/macOS 설치판·고급 텍스처/습식 브러시·벡터 기능은 후속 범위입니다.
 
 ## 설치와 기본 사용
 
@@ -17,16 +19,16 @@ Linux/macOS 설치판·고급 브러시·애니메이션·벡터 기능은 후�
 
 - 처음 실행하면 `%LOCALAPPDATA%\NyatiDraw\Sketchbook\작업 중.ntdr`를 엽니다.
   이 기본 그림은 다음 실행에도 다시 열립니다.
-- **새 그림**은 새 `.ntdr` 파일을 만듭니다. **열기**는 PNG 또는 `.ntdr`를 엽니다.
+- **새 그림**은 파일 이름·경로를 정하지 않고 시작합니다. **열기**는 PNG 또는 `.ntdr`를 엽니다.
 - **저장**은 프로젝트를 저장하고 같은 이름의 PNG를 옆에 내보냅니다.
   PNG 옆에 `.ntdr`가 있으면 이후 열기에서 편집 가능한 프로젝트를 우선합니다.
 - 새 알파판을 받으면 **저장 후 업데이트**로 적용하고 현재 그림을 다시 엽니다.
   다운로드 실패 시 기존 앱은 계속 사용할 수 있습니다.
 
-alpha.12는 입력·오류 복구·도구 설정 복원과 프로젝트 저장 용량을 개선합니다.
-[변경 내용과 남은 검수](docs/releases/0.1.0-alpha.12.md)를 참고하세요.
+alpha.21은 웹의 그림 이동·레이어 터치와 연필의 약한 필압 처리를 개선합니다.
+[변경 내용과 남은 검수](docs/releases/0.1.0-alpha.21.md)를 참고하세요.
 실제 펜/고주사율 하드웨어 검증과 설치·업데이트 검증은 별도입니다.
-프로젝트 X/Y 반복·비파괴 레이어 색상화·메시 변형 등은 아직 구현하지 않았습니다.
+고급 메시 변형과 물리 장치별 필기 감각은 별도 검토 범위입니다.
 자동 업데이트의 운영·검증 범위는 [배포 문서](docs/releasing.md)를 참고하세요.
 
 ## 현재 구현 범위
@@ -35,7 +37,7 @@ alpha.12는 입력·오류 복구·도구 설정 복원과 프로젝트 저장 �
 - Windows pointer/pen 입력과 WGPU live ink
 - 무한 작업공간 좌표와 출력 페이지 crop
 - sparse signed tiles, raster layer/group, undo/history
-- redb 기반 `.ntdr` 저장·재실행·복구
+- SQLite 기반 `.ntdr` 저장·재실행·복구
 - colocated PNG import/export와 single-instance activation
 - 사용자별 Windows 개발판 설치 및 `.ntdr`/PNG Open With 등록
 

@@ -4,13 +4,21 @@ use std::sync::Arc;
 
 use crate::{UiHost, UiIcon, preview::FrameThumbnailFrame};
 
+#[derive(Clone, Copy)]
+pub(crate) struct AnimationPanelVisible(pub Signal<bool>);
+
 #[component]
 pub fn StartAnimation(ui_projection: Signal<UiProjection>, onstarted: EventHandler<()>) -> Element {
     let host = use_context::<UiHost>();
+    let AnimationPanelVisible(mut visible) = use_context();
     let mut error = use_signal(|| None::<String>);
     let state = ui_projection.read();
     if !state.animation.frames.is_empty() {
-        return rsx! {};
+        return rsx! {
+            button { class: "command", title: "애니메이션 타임라인 열기", onclick: move |_| {
+                visible.set(true); onstarted.call(()); crate::focus_editor_shortcuts();
+            }, UiIcon { name: "timeline" } "타임라인 열기" }
+        };
     }
     let disabled = state.edit.busy
         || state.edit.transform.is_some()
@@ -19,7 +27,7 @@ pub fn StartAnimation(ui_projection: Signal<UiProjection>, onstarted: EventHandl
     rsx! {
         button { class: "command", disabled, onclick: move |_| {
             match host.push_ui_editor_command(EditorCommand::Animation(AnimationCommand::Enable)) {
-                Ok(()) => onstarted.call(()), Err(message) => error.set(Some(message)),
+                Ok(()) => { visible.set(true); onstarted.call(()); crate::focus_editor_shortcuts(); }, Err(message) => error.set(Some(message)),
             }
         }, "애니메이션 시작" }
         if let Some(message) = error.read().as_ref() { span { role: "alert", "{message}" } }
@@ -28,6 +36,7 @@ pub fn StartAnimation(ui_projection: Signal<UiProjection>, onstarted: EventHandl
 
 #[component]
 pub fn AnimationPanel(ui_projection: Signal<UiProjection>, host_update: u64) -> Element {
+    let AnimationPanelVisible(mut visible) = use_context();
     let mut collapsed = use_signal(|| false);
     let state = ui_projection.read();
     let animation = state.animation.clone();
@@ -59,9 +68,10 @@ pub fn AnimationPanel(ui_projection: Signal<UiProjection>, host_update: u64) -> 
         "chevron-down"
     };
     rsx! {
-        section { class: "animation-panel", aria_label: "애니메이션 타임라인", "data-collapsed": "{collapsed}",
+        section { id: "animation-timeline", class: "animation-panel", aria_label: "애니메이션 타임라인", "data-collapsed": "{collapsed}",
             div { class: "animation-controls",
-                button { class: "command compact", title: "타임라인 접기/펼치기", aria_expanded: !collapsed(),
+                div { class: "animation-actions",
+                button { class: "command compact", title: "프레임 목록 접기/펼치기", aria_label: "프레임 목록 접기/펼치기", aria_expanded: !collapsed(),
                     onclick: move |_| collapsed.toggle(), UiIcon { name: collapse_icon } }
                 span { class: "animation-title", "프레임" }
                 AnimationButton { command: if animation.playing { AnimationCommand::Stop } else { AnimationCommand::Play },
@@ -77,6 +87,12 @@ pub fn AnimationPanel(ui_projection: Signal<UiProjection>, host_update: u64) -> 
                 AnimationButton { command: AnimationCommand::Move { frame: active, index: u16::try_from(index + 1).unwrap_or(u16::MAX) }, icon: "arrow-right", label: "프레임 순서 뒤로", disabled: editing_disabled || index + 1 >= length }
                 FrameDuration { frame: active, duration, disabled: editing_disabled }
                 span { class: "animation-counter", "{index + 1} / {length}" }
+                }
+                button { class: "command compact animation-close", aria_label: "타임라인 닫기",
+                    title: if animation.playing { "타임라인 닫기 · 프레임 유지 · 재생은 계속됩니다" } else { "타임라인 닫기 · 프레임 유지 · 상단 타임라인 버튼으로 다시 열기" },
+                    onclick: move |_| { crate::focus_editor_shortcuts(); visible.set(false); },
+                    UiIcon { name: "close" }
+                }
             }
             if !collapsed() {
                 FrameList { frames: animation.frames, active, disabled: editing_disabled, host_update }

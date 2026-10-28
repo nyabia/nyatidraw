@@ -306,6 +306,7 @@ impl WebUiBackend {
                 .try_preferences(|document| document.select_tool(tool))?;
         }
         if let Some(runtime) = self.editor.runtime.peek().borrow_mut().as_mut() {
+            runtime.cancel_artwork_move()?;
             runtime.selected_tool = tool;
             runtime.document.set_project_tool(tool);
         }

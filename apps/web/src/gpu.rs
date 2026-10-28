@@ -159,14 +159,36 @@ impl WebRenderer {
         self.scene
             .set_solo(doc.solo_node())
             .map_err(|e| format!("Solo: {e:?}"))?;
-        let unchanged = match (&self.selection, doc.selection()) {
+        self.sync_selection(doc.selection())
+    }
+
+    pub fn preview_artwork_move(
+        &mut self,
+        doc: &WebDocument,
+        preview: &nyatidraw_web_core::ArtworkMovePreview,
+    ) -> Result<(), String> {
+        self.check_device()?;
+        self.scene
+            .replace_document(document_size(doc), doc.render_layers().clone())
+            .map_err(|error| format!("Move preview scene: {error:?}"))?;
+        upload_tiles(&mut self.scene, &preview.tiles, doc.render_layers())?;
+        self.scene
+            .set_solo(doc.solo_node())
+            .map_err(|error| format!("Move preview solo: {error:?}"))?;
+        self.sync_selection(preview.selection.as_ref())
+    }
+
+    fn sync_selection(
+        &mut self,
+        selection: Option<&Arc<nyatidraw_paint_cpu::SelectionMask>>,
+    ) -> Result<(), String> {
+        let unchanged = match (&self.selection, selection) {
             (Some(before), Some(after)) => Arc::ptr_eq(before, after),
             (None, None) => true,
             _ => false,
         };
         if !unchanged {
-            let mask = doc
-                .selection()
+            let mask = selection
                 .map(|mask| {
                     nyatidraw_paint_gpu::GpuSelectionMask::from_coverage(
                         &self.device,
@@ -178,7 +200,7 @@ impl WebRenderer {
                 .transpose()
                 .map_err(|e| format!("Selection: {e:?}"))?;
             self.scene.set_selection_overlay(mask.as_ref());
-            self.selection = doc.selection().cloned();
+            self.selection = selection.cloned();
         }
         Ok(())
     }
@@ -326,11 +348,19 @@ fn validate_texture_size(device: &wgpu::Device, size: [u32; 2]) -> Result<(), St
 }
 
 fn upload_snapshot(scene: &mut GpuCompositeScene, doc: &WebDocument) -> Result<(), String> {
+    upload_tiles(scene, doc.display_snapshot(), doc.display_layers())
+}
+
+fn upload_tiles(
+    scene: &mut GpuCompositeScene,
+    tiles: &nyatidraw_tiles::TileSnapshot,
+    tree: &nyatidraw_document::LayerTree,
+) -> Result<(), String> {
     scene
-        .replace_mask_tiles(doc.display_snapshot())
+        .replace_mask_tiles(tiles)
         .map_err(|error| format!("Upload masks: {error:?}"))?;
-    for (key, tile) in doc.display_snapshot().iter() {
-        if doc.display_layers().raster(key.layer).is_none() {
+    for (key, tile) in tiles.iter() {
+        if tree.raster(key.layer).is_none() {
             continue;
         }
         scene

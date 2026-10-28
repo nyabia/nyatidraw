@@ -1,4 +1,6 @@
 mod animation_panel;
+mod ui_icon;
+pub use ui_icon::UiIcon;
 mod host;
 pub use host::{ExportStatus, PalettePins, UiBackend, UiHost, UiSlots};
 mod brush_presets;
@@ -60,6 +62,8 @@ pub fn EditorChrome(
     reference_panel::provide_reference();
     dock_drag::use_dock_drag(live_ink.clone());
     use_context_provider(|| transform_panel::TransformPanelOpen(Signal::new(false)));
+    let animation_panel::AnimationPanelVisible(animation_visible) =
+        use_context_provider(|| animation_panel::AnimationPanelVisible(Signal::new(true)));
     let page_panel::PagePanelOpen(page_open) =
         use_context_provider(|| page_panel::PagePanelOpen(Signal::new(false)));
     let mut page_shortcuts = page_open;
@@ -77,7 +81,7 @@ pub fn EditorChrome(
     let document_title = ui_projection.read().document_title.clone();
     let layout_notice = live_ink.layout_notice();
     let has_layout_notice = layout_notice.is_some();
-    let has_animation = !ui_projection.read().animation.frames.is_empty();
+    let has_animation = !ui_projection.read().animation.frames.is_empty() && animation_visible();
     let edit = ui_projection.read().edit.clone();
     let shortcut_ink = live_ink.clone();
     let navigator_move_ink = live_ink.clone();
@@ -238,6 +242,7 @@ fn handle_editor_shortcut(live_ink: &UiHost, key: &str, shift: bool, ctrl: bool)
 
 #[component]
 fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -> Element {
+    let animation_panel::AnimationPanelVisible(mut animation_visible) = use_context();
     let live_ink = use_context::<UiHost>();
     let reset_layout_ink = live_ink.clone();
     let mut menu_open = use_signal(|| false);
@@ -258,6 +263,13 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
                 span { class: "hamburger", i {}, i {}, i {} }
             }
             FileButtons {}
+            if !ui_projection.read().animation.frames.is_empty() {
+                button { class: "command compact", aria_label: "애니메이션 타임라인 표시", aria_expanded: animation_visible(),
+                    aria_controls: "animation-timeline", title: if animation_visible() { "타임라인 닫기 · 프레임 유지" } else { "타임라인 열기" },
+                    onclick: move |_| { focus_editor_shortcuts(); animation_visible.toggle(); },
+                    UiIcon { name: "timeline" }
+                }
+            }
             if live_ink.is_saving_as() {
                 span { class: "export-status", role: "status", "다른 이름으로 저장 중…" }
             }
@@ -280,10 +292,10 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
                 }
             }
             span { class: "divider" }
-            button { class: "command compact", title: "실행 취소 (Z)", onclick: move |_| {
+            button { class: "command compact", title: "실행 취소 (Z)", aria_label: "실행 취소", onclick: move |_| {
                 send_editor_command(&undo_ink, EditorCommand::History(HistoryCommand::Undo), error);
             }, UiIcon { name: "undo" } span { class: "shortcut", "Z" } }
-            button { class: "command compact fixed-end", title: "다시 실행 (Shift+Z)", onclick: move |_| {
+            button { class: "command compact fixed-end", title: "다시 실행 (Shift+Z)", aria_label: "다시 실행", onclick: move |_| {
                 send_editor_command(&redo_ink, EditorCommand::History(HistoryCommand::Redo), error);
             }, UiIcon { name: "redo" } span { class: "shortcut", "Shift Z" } }
 
@@ -915,11 +927,22 @@ fn ToolButton(
 ) -> Element {
     let live_ink = use_context::<UiHost>();
     let error = use_signal(|| Option::<String>::None);
+    let title = match tool {
+        Some(DrawingTool::Move) => "화면 이동 (G) · 보기만 이동 · 그림 픽셀 유지".to_owned(),
+        Some(DrawingTool::MoveArtwork) => "그림 이동 (G) · 현재 레이어의 픽셀 이동".to_owned(),
+        Some(DrawingTool::MoveSelection) => {
+            "변형 (G) · 선택 영역 또는 현재 레이어의 크기·회전".to_owned()
+        }
+        Some(DrawingTool::Eyedropper) => {
+            "스포이트 (C) · Alt+클릭: 보이는 그림에서 임시 색 채취".to_owned()
+        }
+        _ => format!("{label} ({shortcut})"),
+    };
     rsx! {
         button {
             class: if active { "tool active" } else { "tool" },
             disabled: tool.is_none_or(|tool| !live_ink.supports_command(&EditorCommand::Tool(ToolCommand::Select(tool)))),
-            title: if tool == Some(DrawingTool::Eyedropper) { "스포이트 (C) · Alt+클릭: 보이는 그림에서 임시 색 채취" } else { "{label} ({shortcut})" },
+            title,
             aria_label: "{label}, 단축키 {shortcut}",
             onclick: move |_| {
                 if let Some(tool) = tool {
@@ -1747,10 +1770,10 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
     rsx! {
         div { class: "layers-panel",
             div { class: "layer-actions",
-                button { title: "래스터 레이어 추가", disabled: layer_busy, onclick: move |_| {
+                button { title: "래스터 레이어 추가", aria_label: "래스터 레이어 추가", disabled: layer_busy, onclick: move |_| {
                     send_editor_command(&add_raster_ink, EditorCommand::Layer(LayerCommand::AddRaster), error);
                 }, UiIcon { name: "plus" } }
-                button { title: "선택 레이어 또는 그룹 전체 복제", disabled: layer_busy || settings_id.is_none(), onclick: move |_| {
+                button { title: "선택 레이어 또는 그룹 전체 복제", aria_label: "선택 레이어 또는 그룹 전체 복제", disabled: layer_busy || settings_id.is_none(), onclick: move |_| {
                     if let Some(node) = settings_id {
                         let command = match node {
                             LayerTreeNodeId::Raster(layer) => LayerCommand::DuplicateRaster(layer),
@@ -1759,10 +1782,10 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
                         send_editor_command(&duplicate_ink, EditorCommand::Layer(command), error);
                     }
                 }, UiIcon { name: "copy" } }
-                button { title: "그룹 추가", disabled: layer_busy || !add_group_ink.supports_command(&EditorCommand::Layer(LayerCommand::AddGroup)), onclick: move |_| {
+                button { title: "그룹 추가", aria_label: "레이어 그룹 추가", disabled: layer_busy || !add_group_ink.supports_command(&EditorCommand::Layer(LayerCommand::AddGroup)), onclick: move |_| {
                     send_editor_command(&add_group_ink, EditorCommand::Layer(LayerCommand::AddGroup), error);
-                }, UiIcon { name: "folder" } }
-                button { title: "흰 배경 추가", disabled: layer_busy || !white_ink.supports_command(&EditorCommand::Layer(LayerCommand::AddWhiteBackground)), onclick: move |_| {
+                }, UiIcon { name: "folder-plus" } }
+                button { title: "흰 배경 추가", aria_label: "흰 배경 레이어 추가", disabled: layer_busy || !white_ink.supports_command(&EditorCommand::Layer(LayerCommand::AddWhiteBackground)), onclick: move |_| {
                     send_editor_command(&white_ink, EditorCommand::Layer(LayerCommand::AddWhiteBackground), error);
                 }, UiIcon { name: "white" } }
                 if group_settings().is_none() { layer_drag::LayerMoveButtons { projection: ui_projection, error } }
@@ -1799,7 +1822,7 @@ fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
                 }
             }
             if let Some(message) = error.read().as_ref() { div { class: "command-error", role: "alert", "{message}" } }
-            div { class: "layers-footer", button { disabled: layer_busy || settings_id.is_none() || (group_settings().is_none() && active_locked), title: "설정 대상 레이어/그룹 삭제 (Undo로 복원)", onclick: move |_| {
+            div { class: "layers-footer", button { disabled: layer_busy || settings_id.is_none() || (group_settings().is_none() && active_locked), title: "설정 대상 레이어/그룹 삭제 (Undo로 복원)", aria_label: "설정 대상 레이어 또는 그룹 삭제", onclick: move |_| {
                 if let Some(node) = settings_id {
                     send_editor_command(&delete_ink, EditorCommand::Layer(LayerCommand::Delete(node)), error);
                 }
@@ -1838,6 +1861,7 @@ fn LayerRow(
         matches!(id, LayerTreeNodeId::Group(group) if collapsed_groups.read().contains(&group));
     let opacity = (u32::from(layer.opacity_u16) * 100 + 32_767) / u32::from(u16::MAX);
     let indent = u32::from(layer.depth.saturating_sub(1)) * 9;
+    let visibility_icon = if layer.visible { "eye" } else { "eye-off" };
     let layer_key = match id {
         LayerTreeNodeId::Raster(id) => format!("r-{}", id.0),
         LayerTreeNodeId::Group(id) => format!("g-{}", id.0),
@@ -1847,14 +1871,15 @@ fn LayerRow(
             "data-layer-key": "{layer_key}", "data-parent": "{layer.parent.0}", "data-index": "{layer.index}",
             "data-depth": "{layer.depth}",
             "data-has-mask": layer_has_mask,
-            button { class: "layer-eye", title: "보기/숨기기", onclick: move |_| {
+            button { class: "layer-eye", title: if layer.visible { "레이어 숨기기" } else { "레이어 표시" }, aria_label: "{layer.name} 표시", aria_pressed: layer.visible, onclick: move |_| {
                 let visible = !layer.visible;
                 send_editor_command(&visibility_ink, EditorCommand::Layer(LayerCommand::SetVisibility { node: id, visible }), error);
-            }, span { class: if layer.visible { "eye-mark" } else { "eye-mark hidden" }, UiIcon { name: "eye" } } }
+            }, span { class: if layer.visible { "eye-mark" } else { "eye-mark hidden" }, UiIcon { name: visibility_icon } } }
             button {
                 class: if solo_node == Some(id) { "layer-solo active" } else { "layer-solo" },
                 disabled: !solo_ink.supports_command(&EditorCommand::Layer(LayerCommand::ToggleSolo(id))),
                 title: if solo_node == Some(id) { "레이어만 보기 해제" } else { "이 레이어만 보기" },
+                aria_label: "{layer.name}만 보기", aria_pressed: solo_node == Some(id),
                 onclick: move |_| send_editor_command(
                     &solo_ink,
                     EditorCommand::Layer(LayerCommand::ToggleSolo(id)),
@@ -1893,7 +1918,7 @@ fn LayerRow(
                         LayerTreeNodeId::Group(group) => group_settings.set(Some(group)),
                     }
                 },
-                title: "페이지 내 원본 픽셀 미리보기 · 끌어서 레이어 순서 또는 그룹 변경",
+                title: "이미지 선택 · 레이어 순서 변경은 오른쪽 이동 핸들",
                 onclick: move |_| {
                     if let LayerTreeNodeId::Raster(layer_id) = id {
                         group_settings.set(None);
@@ -1932,8 +1957,8 @@ fn LayerRow(
                 span { class: "layer-detail",
                     if layer.locked { span { title: "픽셀 잠김", UiIcon { name: "lock" } } }
                     if layer.reference { "참조 · " }
-                    if layer.alpha_locked { "α · " }
-                    if layer.clip_to_below { "↳ · " }
+                    if layer.alpha_locked { span { title: "투명도 잠금", UiIcon { name: "alpha-lock" } } }
+                    if layer.clip_to_below { span { title: "아래 레이어에 클리핑", UiIcon { name: "clip" } } }
                     if layer.blend_mode != nyatidraw_api::LayerBlendMode::Normal { "{blend_mode_option(layer.blend_mode).1} · " }
                     if layer.color_effect.is_some_and(|effect| effect.enabled) { "색상화 · " }
                     if is_group { "그룹 · " }
@@ -1941,11 +1966,18 @@ fn LayerRow(
                 }
                 layer_mask::LayerMaskControls { layer: layer.clone(), ui_projection, error }
             }
+            div { class: "layer-row-actions",
             button {
                 class: "layer-delete", title: "삭제 (Undo로 복원)", aria_label: "{layer.name} 삭제",
                 disabled: layer.locked,
                 onclick: move |_| send_editor_command(&delete_ink, EditorCommand::Layer(LayerCommand::Delete(id)), error),
                 UiIcon { name: "trash" }
+            }
+            span { class: "layer-reorder-handle", "data-layer-reorder-handle": "true",
+                role: "img", aria_label: "{layer.name} 순서 이동 핸들",
+                title: "끌어서 레이어 순서 또는 그룹 변경",
+                UiIcon { name: "grip" }
+            }
             }
         }
     }
@@ -1999,7 +2031,7 @@ fn LayerNameInput(
     });
     rsx! {
         input { class: "layer-name", aria_label: "레이어 이름",
-            title: "끌어서 이동 · 더블클릭/F2 이름 변경 · Enter 확정 · Esc 취소",
+            title: "선택 · 더블클릭/F2 이름 변경 · Enter 확정 · Esc 취소",
             readonly: !editing(), value: "{draft}", maxlength: "128", spellcheck: "false",
             ondoubleclick: move |_| editing.set(true),
             oninput: move |event| draft.set(event.value()),
@@ -2076,12 +2108,12 @@ fn LayerStyleControls(layer: LayerProjection, error: Signal<Option<String>>) -> 
                 onclick: move |_| send_editor_command(&lock_ink, EditorCommand::Layer(LayerCommand::SetLocked { layer: layer_id, locked: !layer.locked }), error),
                 if layer.locked { UiIcon { name: "lock" } } else { UiIcon { name: "unlock" } }
             }
-            button { title: "투명도 잠금", aria_label: "투명도 잠금", disabled: !alpha_ink.supports_command(&EditorCommand::Layer(LayerCommand::SetAlphaLocked { layer: layer_id, alpha_locked: !layer.alpha_locked })), aria_pressed: "{layer.alpha_locked}",
-                onclick: move |_| send_editor_command(&alpha_ink, EditorCommand::Layer(LayerCommand::SetAlphaLocked { layer: layer_id, alpha_locked: !layer.alpha_locked }), error), "α"
+            button { title: "투명도 잠금 · 이미 그려진 픽셀 안에서만 칠하기", aria_label: "투명도 잠금", disabled: !alpha_ink.supports_command(&EditorCommand::Layer(LayerCommand::SetAlphaLocked { layer: layer_id, alpha_locked: !layer.alpha_locked })), aria_pressed: "{layer.alpha_locked}",
+                onclick: move |_| send_editor_command(&alpha_ink, EditorCommand::Layer(LayerCommand::SetAlphaLocked { layer: layer_id, alpha_locked: !layer.alpha_locked }), error), UiIcon { name: "alpha-lock" }
             }
         }
         button { title: "아래 레이어에 클리핑", aria_label: "아래 레이어에 클리핑", disabled: !clip_ink.supports_command(&EditorCommand::Layer(LayerCommand::SetClipToBelow { node: id, clip_to_below: !layer.clip_to_below })), aria_pressed: "{layer.clip_to_below}",
-            onclick: move |_| send_editor_command(&clip_ink, EditorCommand::Layer(LayerCommand::SetClipToBelow { node: id, clip_to_below: !layer.clip_to_below }), error), "↳"
+            onclick: move |_| send_editor_command(&clip_ink, EditorCommand::Layer(LayerCommand::SetClipToBelow { node: id, clip_to_below: !layer.clip_to_below }), error), UiIcon { name: "clip" }
         }
         if let LayerTreeNodeId::Raster(layer_id) = id {
             button { title: "선택·채우기 참조 레이어 (PNG에는 영향 없음)", aria_label: "참조 레이어", disabled: !reference_ink.supports_command(&EditorCommand::Layer(LayerCommand::SetReference { layer: layer_id, reference: !layer.reference })), aria_pressed: "{layer.reference}",
@@ -2235,158 +2267,6 @@ fn send_editor_command(
 fn SharedCanvas() -> Element {
     let render = use_context::<UiSlots>().canvas;
     render()
-}
-
-#[component]
-pub fn UiIcon(name: &'static str) -> Element {
-    let paths: &[&str] = match name {
-        "file-plus" => &[
-            "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z",
-            "M14 2v6h6",
-            "M12 11v6",
-            "M9 14h6",
-        ],
-        "folder" => &["M3 6h6l2 2h10v10H3z"],
-        "save" => &["M5 3h12l2 2v16H5z", "M8 3v6h8V3", "M8 21v-7h8v7"],
-        "undo" => &["M9 7 4 12l5 5", "M5 12h8a6 6 0 0 1 6 6"],
-        "redo" => &["m15 7 5 5-5 5", "M19 12h-8a6 6 0 0 0-6 6"],
-        "white" => &["M5 4h14v16H5z", "M8 8h8v8H8z"],
-        "transform" => &[
-            "M4 9V4h5",
-            "M15 4h5v5",
-            "M20 15v5h-5",
-            "M9 20H4v-5",
-            "M8 8h8v8H8z",
-        ],
-        "fit" => &["M8 3H3v5", "M16 3h5v5", "M21 16v5h-5", "M8 21H3v-5"],
-        "minus" => &["M5 12h14"],
-        "plus" => &["M12 5v14", "M5 12h14"],
-        "clear-layer" => &[
-            "M12 2v4",
-            "M12 18v4",
-            "M2 12h4",
-            "M18 12h4",
-            "m5 5 3 3",
-            "m16 16 3 3",
-            "m5 19 3-3",
-            "m16 8 3-3",
-        ],
-        "copy" => &["M8 8h12v12H8z", "M16 8V4H4v12h4"],
-        "eyedropper" => &[
-            "m14 4 6 6",
-            "m15 5 3-3 4 4-3 3",
-            "m16 8-9 9-4 1 1-4 9-9",
-            "M3 21h4",
-        ],
-        "lock" => &["M5 10h14v11H5z", "M8 10V6a4 4 0 0 1 8 0v4", "M12 14v3"],
-        "unlock" => &["M5 10h14v11H5z", "M8 10V6a4 4 0 0 1 8 0", "M12 14v3"],
-        "rotate" => &["M20 11a8 8 0 1 0-2 6", "M20 4v7h-7"],
-        "swap-axes" => &["M4 8h16", "m16 4 4 4-4 4", "M20 16H4", "m8 12-4 4 4 4"],
-        "mirror-horizontal" => &["M12 3v3m0 4v4m0 4v3", "M3 18 8 6v12z", "m21 18-5-12v12z"],
-        "move" => &[
-            "M3 3v15l4-4 4 7 3-2-4-7h6z",
-            "M15 5h7",
-            "m17 3-2 2 2 2",
-            "m20 3 2 2-2 2",
-        ],
-        "hand" => &[
-            "M8 12V6a2 2 0 0 1 4 0v5",
-            "M12 9V4a2 2 0 0 1 4 0v7",
-            "M16 8a2 2 0 0 1 4 0v8c0 4-3 6-6 6h-2c-2 0-4-1-5-3l-4-6a2 2 0 0 1 3-2l2 2",
-        ],
-        "move-artwork" => &[
-            "M7 7h10v10H7z",
-            "M12 2v4",
-            "m10 4 2-2 2 2",
-            "M12 22v-4",
-            "m10 20 2 2 2-2",
-            "M2 12h4",
-            "m4 10-2 2 2 2",
-            "M22 12h-4",
-            "m20 10 2 2-2 2",
-        ],
-        "rectangle-selection" => &[
-            "M3 7V3h4",
-            "M11 3h2",
-            "M17 3h4v4",
-            "M21 11v2",
-            "M21 17v4h-4",
-            "M13 21h-2",
-            "M7 21H3v-4",
-            "M3 13v-2",
-        ],
-        "invert-selection" => &[
-            "M3 3h18v18H3z",
-            "M3 21 21 3",
-            "M3 8h5",
-            "M3 13h10",
-            "M3 18h15",
-        ],
-        "deselect" => &[
-            "M7 3H3v4",
-            "M17 3h4v4",
-            "M21 17v4h-4",
-            "M7 21H3v-4",
-            "m8 8 8 8",
-            "m16 8-8 8",
-        ],
-        "select-alpha" => &[
-            "M7 3H3v4",
-            "M17 3h4v4",
-            "M21 17v4h-4",
-            "M7 21H3v-4",
-            "M12 6c-2 3-5 5-5 8a5 5 0 0 0 10 0c0-3-3-5-5-8z",
-        ],
-        "wand" => &[
-            "m4 20 10-10",
-            "m12 2 1 3",
-            "m5 2 3 1",
-            "m-1 7 3 1",
-            "m-7 6 1 3",
-        ],
-        "lasso" => &["M5 15c-4-3 0-10 7-10s11 7 6 11c-3 3-10 2-10-2 0-2 5-2 5 1"],
-        "pencil" => &["m4 20 4-1 11-11-3-3L5 16z", "m14-16 2 2"],
-        "pen" => &["m5 19 3-8 8-8 5 5-8 8z", "m8-5-3-3", "M5 19h7"],
-        "brush" => &[
-            "m14 4 6 6-8 8",
-            "M12 18c-2 3-7 2-8 2 2-1 1-6 4-8 3-2 7 1 4 6z",
-        ],
-        "eraser" => &["m4 15 8-11 8 7-7 9H8z", "M11 20h10"],
-        "bucket" => &["m5 12 7-7 7 7-7 7z", "M3 20h18"],
-        "gradient" => &["M4 5h16v14H4z", "M9 5v14", "M14 5v14"],
-        "layer" => &["m4 8 8-4 8 4-8 4z", "m4 4 8 4 8-4", "m4 4 8 4 8-4"],
-        "reference" => &["M4 4h16v16H4z", "M8 8h8v8H8z", "m4-4 4 4"],
-        "trash" => &[
-            "M10 11v6",
-            "M14 11v6",
-            "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6",
-            "M3 6h18",
-            "M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2",
-        ],
-        "eye" => &[
-            "M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12",
-            "M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6",
-        ],
-        "play" => &["m8 5 11 7-11 7Z"],
-        "layers" => &["m12 3 10 5-10 5L2 8Z", "m2 12 10 5 10-5", "m2 16 10 5 10-5"],
-        "stop" => &["M6 6h12v12H6z"],
-        "repeat" => &[
-            "m17 2 4 4-4 4",
-            "M3 11V8a2 2 0 0 1 2-2h16",
-            "m7 22-4-4 4-4",
-            "M21 13v3a2 2 0 0 1-2 2H3",
-        ],
-        "arrow-left" => &["m12 19-7-7 7-7", "M5 12h14"],
-        "arrow-right" => &["m12 5 7 7-7 7", "M5 12h14"],
-        "chevron-right" => &["m9 5 7 7-7 7"],
-        "chevron-down" => &["m5 9 7 7 7-7"],
-        _ => &["M5 5h14v14H5z"],
-    };
-    rsx! {
-        svg { class: "icon", view_box: "0 0 24 24",
-            for path in paths { path { d: "{path}" } }
-        }
-    }
 }
 
 fn panel_label(panel: PanelKind) -> &'static str {
