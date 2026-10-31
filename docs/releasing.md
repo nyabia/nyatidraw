@@ -3,7 +3,7 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
-## alpha.23 릴리즈 후보
+## alpha.23 배포
 
 Windows 상대 마우스의 소수 이동 수집과 웹의 raw/coalesced 입력 선택을 정리하고,
 선택적인 공통 손떨림 보정을 입력 수집과 분리한다. 기본값 0은 정확한 우회이며
@@ -16,6 +16,23 @@ Windows 상대 마우스의 소수 이동 수집과 웹의 raw/coalesced 입력 
   재시작의 자동 복구, NTDR 명시적 열기, 네이티브 CLI 출력 모두 같은 RGBA를 보존했다.
 - 물리 raw 마우스·펜의 품질, Windows 가속 감각, iPad/Pencil과 설치 업데이트는
   미검증이다. 자동화 입력은 그 증거로 취급하지 않는다. 사용자 설치본은 교체하지 않았다.
+- 소스 `54fd7c4`의 [Windows CI](https://github.com/nyabia/nyatidraw/actions/runs/41178210138)가
+  성공했다. [첫 웹 게시](https://github.com/nyabia/nyatidraw/actions/runs/41178210042) 후
+  공개 Edge에서 그리기·강도 변경·프로세스 재시작 복구와 PNG 픽셀 일치를 확인했다.
+  공개 본체·복구 Worker 등 12개 파일은 Pages 산출물과 바이트 단위로 같았다.
+- 태그 `v0.1.0-alpha.23`의
+  [릴리즈 작업](https://github.com/nyabia/nyatidraw/actions/runs/41178210123)이 Windows
+  검사·빌드·패키징·공개를 완료했다. [공개 자산](https://github.com/nyabia/nyatidraw/releases/tag/v0.1.0-alpha.23)
+  7개의 GitHub 크기·SHA256과 `SHA256SUMS.txt`의 6개 항목, JSON·legacy 업데이트 피드,
+  Portable 및 nupkg manifest와 라이선스 구성을 확인했다. 설치 파일은 14,900,792 bytes,
+  SHA256 `01d339bb59f718875165daa56004332f75cad8ca3c4e92eebd0a48df7ff57977`다.
+  공개 패키지의 실행 파일에도 시작 실패를 일으켰던 `GetWindowSubclass` import가 없다.
+- 릴리즈 후속 Pages도 성공했지만 기본 `release.json`과 실제 Edge 다운로드 버튼에는
+  alpha.22가 남아 있었다. 해당 Pages 산출물은 alpha.23을 포함했다. 동일 소스의
+  [홈페이지 재게시](https://github.com/nyabia/nyatidraw/actions/runs/41179728944) 성공 후
+  기본 URL과 실제 버튼 모두 alpha.23 설치 링크를 가리켰고, 공개 파일 12개가 최종
+  산출물과 바이트 단위로 일치했다. 편집기·Worker 10개 파일은 이미 공개 조작·복구를
+  검증한 첫 게시 파일과 동일하다. 이전 응답이 남은 원인은 로그만으로 확정하지 않았다.
 
 [릴리즈 노트](releases/0.1.0-alpha.23.md), [검증 상세](measurements/input-precision.md).
 

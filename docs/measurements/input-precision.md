@@ -63,6 +63,24 @@
 원본 로그·스크린샷·출력물은 무시되는 `output/research/input-precision/` 및
 `output/playwright/` 아래에 보관하며 공개 소스에는 포함하지 않는다.
 
+## 공개 웹 확인
+
+`54fd7c4`의 [Pages 작업](https://github.com/nyabia/nyatidraw/actions/runs/41178210042)이
+성공한 뒤 새 Edge 프로필로 실제 공개 편집기를 열었다. 기본 강도 0, 드래그 중 강도 66
+반영, 59%·100%·26% 배율의 획과 짧은 탭을 확인했다. PNG·NTDR를 저장하고 브라우저
+프로세스를 종료한 뒤 같은 격리 프로필로 다시 열었을 때 그림과 강도 66이 복원됐다.
+복구 전후 PNG의 1280×720 RGBA는 정확히 같다. RGBA SHA-256:
+`d135bcfeba4de1451d63a41eb04ee4809c6c8dfe9716da4916b875db3d46cb81`.
+
+홈페이지·편집기·복구 Worker 등 공개 파일 12개는 해당 Pages 산출물과 바이트 단위로
+일치했다. 이 첫 게시의 다운로드 안내는 당시 공개 중인 alpha.22를 가리킨다.
+브라우저 로그의 favicon 404와 Windows `powerPreference` 무시 경고는 앱 실행 오류와
+구분했다. 실제 장치 증거나 Windows 설치 업데이트 증거로 확대하지 않는다.
+
+릴리즈 후 [최종 홈페이지 재게시](https://github.com/nyabia/nyatidraw/actions/runs/41179728944)에서
+기본 `release.json`과 실제 Edge 다운로드 버튼의 alpha.23 안내를 확인했다. 최종 공개 파일
+12개는 해당 Pages 산출물과 같고, 편집기·Worker 10개 파일은 위 실행 검증 대상과 동일하다.
+
 ## 아직 보장하지 않는 것
 
 - 물리 마우스의 다양한 DPI/폴링률, Windows EPP 설정별 품질과 실제 커서 잔차.
