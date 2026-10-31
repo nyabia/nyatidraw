@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
 mod canvas_mode;
+mod curve;
 mod smoothing;
 
 pub use canvas_mode::CanvasInputMode;
+pub use curve::{StrokePath, StrokePathError, StrokeSampleBatch};
 pub use smoothing::{SmoothingError, StrokeSmoother};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

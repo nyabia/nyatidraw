@@ -745,7 +745,9 @@ impl Editor {
                 runtime.pressure_preset,
             );
             let update = match phase {
-                "begin" => runtime.document.begin_stroke(sample),
+                "begin" => runtime
+                    .document
+                    .begin_stroke_at_scale(sample, runtime.viewport.zoom),
                 "move" if runtime.document.is_drawing() => runtime.document.move_stroke(sample),
                 "end" if runtime.document.is_drawing() => runtime.document.end_stroke(sample),
                 _ => return Ok(()),

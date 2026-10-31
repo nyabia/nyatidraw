@@ -3,6 +3,22 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
+## alpha.23 릴리즈 후보
+
+Windows 상대 마우스의 소수 이동 수집과 웹의 raw/coalesced 입력 선택을 정리하고,
+선택적인 공통 손떨림 보정을 입력 수집과 분리한다. 기본값 0은 정확한 우회이며
+도구 속성의 불투명도 아래 슬라이더와 숫자로 조절한다.
+
+- 전체 workspace 테스트·Clippy, WASM Clippy, fmt, Windows/웹 release 및 문서 빌드 통과.
+- 격리한 Windows release 창에서 그리기·강도 변경·Undo/Redo·저장·정상 종료와 새
+  프로세스 재열기를 확인했다. 원본 PNG와 별도 CLI 재출력 PNG의 RGBA가 일치했다.
+- 격리 Edge의 59%·100%·26% 배율 그리기와 슬라이더를 확인했다. 브라우저 프로세스
+  재시작의 자동 복구, NTDR 명시적 열기, 네이티브 CLI 출력 모두 같은 RGBA를 보존했다.
+- 물리 raw 마우스·펜의 품질, Windows 가속 감각, iPad/Pencil과 설치 업데이트는
+  미검증이다. 자동화 입력은 그 증거로 취급하지 않는다. 사용자 설치본은 교체하지 않았다.
+
+[릴리즈 노트](releases/0.1.0-alpha.23.md), [검증 상세](measurements/input-precision.md).
+
 ## alpha.22 배포
 
 레이어 옵션 메뉴, hover/focus 도움말, 조용한 웹 자동 복구 상태표시,

@@ -17,7 +17,8 @@ use windows::{
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{
-            BeginPaint, EndPaint, InvalidateRect, MapWindowPoints, PAINTSTRUCT, ScreenToClient,
+            BeginPaint, ClientToScreen, EndPaint, InvalidateRect, MapWindowPoints, PAINTSTRUCT,
+            ScreenToClient,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::HiDpi::GetDpiForWindow,
@@ -32,17 +33,17 @@ use windows::{
         UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         UI::WindowsAndMessaging::{
             CREATESTRUCTW, CS_HREDRAW, CS_OWNDC, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-            DestroyWindow, GWLP_HINSTANCE, GWLP_USERDATA, GetClientRect, GetMessageExtraInfo,
-            GetMessagePos, GetMessageTime, GetParent, GetWindowLongPtrW, HWND_BOTTOM, IDC_ARROW,
-            IsWindowVisible, LoadCursorW, MSG, PEN_FLAG_BARREL, POINTER_INPUT_TYPE, PT_PEN,
-            PT_TOUCH, PostMessageW, RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer,
-            SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP,
-            WM_CAPTURECHANGED, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
-            WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-            WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_POINTERCAPTURECHANGED,
-            WM_POINTERDOWN, WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE, WM_SIZE, WM_TIMER,
-            WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP,
-            WS_VISIBLE,
+            DestroyWindow, GA_ROOT, GWLP_HINSTANCE, GWLP_USERDATA, GetAncestor, GetClientRect,
+            GetForegroundWindow, GetMessageExtraInfo, GetMessagePos, GetMessageTime, GetParent,
+            GetWindowLongPtrW, HWND_BOTTOM, IDC_ARROW, IsWindowVisible, LoadCursorW, MSG,
+            PEN_FLAG_BARREL, POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, PostMessageW, RegisterClassW,
+            SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetTimer, SetWindowLongPtrW, SetWindowPos,
+            ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE,
+            WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+            WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
+            WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERLEAVE, WM_POINTERUP,
+            WM_POINTERUPDATE, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
+            WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_VISIBLE,
         },
     },
     core::w,
@@ -171,6 +172,23 @@ impl DesktopCanvasHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(host.clone());
         unsafe { SetTimer(Some(hwnd), CLOSE_TIMER, 50, None) };
         state.resize(hwnd);
+        state.raw_mouse_hook = match nyatidraw_input_platform::WindowsRawMouseHook::install(
+            hwnd.0 as usize,
+            observe_raw_mouse,
+        ) {
+            Ok(hook) => {
+                println!(
+                    "desktop-input event=raw-mouse-observer-ready registration=unchanged alignment_bound_px=0.5 exact-windows-curve=false"
+                );
+                Some(hook)
+            }
+            Err(reason) => {
+                eprintln!(
+                    "desktop-input event=raw-mouse-unavailable reason={reason} fallback=legacy"
+                );
+                None
+            }
+        };
 
         println!(
             "desktop-shell event=native-canvas-created elapsed_ms={} input=child-hwnd render=wgpu",
@@ -431,6 +449,7 @@ fn register_canvas_class() -> Result<(), String> {
 }
 
 struct CanvasWindowState {
+    raw_mouse_hook: Option<nyatidraw_input_platform::WindowsRawMouseHook>,
     live_ink: LiveInkBridge,
     // The HWND owns the single-instance guard for its full lifetime. Dioxus
     // drops its one-shot window configuration immediately after construction.
@@ -451,6 +470,7 @@ impl CanvasWindowState {
     fn new(live_ink: LiveInkBridge, instance: PrimaryInstance) -> Self {
         let activation = instance.inbox();
         Self {
+            raw_mouse_hook: None,
             viewport: WindowsViewportInput::new(live_ink.clone()),
             mouse: WindowsMouseInput::new(live_ink.clone()),
             touch: WindowsMouseInput::new_touch(live_ink.clone()),
@@ -1494,6 +1514,69 @@ unsafe fn canvas_state(hwnd: HWND) -> Option<&'static mut CanvasWindowState> {
     unsafe { pointer.as_mut() }
 }
 
+fn observe_raw_mouse(
+    context: usize,
+    packet: Option<nyatidraw_input_platform::WindowsRawMousePacket>,
+) {
+    let hwnd = HWND(context as *mut c_void);
+    let mut origin = POINT::default();
+    // SAFETY: the observer is removed by the HWND-owned state on this UI
+    // thread before destruction. These read-only queries do not pump messages.
+    let foreground = unsafe { GetForegroundWindow() == GetAncestor(hwnd, GA_ROOT) };
+    let capture = unsafe { GetCapture() };
+    let origin_valid = unsafe { ClientToScreen(hwnd, &raw mut origin) }.as_bool();
+    let timestamp_ms = packet.map_or_else(
+        || unsafe { GetMessageTime() }.cast_unsigned(),
+        |packet| packet.timestamp_ms,
+    );
+    let release_capture = {
+        // SAFETY: the callback is confined to the canvas's owning UI thread.
+        let Some(state) = (unsafe { canvas_state(hwnd) }) else {
+            return;
+        };
+        let mouse_was_active = state.mouse.active.is_some();
+        if packet.is_none() && state.mouse.precision.is_some() {
+            eprintln!(
+                "desktop-input event=raw-mouse-decode-failed action=cancel-active-raw-stroke"
+            );
+        }
+        let blocked = !foreground
+            || !origin_valid
+            || state.live_ink.is_closing()
+            || state.touch_pointer.is_some()
+            || state.pen_contact.is_some()
+            || state.pen.active_pointer.is_some()
+            || state.viewport.drag.is_some()
+            || (state.mouse.active.is_some() && capture != hwnd);
+        let admitted = if blocked || packet.is_none() {
+            state.mouse.recent_raw = None;
+            state.mouse.precision.is_some() && state.mouse.cancel(timestamp_ms)
+        } else if let Some(packet) = packet {
+            state.mouse.observe_raw(
+                packet,
+                nyatidraw_input::Point {
+                    x: packet.position_screen_px.x - f64::from(origin.x),
+                    y: packet.position_screen_px.y - f64::from(origin.y),
+                },
+            )
+        } else {
+            false
+        };
+        if admitted {
+            state.live_ink.request_redraw();
+        }
+        mouse_was_active
+            && capture == hwnd
+            && state.mouse.active.is_none()
+            && !state.viewport.mouse_capture()
+    };
+    if release_capture {
+        // SAFETY: no CanvasWindowState borrow survives synchronous capture-loss
+        // reentry; only this canvas's formerly admitted mouse capture is released.
+        let _ = unsafe { ReleaseCapture() };
+    }
+}
+
 fn current_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> MSG {
     // SAFETY: both functions read metadata for the message currently being
     // dispatched on this thread.
@@ -2048,6 +2131,19 @@ struct WindowsMouseInput {
     next_sequence: u64,
     timestamp_epoch_ms: u64,
     last_timestamp_ms: Option<u32>,
+    recent_raw: Option<nyatidraw_input_platform::WindowsRawMousePacket>,
+    precision: Option<MousePrecisionStroke>,
+    trace_precision: bool,
+}
+
+struct MousePrecisionStroke {
+    device_id: usize,
+    motion: nyatidraw_input_platform::CursorAlignedMouseMotion,
+    begin_timestamp_ms: u32,
+    released: bool,
+    moved: bool,
+    packets: u64,
+    max_alignment_residual_px: f64,
 }
 
 impl WindowsMouseInput {
@@ -2061,6 +2157,9 @@ impl WindowsMouseInput {
             next_sequence: 1_u64 << 63,
             timestamp_epoch_ms: 0,
             last_timestamp_ms: None,
+            recent_raw: None,
+            precision: None,
+            trace_precision: std::env::var_os("NAYATI_MOUSE_INPUT_TRACE").is_some(),
         }
     }
 
@@ -2068,12 +2167,29 @@ impl WindowsMouseInput {
         let mut input = Self::new(live_ink);
         input.device_id = u64::MAX - 1;
         input.next_sequence = 1_u64 << 62;
+        input.trace_precision = false;
         input
     }
 
     fn observe(&mut self, message: &MSG) -> bool {
         if message.message == WM_CAPTURECHANGED {
             return self.capture_lost(message.time);
+        }
+        if message.message == WM_MOUSEMOVE && self.precision.is_some() {
+            return false;
+        }
+        if message.message == WM_LBUTTONDOWN
+            && self.recent_raw.is_some_and(|packet| {
+                !packet.matches_legacy_down(
+                    message.time,
+                    nyatidraw_input::Point {
+                        x: f64::from(message.pt.x),
+                        y: f64::from(message.pt.y),
+                    },
+                )
+            })
+        {
+            self.recent_raw = None;
         }
         // SAFETY: `message` is a live stack value for this call only.
         if let Err(error) = unsafe {
@@ -2083,11 +2199,11 @@ impl WindowsMouseInput {
             )
         } {
             eprintln!("desktop-input event=mouse-error error={error:?}");
-            return false;
+            return self.capture_lost(message.time);
         }
-        let events = self.batch.events().to_vec();
         let mut admitted = false;
-        for event in events {
+        for index in 0..self.batch.events().len() {
+            let event = self.batch.events()[index];
             admitted |= self.admit(event);
         }
         admitted
@@ -2097,6 +2213,7 @@ impl WindowsMouseInput {
         // Drop the platform recorder's down/history state as well as the
         // stroke. A later hover/Up cannot resume or finish a cancelled stroke.
         self.batch = nyatidraw_input_platform::WindowsMouseMessageBuffer::default();
+        self.recent_raw = None;
         self.cancel(timestamp_ms)
     }
 
@@ -2129,9 +2246,38 @@ impl WindowsMouseInput {
                 mapping,
                 last_document_point: document,
             });
+            self.precision = self.recent_raw.take().and_then(|packet| {
+                let policy = nyatidraw_input_platform::windows_mouse_motion_policy()?;
+                let motion = nyatidraw_input_platform::CursorAlignedMouseMotion::new(
+                    event.position_client_px,
+                    event.timestamp_ms,
+                    policy,
+                )?;
+                Some(MousePrecisionStroke {
+                    device_id: packet.device_id,
+                    motion,
+                    begin_timestamp_ms: event.timestamp_ms,
+                    released: false,
+                    moved: false,
+                    packets: 0,
+                    max_alignment_residual_px: 0.0,
+                })
+            });
+            if self.trace_precision {
+                eprintln!(
+                    "desktop-input event=mouse-stroke-begin mode={} alignment_bound_px=0.5",
+                    if self.precision.is_some() {
+                        "cursor-aligned-raw"
+                    } else {
+                        "legacy"
+                    }
+                );
+            }
             true
         } else {
             self.active = None;
+            self.trace_precision_end("queue-rejected", self.precision.as_ref());
+            self.precision = None;
             false
         }
     }
@@ -2157,19 +2303,30 @@ impl WindowsMouseInput {
             true
         } else {
             self.active = None;
+            self.trace_precision_end("queue-rejected", self.precision.as_ref());
+            self.precision = None;
             false
         }
     }
 
-    fn end(&mut self, event: nyatidraw_input_platform::WindowsMouseEvent) -> bool {
+    fn end(&mut self, mut event: nyatidraw_input_platform::WindowsMouseEvent) -> bool {
         if self.active.is_some_and(|active| {
             self.live_ink.canvas_viewport_snapshot().revision != active.mapping.revision
         }) {
             return self.cancel(event.timestamp_ms);
         }
         let Some(active) = self.active.take() else {
+            self.precision = None;
             return false;
         };
+        let precision = self.precision.take();
+        self.trace_precision_end("end", precision.as_ref());
+        if let Some(mut precision) = precision
+            && precision.moved
+            && let Some(position) = precision.motion.finish(event.position_client_px)
+        {
+            event.position_client_px = position;
+        }
         self.push(
             nyatidraw_input::PointerPhase::End,
             active.mapping.document_point(event.position_client_px),
@@ -2179,15 +2336,94 @@ impl WindowsMouseInput {
     }
 
     fn cancel(&mut self, timestamp_ms: u32) -> bool {
+        let precision = self.precision.take();
+        self.recent_raw = None;
         let Some(active) = self.active.take() else {
             return false;
         };
+        self.trace_precision_end("cancel", precision.as_ref());
         self.push(
             nyatidraw_input::PointerPhase::Cancel,
             active.last_document_point,
             active.mapping.revision,
             timestamp_ms,
         )
+    }
+
+    fn observe_raw(
+        &mut self,
+        packet: nyatidraw_input_platform::WindowsRawMousePacket,
+        position_client_px: nyatidraw_input::Point,
+    ) -> bool {
+        if packet.promoted {
+            return false;
+        }
+        if !packet.relative || packet.device_id == 0 {
+            self.recent_raw = None;
+            return self.precision.is_some() && self.cancel(packet.timestamp_ms);
+        }
+        let Some(precision) = self.precision.as_mut() else {
+            if self.active.is_none() {
+                self.recent_raw = Some(packet);
+            }
+            return false;
+        };
+        if packet
+            .timestamp_ms
+            .wrapping_sub(precision.begin_timestamp_ms)
+            > u32::MAX / 2
+        {
+            return false;
+        }
+        if precision.device_id != packet.device_id {
+            return self.cancel(packet.timestamp_ms);
+        }
+        if precision.released {
+            return false;
+        }
+        precision.packets = precision.packets.saturating_add(1);
+        // The legacy Down already contains any motion in the down packet.
+        // A received Up packet contributes its motion; legacy Up alone ends.
+        if packet.left_down {
+            return false;
+        }
+        precision.released = packet.left_up;
+        if packet.delta.x == 0.0 && packet.delta.y == 0.0 {
+            return false;
+        }
+        let anchor = position_client_px;
+        let Some(position_client_px) =
+            precision
+                .motion
+                .advance(packet.delta, position_client_px, packet.timestamp_ms)
+        else {
+            return self.cancel(packet.timestamp_ms);
+        };
+        precision.moved = true;
+        precision.max_alignment_residual_px = precision
+            .max_alignment_residual_px
+            .max((position_client_px.x - anchor.x).abs())
+            .max((position_client_px.y - anchor.y).abs());
+        self.move_to(nyatidraw_input_platform::WindowsMouseEvent {
+            message: nyatidraw_input_platform::WindowsMouseMessage::Move,
+            timestamp_ms: packet.timestamp_ms,
+            position_client_px,
+        })
+    }
+
+    fn trace_precision_end(&self, reason: &str, precision: Option<&MousePrecisionStroke>) {
+        if self.trace_precision {
+            eprintln!(
+                "desktop-input event=mouse-stroke-finished reason={reason} mode={} raw_packets={} max_alignment_residual_px={:.6}",
+                if precision.is_some() {
+                    "cursor-aligned-raw"
+                } else {
+                    "legacy"
+                },
+                precision.map_or(0, |precision| precision.packets),
+                precision.map_or(0.0, |precision| precision.max_alignment_residual_px),
+            );
+        }
     }
 
     fn push(

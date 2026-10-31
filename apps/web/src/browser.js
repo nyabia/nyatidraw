@@ -451,6 +451,7 @@ export function bindCanvas(canvas, callback) {
   let penContact = false;
   const penTouchGuardMs = 700;
   let mode = null;
+  let strokeMoveSource = null;
   let space = false;
   let pickerEvent = null;
   let pickerFrame = 0;
@@ -487,15 +488,36 @@ export function bindCanvas(canvas, callback) {
       event.pointerType === "pen",
     );
   };
-  const releaseActivePointer = () => {
+  const releaseActivePointer = (
+    phase = mode === "rotate" ? "rotateCancel" : mode === "pan" ? "panEnd" : "cancel",
+    timeStamp = 0,
+  ) => {
     clearPicker();
     const captured = active;
-    const phase = mode === "rotate" ? "rotateCancel" : mode === "pan" ? "panEnd" : "cancel";
     active = null;
     activePointerType = null;
     mode = null;
-    callback(phase, 0, 0, 0, 0, false);
-    if (canvas.hasPointerCapture(captured)) canvas.releasePointerCapture(captured);
+    strokeMoveSource = null;
+    try {
+      callback(phase, 0, 0, 0, timeStamp, false);
+    } finally {
+      if (canvas.hasPointerCapture(captured)) canvas.releasePointerCapture(captured);
+    }
+  };
+  const sendStrokeMoves = (event) => {
+    if (modalOpen || event.pointerId !== active || mode !== "stroke") return;
+    // Raw updates precede their duplicate pointermove; first delivery also permits fallback.
+    strokeMoveSource ??= event.type;
+    if (strokeMoveSource !== event.type) return;
+    const samples = event.getCoalescedEvents?.() || [];
+    if (samples.length > 256) {
+      releaseActivePointer("overflow", event.timeStamp);
+      return;
+    }
+    for (const sample of samples.length ? samples : [event]) {
+      if (event.pointerId !== active || mode !== "stroke") break;
+      send("move", sample);
+    }
   };
   canvas.addEventListener("contextmenu", (event) => event.preventDefault());
   const observePen = (event) => {
@@ -511,6 +533,10 @@ export function bindCanvas(canvas, callback) {
   };
   for (const phase of ["pointerdown", "pointermove", "pointerup", "pointercancel"])
     document.addEventListener(phase, observePen, true);
+  if (window.isSecureContext && "onpointerrawupdate" in window) {
+    document.addEventListener("pointerrawupdate", observePen, true);
+    canvas.addEventListener("pointerrawupdate", sendStrokeMoves);
+  }
   canvas.addEventListener("pointerdown", (event) => {
     if (event.pointerType === "touch" &&
         (penContact || canvasInputMode === "pen" ||
@@ -530,6 +556,7 @@ export function bindCanvas(canvas, callback) {
     canvas.focus({ preventScroll: true });
     active = event.pointerId;
     activePointerType = event.pointerType;
+    strokeMoveSource = null;
     mode =
       event.button !== 1 && space && event.shiftKey && !event.altKey
         ? "rotate"
@@ -556,16 +583,7 @@ export function bindCanvas(canvas, callback) {
       if (!pickerFrame) pickerFrame = requestAnimationFrame(flushPicker);
       return;
     }
-    const samples = event.getCoalescedEvents?.() || [];
-    if (samples.length > 256) {
-      callback("overflow", 0, 0, 0, event.timeStamp, false);
-      active = null;
-      activePointerType = null;
-      mode = null;
-      return;
-    }
-    for (const sample of samples.length ? samples : [event])
-      send("move", sample);
+    sendStrokeMoves(event);
   });
   canvas.addEventListener("pointerup", (event) => {
     if (event.pointerType === "pen") lastPenActivity = performance.now();
@@ -575,7 +593,8 @@ export function bindCanvas(canvas, callback) {
     active = null;
     activePointerType = null;
     mode = null;
-    canvas.releasePointerCapture(event.pointerId);
+    strokeMoveSource = null;
+    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
   });
   const cancel = () => {
     space = false;

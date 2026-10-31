@@ -4,7 +4,10 @@
 //! [`StylusSample`] values directly to their bounded input queue; this crate
 //! deliberately does not own an unbounded queue or update Dioxus state.
 
-// The only unsafe operations in this crate are confined to `windows.rs`.
+// Unsafe operations are confined to the Windows adapters.
+
+mod mouse_precision;
+pub use mouse_precision::{CursorAlignedMouseMotion, MouseMotionPolicy};
 
 use std::collections::HashMap;
 
@@ -298,6 +301,14 @@ fn degrees_to_radians(degrees: u16) -> f32 {
 
 #[cfg(windows)]
 mod windows;
+
+#[cfg(windows)]
+mod windows_raw_mouse;
+
+#[cfg(windows)]
+pub use windows_raw_mouse::{
+    WindowsRawMouseHook, WindowsRawMousePacket, windows_mouse_motion_policy,
+};
 
 #[cfg(windows)]
 pub use windows::{

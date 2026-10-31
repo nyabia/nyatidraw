@@ -1220,9 +1220,9 @@ fn BrushSmoothingControl(strength: u8) -> Element {
         draft.set(value.to_string());
     }));
     rsx! {
-        label { class: "property-row", title: "0은 끄기 · 강도가 높을수록 선이 부드럽게 따라옵니다 · 다음 선부터 적용",
-            span { "선 보정" }
-            input { class: "property-number", r#type: "number", min: "0", max: "100", step: "1", value: "{draft}", aria_label: "선 보정 강도 (0: 끄기)",
+        label { class: "property-row", title: "0은 끄기 · 높일수록 손떨림을 줄입니다 · 다음 획부터 적용",
+            span { "손떨림 보정" }
+            input { class: "property-number", r#type: "number", min: "0", max: "100", step: "1", value: "{draft}", aria_label: "손떨림 보정 강도 (0: 끄기)",
                 onkeydown: text_input_keydown,
                 oninput: move |event| draft.set(event.value()),
                 onchange: move |_| {
@@ -1234,8 +1234,8 @@ fn BrushSmoothingControl(strength: u8) -> Element {
                 },
             }
             span { class: "property-unit", aria_hidden: "true" }
-            input { class: "property-range", r#type: "range", min: "0", max: "100", step: "1", value: "{strength}", aria_label: "선 보정 강도 슬라이더",
-                onchange: move |event| {
+            input { class: "property-range", r#type: "range", min: "0", max: "100", step: "1", value: "{strength}", aria_label: "손떨림 보정 강도 슬라이더",
+                oninput: move |event| {
                     if let Ok(value) = event.value().parse::<u8>() {
                         send_editor_command(&slider_ink, EditorCommand::Tool(ToolCommand::SetSmoothing(value.min(100))), error);
                     }

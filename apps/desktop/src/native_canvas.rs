@@ -60,7 +60,7 @@ use nyatidraw_editor::{
     HeadlessStrokeError, HeadlessStrokeSession, ProjectionError, ProjectionState,
 };
 use nyatidraw_input::{
-    PenButtons, Point, PointerPhase, StrokeSmoother, StylusSample, ViewportTransform,
+    PenButtons, Point, PointerPhase, StrokePath, StylusSample, ViewportTransform,
 };
 use nyatidraw_paint_cpu::{
     flatten_layer_tree_rgba8, render_page_preview_rgba8, render_raster_page_preview_rgba8,
@@ -90,6 +90,13 @@ const LIVE_DAB_LIMITS: LiveDabLimits = LiveDabLimits {
     per_segment: 65_536,
     per_stroke: 1_048_576,
 };
+
+fn remaining_live_dab_limits(emitted: u64) -> LiveDabLimits {
+    LiveDabLimits {
+        per_segment: LIVE_DAB_LIMITS.per_segment.saturating_sub(emitted),
+        ..LIVE_DAB_LIMITS
+    }
+}
 
 const LIVE_BRUSH: BrushPreset = BrushPreset {
     id: BrushPresetId(1),
@@ -4524,8 +4531,8 @@ impl StrokePipeline {
 
         let mut artwork_closed = false;
         let mut report = StrokeDrain::default();
-        for admitted in queued_samples.drain(..) {
-            let mut sample = admitted.queued.sample;
+        'input: for admitted in queued_samples.drain(..) {
+            let sample = admitted.queued.sample;
             if sample.phase == PointerPhase::Begin {
                 self.cancel_picker();
                 self.temporary_picker_active = admitted.temporary_picker;
@@ -4694,261 +4701,285 @@ impl StrokePipeline {
                 }
                 continue;
             }
-            // Correct only accepted brush positions, once. Raw input diagnostics
-            // are upstream; live dabs and retained replay samples below receive
-            // this identical evaluated stream. Settings are captured at Begin.
-            let mut begin_smoother = (sample.phase == PointerPhase::Begin)
-                .then(|| StrokeSmoother::new(drawing.smoothing_for_stroke(sample.eraser)));
-            let corrected = if let Some(smoother) = &mut begin_smoother {
-                smoother.process(sample)
+            let mut begin_path = (sample.phase == PointerPhase::Begin).then(|| {
+                StrokePath::with_scale(
+                    drawing.smoothing_for_stroke(sample.eraser),
+                    self.live_ink.canvas_viewport_snapshot().zoom,
+                )
+            });
+            let evaluated = if let Some(path) = &mut begin_path {
+                path.process(sample)
             } else if let Some(active) = &mut self.active {
-                active.smoother.process(sample)
+                active.path.process(sample)
             } else {
-                Ok(sample)
+                continue;
             };
-            let Ok(corrected) = corrected else {
+            let Ok(evaluated) = evaluated else {
                 self.cancel_invalid_smoothed_stroke(sample.sequence);
                 continue;
             };
-            sample = corrected;
-            match sample.phase {
-                PointerPhase::Begin => {
-                    if self.pending_materializations.len() >= self.materialization_backlog_capacity
-                    {
-                        self.live_ink.publish_workspace_error(
-                            "Drawing stopped because the durable stroke backlog is full".into(),
-                        );
-                        self.fail_closed("materialization-backlog-full");
-                        continue;
-                    }
-                    if let Some(previous) = self.active.take() {
-                        self.scratch_dabs.clear();
-                        let record = self.evaluator.end(previous.token, &mut self.scratch_dabs);
-                        self.gpu_ops.push(GpuStrokeOp::Finish {
-                            generation: previous.generation,
-                            disposition: LiveStrokeDisposition::Cancel,
-                        });
-                        println!(
-                            "live-ink event=stroke-aborted reason=replaced-by-begin samples={} first_sequence={} last_sequence={}",
-                            previous.samples.len(),
-                            record.first_sample_sequence,
-                            record.last_sample_sequence,
-                        );
-                    }
-                    self.scratch_dabs.clear();
-                    if self.selected_mask.is_some()
-                        && admitted
-                            .begin_layer
-                            .is_some_and(|layer| layer != active_layer)
-                    {
-                        self.completed_edit = Some(Err(
-                            "마스크 대상 레이어가 변경되어 획을 취소했습니다.".into(),
-                        ));
-                        self.awaiting_clean_begin = true;
-                        continue;
-                    }
-                    let eraser = drawing.tool == DrawingTool::Eraser || sample.eraser;
-                    if self.selected_layer_alpha_locked && eraser {
-                        self.completed_edit = Some(Err(
-                            "투명도 잠금 중에는 지울 수 없습니다. 잠금을 해제하세요.".into(),
-                        ));
-                        self.awaiting_clean_begin = true;
-                        continue;
-                    }
-                    sample.eraser = eraser;
-                    let brush = drawing.preset_for_stroke(sample.eraser);
-                    let color = drawing.stroke_color();
-                    let gpu_color = drawing.gpu_color();
-                    let token = begin_round_stroke(
-                        &mut self.evaluator,
-                        &brush,
-                        sample,
-                        &mut self.scratch_dabs,
-                    );
-                    let mut mask_work = nyatidraw_paint_cpu::MaskStrokeBudget::default();
-                    if self.selected_mask.is_some() && mask_work.admit(&self.scratch_dabs).is_err()
-                    {
-                        let _ = self.evaluator.end(token, &mut self.scratch_dabs);
-                        self.scratch_dabs.clear();
-                        self.cancel_mask_work_limit(sample.sequence, None);
-                        continue;
-                    }
-                    let generation = self.next_generation;
-                    self.next_generation = self.next_generation.saturating_add(1);
-                    let layer = admitted.begin_layer.unwrap_or(active_layer);
-                    let gpu_op_start = self.gpu_ops.len();
-                    self.gpu_ops.push(GpuStrokeOp::Replace {
-                        generation,
-                        layer,
-                        color: gpu_color,
-                        eraser,
-                        alpha_locked: self.selected_layer_alpha_locked,
-                        mask: self.selected_mask,
-                        mask_color: color,
-                        mask_selection: self.selection.clone(),
-                    });
-                    append_gpu_dabs(&mut self.gpu_ops, generation, &mut self.scratch_dabs);
-                    self.active = Some(LiveStroke {
-                        mask_work,
-                        mask: self.selected_mask,
-                        token,
-                        smoother: begin_smoother.expect("Begin owns a fresh smoother"),
-                        generation,
-                        layer,
-                        gpu_op_start,
-                        samples: vec![sample],
-                        sample_limit_exceeded: false,
-                        brush: BrushSnapshot { preset: brush },
-                        color,
-                        eraser,
-                        alpha_locked: self.selected_layer_alpha_locked,
-                        selection: self.selection.clone(),
-                    });
-                    // The preset may be the remembered hardware eraser, not
-                    // the UI's selected brush. Record the accepted Begin only.
-                    let used_size = if sample.eraser && drawing.tool != DrawingTool::Eraser {
-                        drawing.remembered[3].size_tenths
-                    } else {
-                        drawing.size_tenths
-                    };
-                    // Preserve the exact sRGB source chosen for this accepted
-                    // stroke, rather than round-tripping quantized tile bytes.
-                    let used_color = (!eraser
-                        && matches!(
-                            drawing.tool,
-                            DrawingTool::Pencil | DrawingTool::Pen | DrawingTool::Brush
-                        ))
-                    .then_some(drawing.color);
-                    report.record_brush_begin(used_size, used_color);
-                }
-                PointerPhase::Move => {
-                    if let Some(active) = self.active.as_mut() {
-                        sample.eraser = active.eraser;
-                        active.retain_sample(sample);
-                        self.scratch_dabs.clear();
-                        self.evaluator.push_live(
-                            &mut active.token,
-                            &[sample],
-                            &mut self.scratch_dabs,
-                            LIVE_DAB_LIMITS,
-                        );
-                        if active.token.is_discontinuous() {
-                            self.cancel_native_brush_discontinuity(
-                                sample.sequence,
-                                "brush-dab-budget",
-                                "입력 간격이 너무 커 현재 선을 취소했습니다. 다시 그려주세요.",
-                            );
-                            continue;
-                        }
-                        if active.mask.is_some()
-                            && active.mask_work.admit(&self.scratch_dabs).is_err()
+            let mut input_dabs = 0_u64;
+            for mut sample in evaluated.as_slice().iter().copied() {
+                match sample.phase {
+                    PointerPhase::Begin => {
+                        if self.pending_materializations.len()
+                            >= self.materialization_backlog_capacity
                         {
+                            self.live_ink.publish_workspace_error(
+                                "Drawing stopped because the durable stroke backlog is full".into(),
+                            );
+                            self.fail_closed("materialization-backlog-full");
+                            continue 'input;
+                        }
+                        if let Some(previous) = self.active.take() {
+                            self.scratch_dabs.clear();
+                            let record = self.evaluator.end(previous.token, &mut self.scratch_dabs);
+                            self.gpu_ops.push(GpuStrokeOp::Finish {
+                                generation: previous.generation,
+                                disposition: LiveStrokeDisposition::Cancel,
+                            });
+                            println!(
+                                "live-ink event=stroke-aborted reason=replaced-by-begin samples={} first_sequence={} last_sequence={}",
+                                previous.samples.len(),
+                                record.first_sample_sequence,
+                                record.last_sample_sequence,
+                            );
+                        }
+                        self.scratch_dabs.clear();
+                        if self.selected_mask.is_some()
+                            && admitted
+                                .begin_layer
+                                .is_some_and(|layer| layer != active_layer)
+                        {
+                            self.completed_edit = Some(Err(
+                                "마스크 대상 레이어가 변경되어 획을 취소했습니다.".into(),
+                            ));
+                            self.awaiting_clean_begin = true;
+                            continue 'input;
+                        }
+                        let eraser = drawing.tool == DrawingTool::Eraser || sample.eraser;
+                        if self.selected_layer_alpha_locked && eraser {
+                            self.completed_edit = Some(Err(
+                                "투명도 잠금 중에는 지울 수 없습니다. 잠금을 해제하세요.".into(),
+                            ));
+                            self.awaiting_clean_begin = true;
+                            continue 'input;
+                        }
+                        sample.eraser = eraser;
+                        let brush = drawing.preset_for_stroke(sample.eraser);
+                        let color = drawing.stroke_color();
+                        let gpu_color = drawing.gpu_color();
+                        let token = begin_round_stroke(
+                            &mut self.evaluator,
+                            &brush,
+                            sample,
+                            &mut self.scratch_dabs,
+                        );
+                        let mut mask_work = nyatidraw_paint_cpu::MaskStrokeBudget::default();
+                        if self.selected_mask.is_some()
+                            && mask_work.admit(&self.scratch_dabs).is_err()
+                        {
+                            let _ = self.evaluator.end(token, &mut self.scratch_dabs);
+                            self.scratch_dabs.clear();
                             self.cancel_mask_work_limit(sample.sequence, None);
-                            continue;
+                            continue 'input;
                         }
-                        append_gpu_dabs(
-                            &mut self.gpu_ops,
-                            active.generation,
-                            &mut self.scratch_dabs,
-                        );
+                        let generation = self.next_generation;
+                        self.next_generation = self.next_generation.saturating_add(1);
+                        let layer = admitted.begin_layer.unwrap_or(active_layer);
+                        let gpu_op_start = self.gpu_ops.len();
+                        self.gpu_ops.push(GpuStrokeOp::Replace {
+                            generation,
+                            layer,
+                            color: gpu_color,
+                            eraser,
+                            alpha_locked: self.selected_layer_alpha_locked,
+                            mask: self.selected_mask,
+                            mask_color: color,
+                            mask_selection: self.selection.clone(),
+                        });
+                        append_gpu_dabs(&mut self.gpu_ops, generation, &mut self.scratch_dabs);
+                        self.active = Some(LiveStroke {
+                            mask_work,
+                            mask: self.selected_mask,
+                            token,
+                            path: begin_path.take().expect("Begin owns a fresh path"),
+                            generation,
+                            layer,
+                            gpu_op_start,
+                            samples: vec![sample],
+                            sample_limit_exceeded: false,
+                            brush: BrushSnapshot { preset: brush },
+                            color,
+                            eraser,
+                            alpha_locked: self.selected_layer_alpha_locked,
+                            selection: self.selection.clone(),
+                        });
+                        // The preset may be the remembered hardware eraser, not
+                        // the UI's selected brush. Record the accepted Begin only.
+                        let used_size = if sample.eraser && drawing.tool != DrawingTool::Eraser {
+                            drawing.remembered[3].size_tenths
+                        } else {
+                            drawing.size_tenths
+                        };
+                        // Preserve the exact sRGB source chosen for this accepted
+                        // stroke, rather than round-tripping quantized tile bytes.
+                        let used_color = (!eraser
+                            && matches!(
+                                drawing.tool,
+                                DrawingTool::Pencil | DrawingTool::Pen | DrawingTool::Brush
+                            ))
+                        .then_some(drawing.color);
+                        report.record_brush_begin(used_size, used_color);
                     }
-                }
-                PointerPhase::End => {
-                    if let Some(mut active) = self.active.take() {
-                        sample.eraser = active.eraser;
-                        active.retain_sample(sample);
-                        self.scratch_dabs.clear();
-                        self.evaluator.push_live(
-                            &mut active.token,
-                            &[sample],
-                            &mut self.scratch_dabs,
-                            LIVE_DAB_LIMITS,
-                        );
-                        if active.token.is_discontinuous() {
-                            self.active = Some(active);
-                            self.cancel_native_brush_discontinuity(
-                                sample.sequence,
-                                "brush-dab-budget",
-                                "입력 간격이 너무 커 현재 선을 취소했습니다. 다시 그려주세요.",
+                    PointerPhase::Move => {
+                        if let Some(active) = self.active.as_mut() {
+                            sample.eraser = active.eraser;
+                            active.retain_sample(sample);
+                            if active.sample_limit_exceeded {
+                                self.cancel_native_brush_discontinuity(
+                                    sample.sequence,
+                                    "evaluated-sample-budget",
+                                    "입력 한도를 넘은 현재 선을 취소했습니다. 다시 그려주세요.",
+                                );
+                                continue 'input;
+                            }
+                            self.scratch_dabs.clear();
+                            self.evaluator.push_live(
+                                &mut active.token,
+                                &[sample],
+                                &mut self.scratch_dabs,
+                                remaining_live_dab_limits(input_dabs),
                             );
-                            continue;
-                        }
-                        let record = self.evaluator.end(active.token, &mut self.scratch_dabs);
-                        if active.mask.is_some()
-                            && active.mask_work.admit(&self.scratch_dabs).is_err()
-                        {
-                            self.cancel_mask_work_limit(
-                                sample.sequence,
-                                Some((active.generation, active.gpu_op_start)),
+                            input_dabs += self.scratch_dabs.len() as u64;
+                            if active.token.is_discontinuous() {
+                                self.cancel_native_brush_discontinuity(
+                                    sample.sequence,
+                                    "brush-dab-budget",
+                                    "입력 간격이 너무 커 현재 선을 취소했습니다. 다시 그려주세요.",
+                                );
+                                continue 'input;
+                            }
+                            if active.mask.is_some()
+                                && active.mask_work.admit(&self.scratch_dabs).is_err()
+                            {
+                                self.cancel_mask_work_limit(sample.sequence, None);
+                                continue 'input;
+                            }
+                            append_gpu_dabs(
+                                &mut self.gpu_ops,
+                                active.generation,
+                                &mut self.scratch_dabs,
                             );
-                            continue;
                         }
-                        append_gpu_dabs(
-                            &mut self.gpu_ops,
-                            active.generation,
-                            &mut self.scratch_dabs,
-                        );
-                        self.closed_strokes = self.closed_strokes.saturating_add(1);
-                        self.last_closed_layer = Some(active.layer);
-                        println!(
-                            "live-ink event=stroke-closed count={} samples={} first_sequence={} last_sequence={}",
-                            self.closed_strokes,
-                            record.sample_count,
-                            record.first_sample_sequence,
-                            record.last_sample_sequence,
-                        );
-                        if active.sample_limit_exceeded {
+                    }
+                    PointerPhase::End => {
+                        if let Some(mut active) = self.active.take() {
+                            sample.eraser = active.eraser;
+                            active.retain_sample(sample);
+                            if active.sample_limit_exceeded {
+                                self.active = Some(active);
+                                self.cancel_native_brush_discontinuity(
+                                    sample.sequence,
+                                    "evaluated-sample-budget",
+                                    "입력 한도를 넘은 현재 선을 취소했습니다. 다시 그려주세요.",
+                                );
+                                continue 'input;
+                            }
+                            self.scratch_dabs.clear();
+                            self.evaluator.push_live(
+                                &mut active.token,
+                                &[sample],
+                                &mut self.scratch_dabs,
+                                remaining_live_dab_limits(input_dabs),
+                            );
+                            input_dabs += self.scratch_dabs.len() as u64;
+                            if active.token.is_discontinuous() {
+                                self.active = Some(active);
+                                self.cancel_native_brush_discontinuity(
+                                    sample.sequence,
+                                    "brush-dab-budget",
+                                    "입력 간격이 너무 커 현재 선을 취소했습니다. 다시 그려주세요.",
+                                );
+                                continue 'input;
+                            }
+                            let record = self.evaluator.end(active.token, &mut self.scratch_dabs);
+                            if active.mask.is_some()
+                                && active.mask_work.admit(&self.scratch_dabs).is_err()
+                            {
+                                self.cancel_mask_work_limit(
+                                    sample.sequence,
+                                    Some((active.generation, active.gpu_op_start)),
+                                );
+                                continue 'input;
+                            }
+                            append_gpu_dabs(
+                                &mut self.gpu_ops,
+                                active.generation,
+                                &mut self.scratch_dabs,
+                            );
+                            self.closed_strokes = self.closed_strokes.saturating_add(1);
+                            self.last_closed_layer = Some(active.layer);
+                            println!(
+                                "live-ink event=stroke-closed count={} samples={} first_sequence={} last_sequence={}",
+                                self.closed_strokes,
+                                record.sample_count,
+                                record.first_sample_sequence,
+                                record.last_sample_sequence,
+                            );
+                            if active.sample_limit_exceeded {
+                                self.gpu_ops.push(GpuStrokeOp::Finish {
+                                    generation: active.generation,
+                                    disposition: LiveStrokeDisposition::Cancel,
+                                });
+                                eprintln!(
+                                    "live-ink event=stroke-materialization-rejected source=native-input count={} reason=sample-limit limit={MAX_SAMPLES_PER_STROKE}",
+                                    self.closed_strokes,
+                                );
+                            } else {
+                                self.gpu_ops.push(GpuStrokeOp::Finish {
+                                    generation: active.generation,
+                                    disposition: LiveStrokeDisposition::Commit,
+                                });
+                                let request = ClosedStrokeRequest {
+                                    mask: active.mask,
+                                    ordinal: self.closed_strokes,
+                                    stroke_generation: active.generation,
+                                    layer: active.layer,
+                                    recorded: record,
+                                    samples: active.samples,
+                                    brush: active.brush,
+                                    color: active.color,
+                                    alpha_locked: active.alpha_locked,
+                                    selection: active.selection,
+                                    end_timestamp_ns: sample.timestamp_ns,
+                                    enqueued_at: Instant::now(),
+                                };
+                                self.queue_closed_stroke(request);
+                                artwork_closed = true;
+                            }
+                        } else {
+                            eprintln!(
+                                "live-ink event=stroke-materialization-rejected source=native-input reason=end-without-active sequence={}",
+                                sample.sequence,
+                            );
+                        }
+                    }
+                    PointerPhase::Cancel => {
+                        if let Some(active) = self.active.take() {
+                            self.scratch_dabs.clear();
+                            let record = self.evaluator.end(active.token, &mut self.scratch_dabs);
                             self.gpu_ops.push(GpuStrokeOp::Finish {
                                 generation: active.generation,
                                 disposition: LiveStrokeDisposition::Cancel,
                             });
-                            eprintln!(
-                                "live-ink event=stroke-materialization-rejected source=native-input count={} reason=sample-limit limit={MAX_SAMPLES_PER_STROKE}",
-                                self.closed_strokes,
+                            println!(
+                                "live-ink event=stroke-cancelled samples={} first_sequence={} last_sequence={}",
+                                record.sample_count,
+                                record.first_sample_sequence,
+                                record.last_sample_sequence,
                             );
-                        } else {
-                            self.gpu_ops.push(GpuStrokeOp::Finish {
-                                generation: active.generation,
-                                disposition: LiveStrokeDisposition::Commit,
-                            });
-                            let request = ClosedStrokeRequest {
-                                mask: active.mask,
-                                ordinal: self.closed_strokes,
-                                stroke_generation: active.generation,
-                                layer: active.layer,
-                                recorded: record,
-                                samples: active.samples,
-                                brush: active.brush,
-                                color: active.color,
-                                alpha_locked: active.alpha_locked,
-                                selection: active.selection,
-                                end_timestamp_ns: sample.timestamp_ns,
-                                enqueued_at: Instant::now(),
-                            };
-                            self.queue_closed_stroke(request);
-                            artwork_closed = true;
                         }
-                    } else {
-                        eprintln!(
-                            "live-ink event=stroke-materialization-rejected source=native-input reason=end-without-active sequence={}",
-                            sample.sequence,
-                        );
-                    }
-                }
-                PointerPhase::Cancel => {
-                    if let Some(active) = self.active.take() {
-                        self.scratch_dabs.clear();
-                        let record = self.evaluator.end(active.token, &mut self.scratch_dabs);
-                        self.gpu_ops.push(GpuStrokeOp::Finish {
-                            generation: active.generation,
-                            disposition: LiveStrokeDisposition::Cancel,
-                        });
-                        println!(
-                            "live-ink event=stroke-cancelled samples={} first_sequence={} last_sequence={}",
-                            record.sample_count,
-                            record.first_sample_sequence,
-                            record.last_sample_sequence,
-                        );
                     }
                 }
             }
@@ -4970,7 +5001,7 @@ impl StrokePipeline {
         self.cancel_native_brush_discontinuity(
             sequence,
             "invalid-smoothing-position",
-            "잘못된 입력 좌표로 현재 선을 취소했습니다. 다시 그려주세요.",
+            "유효하지 않거나 한도를 넘은 입력으로 현재 선을 취소했습니다. 다시 그려주세요.",
         );
     }
 
@@ -5146,9 +5177,14 @@ impl StrokePipeline {
         if self.fatal || self.awaiting_clean_begin {
             return;
         }
-        let mut end = *active.samples.last().expect("active stroke has a Begin");
+        let mut end = active.path.last_input().expect("active path has an input");
         let Some(sequence) = end.sequence.checked_add(1).filter(|_| {
-            !active.sample_limit_exceeded && active.samples.len() < MAX_SAMPLES_PER_STROKE
+            !active.sample_limit_exceeded
+                && active.samples.len() < MAX_SAMPLES_PER_STROKE
+                && active
+                    .samples
+                    .last()
+                    .is_some_and(|sample| sample.sequence < u64::MAX)
         }) else {
             self.live_ink.publish_workspace_error(
                 "The active stroke exceeded its safe recording limits and could not be sealed on close".into(),
@@ -5160,14 +5196,28 @@ impl StrokePipeline {
         };
         end.sequence = sequence;
         end.phase = PointerPhase::End;
-        active.samples.push(end);
+        let Ok(evaluated) = active.path.process(end) else {
+            self.active = Some(active);
+            self.cancel_invalid_smoothed_stroke(end.sequence);
+            return;
+        };
+        if active.samples.len() + evaluated.as_slice().len() > MAX_SAMPLES_PER_STROKE {
+            self.active = Some(active);
+            self.cancel_native_brush_discontinuity(
+                end.sequence,
+                "evaluated-sample-budget-on-close",
+                "입력 한도를 넘은 현재 선을 취소했습니다. 이전 그림은 보존됩니다.",
+            );
+            return;
+        }
         self.scratch_dabs.clear();
-        self.evaluator.push_live(
-            &mut active.token,
-            &[end],
-            &mut self.scratch_dabs,
-            LIVE_DAB_LIMITS,
-        );
+        for mut sample in evaluated.as_slice().iter().copied() {
+            sample.eraser = active.eraser;
+            active.samples.push(sample);
+            let limits = remaining_live_dab_limits(self.scratch_dabs.len() as u64);
+            self.evaluator
+                .push_live(&mut active.token, &[sample], &mut self.scratch_dabs, limits);
+        }
         if active.token.is_discontinuous() {
             self.active = Some(active);
             self.cancel_native_brush_discontinuity(
@@ -5363,7 +5413,7 @@ struct LiveStroke {
     alpha_locked: bool,
     selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     token: RoundBrushStroke,
-    smoother: StrokeSmoother,
+    path: StrokePath,
     generation: u64,
     layer: LayerId,
     gpu_op_start: usize,
@@ -9082,10 +9132,10 @@ mod tests {
             sample(4, PointerPhase::Move, 120.0, 68.0),
             sample(5, PointerPhase::End, 150.0, 40.0),
         ];
-        let mut smoother = StrokeSmoother::new(100);
+        let mut path_builder = StrokePath::new(100);
         let expected: Vec<_> = received
             .iter()
-            .map(|sample| smoother.process(*sample).unwrap())
+            .flat_map(|sample| path_builder.process(*sample).unwrap().as_slice().to_vec())
             .collect();
         if let Some(path) = std::env::var_os(REOPEN).map(PathBuf::from) {
             let database = ProjectDb::open(&path).unwrap();
@@ -9410,6 +9460,18 @@ mod tests {
         std::fs::remove_file(path).expect("remove owned scratch project");
     }
 
+    fn expected_close_samples(mut received: Vec<StylusSample>, case: &str) -> Vec<StylusSample> {
+        let mut end = *received.last().unwrap();
+        end.sequence += 1;
+        end.phase = PointerPhase::End;
+        received.push(end);
+        let mut path = StrokePath::new(if case == "smoothed-tail" { 100 } else { 0 });
+        received
+            .iter()
+            .flat_map(|sample| path.process(*sample).unwrap().as_slice().to_vec())
+            .collect()
+    }
+
     #[test]
     fn close_preserves_received_samples_without_resurrecting_cancelled_or_invalid_strokes() {
         let nonce = system_timestamp_ns();
@@ -9421,6 +9483,8 @@ mod tests {
             "limit",
             "sequence",
             "smoothing-invalid",
+            "smoothed-tail",
+            "smoothed-cancel",
         ] {
             let path = std::env::temp_dir().join(format!(
                 "nyatidraw-active-close-{}-{nonce}-{case}.ntdr",
@@ -9433,19 +9497,26 @@ mod tests {
             )
             .expect("scratch writer");
             let mut pipeline = StrokePipeline::new(live_ink.clone(), bootstrap.worker);
-            if case == "smoothing-invalid" {
+            if matches!(
+                case,
+                "smoothing-invalid" | "smoothed-tail" | "smoothed-cancel"
+            ) {
                 pipeline.drawing.brush_settings.smoothing = 100;
             }
             let mut received = vec![sample(1, PointerPhase::Begin, -4.0, 12.0)];
             if case != "tap" {
-                received.push(sample(2, PointerPhase::Move, 150.0, 120.0));
+                received.push(if matches!(case, "smoothed-tail" | "smoothed-cancel") {
+                    sample(2, PointerPhase::Move, -3.0, 12.0)
+                } else {
+                    sample(2, PointerPhase::Move, 150.0, 120.0)
+                });
             }
             for sample in &received {
                 live_ink.push(*sample).expect("bounded fixture admission");
             }
             pipeline.drain(LIVE_LAYER, pipeline.drawing);
             match case {
-                "cancel" => {
+                "cancel" | "smoothed-cancel" => {
                     live_ink
                         .push(sample(3, PointerPhase::Cancel, 150.0, 120.0))
                         .unwrap();
@@ -9479,15 +9550,12 @@ mod tests {
             drop(pipeline);
             let database = ProjectDb::open(&path).expect("closed writer unlocked project");
             let reopened = database.load_reopened().expect("valid recovery state");
-            if matches!(case, "tap" | "line") {
+            if matches!(case, "tap" | "line" | "smoothed-tail") {
                 let reopened = reopened.expect("healthy active stroke was saved");
                 let saved = reopened.current().unwrap().stroke.samples();
-                let mut end = *received.last().unwrap();
-                end.sequence += 1;
-                end.phase = PointerPhase::End;
-                received.push(end);
+                let expected = expected_close_samples(received, case);
                 assert_eq!(
-                    saved, received,
+                    saved, expected,
                     "{case}: every received sample and last position survive"
                 );
                 assert_eq!(reopened.history().node_count(), 1);

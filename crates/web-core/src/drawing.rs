@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
-use nyatidraw_brush::{BrushDab, BrushEvaluator, RoundBrushStroke, begin_round_stroke};
-use nyatidraw_input::{PenButtons, Point, PointerPhase, StrokeSmoother, StylusSample};
+use nyatidraw_brush::{
+    BrushDab, BrushEvaluator, LiveDabLimits, RoundBrushStroke, begin_round_stroke,
+};
+use nyatidraw_input::{PenButtons, Point, PointerPhase, StrokePath, StrokePathError, StylusSample};
 use nyatidraw_paint_cpu::{CpuCanvas, PremultipliedRgba8};
 
 use crate::{
@@ -19,9 +21,9 @@ const MAX_UPDATE_TILES: usize = 128;
 pub(super) struct ActiveStroke {
     pub(super) before: Artwork,
     token: Option<RoundBrushStroke>,
-    preset: BrushPreset,
-    smoother: StrokeSmoother,
+    path: StrokePath,
     last: StylusSample,
+    evaluated_samples: usize,
     color: PremultipliedRgba8,
     erase: bool,
     alpha_locked: bool,
@@ -52,6 +54,17 @@ impl WebDocument {
     /// Rejects invalid input, hidden/locked layers, or an already-live stroke.
     /// On any paint error the entire gesture is cancelled; hosts must resync tiles.
     pub fn begin_stroke(&mut self, point: StrokePoint) -> Result<CanvasUpdate, WebError> {
+        self.begin_stroke_at_scale(point, 1.0)
+    }
+
+    /// Captures document-to-logical-screen scale for bounded stroke correction.
+    /// # Errors
+    /// Rejects invalid input or scale; painting failures cancel the whole gesture.
+    pub fn begin_stroke_at_scale(
+        &mut self,
+        point: StrokePoint,
+        scale: f64,
+    ) -> Result<CanvasUpdate, WebError> {
         if self.stroke.is_some() {
             self.cancel_stroke();
             return Err(WebError::StrokeInProgress);
@@ -86,18 +99,17 @@ impl WebDocument {
         sample.eraser = self.tool == WebTool::Eraser;
         let alpha_locked = mask.is_none() && layer.alpha_locked;
         let preset = self.brush_preset();
-        let mut smoother = StrokeSmoother::new(self.brush_settings().smoothing);
-        let sample = smoother
-            .process(sample)
-            .map_err(|_| WebError::InvalidInput)?;
+        let mut path = StrokePath::with_scale(self.brush_settings().smoothing, scale);
+        let evaluated = path.process(sample).map_err(path_error)?;
+        let sample = evaluated.as_slice()[0];
         let mut dabs = Vec::with_capacity(1);
         let token = begin_round_stroke(&mut self.evaluator, &preset, sample, &mut dabs);
         self.stroke = Some(ActiveStroke {
             before: self.artwork.clone(),
             token: Some(token),
-            preset,
-            smoother,
+            path,
             last: sample,
+            evaluated_samples: 1,
             color: PremultipliedRgba8(srgb8_to_linear_premultiplied(self.foreground)),
             erase: sample.eraser,
             alpha_locked,
@@ -194,19 +206,28 @@ impl WebDocument {
         }
         let mut sample = make_sample(point, stroke.last.sequence + 1, phase)?;
         sample.eraser = stroke.erase;
-        let sample = stroke
-            .smoother
-            .process(sample)
-            .map_err(|_| WebError::InvalidInput)?;
-        let distance = (sample.position_document.x - stroke.last.position_document.x)
-            .hypot(sample.position_document.y - stroke.last.position_document.y);
-        let spacing = f64::from((stroke.preset.size_px * stroke.preset.spacing_ratio).max(0.25));
-        if distance / spacing + 2.0 > f64::from(MAX_DABS_PER_UPDATE) {
+        let evaluated = stroke.path.process(sample).map_err(path_error)?;
+        stroke.evaluated_samples += evaluated.as_slice().len();
+        if stroke.evaluated_samples as u64 > MAX_SAMPLES_PER_STROKE {
             return Err(WebError::LimitExceeded);
         }
         let mut dabs = Vec::new();
         let token = stroke.token.as_mut().ok_or(WebError::NoStroke)?;
-        self.evaluator.push(token, &[sample], &mut dabs);
+        for evaluated in evaluated.as_slice() {
+            let remaining = u64::from(MAX_DABS_PER_UPDATE).saturating_sub(dabs.len() as u64);
+            self.evaluator.push_live(
+                token,
+                &[*evaluated],
+                &mut dabs,
+                LiveDabLimits {
+                    per_segment: remaining,
+                    per_stroke: MAX_DABS_PER_STROKE as u64,
+                },
+            );
+            if token.is_discontinuous() {
+                return Err(WebError::LimitExceeded);
+            }
+        }
         stroke.dabs += dabs.len();
         if token.is_discontinuous() || stroke.dabs > MAX_DABS_PER_STROKE {
             return Err(WebError::LimitExceeded);
@@ -323,6 +344,15 @@ impl WebDocument {
     }
 }
 
+fn path_error(error: StrokePathError) -> WebError {
+    match error {
+        StrokePathError::SampleBudgetExceeded => WebError::LimitExceeded,
+        StrokePathError::NonFinitePosition
+        | StrokePathError::InvalidContinuity
+        | StrokePathError::InvalidScale => WebError::InvalidInput,
+    }
+}
+
 fn apply_image_dab(canvas: &mut CpuCanvas, stroke: &ActiveStroke, key: TileKey, dab: BrushDab) {
     let (ox, oy) = key.pixel_origin();
     let local = dab.to_local(ox, oy);
@@ -388,6 +418,61 @@ fn make_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrected_curves_keep_atomic_cancel_undo_and_portable_pixels() {
+        for scale in [0.25, 0.5, 1.0, 2.0] {
+            let mut doc = WebDocument::import_rgba8(32, 32, &[0; 32 * 32 * 4]).unwrap();
+            doc.select_tool(WebTool::Pen).unwrap();
+            doc.set_brush_settings(crate::BrushSettings {
+                smoothing: 100,
+                size_px: 2.0,
+                ..doc.brush_settings()
+            })
+            .unwrap();
+            let before = doc.snapshot().clone();
+            let begin = StrokePoint {
+                x: 4.0,
+                y: 8.0,
+                pressure: 0.5,
+                time_ms: 1.0,
+            };
+            let middle = StrokePoint {
+                x: 5.0,
+                y: 8.3,
+                pressure: 0.7,
+                time_ms: 5.0,
+            };
+            let end = StrokePoint {
+                x: 6.0,
+                y: 8.8,
+                pressure: 0.8,
+                time_ms: 9.0,
+            };
+            doc.begin_stroke_at_scale(begin, scale).unwrap();
+            doc.move_stroke(middle).unwrap();
+            doc.cancel_stroke();
+            assert_eq!(doc.snapshot(), &before);
+            assert_eq!(doc.history_len(), 0);
+            doc.begin_stroke_at_scale(begin, scale).unwrap();
+            doc.move_stroke(middle).unwrap();
+            assert!(doc.end_stroke(StrokePoint { x: f64::NAN, ..end }).is_err());
+            assert_eq!(doc.snapshot(), &before);
+            assert!(!doc.is_drawing());
+            doc.begin_stroke_at_scale(begin, scale).unwrap();
+            doc.move_stroke(middle).unwrap();
+            doc.end_stroke(end).unwrap();
+            assert_eq!(doc.history_len(), 1);
+            let painted = doc.export_rgba8().unwrap();
+            let bytes = doc.encode_portable().unwrap();
+            let reopened = WebDocument::decode_portable(&bytes).unwrap();
+            assert_eq!(reopened.export_rgba8().unwrap(), painted);
+            doc.undo().unwrap();
+            assert_eq!(doc.snapshot(), &before);
+            doc.redo().unwrap();
+            assert_eq!(doc.export_rgba8().unwrap(), painted);
+        }
+    }
 
     #[test]
     fn mask_work_rejection_restores_original_and_keeps_history_usable() {
