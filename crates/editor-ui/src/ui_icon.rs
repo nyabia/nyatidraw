@@ -20,6 +20,7 @@ pub fn UiIcon(name: &'static str) -> Element {
         "undo" => &["M3 10h11a7 7 0 0 1 7 7v3", "M3 10l5-5", "M3 10l5 5"],
         "redo" => &["M21 10H10a7 7 0 0 0-7 7v3", "M21 10l-5-5", "M21 10l-5 5"],
         "white" => &["M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"],
+        "canvas" => &["M3 5h18v14H3Z", "M7 12V9h3 M14 15h3v-3"],
         "transform" => &[
             "M3 3h4v4H3Z M17 3h4v4h-4Z M3 17h4v4H3Z M17 17h4v4h-4Z",
             "M7 5h10 M7 19h10 M5 7v10 M19 7v10",

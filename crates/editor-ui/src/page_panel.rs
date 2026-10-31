@@ -246,6 +246,43 @@ impl CanvasDraft {
 #[derive(Clone, Copy)]
 pub struct PagePanelOpen(pub Signal<bool>);
 
+#[derive(Clone, Copy)]
+enum PageOutcome {
+    Resize([u32; 2]),
+    Crop,
+}
+
+#[derive(Clone)]
+struct PendingPage {
+    outcome: PageOutcome,
+    project_epoch: u64,
+    revision: nyatidraw_api::Revision,
+    event_sequence: u64,
+    error: Option<String>,
+}
+
+fn submit_page(
+    host: &UiHost,
+    command: EditCommand,
+    outcome: PageOutcome,
+    mut pending: Signal<Option<PendingPage>>,
+    mut error: Signal<Option<String>>,
+) {
+    let (before, event) = host.protocol_snapshot();
+    pending.set(Some(PendingPage {
+        outcome,
+        project_epoch: host.project_epoch(),
+        revision: before.revision,
+        event_sequence: event.map_or(0, |event| event.sequence),
+        error: before.edit.error,
+    }));
+    error.set(None);
+    if let Err(message) = host.push_editor_command(before.revision, EditorCommand::Edit(command)) {
+        pending.set(None);
+        error.set(Some(message));
+    }
+}
+
 #[component]
 pub fn PagePanel(ui_projection: Signal<UiProjection>) -> Element {
     let live_ink = use_context::<UiHost>();
@@ -254,8 +291,58 @@ pub fn PagePanel(ui_projection: Signal<UiProjection>) -> Element {
     let mut draft = use_signal(|| CanvasDraft::new(ui_projection.read().canvas));
     let mut appearance = use_signal(|| live_ink.workspace_appearance());
     let mut error = use_signal(|| None::<String>);
+    let mut pending = use_signal(|| None::<PendingPage>);
+    let crate::host::HostUpdate(host_update) = use_context();
+    let completed_ink = live_ink.clone();
+    use_effect(move || {
+        let _ = host_update.read();
+        let current = ui_projection.read();
+        let Some(request) = pending.read().clone() else {
+            return;
+        };
+        if completed_ink.project_epoch() != request.project_epoch {
+            pending.set(None);
+            opened.set(false);
+            return;
+        }
+        let event = completed_ink.protocol_snapshot().1;
+        if let Some(nyatidraw_api::EditorEvent::CommandRejected { reason, .. }) = event
+            .filter(|event| event.sequence > request.event_sequence)
+            .map(|event| event.event)
+        {
+            pending.set(None);
+            error.set(Some(crate::reject_label(reason).to_owned()));
+            return;
+        }
+        if current.edit.busy {
+            return;
+        }
+        if let Some(message) = &current.edit.error
+            && (current.revision != request.revision || current.edit.error != request.error)
+        {
+            pending.set(None);
+            error.set(Some(message.clone()));
+            return;
+        }
+        let complete = current.revision != request.revision
+            && match request.outcome {
+                PageOutcome::Resize(size) => {
+                    size == [current.canvas.width_px, current.canvas.height_px]
+                }
+                PageOutcome::Crop => !current.edit.has_selection,
+            };
+        if complete {
+            pending.set(None);
+            completed_ink.set_workspace_appearance(appearance());
+            opened.set(false);
+        }
+    });
     let current = ui_projection.read();
-    let busy = current.edit.busy;
+    let busy = current.edit.busy
+        || pending.read().is_some()
+        || current.edit.transform.is_some()
+        || current.edit.color_adjustment.is_some()
+        || current.animation.playing;
     let can_crop = current.edit.has_selection && !busy;
     let size = draft.read().current.size();
     let source = draft.read().current.source;
@@ -334,7 +421,7 @@ pub fn PagePanel(ui_projection: Signal<UiProjection>) -> Element {
             }
             p { class: "transform-help", "왼쪽 위 기준으로 출력 영역만 변경합니다. 그림과 바깥쪽 내용은 유지됩니다." }
             if let Err(message) = size { p { class: "canvas-size-error", role: "status", "{message}" } }
-            fieldset { class: "canvas-background-settings",
+            fieldset { class: "canvas-background-settings", disabled: busy,
                 legend { "바깥 배경" }
                 div { class: "canvas-background-options", role: "group", aria_label: "캔버스 바깥 배경",
                     button { aria_pressed: appearance.read().checkerboard,
@@ -363,26 +450,14 @@ pub fn PagePanel(ui_projection: Signal<UiProjection>) -> Element {
                         opened.set(false);
                         return;
                     }
-                    let command = EditCommand::ResizePage { size: [w, h] };
-                    let result = live_ink.push_editor_command(ui_projection.read().revision, EditorCommand::Edit(command));
-                    println!("desktop-page event=resize size={w}x{h} admission={result:?}");
-                    if result.is_ok() {
-                        live_ink.set_workspace_appearance(appearance());
-                        opened.set(false);
-                    }
-                    else { error.set(Some("현재 작업이 끝난 뒤 다시 적용하세요.".into())); }
+                    submit_page(&live_ink, EditCommand::ResizePage { size: [w, h] }, PageOutcome::Resize([w, h]), pending, error);
                 }, "적용" }
                 button { disabled: !can_crop, title: "선택 경계에 캔버스를 맞춥니다. 바깥 그림도 보존하며 함께 이동합니다.", onclick: move |_| {
-                    let result = crop_ink.push_editor_command(ui_projection.read().revision, EditorCommand::Edit(EditCommand::CropPageToSelection));
-                    println!("desktop-page event=crop-selection admission={result:?}");
-                    if result.is_ok() {
-                        crop_ink.set_workspace_appearance(appearance());
-                        opened.set(false);
-                    }
-                    else { error.set(Some("현재 작업이 끝난 뒤 다시 적용하세요.".into())); }
+                    submit_page(&crop_ink, EditCommand::CropPageToSelection, PageOutcome::Crop, pending, error);
                 }, "선택에 맞추기" }
                 button { onclick: move |_| opened.set(false), "닫기" }
             }
+            if pending.read().is_some() { p { role: "status", "캔버스 변경 확인 중… 닫아도 접수된 작업은 계속됩니다." } }
             if let Some(message) = error() { p { role: "alert", "{message}" } }
         }
         }

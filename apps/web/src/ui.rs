@@ -6,7 +6,7 @@ use nyatidraw_editor_ui::{EditorChrome, ExportStatus, UiBackend, UiHost, UiIcon,
 
 use crate::{
     adapter::WebUiBackend,
-    runtime::{Editor, EditorModal},
+    runtime::{Editor, EditorModal, RecoveryStatus},
 };
 
 const HOST_STYLE: Asset = asset!("/assets/host.css");
@@ -23,6 +23,7 @@ pub fn App() -> Element {
                 "WebGPU와 이전 작업을 준비하는 중…".to_owned()
             }
         }),
+        recovery_status: use_signal(|| RecoveryStatus::Idle),
         ready: use_signal(|| false),
         modal: use_signal(|| None),
         notice: use_signal(|| None),
@@ -98,12 +99,14 @@ pub fn App() -> Element {
 fn BrowserCanvas() -> Element {
     let editor = use_context::<Editor>();
     let ready = (editor.ready)();
-    let save_status = (editor.status)();
     rsx! {
         div { class: "browser-canvas-host",
             div { id: "drawing-canvas-slot" }
             if ready {
-                div { class: "browser-save-status", role: "status", "{save_status}" }
+                div { class: "browser-feedback",
+                    BrowserOperationStatus {}
+                    if !crate::browser::is_hosted() { BrowserRecoveryStatus {} }
+                }
             }
             if !ready {
                 section { class: "browser-startup", role: "status",
@@ -114,6 +117,60 @@ fn BrowserCanvas() -> Element {
                     a { href: "../", "홈페이지" }
                 }
             }
+        }
+    }
+}
+
+#[component]
+fn BrowserRecoveryStatus() -> Element {
+    let editor = use_context::<Editor>();
+    let status = (editor.recovery_status)();
+    if status == RecoveryStatus::Idle {
+        return rsx! {};
+    }
+    let label = status.description();
+    let state = match status {
+        RecoveryStatus::Idle => "idle",
+        RecoveryStatus::Pending => "pending",
+        RecoveryStatus::Saving => "saving",
+        RecoveryStatus::Saved => "saved",
+        RecoveryStatus::Failed => "failed",
+    };
+    rsx! {
+        div { class: "browser-recovery-status", "data-state": state, "data-no-tooltip": "true", role: "img", aria_label: label, aria_live: "off",
+            span { aria_hidden: "true",
+                if status == RecoveryStatus::Failed { "자동 복구 실패" } else { "자동 복구" }
+            }
+            span { class: "browser-recovery-mark", aria_hidden: "true",
+                if matches!(status, RecoveryStatus::Pending | RecoveryStatus::Saving) {
+                    span { class: "browser-recovery-dots", "•••" }
+                } else if status == RecoveryStatus::Saved { "✓" } else { "!" }
+            }
+        }
+    }
+}
+
+#[component]
+fn BrowserOperationStatus() -> Element {
+    let editor = use_context::<Editor>();
+    let mut visible = use_signal(|| false);
+    let mut generation = use_signal(|| 0_u64);
+    use_effect(move || {
+        let _message = (editor.status)();
+        let current = generation.peek().wrapping_add(1);
+        generation.set(current);
+        visible.set(true);
+        spawn(async move {
+            let mut timer =
+                document::eval("await new Promise(r => setTimeout(r, 6000)); dioxus.send(true);");
+            if timer.recv::<bool>().await.is_ok() && *generation.peek() == current {
+                visible.set(false);
+            }
+        });
+    });
+    rsx! {
+        if visible() {
+            div { class: "browser-operation-status", role: "status", "{editor.status}" }
         }
     }
 }
@@ -164,7 +221,11 @@ fn BrowserFileButtons(extended: bool) -> Element {
 #[component]
 fn BrowserHelp() -> Element {
     let editor = use_context::<Editor>();
-    let save_status = (editor.status)();
+    let save_status = if crate::browser::is_hosted() {
+        "이 연결 세션은 자동 복구 저장을 사용하지 않습니다. 완료하면 호스트에 PNG를 전달합니다."
+    } else {
+        (editor.recovery_status)().description()
+    };
     rsx! { button { class: "command", title: "{save_status}", onclick: move |_| editor.show_modal(EditorModal::Help), "웹판 안내" } }
 }
 

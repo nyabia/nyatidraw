@@ -190,6 +190,7 @@ pub(crate) fn preset_for_ui_preview(projection: &nyatidraw_api::UiProjection) ->
 
 mod animation;
 mod animation_probe;
+mod artwork_move;
 mod color_adjustment;
 mod export_receipt;
 mod frame_previews;
@@ -1145,6 +1146,7 @@ struct ActiveCanvas {
     pending_save: Option<u64>,
     retirement: CanvasRetirement,
     artwork_job: Option<ArtworkJob>,
+    artwork_move: artwork_move::State,
     frame_preview_job: Option<frame_previews::Job>,
     selection: Option<Arc<nyatidraw_paint_cpu::SelectionMask>>,
     canvas_spec: CanvasSpec,
@@ -1340,6 +1342,7 @@ impl ActiveCanvas {
             pending_save: None,
             retirement: CanvasRetirement::Recreate,
             artwork_job: None,
+            artwork_move: artwork_move::State::default(),
             frame_preview_job: None,
             selection: None,
             canvas_spec,
@@ -1958,6 +1961,7 @@ impl ActiveCanvas {
         self.flush_color_adjustment();
         self.apply_commands(width, height, scale);
         self.correct_initial_layout_fit(width, height, scale);
+        self.update_artwork_move_preview();
         self.update_picker_preview();
         self.poll_frame_previews();
         if self
@@ -2062,6 +2066,8 @@ impl ActiveCanvas {
                 .map(|p| [p[0].round() as i32, p[1].round() as i32])
                 .collect();
             self.scene.set_gesture_preview(&points, false);
+        } else if self.drawing.tool == DrawingTool::MoveArtwork {
+            self.scene.set_gesture_preview(&[], false);
         } else {
             self.scene.set_gesture_preview(guide, closed);
         }
@@ -4374,6 +4380,7 @@ struct StrokePipeline {
     pending_transform: Option<nyatidraw_api::AffineTransform>,
     pending_transform_cancel: bool,
     edit_gesture: Option<crate::edit_gesture::EditGesture>,
+    edit_gesture_identity: (u64, u64, u64),
     temporary_picker_active: bool,
     completed_temporary_picker: Option<(u64, u64)>,
     picker: picker_preview::PickerRuntime,
@@ -4453,6 +4460,7 @@ impl StrokePipeline {
             pending_transform_cancel: false,
             selection: None,
             edit_gesture: None,
+            edit_gesture_identity: (0, 0, 0),
             temporary_picker_active: false,
             completed_temporary_picker: None,
             picker: picker_preview::PickerRuntime::default(),
@@ -4619,6 +4627,8 @@ impl StrokePipeline {
                         } else {
                             drawing.edit_settings
                         };
+                        self.edit_gesture_identity =
+                            (sample.device_id, sample.sequence, sample.viewport_revision);
                         self.edit_gesture =
                             Some(crate::edit_gesture::EditGesture::begin_with_colors(
                                 gesture_tool,
@@ -5529,6 +5539,7 @@ struct MaterializationBootstrap {
 use nyatidraw_editor::layer_edit::LayerPixelChange;
 
 enum WorkerRequest {
+    MovePreview(artwork_move::Request),
     FrameThumbnail {
         request: nyatidraw_editor_ui::preview::FrameThumbnailRequest,
         reply: SyncSender<frame_previews::Result>,
@@ -6254,6 +6265,17 @@ fn materialization_loop(
         }
         let edit_tree = animation_state.edit_tree(&preview_tree);
         let request = match work {
+            WorkerRequest::MovePreview(request) => {
+                artwork_move::execute(
+                    request,
+                    &edit_tree,
+                    session.tiles(),
+                    selection.as_ref(),
+                    preview_canvas,
+                );
+                live_ink.request_redraw();
+                continue;
+            }
             WorkerRequest::FrameThumbnail { request, reply } => {
                 let result = frame_previews::render(
                     &request,

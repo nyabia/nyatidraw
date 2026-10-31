@@ -4,7 +4,7 @@ use crate::{
     workspace_appearance::WorkspaceAppearance,
 };
 use dioxus::prelude::*;
-use nyatidraw_api::{EditorCommand, EventEnvelope, Revision, UiProjection};
+use nyatidraw_api::{EditorCommand, EventEnvelope, Revision, ToolCommand, UiProjection};
 use nyatidraw_input::{CanvasInputMode, PressurePreset};
 use std::{ops::Deref, rc::Rc};
 
@@ -87,6 +87,9 @@ pub trait UiBackend {
 #[derive(Clone)]
 pub struct UiHost(pub Rc<dyn UiBackend>);
 
+#[derive(Clone, Copy)]
+pub(crate) struct HostUpdate(pub Signal<u64>);
+
 impl UiHost {
     /// # Errors
     /// Rejects unsupported commands or host admission failures.
@@ -98,6 +101,7 @@ impl UiHost {
         if !self.supports_command(&command) {
             return Err("현재 환경에서는 아직 지원하지 않는 기능입니다.".into());
         }
+        self.check_transform_draft(&command)?;
         self.0.push_editor_command(based_on, command)
     }
 
@@ -107,7 +111,37 @@ impl UiHost {
         if !self.supports_command(&command) {
             return Err("현재 환경에서는 아직 지원하지 않는 기능입니다.".into());
         }
+        self.check_transform_draft(&command)?;
         self.0.push_ui_editor_command(command)
+    }
+
+    fn check_transform_draft(&self, command: &EditorCommand) -> Result<(), String> {
+        if !matches!(
+            command,
+            EditorCommand::Tool(
+                ToolCommand::Select(_)
+                    | ToolCommand::SelectPencilTemplate(_)
+                    | ToolCommand::CycleBrushFamily
+                    | ToolCommand::CycleSelectionFamily
+                    | ToolCommand::CycleFillFamily
+                    | ToolCommand::ApplyBrushPreset(_)
+            )
+        ) {
+            return Ok(());
+        }
+        let Some(runtime) = dioxus::core::Runtime::try_current() else {
+            return Ok(());
+        };
+        if runtime.try_current_scope_id().is_none() {
+            return Ok(());
+        }
+        if let Some(crate::transform_panel::TransformDraftGuard(dirty)) = try_consume_context()
+            && *dirty.peek()
+            && self.protocol_snapshot().0.edit.transform.is_some()
+        {
+            return Err("입력한 변형 값을 먼저 미리보기로 확인하거나 취소하세요.".into());
+        }
+        Ok(())
     }
 }
 

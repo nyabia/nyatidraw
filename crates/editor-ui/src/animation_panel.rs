@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use nyatidraw_api::{AnimationCommand, EditorCommand, FrameId, UiProjection};
+use nyatidraw_api::{AnimationCommand, EditorCommand, EditorEvent, FrameId, UiProjection};
 use std::sync::Arc;
 
 use crate::{UiHost, UiIcon, preview::FrameThumbnailFrame};
@@ -36,7 +36,6 @@ pub fn StartAnimation(ui_projection: Signal<UiProjection>, onstarted: EventHandl
 
 #[component]
 pub fn AnimationPanel(ui_projection: Signal<UiProjection>, host_update: u64) -> Element {
-    let AnimationPanelVisible(mut visible) = use_context();
     let mut collapsed = use_signal(|| false);
     let state = ui_projection.read();
     let animation = state.animation.clone();
@@ -88,17 +87,129 @@ pub fn AnimationPanel(ui_projection: Signal<UiProjection>, host_update: u64) -> 
                 FrameDuration { frame: active, duration, disabled: editing_disabled }
                 span { class: "animation-counter", "{index + 1} / {length}" }
                 }
-                button { class: "command compact animation-close", aria_label: "타임라인 닫기",
-                    title: if animation.playing { "타임라인 닫기 · 프레임 유지 · 재생은 계속됩니다" } else { "타임라인 닫기 · 프레임 유지 · 상단 타임라인 버튼으로 다시 열기" },
-                    onclick: move |_| { crate::focus_editor_shortcuts(); visible.set(false); },
-                    UiIcon { name: "close" }
-                }
+                TimelineVisibilityButton { ui_projection, host_update, close_only: true }
             }
             if !collapsed() {
                 FrameList { frames: animation.frames, active, disabled: editing_disabled, host_update }
             }
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct PendingTimelineClose {
+    project_epoch: u64,
+    event_sequence: u64,
+}
+
+#[component]
+pub(super) fn TimelineVisibilityButton(
+    ui_projection: Signal<UiProjection>,
+    host_update: u64,
+    #[props(default)] close_only: bool,
+) -> Element {
+    let host = use_context::<UiHost>();
+    let AnimationPanelVisible(mut visible) = use_context();
+    let mut pending = use_signal(|| None::<PendingTimelineClose>);
+    let mut error = use_signal(|| None::<String>);
+    let monitor = host.clone();
+    use_effect(use_reactive((&host_update,), move |_| {
+        let _ = ui_projection.read().revision;
+        let Some(request) = pending() else {
+            return;
+        };
+        if monitor.project_epoch() != request.project_epoch {
+            pending.set(None);
+            error.set(None);
+            return;
+        }
+        let (projection, event) = monitor.protocol_snapshot();
+        if let Some(event) = event.filter(|event| event.sequence > request.event_sequence)
+            && let EditorEvent::CommandRejected { reason, .. } = event.event
+        {
+            pending.set(None);
+            error.set(Some(crate::reject_label(reason).to_owned()));
+        } else if !projection.animation.playing {
+            pending.set(None);
+            crate::focus_editor_shortcuts();
+            visible.set(false);
+        }
+    }));
+    let waiting = pending().is_some();
+    let showing = visible();
+    let icon = if waiting {
+        "stop"
+    } else if close_only {
+        "close"
+    } else {
+        "timeline"
+    };
+    let label = if waiting {
+        "재생 정지 확인 중"
+    } else if showing {
+        "타임라인 닫기"
+    } else {
+        "타임라인 열기"
+    };
+    let class = if close_only {
+        "command compact animation-close"
+    } else {
+        "command compact"
+    };
+    rsx! {
+        button { class, disabled: waiting,
+            aria_label: label, aria_expanded: showing, aria_controls: "animation-timeline",
+            title: if showing { "재생을 정지하고 타임라인 닫기 · 프레임 유지" } else { "타임라인 열기" },
+            onclick: move |_| {
+                crate::focus_editor_shortcuts();
+                error.set(None);
+                if !visible() {
+                    visible.set(true);
+                    return;
+                }
+                let (projection, event) = host.protocol_snapshot();
+                if !projection.animation.playing {
+                    visible.set(false);
+                    return;
+                }
+                let request = PendingTimelineClose {
+                    project_epoch: host.project_epoch(),
+                    event_sequence: event.map_or(0, |event| event.sequence),
+                };
+                match host.push_ui_editor_command(EditorCommand::Animation(AnimationCommand::Stop)) {
+                    Ok(()) => {
+                        pending.set(Some(request));
+                        expire_pending_close(request, pending, error);
+                    }
+                    Err(message) => error.set(Some(message)),
+                }
+            },
+            UiIcon { name: icon }
+        }
+        if let Some(message) = error() {
+            aside { class: "status-toast error", role: "alert",
+                span { "타임라인을 닫지 못했습니다. {message}" }
+                button { aria_label: "타임라인 오류 알림 닫기", onclick: move |_| error.set(None), "×" }
+            }
+        }
+    }
+}
+
+fn expire_pending_close(
+    request: PendingTimelineClose,
+    mut pending: Signal<Option<PendingTimelineClose>>,
+    mut error: Signal<Option<String>>,
+) {
+    spawn(async move {
+        let mut timer =
+            document::eval("await new Promise(r => setTimeout(r, 5000)); dioxus.send(true);");
+        if timer.recv::<bool>().await.is_ok() && *pending.peek() == Some(request) {
+            pending.set(None);
+            error.set(Some(
+                "재생 정지를 확인하지 못했습니다. 다시 시도하세요.".to_owned(),
+            ));
+        }
+    });
 }
 
 #[component]

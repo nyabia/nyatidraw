@@ -1,0 +1,18 @@
+.control-help {
+    position: fixed;
+    z-index: 300;
+    width: max-content;
+    max-width: min(300px, calc(100vw - 16px));
+    padding: 7px 9px;
+    border: 1px solid #888;
+    border-radius: 3px;
+    background: #292929;
+    color: #fff;
+    box-shadow: 0 2px 6px #0006;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    pointer-events: none;
+}
+.control-help[hidden] { display: none; }

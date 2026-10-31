@@ -94,7 +94,7 @@ pub(super) fn FillProperties(ui_projection: Signal<UiProjection>) -> Element {
         None
     };
     rsx! {
-        div { class: "fill-properties", onkeydown: move |event| { if event.key() != Key::Escape { event.stop_propagation(); } },
+        div { class: "fill-properties",
             if mask_selected { crate::layer_mask::MaskImageTargetSwitch { ui_projection, selection_fill: true } }
             div { class: "fill-target", title: "현재 색으로 칠할 레이어: {target_name}",
                 span { class: "fill-color", style: "background:rgb({red},{green},{blue})" }

@@ -3,8 +3,8 @@ use nyatidraw_api::{
     EditorCommand, LayerProjection, LayerTreeNodeId, MaskCommand, RasterEditTarget, UiProjection,
 };
 
+use crate::UiHost;
 use crate::preview::MaskThumbnailFrame;
-use crate::{UiHost, UiIcon};
 use std::sync::Arc;
 
 #[component]
@@ -61,12 +61,14 @@ pub fn MaskThumbnail(
 }
 
 #[component]
-pub fn LayerMaskControls(
+pub(super) fn LayerMaskActions(
     layer: LayerProjection,
     ui_projection: Signal<UiProjection>,
+    opened: Signal<Option<u64>>,
     error: Signal<Option<String>>,
 ) -> Element {
-    let mut opened = use_signal(|| false);
+    use crate::layer_context_menu::LayerMenuAction;
+    let mut confirm_remove = use_signal(|| false);
     let LayerTreeNodeId::Raster(id) = layer.id else {
         return rsx! {};
     };
@@ -75,75 +77,35 @@ pub fn LayerMaskControls(
         || state.animation.playing
         || state.edit.transform.is_some()
         || state.edit.color_adjustment.is_some();
-    let has_selection = state.edit.has_selection;
-    let is_active = state.active_layer == Some(id);
     let disabled = busy || layer.locked;
-    let mask = layer.mask;
-    let toggle_label = if mask.is_some_and(|mask| mask.enabled) {
-        "마스크 사용 중지"
-    } else {
-        "마스크 다시 사용"
-    };
-    let label = if mask.is_some() {
-        "마스크 작업"
-    } else {
-        "마스크 추가"
-    };
+    let has_selection = state.edit.has_selection;
     rsx! {
-        div { class: "layer-mask-controls",
-            if mask.is_some() || is_active {
-                button { class: "layer-mask-menu-button", aria_label: "{layer.name} {label}", title: label,
-                    disabled: busy, aria_expanded: opened(),
-                    onclick: move |event| { event.stop_propagation(); opened.set(true); },
-                    UiIcon { name: "mask" }
-                    if mask.is_none() { span { "마스크 추가" } }
+        div { class: "layer-menu-section",
+            onkeydown: move |event| {
+                if event.key() == Key::Escape && confirm_remove() {
+                    event.prevent_default(); event.stop_propagation(); confirm_remove.set(false);
+                    crate::layer_context_menu::focus_menu();
                 }
-            }
-        }
-        if opened() {
-            div { class: "layer-mask-backdrop", onclick: move |event| { event.stop_propagation(); opened.set(false); },
-                div { id: "layer-mask-menu", class: "layer-mask-popover", role: "dialog", aria_modal: "true", aria_label: "{layer.name} 마스크 작업",
-                    onmounted: move |_| crate::contain_overlay_focus("layer-mask-menu"),
-                    onclick: move |event| event.stop_propagation(),
-                    onkeydown: move |event| {
-                        event.stop_propagation();
-                        if event.key() == Key::Escape { event.prevent_default(); opened.set(false); }
-                    },
-                    if let Some(mask) = mask {
-                        MaskAction { command: MaskCommand::SelectImage(id), label: "이미지 편집", disabled: busy, opened, error }
-                        MaskAction { command: MaskCommand::SelectMask(id), label: "마스크 편집", disabled, opened, error }
-                        MaskAction { command: MaskCommand::SetEnabled { layer: id, enabled: !mask.enabled }, label: toggle_label, disabled, opened, error }
-                        MaskAction { command: MaskCommand::Remove(id), label: "마스크 삭제 · 원본 그림 유지", disabled, opened, error }
-                    } else {
-                        MaskAction { command: MaskCommand::AddRevealAll(id), label: "모두 보이는 마스크 추가", disabled, opened, error }
-                        MaskAction { command: MaskCommand::AddFromSelection(id), label: "선택 영역으로 마스크 추가", disabled: disabled || !has_selection, opened, error }
-                    }
-                    button { class: "mask-menu-close", onclick: move |_| opened.set(false), "닫기 (Esc)" }
-                }
+            },
+            if confirm_remove() && layer.mask.is_some() {
+                p { class: "layer-menu-confirm", "마스크를 삭제할까요? 원본 그림은 유지됩니다." }
+                button { id: "mask-remove-cancel", onmounted: move |_| {
+                    let _ = document::eval("document.getElementById('mask-remove-cancel')?.focus();");
+                }, onclick: move |_| { confirm_remove.set(false); crate::layer_context_menu::focus_menu(); }, "취소" }
+                LayerMenuAction { command: EditorCommand::Mask(MaskCommand::Remove(id)), label: "마스크 삭제", disabled, opened, error }
+            } else if let Some(mask) = layer.mask {
+                LayerMenuAction { command: EditorCommand::Mask(MaskCommand::SelectImage(id)), label: "이미지 편집", disabled: busy, opened, error }
+                LayerMenuAction { command: EditorCommand::Mask(MaskCommand::SelectMask(id)), label: "마스크 편집", disabled, opened, error }
+                LayerMenuAction { command: EditorCommand::Mask(MaskCommand::SetEnabled { layer: id, enabled: !mask.enabled }), label: "마스크 사용", checked: mask.enabled, disabled, opened, error }
+                button { disabled, onclick: move |_| confirm_remove.set(true), "마스크 삭제…" }
+            } else {
+                LayerMenuAction { command: EditorCommand::Mask(MaskCommand::AddRevealAll(id)), label: "모두 보이는 마스크 추가", disabled, opened, error }
+                LayerMenuAction { command: EditorCommand::Mask(MaskCommand::AddFromSelection(id)), label: "선택 영역으로 마스크 추가", disabled: disabled || !has_selection, opened, error }
             }
         }
     }
 }
 
-#[component]
-fn MaskAction(
-    command: MaskCommand,
-    label: &'static str,
-    disabled: bool,
-    mut opened: Signal<bool>,
-    mut error: Signal<Option<String>>,
-) -> Element {
-    let host = use_context::<UiHost>();
-    let disabled = disabled || !host.supports_command(&EditorCommand::Mask(command));
-    rsx! {
-        button { disabled, onclick: move |_| {
-            match host.push_ui_editor_command(EditorCommand::Mask(command)) {
-                Ok(()) => { opened.set(false); error.set(None); crate::focus_editor_shortcuts(); }
-                Err(message) => { opened.set(false); error.set(Some(message)); }
-            }
-        }, "{label}" }
-    }
-}
 #[component]
 pub(crate) fn MaskImageTargetSwitch(
     ui_projection: Signal<UiProjection>,

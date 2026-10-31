@@ -8,8 +8,10 @@ mod brush_preview;
 mod color_adjustment_dialog;
 mod color_panel;
 mod color_picker;
+mod control_help;
 mod dock_drag;
 mod fill_panel;
+mod layer_context_menu;
 mod layer_drag;
 mod layer_mask;
 pub mod layout_codec;
@@ -20,15 +22,16 @@ pub mod picker_loupe;
 pub mod preview;
 pub mod reference_panel;
 pub mod scaled_export;
+mod selection_context;
 mod transform_panel;
 pub mod workspace_appearance;
 
 use dioxus::prelude::*;
 use nyatidraw_api::{
     CommandRejectReason, DockAxis, DockCommand, DockNode, DrawingTool, EditorCommand, EditorEvent,
-    EventEnvelope, GroupId, HistoryCommand, HistoryOperationLabel, LayerColorEffect, LayerCommand,
-    LayerId, LayerProjection, LayerProjectionKind, LayerTreeNodeId, PanelKind, ProjectCommand,
-    ToolCommand, UiProjection, ViewportCommand, WorkspaceProjection,
+    GroupId, HistoryCommand, HistoryOperationLabel, LayerColorEffect, LayerCommand, LayerId,
+    LayerProjection, LayerProjectionKind, LayerTreeNodeId, PanelKind, ProjectCommand, ToolCommand,
+    UiProjection, ViewportCommand, WorkspaceProjection,
 };
 use nyatidraw_input::{CanvasInputMode, PressurePreset};
 use preview::LayerThumbnailFrame;
@@ -62,6 +65,19 @@ pub fn EditorChrome(
     reference_panel::provide_reference();
     dock_drag::use_dock_drag(live_ink.clone());
     use_context_provider(|| transform_panel::TransformPanelOpen(Signal::new(false)));
+    let transform_panel::TransformDraftGuard(mut transform_draft) =
+        use_context_provider(|| transform_panel::TransformDraftGuard(Signal::new(false)));
+    use_effect(move || {
+        if ui_projection.read().edit.transform.is_none() {
+            transform_draft.set(false);
+        }
+    });
+    let shortcut_error = use_signal(|| None::<String>);
+    let host::HostUpdate(mut transform_host_update) =
+        use_context_provider(|| host::HostUpdate(Signal::new(host_update)));
+    use_effect(use_reactive((&host_update,), move |(value,)| {
+        transform_host_update.set(value);
+    }));
     let animation_panel::AnimationPanelVisible(animation_visible) =
         use_context_provider(|| animation_panel::AnimationPanelVisible(Signal::new(true)));
     let page_panel::PagePanelOpen(page_open) =
@@ -94,6 +110,7 @@ pub fn EditorChrome(
     rsx! {
         style { {STYLES} }
         style { {COLOR_STYLES} }
+        style { {include_str!("../assets/layer-menu.css")} }
         style { {CAPABILITY_STYLES} }
         main {
             onmounted: move |_| focus_editor_shortcuts(),
@@ -119,7 +136,25 @@ pub fn EditorChrome(
                     event.prevent_default(); event.stop_propagation(); return;
                 }
                 if key == "Escape" && event.is_auto_repeating() { event.prevent_default(); return; }
-                if handle_editor_shortcut(&shortcut_ink, &key, event.modifiers().shift(), event.modifiers().ctrl()) { event.prevent_default(); return; }
+                if key == "Enter" && ui_projection.read().edit.transform.is_some() {
+                    event.prevent_default();
+                    if event.is_auto_repeating() { return; }
+                    if transform_draft() {
+                        let mut error = shortcut_error;
+                        error.set(Some("입력한 변형 값을 먼저 미리보기로 확인하거나 취소하세요.".into()));
+                    } else {
+                        let state = ui_projection.read();
+                        let generation = state.edit.transform.as_ref()
+                            .filter(|value| value.can_commit && !state.edit.busy)
+                            .map(|value| value.generation);
+                        drop(state);
+                        if let Some(generation) = generation {
+                            send_editor_command(&shortcut_ink, EditorCommand::Edit(nyatidraw_api::EditCommand::FreeTransform(nyatidraw_api::TransformCommand::Commit { generation })), shortcut_error);
+                        }
+                    }
+                    return;
+                }
+                if handle_editor_shortcut(&shortcut_ink, &key, event.modifiers().shift(), event.modifiers().ctrl(), shortcut_error) { event.prevent_default(); return; }
                 let panel = match key.as_str() {
                     "1" | "F6" => Some(PanelKind::Canvas), "2" => Some(PanelKind::Tools),
                     "3" => Some(PanelKind::Brush), "4" => Some(PanelKind::Navigator),
@@ -129,21 +164,23 @@ pub fn EditorChrome(
                 };
                 if let Some(panel) = panel { send_dock_command(&shortcut_ink, DockCommand::ActivatePanel(panel)); }
             },
-            ActionBar { ui_projection, export_status }
+            ActionBar { ui_projection, export_status, host_update }
             if let Some(notice) = layout_notice { div { class: "layout-notice", role: "status", "{notice}" } }
             section {
                 class: "workspace", aria_label: "Editor workspace. F6 returns to the drawing canvas.",
-                title: "{document_title} · r{projected_revision} · {protocol_status(latest_event.as_ref())}",
+                "data-document-title": "{document_title}",
                 DockNodeView { node: dock.root().clone(), ui_projection }
             }
             if has_animation { animation_panel::AnimationPanel { ui_projection, host_update } }
             if dirty { span { class: "unsaved-dot", title: "저장되지 않은 변경", "•" } }
             if edit.busy { aside { class: "edit-status", role: "status", aria_live: "polite", span { "작업 처리 중…" } } }
             if let Some(reason) = &edit.error { TransientNotice { key: "edit-{reason}", message: format!("편집 실패: {reason}") } }
+            if let Some(message) = shortcut_error() { TransientNotice { key: "shortcut-{message}", message } }
             if let Some((command, reason)) = rejection { TransientNotice { key: "reject-{command.0}", message: reject_label(reason).to_owned() } }
             if page_open() { page_panel::PagePanel { ui_projection } }
             if edit.color_adjustment.is_some() { color_adjustment_dialog::ColorAdjustmentDialog { ui_projection } }
             {overlays}
+            control_help::ControlHelp {}
         }
     }
 }
@@ -167,7 +204,13 @@ pub fn TransientNotice(message: String) -> Element {
     } }
 }
 
-fn handle_editor_shortcut(live_ink: &UiHost, key: &str, shift: bool, ctrl: bool) -> bool {
+fn handle_editor_shortcut(
+    live_ink: &UiHost,
+    key: &str,
+    shift: bool,
+    ctrl: bool,
+    error: Signal<Option<String>>,
+) -> bool {
     let command = if ctrl && key.eq_ignore_ascii_case("a") {
         Some(EditorCommand::Edit(nyatidraw_api::EditCommand::SelectAll))
     } else if ctrl && key.eq_ignore_ascii_case("d") {
@@ -236,13 +279,16 @@ fn handle_editor_shortcut(live_ink: &UiHost, key: &str, shift: bool, ctrl: bool)
     let Some(command) = command else {
         return false;
     };
-    let _ = live_ink.push_ui_editor_command(command);
+    send_editor_command(live_ink, command, error);
     true
 }
 
 #[component]
-fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -> Element {
-    let animation_panel::AnimationPanelVisible(mut animation_visible) = use_context();
+fn ActionBar(
+    ui_projection: Signal<UiProjection>,
+    export_status: ExportStatus,
+    host_update: u64,
+) -> Element {
     let live_ink = use_context::<UiHost>();
     let reset_layout_ink = live_ink.clone();
     let mut menu_open = use_signal(|| false);
@@ -264,16 +310,12 @@ fn ActionBar(ui_projection: Signal<UiProjection>, export_status: ExportStatus) -
             }
             FileButtons {}
             if !ui_projection.read().animation.frames.is_empty() {
-                button { class: "command compact", aria_label: "애니메이션 타임라인 표시", aria_expanded: animation_visible(),
-                    aria_controls: "animation-timeline", title: if animation_visible() { "타임라인 닫기 · 프레임 유지" } else { "타임라인 열기" },
-                    onclick: move |_| { focus_editor_shortcuts(); animation_visible.toggle(); },
-                    UiIcon { name: "timeline" }
-                }
+                animation_panel::TimelineVisibilityButton { ui_projection, host_update }
             }
             if live_ink.is_saving_as() {
                 span { class: "export-status", role: "status", "다른 이름으로 저장 중…" }
             }
-            button { class: "command", title: "저장 (S)", onclick: move |_| {
+            button { class: "command", title: "저장 (S)", aria_label: "작업 저장", onclick: move |_| {
                 send_editor_command(&save_ink, EditorCommand::Project(ProjectCommand::Save), error);
             }, UiIcon { name: "save" } span { class: "command-label", "저장" } span { class: "shortcut", "S" } }
             if export_status != ExportStatus::Idle {
@@ -435,7 +477,7 @@ fn CanvasActions(ui_projection: Signal<UiProjection>) -> Element {
                 button { class: "command", title: "흰 배경 추가", disabled: !white_ink.supports_command(&EditorCommand::Layer(LayerCommand::AddWhiteBackground)), onclick: move |_| {
                     send_editor_command(&white_ink, EditorCommand::Layer(LayerCommand::AddWhiteBackground), error);
                 }, UiIcon { name: "white" } span { class: "command-label", "흰 배경" } }
-                button { class: if ui_projection.read().edit.transform.is_some() { "command active" } else { "command" }, title: "선택 영역 변형 · 먼저 영역을 선택하세요", disabled: !ui_projection.read().edit.has_selection || ui_projection.read().edit.busy || ui_projection.read().edit.transform.is_some() || matches!(ui_projection.read().raster_target, Some(nyatidraw_api::RasterEditTarget::Mask { .. })), onclick: move |_| {
+                button { class: if ui_projection.read().edit.transform.is_some() { "command active" } else { "command" }, aria_label: "그림 변형", title: "선택한 그림 변형 · 선택이 없으면 현재 레이어 전체", disabled: !transform_panel::can_begin_transform(&ui_projection.read()), onclick: move |_| {
                     page_open.set(false);
                     transform_open.set(true);
                     focus_editor_shortcuts();
@@ -443,18 +485,18 @@ fn CanvasActions(ui_projection: Signal<UiProjection>) -> Element {
                 },
                     UiIcon { name: "transform" } span { class: "command-label", "변형" }
                 }
-                button { class: "command", title: "캔버스 크기·프리셋 및 선택 영역에 맞추기", disabled: ui_projection.read().edit.busy || ui_projection.read().edit.transform.is_some(), onclick: move |_| {
+                button { class: "command", aria_label: "캔버스 설정", title: "캔버스 크기·프리셋 및 선택 영역에 맞추기", disabled: ui_projection.read().edit.busy || ui_projection.read().edit.transform.is_some(), onclick: move |_| {
                     transform_open.set(false);
                     page_open.set(true);
-                }, span { class: "command-label", "캔버스" } }
-                button { class: "command", title: "현재 조작 취소 / 선택 해제 (Esc)", disabled: !page_open() && !ui_projection.read().edit.can_cancel && (!ui_projection.read().edit.has_selection || ui_projection.read().edit.busy),
+                }, UiIcon { name: "canvas" } span { class: "command-label", "캔버스" } }
+                button { class: "command", aria_label: "현재 조작 취소 또는 선택 해제", title: "현재 조작 취소 / 선택 해제 (Esc)", disabled: !page_open() && !ui_projection.read().edit.can_cancel && (!ui_projection.read().edit.has_selection || ui_projection.read().edit.busy),
                     onclick: move |_| {
                         if page_open() { page_open.set(false); }
                         else {
                             focus_editor_shortcuts();
                             send_editor_command(&cancel_ink, EditorCommand::Tool(ToolCommand::CancelGesture), error);
                         }
-                    }, span { class: "command-label", "취소" } span { class: "shortcut", "Esc" }
+                    }, UiIcon { name: "close" } span { class: "command-label", "취소" } span { class: "shortcut", "Esc" }
                 }
                 if let Some(message) = error() {
                     TransientNotice { key: "canvas-action-{message}", message }
@@ -755,7 +797,7 @@ fn PanelContents(
     ui_projection: Signal<UiProjection>,
 ) -> Element {
     if panel == PanelKind::Canvas {
-        return rsx! { CanvasWorkspace { workspace } };
+        return rsx! { CanvasWorkspace { workspace, ui_projection } };
     }
     match workspace {
         WorkspaceProjection::Empty => rsx! {
@@ -782,13 +824,14 @@ fn PanelContents(
 }
 
 #[component]
-fn CanvasWorkspace(workspace: WorkspaceProjection) -> Element {
+fn CanvasWorkspace(workspace: WorkspaceProjection, ui_projection: Signal<UiProjection>) -> Element {
     rsx! {
         div {
             class: "canvas-panel",
             tabindex: 0,
             role: "application",
             aria_label: "그리기 영역",
+            selection_context::SelectionContext { ui_projection }
             div { class: "canvas-frame", SharedCanvas {} }
             if let WorkspaceProjection::Error { summary } = workspace {
                 div { class: "workspace-error-notice", role: "alert",
@@ -944,6 +987,7 @@ fn ToolButton(
             disabled: tool.is_none_or(|tool| !live_ink.supports_command(&EditorCommand::Tool(ToolCommand::Select(tool)))),
             title,
             aria_label: "{label}, 단축키 {shortcut}",
+            aria_pressed: active,
             onclick: move |_| {
                 if let Some(tool) = tool {
                     send_editor_command(&live_ink, EditorCommand::Tool(ToolCommand::Select(tool)), error);
@@ -952,6 +996,7 @@ fn ToolButton(
             UiIcon { name: icon }
             span { class: "tool-key", "{shortcut}" }
         }
+        if let Some(message) = error() { TransientNotice { key: "tool-{message}", message } }
     }
 }
 
@@ -1012,6 +1057,11 @@ fn BrushPanel(ui_projection: Signal<UiProjection>) -> Element {
 
 #[component]
 fn ToolPropertiesPanel(ui_projection: Signal<UiProjection>) -> Element {
+    if ui_projection.read().drawing_tool == DrawingTool::Move
+        && ui_projection.read().edit.transform.is_none()
+    {
+        return rsx! { div { class: "edit-tool-properties", p { "끌어서 화면을 이동합니다. 그림은 바뀌지 않습니다." } } };
+    }
     if ui_projection.read().edit.transform.is_some()
         || ui_projection.read().drawing_tool == DrawingTool::MoveSelection
     {
@@ -1034,7 +1084,7 @@ fn ToolPropertiesPanel(ui_projection: Signal<UiProjection>) -> Element {
     let opacity_u16 = ui_projection.read().brush_opacity_u16;
     let pencil_template = ui_projection.read().pencil_template;
     rsx! {
-        div { class: "tool-properties", onkeydown: move |event| { if event.key() != Key::Escape { event.stop_propagation(); } },
+        div { class: "tool-properties",
             brush_preview::BrushStrokePreview { tool, pencil_template, size_tenths: current_size, opacity_u16, settings }
             BrushSizeControl { size_tenths: current_size }
             OpacityControl { percent: opacity }
@@ -1054,10 +1104,16 @@ fn MoveArtworkPanel(ui_projection: Signal<UiProjection>) -> Element {
     let ink = use_context::<UiHost>();
     let error = use_signal(|| Option::<String>::None);
     let has_selection = ui_projection.read().edit.has_selection;
-    let busy = ui_projection.read().edit.busy;
+    let mask_target = matches!(
+        ui_projection.read().raster_target,
+        Some(nyatidraw_api::RasterEditTarget::Mask { .. })
+    );
+    let busy =
+        ui_projection.read().edit.busy || mask_target || ui_projection.read().animation.playing;
     rsx! {
         div { class: "edit-tool-properties",
-            p { if has_selection { "선택한 그림을 끌어 이동합니다. 손을 떼면 확정됩니다." } else { "현재 레이어의 그림을 끌어 이동합니다. 페이지 밖 그림도 함께 이동합니다." } }
+            layer_mask::MaskImageTargetSwitch { ui_projection }
+            if !mask_target { p { if has_selection { "선택한 그림을 끌어 이동합니다. 손을 떼면 확정됩니다." } else { "현재 레이어의 그림을 끌어 이동합니다. 캔버스 밖 그림도 함께 이동합니다." } } }
             div { class: "selection-morph-actions", role: "group", aria_label: "캔버스 중앙 정렬",
                 button { disabled: busy, onclick: { let ink = ink.clone(); move |_| send_editor_command(&ink, EditorCommand::Edit(nyatidraw_api::EditCommand::CenterArtwork { horizontal: true, vertical: false }), error) }, "가로 중앙" }
                 button { disabled: busy, onclick: move |_| send_editor_command(&ink, EditorCommand::Edit(nyatidraw_api::EditCommand::CenterArtwork { horizontal: false, vertical: true }), error), "세로 중앙" }
@@ -1093,6 +1149,7 @@ fn BrushPressureControl(size_axis: bool, enabled: bool, minimum_u16: u16) -> Ele
             label { class: "pressure-minimum", title: "필압이 가장 약할 때의 {axis} 비율",
                 span { "최소 {axis}" }
                 input { class: "property-number", r#type: "number", min: "0", max: "100", step: "1",
+                    onkeydown: text_input_keydown,
                     disabled: !enabled || !minimum_ink.supports_command(&EditorCommand::Tool(if size_axis { ToolCommand::SetSizeMinimumU16(minimum_u16) } else { ToolCommand::SetOpacityMinimumU16(minimum_u16) })), value: "{draft}", aria_label: "{axis} 최소 필압 비율 %",
                     oninput: move |event| draft.set(event.value()),
                     onchange: move |_| {
@@ -1127,6 +1184,7 @@ fn BrushHardnessControl(hardness_u16: u16) -> Element {
         label { class: "property-row", title: "0%는 부드러운 경계, 100%는 단단한 경계",
             span { "가장자리 경도" }
             input { class: "property-number", r#type: "number", min: "0", max: "100", step: "1", value: "{draft}", aria_label: "브러시 가장자리 경도 %",
+                onkeydown: text_input_keydown,
                 oninput: move |event| draft.set(event.value()),
                 onchange: move |_| {
                     if let Ok(value) = draft().parse::<u32>() {
@@ -1165,6 +1223,7 @@ fn BrushSmoothingControl(strength: u8) -> Element {
         label { class: "property-row", title: "0은 끄기 · 강도가 높을수록 선이 부드럽게 따라옵니다 · 다음 선부터 적용",
             span { "선 보정" }
             input { class: "property-number", r#type: "number", min: "0", max: "100", step: "1", value: "{draft}", aria_label: "선 보정 강도 (0: 끄기)",
+                onkeydown: text_input_keydown,
                 oninput: move |event| draft.set(event.value()),
                 onchange: move |_| {
                     if let Ok(value) = draft().parse::<u8>() {
@@ -1237,6 +1296,7 @@ fn BrushSizeControl(size_tenths: u16) -> Element {
     rsx! {
         label { class: "property-row", title: "브러시 크기 · [ 작게 / ] 크게", span { "크기" }
             input { class: "property-number", r#type: "number", min: "0.1", max: "200", step: "0.1", value: "{draft}", aria_label: "브러시 크기 px",
+                onkeydown: text_input_keydown,
                 oninput: move |event| draft.set(event.value()),
                 onchange: move |_| commit(),
             }
@@ -1340,23 +1400,17 @@ fn EditToolPanel(ui_projection: Signal<UiProjection>) -> Element {
                 p { class: "transform-help", "선택 안에 칠하기 · 선택이 없으면 페이지 전체. 배경색은 색 패널에서 X로 교환해 바꿉니다." }
             }
             if matches!(tool, DrawingTool::Lasso | DrawingTool::RectangleSelection | DrawingTool::Wand) {
-                select { aria_label: "선택 조합",
-                    value: match settings.selection_mode {
-                        nyatidraw_api::SelectionMode::Replace => "replace",
-                        nyatidraw_api::SelectionMode::Add => "add",
-                        nyatidraw_api::SelectionMode::Subtract => "subtract",
-                    },
-                    onchange: move |event| {
-                        let mode = match event.value().as_str() {
-                            "add" => nyatidraw_api::SelectionMode::Add,
-                            "subtract" => nyatidraw_api::SelectionMode::Subtract,
-                            _ => nyatidraw_api::SelectionMode::Replace,
-                        };
-                        send_editor_command(&mode_ink, EditorCommand::Tool(ToolCommand::SetSelectionMode(mode)), error);
-                    },
-                    option { value: "replace", "새 선택" }
-                    option { value: "add", "추가 (+)" }
-                    option { value: "subtract", "빼기 (−)" }
+                div { class: "selection-mode", role: "group", aria_label: "선택 조합",
+                    for (mode, label) in [
+                        (nyatidraw_api::SelectionMode::Replace, "새 선택"),
+                        (nyatidraw_api::SelectionMode::Add, "추가 +"),
+                        (nyatidraw_api::SelectionMode::Subtract, "빼기 −"),
+                    ] {
+                        button { aria_pressed: settings.selection_mode == mode,
+                            onclick: { let ink = mode_ink.clone(); move |_| send_editor_command(&ink, EditorCommand::Tool(ToolCommand::SetSelectionMode(mode)), error) },
+                            "{label}"
+                        }
+                    }
                 }
             }
             if matches!(tool, DrawingTool::Lasso | DrawingTool::RectangleSelection | DrawingTool::Wand | DrawingTool::MoveSelection) {
@@ -1438,6 +1492,7 @@ fn SelectionActions(ui_projection: Signal<UiProjection>) -> Element {
             }, UiIcon { name: icon } span { "{label}" } }
         }
         }
+        if let Some(message) = error() { p { class: "command-error", role: "alert", "{message}" } }
     } }
 }
 
@@ -1459,6 +1514,7 @@ fn EditNumberInput(
     }));
     rsx! {
         input { class: "property-number", r#type: "number", min: "{min}", max: "{max}", step: "1", value: "{draft}", aria_label: "{label}", disabled,
+            onkeydown: text_input_keydown,
             onfocus: move |_| editing.set(true),
             oninput: move |event| draft.set(event.value()),
             onblur: move |_| {
@@ -1494,6 +1550,7 @@ fn OpacityControl(percent: u32) -> Element {
         label { class: "property-row",
             span { "불투명도" }
             input { class: "property-number", r#type: "number", min: "1", max: "100", step: "1", value: "{draft}", aria_label: "브러시 불투명도 %",
+                onkeydown: text_input_keydown,
                 oninput: move |event| draft.set(event.value()),
                 onchange: move |_| {
                     if let Ok(value) = draft().parse::<u32>() {
@@ -1556,16 +1613,13 @@ fn DocumentNavigatorPanel(ui_projection: Signal<UiProjection>) -> Element {
     let zoom = viewport.zoom_ppm / 10_000;
     let navigator = live_ink.navigator_snapshot();
     let frame = navigator.frame;
+    let preview_size = use_signal(|| [0_u16; 2]);
+    let displayed = frame
+        .as_ref()
+        .map(|frame| navigator_preview_extent([frame.width, frame.height], preview_size()));
     let navigator_dragging = navigator_drag.read().is_some();
-    let canvas_style = frame.as_ref().map(|frame| {
-        format!(
-            "width:{}px;height:{}px;aspect-ratio:{} / {};",
-            frame.width,
-            frame.height,
-            u32::from(frame.width),
-            u32::from(frame.height)
-        )
-    });
+    let canvas_style =
+        displayed.map(|[width, height]| format!("width:{width}px;height:{height}px;"));
     let viewport_style = navigator.viewport.map(|viewport| {
         let points = viewport
             .quad_page_10k
@@ -1583,7 +1637,8 @@ fn DocumentNavigatorPanel(ui_projection: Signal<UiProjection>) -> Element {
     });
     rsx! {
         div { class: "navigator-panel",
-            div { class: "navigator-preview",
+            div { id: "navigator-preview", class: "navigator-preview",
+                onmounted: move |_| observe_navigator_preview(preview_size),
                 div {
                     class: if navigator_dragging {
                         "navigator-canvas dragging"
@@ -1593,7 +1648,8 @@ fn DocumentNavigatorPanel(ui_projection: Signal<UiProjection>) -> Element {
                     style: canvas_style,
                     title: "클릭한 위치를 작업영역 중앙으로 이동",
                     onpointerdown: move |event| {
-                        let Some(frame) = frame.as_ref() else { return };
+                        let Some([width, height]) = displayed else { return };
+                        if width == 0 || height == 0 { return; }
                         if event.data().trigger_button()
                             != Some(dioxus::html::input_data::MouseButton::Primary)
                         {
@@ -1603,16 +1659,16 @@ fn DocumentNavigatorPanel(ui_projection: Signal<UiProjection>) -> Element {
                         let point = event.data().element_coordinates();
                         let client = event.data().client_coordinates();
                         let page = [
-                            navigator_coordinate_10k(point.x, frame.width),
-                            navigator_coordinate_10k(point.y, frame.height),
+                            navigator_coordinate_10k(point.x, width),
+                            navigator_coordinate_10k(point.y, height),
                         ];
                         let sent = send_navigator_center(&center_ink, page);
                         navigator_drag.set(Some(NavigatorDrag {
                             pointer_id: event.data().pointer_id(),
                             origin_x: client.x - point.x,
                             origin_y: client.y - point.y,
-                            width: frame.width,
-                            height: frame.height,
+                            width,
+                            height,
                             last_sent: sent.then_some(page),
                             last_sent_at: center_ink.now_millis(),
                         }));
@@ -1638,6 +1694,52 @@ fn DocumentNavigatorPanel(ui_projection: Signal<UiProjection>) -> Element {
             }
         }
     }
+}
+
+fn navigator_preview_extent([width, height]: [u16; 2], available: [u16; 2]) -> [u16; 2] {
+    if width == 0 || height == 0 || available.contains(&0) {
+        return [0, 0];
+    }
+    let fitted_width = width.min(available[0]);
+    let fitted_height = u32::from(height) * u32::from(fitted_width) / u32::from(width);
+    if fitted_height <= u32::from(available[1]) {
+        [
+            fitted_width,
+            u16::try_from(fitted_height.max(1)).unwrap_or(available[1]),
+        ]
+    } else {
+        let fitted_width = u32::from(width) * u32::from(available[1]) / u32::from(height);
+        [
+            u16::try_from(fitted_width.max(1)).unwrap_or(available[0]),
+            available[1],
+        ]
+    }
+}
+
+fn observe_navigator_preview(mut size: Signal<[u16; 2]>) {
+    spawn(async move {
+        let mut observer = document::eval(
+            "const preview = document.getElementById('navigator-preview');
+             if (!preview) { dioxus.send(null); return; }
+             let previous = '';
+             const resize = new ResizeObserver(entries => {
+                 const rect = entries[0].contentRect;
+                 const size = [rect.width, rect.height].map(value => Math.max(0, Math.min(65535, Math.floor(value))));
+                 const serialized = JSON.stringify(size);
+                 if (serialized !== previous) { previous = serialized; dioxus.send(size); }
+             });
+             resize.observe(preview);
+             const cleanup = new MutationObserver(() => {
+                 if (preview.isConnected) return;
+                 resize.disconnect(); cleanup.disconnect(); dioxus.send(null);
+             });
+             cleanup.observe(document.body, {childList:true, subtree:true});
+             await new Promise(() => {});",
+        );
+        while let Ok(Some(measured)) = observer.recv::<Option<[u16; 2]>>().await {
+            size.set(measured);
+        }
+    });
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -1716,11 +1818,11 @@ fn ColorPanel(ui_projection: Signal<UiProjection>) -> Element {
 #[component]
 fn LayersPanel(ui_projection: Signal<UiProjection>) -> Element {
     let live_ink = use_context::<UiHost>();
+    let delete_ink = live_ink.clone();
     let add_raster_ink = live_ink.clone();
     let duplicate_ink = live_ink.clone();
     let add_group_ink = live_ink.clone();
     let white_ink = live_ink.clone();
-    let delete_ink = live_ink.clone();
     let group_transform_ink = live_ink.clone();
     let transform_panel::TransformPanelOpen(mut transform_open) = use_context();
     let state = ui_projection.read();
@@ -1847,8 +1949,19 @@ fn LayerRow(
     let visibility_ink = live_ink.clone();
     let thumbnail_ink = live_ink.clone();
     let keyboard_ink = live_ink.clone();
-    let solo_ink = live_ink.clone();
-    let delete_ink = live_ink.clone();
+    let context_ink = live_ink.clone();
+    let mut menu_opened = use_signal(|| None::<u64>);
+    let mut renaming = use_signal(|| false);
+    let project_epoch = live_ink.project_epoch();
+    use_effect(use_reactive((&project_epoch,), move |(epoch,)| {
+        if menu_opened
+            .peek()
+            .is_some_and(|opened_epoch| opened_epoch != epoch)
+        {
+            menu_opened.set(None);
+        }
+        renaming.set(false);
+    }));
     let id = layer.id;
     let is_active = matches!(id, LayerTreeNodeId::Raster(layer_id) if active == Some(layer_id));
     let is_group = layer.kind == LayerProjectionKind::Group;
@@ -1871,22 +1984,20 @@ fn LayerRow(
             "data-layer-key": "{layer_key}", "data-parent": "{layer.parent.0}", "data-index": "{layer.index}",
             "data-depth": "{layer.depth}",
             "data-has-mask": layer_has_mask,
+            oncontextmenu: move |event| {
+                event.prevent_default(); event.stop_propagation();
+                layer_context_menu::open_menu(&context_ink, menu_opened, error);
+            },
+            onkeydown: move |event| {
+                if event.key() == Key::ContextMenu || (event.key() == Key::F10 && event.modifiers().shift()) {
+                    event.prevent_default(); event.stop_propagation();
+                    layer_context_menu::open_menu(&live_ink, menu_opened, error);
+                }
+            },
             button { class: "layer-eye", title: if layer.visible { "레이어 숨기기" } else { "레이어 표시" }, aria_label: "{layer.name} 표시", aria_pressed: layer.visible, onclick: move |_| {
                 let visible = !layer.visible;
                 send_editor_command(&visibility_ink, EditorCommand::Layer(LayerCommand::SetVisibility { node: id, visible }), error);
             }, span { class: if layer.visible { "eye-mark" } else { "eye-mark hidden" }, UiIcon { name: visibility_icon } } }
-            button {
-                class: if solo_node == Some(id) { "layer-solo active" } else { "layer-solo" },
-                disabled: !solo_ink.supports_command(&EditorCommand::Layer(LayerCommand::ToggleSolo(id))),
-                title: if solo_node == Some(id) { "레이어만 보기 해제" } else { "이 레이어만 보기" },
-                aria_label: "{layer.name}만 보기", aria_pressed: solo_node == Some(id),
-                onclick: move |_| send_editor_command(
-                    &solo_ink,
-                    EditorCommand::Layer(LayerCommand::ToggleSolo(id)),
-                    error,
-                ),
-                "S"
-            }
             if let LayerTreeNodeId::Group(group) = id {
                 button { class: "layer-tree", title: if is_collapsed { "그룹 펼치기" } else { "그룹 접기" }, onclick: move |_| {
                     let mut next = collapsed_groups.read().clone();
@@ -1948,13 +2059,14 @@ fn LayerRow(
             div { class: "layer-meta", onclick: move |_| {
                 if let LayerTreeNodeId::Raster(layer_id) = id {
                     group_settings.set(None);
-                    send_editor_command(&active_ink, EditorCommand::Layer(LayerCommand::SetActive(layer_id)), error);
+                    if !is_active { send_editor_command(&active_ink, EditorCommand::Layer(LayerCommand::SetActive(layer_id)), error); }
                 } else if let LayerTreeNodeId::Group(group) = id {
                     group_settings.set(Some(group));
                 }
             },
-                LayerNameInput { node: id, name: layer.name.clone(), error }
+                LayerNameInput { key: "layer-name-{project_epoch}", node: id, name: layer.name.clone(), editing: renaming, project_epoch, error }
                 span { class: "layer-detail",
+                    if solo_node == Some(id) { "단독 · " }
                     if layer.locked { span { title: "픽셀 잠김", UiIcon { name: "lock" } } }
                     if layer.reference { "참조 · " }
                     if layer.alpha_locked { span { title: "투명도 잠금", UiIcon { name: "alpha-lock" } } }
@@ -1964,21 +2076,19 @@ fn LayerRow(
                     if is_group { "그룹 · " }
                     "{opacity}%"
                 }
-                layer_mask::LayerMaskControls { layer: layer.clone(), ui_projection, error }
             }
             div { class: "layer-row-actions",
-            button {
-                class: "layer-delete", title: "삭제 (Undo로 복원)", aria_label: "{layer.name} 삭제",
-                disabled: layer.locked,
-                onclick: move |_| send_editor_command(&delete_ink, EditorCommand::Layer(LayerCommand::Delete(id)), error),
-                UiIcon { name: "trash" }
-            }
+            layer_context_menu::LayerOptionsButton { layer: layer.clone(), opened: menu_opened, error }
             span { class: "layer-reorder-handle", "data-layer-reorder-handle": "true",
                 role: "img", aria_label: "{layer.name} 순서 이동 핸들",
                 title: "끌어서 레이어 순서 또는 그룹 변경",
                 UiIcon { name: "grip" }
             }
             }
+        }
+        if menu_opened().is_some() {
+            layer_context_menu::LayerContextMenu { key: "layer-menu-{project_epoch}", layer: layer.clone(), ui_projection, opened: menu_opened, error,
+                onrename: move |()| renaming.set(true) }
         }
     }
 }
@@ -1995,11 +2105,21 @@ fn image_target_command(layer: LayerId, masked: bool) -> EditorCommand {
 fn LayerNameInput(
     node: LayerTreeNodeId,
     name: String,
+    mut editing: Signal<bool>,
+    project_epoch: u64,
     mut error: Signal<Option<String>>,
 ) -> Element {
     let host = use_context::<UiHost>();
-    let mut editing = use_signal(|| false);
     let mut draft = use_signal(|| name.clone());
+    let input_key = layer_context_menu::node_key(node);
+    use_effect(move || {
+        if editing() {
+            let key = layer_context_menu::node_key(node);
+            let _ = document::eval(&format!(
+                "const input = document.getElementById('layer-name-{key}'); input?.focus({{preventScroll:true}}); input?.select();"
+            ));
+        }
+    });
     use_effect(use_reactive((&name,), move |(name,)| {
         if !*editing.peek() {
             draft.set(name);
@@ -2007,7 +2127,7 @@ fn LayerNameInput(
     }));
     let original = name.clone();
     let commit = use_callback(move |()| {
-        if !editing() {
+        if !editing() || host.project_epoch() != project_epoch {
             return;
         }
         editing.set(false);
@@ -2030,14 +2150,15 @@ fn LayerNameInput(
         }
     });
     rsx! {
-        input { class: "layer-name", aria_label: "레이어 이름",
+        input { id: "layer-name-{input_key}", class: "layer-name", aria_label: "레이어 이름",
             title: "선택 · 더블클릭/F2 이름 변경 · Enter 확정 · Esc 취소",
             readonly: !editing(), value: "{draft}", maxlength: "128", spellcheck: "false",
+            oncontextmenu: move |event| { if editing() { event.stop_propagation(); } },
             ondoubleclick: move |_| editing.set(true),
             oninput: move |event| draft.set(event.value()),
             onblur: move |_| commit.call(()),
             onkeydown: move |event| {
-                event.stop_propagation();
+                if editing() || matches!(event.key(), Key::F2 | Key::Enter | Key::Escape) { event.stop_propagation(); }
                 match event.key() {
                     Key::F2 => { event.prevent_default(); editing.set(true); }
                     Key::Enter => {
@@ -2255,6 +2376,15 @@ fn LayerOpacityControl(
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
+fn text_input_keydown(event: KeyboardEvent) {
+    event.stop_propagation();
+    if matches!(event.key(), Key::Enter | Key::Escape) {
+        event.prevent_default();
+        focus_editor_shortcuts();
+    }
+}
+
 fn send_editor_command(
     live_ink: &UiHost,
     command: EditorCommand,
@@ -2322,24 +2452,6 @@ fn send_dock_command(live_ink: &UiHost, command: DockCommand) {
         .is_err()
     {
         eprintln!("native-ui event=dock-command-rejected reason=queue-full");
-    }
-}
-
-fn protocol_status(event: Option<&EventEnvelope>) -> String {
-    match event.map(|envelope| &envelope.event) {
-        None => "Starting".to_owned(),
-        Some(EditorEvent::CommandAccepted { command, revision }) => {
-            format!("Accepted #{} at r{}", command.0, revision.0)
-        }
-        Some(EditorEvent::CommandRejected { command, reason }) => {
-            format!("Rejected #{}: {}", command.0, reject_label(*reason))
-        }
-        Some(EditorEvent::ProjectionChanged { revision }) => {
-            format!("Projection r{}", revision.0)
-        }
-        Some(EditorEvent::LayoutRecovered { revision, .. }) => {
-            format!("Layout recovered at r{}", revision.0)
-        }
     }
 }
 

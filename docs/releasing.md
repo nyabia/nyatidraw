@@ -3,6 +3,23 @@
 홈페이지: <https://nyabia.github.io/nyatidraw/>
 소스/배포: <https://github.com/nyabia/nyatidraw>
 
+## alpha.22 배포
+
+레이어 옵션 메뉴, hover/focus 도움말, 조용한 웹 자동 복구 상태표시,
+선택·변형·타임라인·캔버스 설정의 종료 동선을 공용 UI에 반영한다.
+Windows 그림 이동에는 작업자 기반 임시 픽셀 미리보기를 추가했고,
+변경 타일만 올리며 취소 시 원본을 복원한다. 내비게이터 미리보기는
+하단 버튼을 덮지 않도록 표시 크기와 입력 좌표를 함께 맞춘다.
+
+- 전체 workspace 테스트 312개, 전체/웹 Clippy, fmt, DX Windows/웹 release 빌드 통과.
+- Edge의 드래그 중 표시·취소·Undo 및 프로세스 종료 후 자동 복구/NTDR 재열기에서
+  앱 출력 PNG 기준 RGBA 일치. 메뉴·키보드·터치 에뮬레이션 검사 통과.
+- Windows release 시험 창은 실행했으나 수동 조작 검사가 중단되어 최종 네이티브
+  드래그 표시와 설치 업데이트는 미검증. 물리 iPad/Pencil/Windows 펜 검증도 별도다.
+- 태그 CI·자산·공개 웹 결과는 게시 후 이 항목에 덧붙인다.
+
+[릴리즈 노트](releases/0.1.0-alpha.22.md), [검증 상세](ux-workflow-review.md).
+
 ## alpha.21 배포
 
 웹의 그림 이동 미리보기, 레이어 터치 구분, 타임라인 닫기, 아이콘과 약한 필압의

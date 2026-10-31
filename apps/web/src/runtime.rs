@@ -15,6 +15,8 @@ use crate::{browser, gpu::WebRenderer};
 mod animation;
 mod artwork_move;
 mod frame_previews;
+mod recovery_status;
+pub use recovery_status::RecoveryStatus;
 
 const RECOVERY_QUIET_MS: f64 = 600.0;
 const RECOVERY_MAX_WAIT_MS: f64 = 3000.0;
@@ -133,6 +135,7 @@ pub struct Editor {
     pub runtime: Signal<Rc<RefCell<Option<Runtime>>>>,
     pub revision: Signal<u64>,
     pub status: Signal<String>,
+    pub recovery_status: Signal<RecoveryStatus>,
     pub ready: Signal<bool>,
     pub modal: Signal<Option<EditorModal>>,
     pub notice: Signal<Option<String>>,
@@ -263,6 +266,9 @@ impl Editor {
         browser::set_canvas_tool(canvas_input_mode(selected_tool));
         callback.forget();
         self.ready.set(true);
+        if restored {
+            self.set_recovery_status(RecoveryStatus::Saved);
+        }
         self.report(if hosted {
             "호스트 연결됨 · 완료를 눌러 PNG를 전달하세요"
         } else if restored {
@@ -902,6 +908,10 @@ impl Editor {
 
     #[allow(clippy::too_many_lines)]
     fn persist_recovery(self, save_app_preferences: bool) {
+        if browser::is_hosted() {
+            browser::set_unsaved(true);
+            return;
+        }
         let cell = self.runtime.peek().clone();
         {
             let mut borrow = cell.borrow_mut();
@@ -924,13 +934,13 @@ impl Editor {
             };
             runtime.save_generation += 1;
             runtime.save_pending = true;
+            self.set_recovery_status(RecoveryStatus::Pending);
             browser::set_unsaved(true);
             if runtime.save_running {
                 return;
             }
             runtime.save_running = true;
         }
-        self.report("변경사항 저장 대기 중…");
         spawn_local(async move {
             loop {
                 let delay = cell.borrow().as_ref().map_or(0.0, |runtime| {
@@ -963,7 +973,7 @@ impl Editor {
                     browser::record_work("recovery_capture", started);
                     result
                 };
-                self.report("브라우저에 저장 중…");
+                self.set_recovery_status(RecoveryStatus::Saving);
                 let (generation, request, download) = match prepared {
                     Ok(value) => value,
                     Err(error) => {
@@ -971,7 +981,7 @@ impl Editor {
                             runtime.save_running = false;
                             runtime.worker_failed = true;
                         }
-                        self.report("브라우저 저장 실패");
+                        self.set_recovery_status(RecoveryStatus::Failed);
                         self.warn(format!(
                             "자동 복구 저장 실패 · 작업 저장으로 내려받으세요: {error}"
                         ));
@@ -991,7 +1001,7 @@ impl Editor {
                     runtime.save_running = false;
                     runtime.worker_failed = true;
                     drop(borrow);
-                    self.report("브라우저 저장 실패");
+                    self.set_recovery_status(RecoveryStatus::Failed);
                     self.warn(format!(
                         "브라우저 저장 실패 · 작업 파일을 내려받으세요: {}",
                         browser::error_text(&error)
@@ -1009,17 +1019,21 @@ impl Editor {
                 if download {
                     let bytes = Uint8Array::new(&result.unwrap_or(JsValue::NULL));
                     browser::download_bytes(&bytes, "drawing.ntdr", "application/octet-stream");
+                    self.report(
+                        "작업 파일 다운로드를 요청했습니다. 브라우저 다운로드를 확인하세요.",
+                    );
                 }
                 if pending {
                     continue;
                 }
                 if current {
                     browser::set_unsaved(false);
-                    self.report(if self.read(|r| r.gpu_failed).unwrap_or(false) {
-                        "화면 표시 중단 · 복구 저장 완료 · 작업 파일을 내려받은 후 새로고침해주세요"
-                    } else {
-                        "이 브라우저에 저장됨 · 중요한 그림은 작업 파일로 보관하세요"
-                    });
+                    self.set_recovery_status(RecoveryStatus::Saved);
+                    if self.read(|r| r.gpu_failed).unwrap_or(false) {
+                        self.warn("화면 표시 중단 · 복구 저장 완료 · 작업 파일을 내려받은 후 새로고침해주세요");
+                    }
+                } else {
+                    self.set_recovery_status(RecoveryStatus::Pending);
                 }
                 return;
             }
@@ -1027,6 +1041,7 @@ impl Editor {
     }
 
     pub fn download_project(self) {
+        self.report("작업 파일 다운로드 준비 중…");
         if browser::is_hosted() {
             let result = {
                 let cell = self.runtime.peek().clone();
@@ -1037,11 +1052,7 @@ impl Editor {
                 runtime.document.encode_ntdr()
             };
             match result {
-                Ok(bytes) => browser::download_bytes(
-                    &Uint8Array::from(bytes.as_slice()),
-                    "drawing.ntdr",
-                    "application/octet-stream",
-                ),
+                Ok(bytes) => self.download_project_bytes(&bytes),
                 Err(error) => self.warn(error),
             }
             return;
@@ -1067,13 +1078,18 @@ impl Editor {
             runtime.document.encode_ntdr()
         };
         match result {
-            Ok(bytes) => browser::download_bytes(
-                &Uint8Array::from(bytes.as_slice()),
-                "drawing.ntdr",
-                "application/octet-stream",
-            ),
+            Ok(bytes) => self.download_project_bytes(&bytes),
             Err(error) => self.warn(error),
         }
+    }
+
+    fn download_project_bytes(self, bytes: &[u8]) {
+        browser::download_bytes(
+            &Uint8Array::from(bytes),
+            "drawing.ntdr",
+            "application/octet-stream",
+        );
+        self.report("작업 파일 다운로드를 요청했습니다. 브라우저 다운로드를 확인하세요.");
     }
 
     pub fn download_recovery(self) {
@@ -1111,11 +1127,14 @@ impl Editor {
             return;
         };
         match result {
-            Ok(bytes) => browser::download_bytes(
-                &Uint8Array::from(bytes.as_slice()),
-                "drawing.png",
-                "image/png",
-            ),
+            Ok(bytes) => {
+                browser::download_bytes(
+                    &Uint8Array::from(bytes.as_slice()),
+                    "drawing.png",
+                    "image/png",
+                );
+                self.report("PNG 다운로드를 요청했습니다. 브라우저 다운로드를 확인하세요.");
+            }
             Err(error) => self.warn(error),
         }
     }
@@ -1404,6 +1423,7 @@ impl Editor {
             }
             browser::set_canvas_tool(canvas_input_mode(DrawingTool::MoveSelection));
             self.refresh();
+            self.report("이미지를 가져왔습니다. 위치를 조정한 뒤 확정하세요.");
             Ok::<(), String>(())
         }
         .await;
@@ -1480,6 +1500,7 @@ impl Editor {
                 self.refresh();
                 self.redraw();
                 self.persist_recovery(false);
+                self.report("새 그림으로 전환했습니다.");
                 if let Some(notice) = import_notice {
                     self.warn(notice);
                 }

@@ -119,7 +119,14 @@ html.dock-resizing-height, html.dock-resizing-height * { cursor: row-resize !imp
 .dock-tab.active { background: #898989; color: #fff; }
 .dock-tabs > .dock-panel > .panel-header { display: none; }
 
-.canvas-panel { position: relative; display: flex; flex: 1 1 0; padding: 17px; overflow: hidden; background: #181818; }
+.canvas-panel { position: relative; display: flex; flex-direction: column; flex: 1 1 0; padding: 17px; overflow: hidden; background: #181818; }
+.selection-context { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; flex: none; min-width: 0; padding: 3px 6px; background: #444; color: #fff; }
+.selection-context-status { flex: 1 1 140px; min-width: 0; font-size: 12px; }
+.selection-context-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+.selection-context-actions button { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; min-height: 32px; padding: 4px 7px; background: #666; border: 1px solid #888; }
+.selection-context-actions .icon { width: 17px; height: 17px; }
+.selection-context-actions kbd { font: inherit; font-size: 10px; }
+.selection-context-error { flex-basis: 100%; min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
 .workspace-error-notice { position: absolute; inset: 16px 16px auto; z-index: 10; max-height: 70%; overflow: auto; padding: 16px; border: 1px solid #777; background: #333; color: #fff; }
 .canvas-frame { display: flex; min-width: 0; min-height: 0; flex: 1 1 0; padding: 2px; overflow: hidden; background: #050505; border: 1px solid #000; }
 #shared-gpu-canvas { display: block; width: 100%; height: 100%; flex: 1 1 0; border: 0; border-radius: 0; }
@@ -187,13 +194,13 @@ html.dock-resizing-height, html.dock-resizing-height * { cursor: row-resize !imp
 .size-number { text-align: right; font-variant-numeric: tabular-nums; }
 .size-option.active { box-shadow: inset 0 0 0 1px #eee; background: #606060; }
 
-.navigator-panel { display: flex; width: 100%; min-height: 0; flex-direction: column; }
-.navigator-preview { display: grid; min-height: 0; flex: 1; padding: 8px; place-items: center; }
+.navigator-panel { display: flex; width: 100%; min-width: 0; min-height: 0; overflow: hidden; flex-direction: column; }
+.navigator-preview { display: grid; min-width: 0; min-height: 0; flex: 1 1 0px; padding: 8px; place-items: center; overflow: hidden; grid-template: minmax(0, 1fr) / minmax(0, 1fr); }
 .navigator-canvas { position: relative; flex: 0 0 auto; overflow: hidden; outline: 2px solid #111; outline-offset: 0; background-color: #fff; background-image: linear-gradient(45deg,#e4e4e4 25%,transparent 25%),linear-gradient(-45deg,#e4e4e4 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#e4e4e4 75%),linear-gradient(-45deg,transparent 75%,#e4e4e4 75%); background-position: 0 0,0 5px,5px -5px,-5px 0; background-size: 10px 10px; cursor: crosshair; touch-action: none; user-select: none; }
 .navigator-canvas.dragging { cursor: grabbing; }
 .navigator-image { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; pointer-events: none; }
 .viewport-box { position: absolute; inset: 0; background: rgba(255,255,255,.10); box-shadow: inset 0 0 0 2px #555, inset 0 0 0 3px #fff; pointer-events: none; }
-.navigator-actions { display: flex; flex: 0 0 32px; align-items: center; justify-content: center; gap: 3px; background: #777; border-top: 1px solid #686868; }
+.navigator-actions { display: flex; flex: 0 0 32px; min-height: 32px; align-items: center; justify-content: center; gap: 3px; background: #777; border-top: 1px solid #686868; }
 .navigator-actions button { display: grid; width: 27px; height: 25px; place-items: center; }
 .navigator-actions .icon { width: 16px; height: 16px; }
 .navigator-actions .nav-mode { width: 31px; font-size: 10px; font-weight: 700; }
@@ -251,8 +258,6 @@ html.dock-resizing-height, html.dock-resizing-height * { cursor: row-resize !imp
 .layer-solo { font-size: 12px; font-weight: 700; }
 .layer-solo .icon { width: 16px; height: 16px; }
 .layer-solo.active { background: #3b7fa0; color: #fff; }
-.layer-delete { display: grid; width: 22px; height: 28px; place-items: center; }
-.layer-delete .icon { width: 17px; height: 17px; }
 .layer-tree { width: 17px; font-size: 16px; }
 .layer-tree .icon { width: 15px; height: 15px; }
 .layer-thumb { display: grid; width: 50px; height: 56px; place-items: center; overflow: hidden; border: 1px solid #4b4b4b; background: #fff; }
@@ -264,8 +269,8 @@ html.dock-resizing-height, html.dock-resizing-height * { cursor: row-resize !imp
 .layer-name:focus { outline: 1px solid #d8e9ee; background: #555; }
 .layer-row { touch-action: pan-y; }
 .layer-thumb, .layer-name[readonly], .layer-detail { cursor: pointer; user-select: none; }
-.layer-row-actions { display: flex; flex-direction: column; align-items: center; }
-.layer-reorder-handle { display: grid; place-items: center; width: 24px; height: 30px; cursor: grab; touch-action: none; user-select: none; }
+.layer-row-actions { display: flex; align-self: stretch; align-items: stretch; }
+.layer-reorder-handle { display: grid; place-items: center; width: 24px; min-height: 44px; cursor: grab; touch-action: none; user-select: none; }
 .layer-reorder-handle .icon { width: 18px; height: 18px; }
 .layer-pointer-dragging, .layer-pointer-dragging * { cursor: grabbing !important; user-select: none !important; }
 .layer-pointer-source { opacity: .55; }
@@ -338,6 +343,9 @@ html.dock-resizing-height, html.dock-resizing-height * { cursor: row-resize !imp
 .selection-toolbar { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 4px; }
 .selection-toolbar button { display: grid; place-items: center; height: 32px; border: 1px solid #aaa; border-radius: 2px; background: #707070; }
 .selection-toolbar .icon { width: 21px; height: 21px; }
+.selection-mode { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 3px; }
+.selection-mode button { min-height: 32px; padding: 2px; font-size: 12px; border: 1px solid #aaa; background: #707070; }
+.selection-mode button[aria-pressed="true"] { background: #444; outline: 1px solid #eee; outline-offset: -1px; }
 .edit-tool-properties .selection-actions .property-row { margin: 2px 0; }
 .selection-morph-actions { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 6px; }
 .selection-morph-actions button { display: flex; align-items: center; justify-content: center; gap: 6px; min-height: 28px; border: 1px solid #aaa; border-radius: 2px; background: #707070; }
@@ -440,6 +448,11 @@ html.dock-resizing-height, html.dock-resizing-height * { cursor: row-resize !imp
 .layer-mask-popover button { padding: 8px; text-align: left; font-size: 12px; }
 .layer-mask-popover button:hover:not(:disabled), .layer-mask-popover button:focus-visible { background: #777; outline: 1px solid #ddd; }
 .layer-mask-popover .mask-menu-close { margin-top: 3px; border-top: 1px solid #888; }
+.mask-menu-heading { padding: 4px 8px 1px; font-size: 12px; overflow-wrap: anywhere; }
+.mask-menu-status { padding: 0 8px 7px; font-size: 11px; color: #ddd; border-bottom: 1px solid #777; }
+.mask-menu-remove { margin-top: 4px; border-top: 1px solid #777; }
+.mask-remove-confirm { display: flex; flex-direction: column; gap: 3px; }
+.mask-remove-confirm p { margin: 4px 8px; font-size: 12px; line-height: 1.4; }
 .mask-target-guidance { padding: 5px 0; font-size: 11px; }
 .mask-target-guidance p { margin: 0 0 5px; line-height: 1.4; }
 .mask-target-guidance button { padding: 5px 7px; border: 1px solid #aaa; background: #555; color: #fff; }

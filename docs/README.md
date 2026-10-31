@@ -9,6 +9,8 @@
 
 | 문서 | 답하는 질문 |
 |---|---|
+| [드로잉 작업 동선 점검](ux-workflow-review.md) | Procreate/CSP와 비교해 어떤 UX 문제를 고쳤으며, 태블릿·메뉴·레이어 배치는 무엇을 더 바꿔야 하는가? |
+| [Procreate·CSP 동선 비교](research/drawing-ux-comparison.md) | 러프·선택·변형·채색·출력에서 무엇을 상시 표시하고 무엇을 문맥에 맞춰 여는가? |
 | [현재 우선순위](sprints/current-priorities.md) | 웹 편집 연결·새 그림/최근 그림 다음에 무엇을 결정하며, 아직 무엇을 시작하지 않는가? |
 | [실사용 UX 수정 묶음](sprints/ux-feedback.md) | 취소·도구·색상·레이어·자체 연필을 어디까지 구현하고 어느 실행본을 검증했는가? |
 | [이번 UX 요청 체크리스트](sprints/ux-feedback-checklist.md) | 요청별로 구현된 것·일부 남은 것·미구현과 최신 빌드 검증을 어떻게 구별하는가? |
