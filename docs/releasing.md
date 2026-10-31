@@ -11,12 +11,29 @@ Windows 그림 이동에는 작업자 기반 임시 픽셀 미리보기를 추�
 변경 타일만 올리며 취소 시 원본을 복원한다. 내비게이터 미리보기는
 하단 버튼을 덮지 않도록 표시 크기와 입력 좌표를 함께 맞춘다.
 
-- 전체 workspace 테스트 312개, 전체/웹 Clippy, fmt, DX Windows/웹 release 빌드 통과.
+- 전체 workspace 테스트 280개, 전체/웹 Clippy, fmt, DX Windows/웹 release 빌드 통과.
 - Edge의 드래그 중 표시·취소·Undo 및 프로세스 종료 후 자동 복구/NTDR 재열기에서
   앱 출력 PNG 기준 RGBA 일치. 메뉴·키보드·터치 에뮬레이션 검사 통과.
 - Windows release 시험 창은 실행했으나 수동 조작 검사가 중단되어 최종 네이티브
   드래그 표시와 설치 업데이트는 미검증. 물리 iPad/Pencil/Windows 펜 검증도 별도다.
-- 태그 CI·자산·공개 웹 결과는 게시 후 이 항목에 덧붙인다.
+- `88caa8e`의 [Windows CI](https://github.com/nyabia/nyatidraw/actions/runs/41171601359)가
+  성공했다. [웹 게시](https://github.com/nyabia/nyatidraw/actions/runs/41171601342)도 성공했다.
+  공개 홈페이지·편집기·복구 Worker 12개 파일은 해당 Pages 산출물과 바이트 단위로 일치했다.
+- 새 Edge 프로필로 공개 웹에서 레이어 메뉴·취소 초점·도움말·그리기·자동 복구·PNG 출력을
+  확인했다. 브라우저 프로세스 종료 후 복구 출력은 이전 PNG와 정확히 같은 RGBA였다.
+  이 첫 웹 게시의 다운로드 안내는 당시 공개 중인 alpha.21을 가리켰다.
+- 공개 iframe 데모에서 64×64 새 그림 교체 후 허위 저장 실패 알림과 자동 복구 표시가
+  모두 없었으며, 완료 시 호스트가 330-byte PNG를 수신했다.
+- `v0.1.0-alpha.22`의 [릴리즈 작업](https://github.com/nyabia/nyatidraw/actions/runs/41171601333)은
+  Windows 패키징·공개와 Pages 게시까지 성공했다. 자산 7개의 GitHub 크기·SHA256,
+  `SHA256SUMS.txt`의 6개 항목, JSON·legacy 업데이트 피드와 포터블 구성을 확인했다.
+  설치 파일은 14,892,183 bytes이며 SHA256은
+  `59ff4157121fc10f242e55590b8690fa1b2a95da315ec39f9c7d22f14d5f7d09`다.
+  사용자 설치본은 교체하지 않았다.
+- 이 작업의 Pages 산출물은 alpha.22 안내를 포함하지만 기본 공개 `release.json`과
+  실제 Edge 다운로드 버튼에는 alpha.21이 남아 있었다. 편집기 본체와 Worker 파일은
+  검증한 새 코드와 같았다. Worker manifest 차이는 JSON 키 순서뿐이다.
+  다운로드 안내를 맞추기 위해 홈페이지를 다시 게시한다. Windows 태그와 자산은 변경하지 않는다.
 
 [릴리즈 노트](releases/0.1.0-alpha.22.md), [검증 상세](ux-workflow-review.md).
 
