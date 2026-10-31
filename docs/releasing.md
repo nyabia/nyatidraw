@@ -33,7 +33,13 @@ Windows 그림 이동에는 작업자 기반 임시 픽셀 미리보기를 추�
 - 이 작업의 Pages 산출물은 alpha.22 안내를 포함하지만 기본 공개 `release.json`과
   실제 Edge 다운로드 버튼에는 alpha.21이 남아 있었다. 편집기 본체와 Worker 파일은
   검증한 새 코드와 같았다. Worker manifest 차이는 JSON 키 순서뿐이다.
-  다운로드 안내를 맞추기 위해 홈페이지를 다시 게시한다. Windows 태그와 자산은 변경하지 않는다.
+  Windows 태그와 자산은 변경하지 않았다.
+- 검증 문서 커밋 `225805a`의
+  [홈페이지 재게시](https://github.com/nyabia/nyatidraw/actions/runs/41173196477)가 성공했다.
+  기본 공개 `release.json`과 실제 Edge 다운로드 버튼 모두 alpha.22 설치 링크를 가리켰다.
+  홈페이지·편집기·Worker 12개 파일은 최종 Pages 산출물과 바이트 단위로 일치했다.
+  웹 본체와 Worker 코드는 앞서 공개 조작·저장·재열기를 검증한 파일과 동일하다.
+  이전 게시가 오래된 안내를 반환한 원인은 로그만으로 확정하지 못했다.
 
 [릴리즈 노트](releases/0.1.0-alpha.22.md), [검증 상세](ux-workflow-review.md).
 
