@@ -29,6 +29,14 @@ pub struct FrameThumbnailSnapshot {
 
 impl FrameThumbnailSnapshot {
     #[must_use]
+    pub fn displayed_frame(&self, id: FrameId) -> Option<Arc<FrameThumbnailFrame>> {
+        self.frames
+            .get(&id)
+            .filter(|frame| frame.project_epoch == self.project_epoch)
+            .cloned()
+    }
+
+    #[must_use]
     pub fn frame(&self, id: FrameId) -> Option<Arc<FrameThumbnailFrame>> {
         self.frames
             .get(&id)
@@ -95,7 +103,6 @@ impl FrameThumbnailCache {
 
     pub fn invalidate(&mut self) {
         self.snapshot.generation = self.snapshot.generation.saturating_add(1);
-        self.snapshot.frames.clear();
         self.attempted.clear();
     }
 
@@ -158,6 +165,8 @@ impl FrameThumbnailCache {
                     break;
                 }
             }
+        } else {
+            self.snapshot.frames.remove(&request.frame);
         }
         true
     }

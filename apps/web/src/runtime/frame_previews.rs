@@ -1,4 +1,4 @@
-use dioxus::prelude::ReadableExt;
+use crate::model_state::ReadableExt;
 use nyatidraw_api::FrameId;
 use nyatidraw_editor_ui::preview::{
     FrameThumbnailCache, FrameThumbnailRequest, FrameThumbnailSnapshot, frame_thumbnail_frame,

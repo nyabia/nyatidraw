@@ -184,7 +184,12 @@ pub fn edit_allowed_on_mask(command: &nyatidraw_api::EditCommand) -> bool {
     use nyatidraw_api::EditCommand as C;
     matches!(
         command,
-        C::PickColor { .. }
+        C::ColorAdjustment(
+            nyatidraw_api::ColorAdjustmentCommand::BeginLayer(_)
+                | nyatidraw_api::ColorAdjustmentCommand::Preview(_)
+                | nyatidraw_api::ColorAdjustmentCommand::Commit { .. }
+                | nyatidraw_api::ColorAdjustmentCommand::Cancel
+        ) | C::PickColor { .. }
             | C::PickDisplayColor { .. }
             | C::ResizePage { .. }
             | C::SelectWand { .. }

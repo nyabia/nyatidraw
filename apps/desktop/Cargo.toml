@@ -3,10 +3,31 @@ name = "nyatidraw-desktop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+default-run = "nyatidraw-gpui-desktop"
+
+[features]
+default = ["gpui"]
+legacy-ui = ["dep:dioxus", "dep:dioxus-desktop", "nyatidraw-editor-ui/chrome"]
+gpui = ["dep:gpui-kit", "dep:nyatidraw-editor-gpui", "dep:async-channel", "dep:base64"]
+
+[[bin]]
+name = "nyatidraw-desktop"
+path = "src/main.rs"
+required-features = ["legacy-ui"]
+
+[[bin]]
+name = "nyatidraw-gpui-desktop"
+path = "src/gpui.rs"
+required-features = ["gpui"]
+test = false
 
 [dependencies]
-dioxus.workspace = true
-dioxus-desktop.workspace = true
+dioxus = { workspace = true, optional = true }
+dioxus-desktop = { workspace = true, optional = true }
+async-channel = { version = "=2.5.0", optional = true }
+base64 = { version = "=0.22.1", optional = true }
+gpui-kit = { workspace = true, optional = true }
+nyatidraw-editor-gpui = { workspace = true, optional = true }
 nyatidraw-api.workspace = true
 nyatidraw-brush.workspace = true
 nyatidraw-document.workspace = true
@@ -53,3 +74,6 @@ windows = { version = "=0.62.2", features = [
 
 [lints]
 workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "=3.0.12"

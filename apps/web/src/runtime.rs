@@ -1,6 +1,6 @@
 use std::{cell::RefCell, io::Cursor, rc::Rc};
 
-use dioxus::prelude::*;
+use crate::model_state::{ReadableExt, Signal, WritableExt};
 use js_sys::{Array, Uint8Array};
 use nyatidraw_api::DrawingTool;
 use nyatidraw_input::{LivePressureMapper, Point, PointerPhase, PressurePreset, ViewportTransform};
@@ -21,6 +21,36 @@ pub use recovery_status::RecoveryStatus;
 const RECOVERY_QUIET_MS: f64 = 600.0;
 const RECOVERY_MAX_WAIT_MS: f64 = 3000.0;
 const PREVIEW_DELAY_MS: f64 = 200.0;
+
+/// Downloads the original stored bytes, including projects from older web versions.
+///
+/// # Errors
+/// Returns a message if the standalone recovery store is unavailable or empty.
+pub async fn download_recovery_file() -> Result<(), String> {
+    if !browser::can_start_standalone() {
+        return Err("연결된 편집 세션에는 브라우저 자동 복구 파일이 없습니다.".into());
+    }
+    let saved = JsFuture::from(browser::load_workspace())
+        .await
+        .map_err(|error| {
+            format!(
+                "복구 데이터를 읽지 못했습니다. 기존 데이터는 유지됩니다: {}",
+                browser::error_text(&error)
+            )
+        })?;
+    if saved.is_null() {
+        return Err("이 브라우저에 저장된 작업이 없습니다.".into());
+    }
+    let bytes = Uint8Array::new(&saved);
+    let header = bytes.subarray(0, 8).to_vec();
+    let filename = if header == b"NYWEB001" || header == b"NYWEB002" {
+        "recovered.nyatidraw-web"
+    } else {
+        "recovered.ntdr"
+    };
+    browser::download_bytes(&bytes, filename, "application/octet-stream");
+    Ok(())
+}
 
 fn hosted_project(config: &Array) -> Result<WebProject, String> {
     let width = config
@@ -297,7 +327,10 @@ impl Editor {
         self,
         operation: impl FnOnce(&mut WebDocument) -> Result<CanvasUpdate, WebError>,
     ) -> Result<(), String> {
-        if self.modal.peek().is_some() || (self.integration_busy)() || (self.integration_closed)() {
+        if self.modal.peek().is_some()
+            || *self.integration_busy.peek()
+            || *self.integration_closed.peek()
+        {
             return Err("열려 있는 대화상자를 먼저 닫아주세요.".into());
         }
         let cell = self.runtime.peek().clone();
@@ -379,7 +412,7 @@ impl Editor {
         clippy::too_many_lines
     )]
     pub fn input(mut self, phase: &str, x: f64, y: f64, pressure: f64, time_ms: f64, is_pen: bool) {
-        if (self.integration_busy)() || (self.integration_closed)() {
+        if *self.integration_busy.peek() || *self.integration_closed.peek() {
             return;
         }
         if self
@@ -1095,31 +1128,9 @@ impl Editor {
     }
 
     pub fn download_recovery(self) {
-        if !browser::can_start_standalone() {
-            self.warn("연결된 편집 세션에는 브라우저 자동 복구 파일이 없습니다.");
-            return;
-        }
         spawn_local(async move {
-            match JsFuture::from(browser::load_workspace()).await {
-                Ok(saved) if saved.is_null() => self.warn("이 브라우저에 저장된 작업이 없습니다."),
-                Ok(saved) => {
-                    let bytes = Uint8Array::new(&saved);
-                    let header = bytes.subarray(0, 8).to_vec();
-                    let legacy = header == b"NYWEB001" || header == b"NYWEB002";
-                    browser::download_bytes(
-                        &bytes,
-                        if legacy {
-                            "recovered.nyatidraw-web"
-                        } else {
-                            "recovered.ntdr"
-                        },
-                        "application/octet-stream",
-                    );
-                }
-                Err(error) => self.warn(format!(
-                    "복구 데이터를 읽지 못했습니다. 기존 데이터는 유지됩니다: {}",
-                    browser::error_text(&error)
-                )),
+            if let Err(error) = download_recovery_file().await {
+                self.warn(error);
             }
         });
     }
@@ -1142,7 +1153,7 @@ impl Editor {
     }
 
     pub fn download_scaled_png(mut self, size: [u32; 2]) {
-        if (self.exporting_png)() {
+        if *self.exporting_png.peek() {
             return;
         }
         let Some(result) = self.read(|runtime| {
@@ -1216,7 +1227,7 @@ impl Editor {
     }
 
     pub fn copy_png(mut self) {
-        if (self.copying_png)() {
+        if *self.copying_png.peek() {
             self.warn("PNG 복사가 진행 중입니다. 잠시 기다려주세요.");
             return;
         }
@@ -1262,7 +1273,8 @@ impl Editor {
     }
 
     pub fn complete_integration(mut self) {
-        if !browser::is_hosted() || (self.integration_busy)() || (self.integration_closed)() {
+        if !browser::is_hosted() || *self.integration_busy.peek() || *self.integration_closed.peek()
+        {
             return;
         }
         let Some(result) = self.read(|runtime| {
@@ -1313,7 +1325,8 @@ impl Editor {
     }
 
     pub fn cancel_integration(mut self) {
-        if !browser::is_hosted() || (self.integration_busy)() || (self.integration_closed)() {
+        if !browser::is_hosted() || *self.integration_busy.peek() || *self.integration_closed.peek()
+        {
             return;
         }
         self.close_modal();

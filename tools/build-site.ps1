@@ -10,17 +10,18 @@ $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 & (Join-Path $PSScriptRoot 'build-docs.ps1')
 $destination = Join-Path $repositoryRoot 'target/site'
 if (-not $WebPublicDirectory) {
-    $candidate = Join-Path $repositoryRoot 'target/dx/nyatidraw-web/release/web/public'
+    $candidate = Join-Path $repositoryRoot 'target/gpui-web/release/public'
     if (Test-Path -LiteralPath $candidate -PathType Container) { $WebPublicDirectory = $candidate }
 }
 if ($WebPublicDirectory) {
     $WebPublicDirectory = [IO.Path]::GetFullPath($WebPublicDirectory)
-    if (-not (Test-Path -LiteralPath (Join-Path $WebPublicDirectory 'index.html') -PathType Leaf)) {
-        throw 'The web editor public directory must contain index.html.'
+    foreach ($asset in @('index.html', 'start.js', 'pkg/editor.js', 'pkg/editor_bg.wasm')) {
+        $path = Join-Path $WebPublicDirectory $asset
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+            (Get-Item -LiteralPath $path).Length -eq 0) {
+            throw "GPUI web editor output is incomplete: $asset"
+        }
     }
-    $wasm = Get-ChildItem -LiteralPath $WebPublicDirectory -Filter '*.wasm' -Recurse -File | Select-Object -First 1
-    $javascript = Get-ChildItem -LiteralPath $WebPublicDirectory -Filter '*.js' -Recurse -File | Select-Object -First 1
-    if (-not $wasm -or -not $javascript) { throw 'Web editor output is incomplete: wasm and JavaScript are required.' }
     $workerRoot = Join-Path $WebPublicDirectory 'worker'
     $workerManifest = Get-Content -LiteralPath (Join-Path $workerRoot 'manifest.json') -Raw | ConvertFrom-Json
     if ($workerManifest.protocol -ne 1) { throw 'Unsupported recovery Worker protocol.' }
@@ -34,7 +35,7 @@ if ($WebPublicDirectory) {
         -not (Get-ChildItem -LiteralPath $workerRoot -Filter 'ntdr-*.js' -File)) {
         throw 'Recovery Worker WASM bindings are missing.'
     }
-    $header = @(Get-Content -LiteralPath $wasm.FullName -AsByteStream -TotalCount 4)
+    $header = @(Get-Content -LiteralPath (Join-Path $WebPublicDirectory 'pkg/editor_bg.wasm') -AsByteStream -TotalCount 4)
     if (($header -join ',') -ne '0,97,115,109') { throw 'Web editor output does not contain a valid WebAssembly header.' }
 }
 elseif ($RequireWeb) {

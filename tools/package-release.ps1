@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$source = Join-Path $repositoryRoot 'target/dx/nyatidraw-desktop/release/windows/app'
+$sourceExecutable = Join-Path $repositoryRoot 'target/release/nyatidraw-gpui-desktop.exe'
 $toolRoot = Join-Path $repositoryRoot '.nyatidraw/toolchains/vpk-1.2.0'
 $archive = Join-Path $repositoryRoot 'target/vpk-1.2.0.zip'
 $tool = Join-Path $toolRoot 'tools/net8.0/any/vpk.dll'
@@ -18,15 +18,14 @@ if (-not (Test-Path $tool)) {
     }
     Expand-Archive -LiteralPath $archive -DestinationPath $toolRoot -Force
 }
-if (-not (Test-Path (Join-Path $source 'nyatidraw-desktop.exe'))) { throw 'Build the release app first.' }
+if (-not (Test-Path -LiteralPath $sourceExecutable -PathType Leaf)) { throw 'Build the release app first.' }
 $output = Join-Path $repositoryRoot "target/releases/$Version"
 if (Test-Path $output) { throw "Release output already exists; preserve it and choose a new version: $output" }
 New-Item -ItemType Directory -Force $output | Out-Null
-# A dedicated stage avoids mutating the Dioxus output or packaging developer files.
+# Stage only the application and its notices.
 $stage = Join-Path $output 'stage'
 New-Item -ItemType Directory $stage | Out-Null
-Copy-Item (Join-Path $source '*') $stage -Recurse
-Rename-Item -LiteralPath (Join-Path $stage 'nyatidraw-desktop.exe') -NewName 'nyatidraw.exe'
+Copy-Item -LiteralPath $sourceExecutable -Destination (Join-Path $stage 'nyatidraw.exe')
 $notices = [Text.StringBuilder]::new()
 [void]$notices.AppendLine('NyatiDraw — third-party notices')
 [void]$notices.AppendLine([IO.File]::ReadAllText((Join-Path $repositoryRoot 'THIRD-PARTY-ASSETS.txt')))
@@ -53,7 +52,7 @@ $versionText = (Get-Item -LiteralPath $tool).VersionInfo.ProductVersion
 if ($versionText -notmatch '^1\.2\.0(?:\+|$)') { throw 'Expected Velopack packager 1.2.0.' }
 # Keep the new identity off the legacy Alpha feed: its shipped updater does not
 # filter package IDs. Alpha is a release maturity label, not an install identity.
-& $Dotnet $tool pack --packId NyatiDraw --packVersion $Version --packDir $stage --mainExe nyatidraw.exe --packTitle NyatiDraw --packAuthors nyabia --channel nyatidraw-alpha --runtime win-x64 --framework webview2 --delta None --shortcuts StartMenuRoot --icon (Join-Path $repositoryRoot 'apps/desktop/assets/nyatidraw.ico') --outputDir $output
+& $Dotnet $tool pack --packId NyatiDraw --packVersion $Version --packDir $stage --mainExe nyatidraw.exe --packTitle NyatiDraw --packAuthors nyabia --channel nyatidraw-alpha --runtime win-x64 --delta None --shortcuts StartMenuRoot --icon (Join-Path $repositoryRoot 'apps/desktop/assets/nyatidraw.ico') --outputDir $output
 if ($LASTEXITCODE -ne 0) { throw 'Installer packaging failed.' }
 $setup = Get-ChildItem -LiteralPath $output -Filter '*Setup.exe' -File | Select-Object -First 1
 if (-not $setup) { throw 'Installer was not produced.' }

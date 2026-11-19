@@ -51,7 +51,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         run: |
-          ./tools/setup-ci.ps1
           ./tools/build-dev.ps1
       - name: Package installer and update feed
         run: ./tools/package-release.ps1 -Version $env:RELEASE_VERSION
@@ -81,3 +80,5 @@ jobs:
       id-token: write
     # GITHUB_TOKEN release events do not start another workflow. Call Pages directly.
     uses: ./.github/workflows/pages.yml
+    with:
+      source_ref: ${{ github.sha }}

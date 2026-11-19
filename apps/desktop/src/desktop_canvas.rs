@@ -58,10 +58,12 @@ use crate::{
 };
 
 mod composition_surface;
+mod picker_overlay;
 mod present_trace;
 
 pub(crate) fn composition_host_enabled() -> bool {
-    std::env::var_os("NAYATI_COMPOSITION_HOST").is_some_and(|value| value == "1")
+    crate::GPUI_SHELL
+        || std::env::var_os("NAYATI_COMPOSITION_HOST").is_some_and(|value| value == "1")
 }
 
 const WM_NAYATI_REDRAW: u32 = WM_APP + 0x4e1;
@@ -82,17 +84,21 @@ pub(crate) struct DesktopCanvasHandle {
 }
 
 impl DesktopCanvasHandle {
+    #[cfg(feature = "legacy-ui")]
+    #[cfg_attr(
+        feature = "gpui",
+        allow(dead_code, reason = "Only the legacy shell uses this adapter.")
+    )]
     pub(crate) fn input_router_hwnd(&self) -> isize {
         self.hwnd.0 as isize
     }
     pub(crate) fn create(
-        parent_window: &Arc<dioxus_desktop::tao::window::Window>,
+        parent: HWND,
+        parent_anchor: Option<std::sync::Weak<dyn Send + Sync>>,
         live_ink: &LiveInkBridge,
         instance: PrimaryInstance,
-        exit_host: &Arc<Mutex<Option<RenderHost>>>,
+        exit_host: Option<&Mutex<Option<RenderHost>>>,
     ) -> Result<Self, String> {
-        use dioxus_desktop::tao::platform::windows::WindowExtWindows as _;
-        let parent = HWND(parent_window.hwnd() as *mut c_void);
         register_canvas_class()?;
 
         // WM_NCCREATE takes this Option exactly once. If creation later fails,
@@ -132,7 +138,7 @@ impl DesktopCanvasHandle {
         // WM_NCCREATE before CreateWindowExW returned.
         let state = unsafe { canvas_state(hwnd) }
             .ok_or_else(|| "child canvas state was not installed".to_owned())?;
-        let host = RenderHost::new(parent_window, hwnd.0 as isize, live_ink.clone());
+        let host = RenderHost::new(parent_anchor, hwnd.0 as isize, live_ink.clone());
         state.host = Some(host.clone());
 
         state.activation.attach_windows(parent, hwnd);
@@ -167,9 +173,11 @@ impl DesktopCanvasHandle {
                 )
             };
         }));
-        *exit_host
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(host.clone());
+        if let Some(exit_host) = exit_host {
+            *exit_host
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(host.clone());
+        }
         unsafe { SetTimer(Some(hwnd), CLOSE_TIMER, 50, None) };
         state.resize(hwnd);
         state.raw_mouse_hook = match nyatidraw_input_platform::WindowsRawMouseHook::install(
@@ -271,6 +279,32 @@ impl DesktopCanvasHandle {
         }
     }
 
+    #[cfg(feature = "gpui")]
+    #[cfg_attr(
+        feature = "legacy-ui",
+        allow(dead_code, reason = "Only the GPUI shell wakes commands directly.")
+    )]
+    pub(crate) fn wake_for_command(&self) {
+        self.lifetime.0.wake();
+    }
+
+    #[cfg(feature = "gpui")]
+    #[cfg_attr(
+        feature = "legacy-ui",
+        allow(dead_code, reason = "Only the GPUI shell forwards dock drags.")
+    )]
+    pub(crate) fn set_dock_drag(&self, active: bool) {
+        // SAFETY: the GPUI host calls on the owning window thread, outside canvas dispatch.
+        if let Some(state) = unsafe { canvas_state(self.hwnd) } {
+            state.dock_drag = active;
+        }
+    }
+
+    #[cfg(feature = "legacy-ui")]
+    #[cfg_attr(
+        feature = "gpui",
+        allow(dead_code, reason = "Only the legacy shell uses this adapter.")
+    )]
     pub(crate) fn repaint_underlay(&self) {
         // A changed web input region can invalidate the swapchain's visible
         // area even if canvas bounds stayed fixed. A fully covered child may
@@ -367,6 +401,14 @@ unsafe extern "system" fn close_wnd_proc(
     }
     // SAFETY: only this parent subclass owns data, until WM_NCDESTROY above.
     let state = unsafe { &*(data as *const CloseWindowState) };
+    if message == windows::Win32::UI::WindowsAndMessaging::WM_DESTROY {
+        // An external DestroyWindow bypasses WM_CLOSE. Retire the surface
+        // before Windows destroys child HWNDs, servicing synchronous DXGI
+        // calls while the render thread releases the swapchain.
+        let host = state.host.clone();
+        host.finish_before_window_destruction();
+        return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    }
     if message == WM_ACTIVATEAPP && wparam.0 == 0 {
         // Parent deactivation is not reliably delivered as child focus loss.
         // Post instead of reentering the child while parent state is borrowed.
@@ -449,6 +491,8 @@ fn register_canvas_class() -> Result<(), String> {
 }
 
 struct CanvasWindowState {
+    #[cfg(feature = "gpui")]
+    dock_drag: bool,
     raw_mouse_hook: Option<nyatidraw_input_platform::WindowsRawMouseHook>,
     live_ink: LiveInkBridge,
     // The HWND owns the single-instance guard for its full lifetime. Dioxus
@@ -470,6 +514,8 @@ impl CanvasWindowState {
     fn new(live_ink: LiveInkBridge, instance: PrimaryInstance) -> Self {
         let activation = instance.inbox();
         Self {
+            #[cfg(feature = "gpui")]
+            dock_drag: false,
             raw_mouse_hook: None,
             viewport: WindowsViewportInput::new(live_ink.clone()),
             mouse: WindowsMouseInput::new(live_ink.clone()),
@@ -759,8 +805,7 @@ unsafe extern "system" fn canvas_wnd_proc(
             // SAFETY: WM_NCDESTROY reclaims the HWND-owned allocation once.
             let state = unsafe { Box::from_raw(pointer) };
             state.live_ink.invalidate_canvas_viewport();
-            // The actor's strong Tao parent anchor prevents parent/child
-            // destruction until every surface is gone. No join is needed here.
+            // Parent close and destruction both retire the surface first.
             debug_assert!(state.host.as_ref().is_none_or(RenderHost::surface_retired));
             println!("desktop-render event=canvas-hwnd-destroyed surface-retired=true");
         }
@@ -784,6 +829,11 @@ unsafe extern "system" fn canvas_wnd_proc(
     let state = unsafe { canvas_state(hwnd) };
     if let Some(state) = state {
         match message {
+            #[cfg(feature = "gpui")]
+            windows::Win32::UI::WindowsAndMessaging::WM_NCHITTEST if state.dock_drag => {
+                // HTTRANSPARENT lets GPUI receive the drop through the drawing surface.
+                return LRESULT(-1);
+            }
             WM_NAYATI_CANCEL_INPUT | WM_KILLFOCUS => {
                 state.live_ink.invalidate_picker();
                 let timestamp = current_message(hwnd, message, wparam, lparam).time;
@@ -1614,7 +1664,9 @@ fn canvas_instance() -> Result<wgpu::Instance, String> {
     }
     if composition_host_enabled() {
         if !descriptor.backends.contains(wgpu::Backends::DX12) {
-            return Err("NAYATI_COMPOSITION_HOST=1 requires the dx12 backend".into());
+            return Err(
+                "Windows DirectComposition canvas presentation requires the dx12 backend".into(),
+            );
         }
         descriptor.backends = wgpu::Backends::DX12;
     }
@@ -1624,8 +1676,8 @@ fn canvas_instance() -> Result<wgpu::Instance, String> {
 fn hwnd_surface(instance: &wgpu::Instance, hwnd: HWND) -> Result<wgpu::Surface<'static>, String> {
     let mut raw_window =
         Win32WindowHandle::new(NonZeroIsize::new(hwnd.0 as isize).ok_or("child HWND is null")?);
-    // SAFETY: the render actor retains the child HWND and a strong Tao parent
-    // anchor until this surface and all GPU state drop.
+    // SAFETY: the parent subclass drains the render actor before destroying
+    // this child. Its HWND and HINSTANCE stay valid for the surface lifetime.
     raw_window.hinstance = NonZeroIsize::new(unsafe { GetWindowLongPtrW(hwnd, GWLP_HINSTANCE) });
     if raw_window.hinstance.is_none() {
         return Err("child HWND has no HINSTANCE".into());
@@ -1649,6 +1701,8 @@ pub(crate) struct CanvasSurfaceRenderer {
     pub(crate) queue: wgpu::Queue,
     pub(crate) config: wgpu::SurfaceConfiguration,
     presenter: TexturePresenter,
+    picker: Option<picker_overlay::PickerOverlay>,
+    origin: [i32; 2],
     pub(crate) canvas: SharedGpuCanvas,
     pub(crate) scale: f64,
     geometry_epoch: u64,
@@ -1666,13 +1720,21 @@ impl Drop for CanvasSurfaceRenderer {
 }
 
 impl CanvasSurfaceRenderer {
+    pub(crate) fn begin_close(&mut self) {
+        self.canvas
+            .begin_close(self.config.width, self.config.height, self.scale);
+    }
+
     pub(crate) fn new(hwnd: HWND, live_ink: LiveInkBridge) -> Result<Self, String> {
         let instance = canvas_instance()?;
         let composition = if composition_host_enabled() {
             // SAFETY: this actor holds the child's strong parent lifetime anchor.
             let parent = unsafe { GetParent(hwnd) }
                 .map_err(|error| format!("find canvas composition parent: {error}"))?;
-            Some(composition_surface::CompositionSurface::new(parent)?)
+            Some(composition_surface::CompositionSurface::new(
+                parent,
+                crate::GPUI_SHELL,
+            )?)
         } else {
             None
         };
@@ -1745,6 +1807,8 @@ impl CanvasSurfaceRenderer {
             queue,
             config,
             presenter,
+            picker: None,
+            origin: [0; 2],
             canvas,
             scale: 1.0,
             geometry_epoch: 0,
@@ -1772,6 +1836,7 @@ impl CanvasSurfaceRenderer {
     }
 
     fn try_resize_geometry(&mut self, geometry: Geometry) -> Result<(), String> {
+        self.origin = geometry.origin;
         let composition_changed = if let Some(owner) = &mut self.composition {
             let changed = owner.geometry(geometry)?;
             if !geometry.visible || geometry.width == 0 || geometry.height == 0 {
@@ -1844,6 +1909,13 @@ impl CanvasSurfaceRenderer {
         frame_mark(FrameMark::Render);
         self.canvas.poll_save_as(&self.device, &self.queue);
         if !self.configured {
+            if self.config.width >= 16 && self.config.height >= 16 {
+                self.canvas.apply_hidden_commands(
+                    self.config.width,
+                    self.config.height,
+                    self.scale,
+                );
+            }
             return Ok(());
         }
         // CreateWindowExW briefly exposes the child at 1x1 before the DOM
@@ -1886,8 +1958,25 @@ impl CanvasSurfaceRenderer {
         let target = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let picker = if crate::GPUI_SHELL
+            && let Some(snapshot) = self.live_ink.picker_snapshot()
+        {
+            let overlay = self.picker.get_or_insert_with(|| {
+                picker_overlay::PickerOverlay::new(&self.device, &self.presenter)
+            });
+            overlay.update(
+                &self.queue,
+                snapshot,
+                self.origin,
+                self.scale,
+                [self.config.width, self.config.height],
+            );
+            Some(&*overlay)
+        } else {
+            None
+        };
         self.presenter
-            .present(&self.device, &self.queue, &display.texture, &target);
+            .present(&self.device, &self.queue, &display.texture, &target, picker);
         self.trace_present(&frame, &display);
         frame.present();
         self.mask_present_trace
@@ -1977,7 +2066,7 @@ impl CanvasSurfaceRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.presenter
-            .present(&self.device, &self.queue, texture, &target);
+            .present(&self.device, &self.queue, texture, &target, None);
         self.mask_present_trace.sample_retained(
             &self.device,
             &self.queue,
@@ -2073,22 +2162,10 @@ impl TexturePresenter {
         queue: &wgpu::Queue,
         source: &wgpu::Texture,
         target: &wgpu::TextureView,
+        picker: Option<&picker_overlay::PickerOverlay>,
     ) {
         let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("nayati-desktop-present-bind-group"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&source_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        let bind_group = self.bind(device, &source_view, &self.sampler);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("nayati-desktop-present-encoder"),
         });
@@ -2111,8 +2188,33 @@ impl TexturePresenter {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
+            if let Some(picker) = picker {
+                picker.draw(&mut pass);
+            }
         }
         queue.submit([encoder.finish()]);
+    }
+
+    fn bind(
+        &self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("nyatidraw-present-texture"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        })
     }
 }
 

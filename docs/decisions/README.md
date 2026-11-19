@@ -77,3 +77,5 @@
 | 저장 형식 통합·로컬 검증 중 | [브라우저와 데스크톱의 NTDR 저장 형식 공유](ADR-0061-shared-ntdr-browser-storage.md). 별도 웹 파일 대신 같은 redb/레코드/타일 코덱을 사용한다. |
 | 로컬 검증 | [저장 Worker와 NTDR 복구](ADR-0062-worker-ntdr-recovery.md), [짧은 획과 연필 양자화](ADR-0063-short-stroke-contact-and-pencil-quantization.md) |
 | 공용 편집 연결·로컬 검증 | [선택·채움·변형·그룹·도킹과 저장 위치 없는 새 그림](ADR-0064-shared-editor-commands.md). 편집 코드는 공유하고 commit/클립보드/수명은 호스트가 담당한다. |
+
+Windows와 웹 편집 UI의 구현과 검증은 [ADR-0066](ADR-0066-gpui-editor.md)에 기록합니다.

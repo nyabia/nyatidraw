@@ -1,7 +1,7 @@
-#[cfg(windows)]
+#[cfg(all(windows, feature = "legacy-ui"))]
 use dioxus::prelude::*;
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "legacy-ui"))]
 #[component]
 pub(crate) fn SpriteExportButton() -> Element {
     let live_ink = use_context::<crate::live_ink::LiveInkBridge>();

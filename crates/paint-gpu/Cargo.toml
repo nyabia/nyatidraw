@@ -10,7 +10,11 @@ nyatidraw-brush.workspace = true
 nyatidraw-document.workspace = true
 nyatidraw-input.workspace = true
 nyatidraw-tiles.workspace = true
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wgpu.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = "=30.0.2"
 
 [dev-dependencies]
 nyatidraw-input.workspace = true

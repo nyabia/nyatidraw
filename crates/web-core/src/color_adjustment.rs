@@ -15,9 +15,9 @@ impl WebDocument {
         if self.is_drawing() || self.transform_projection().is_some() {
             return Err(WebError::StrokeInProgress);
         }
+        let tree = self.edit_tree()?;
         let mut adjustment = std::mem::take(&mut self.color_adjustment);
         let mut next = self.next_layer_id;
-        let tree = self.edit_tree()?;
         let selection = self.selection.clone();
         let target = self.active_layer();
         let result = adjustment.execute(

@@ -1082,6 +1082,16 @@ impl SharedGpuCanvas {
             .then_some([canvas.canvas_spec.width_px, canvas.canvas_spec.height_px])
     }
 
+    pub(crate) fn apply_hidden_commands(&mut self, width: u32, height: u32, scale: f64) {
+        if let CanvasState::Active(canvas) = &mut self.state {
+            let _ = canvas.render(width, height, scale, self.geometry_epoch);
+        }
+    }
+
+    pub(crate) fn has_pending_artwork(&self) -> bool {
+        matches!(&self.state, CanvasState::Active(canvas) if canvas.artwork_job.is_some() && !canvas.stroke.live_ink.workspace_failed())
+    }
+
     pub(crate) fn render(&mut self, width: u32, height: u32, scale: f64) -> Option<RenderedCanvas> {
         let CanvasState::Active(canvas) = &mut self.state else {
             return None;
@@ -3239,6 +3249,7 @@ impl ActiveCanvas {
             color_adjustment,
             Some(
                 nyatidraw_api::ColorAdjustmentCommand::Begin
+                    | nyatidraw_api::ColorAdjustmentCommand::BeginLayer(_)
                     | nyatidraw_api::ColorAdjustmentCommand::Preview(_)
             )
         ) || matches!(
@@ -9926,5 +9937,105 @@ mod tests {
         );
         assert!(png.is_file(), "source PNG remains untouched");
         std::fs::remove_dir_all(directory).expect("remove scratch pair directory");
+    }
+}
+
+#[cfg(test)]
+mod hidden_command_acceptance {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    #[ignore = "requires a real WGPU adapter; run explicitly"]
+    fn hidden_resize_receipt_and_project_reopen_preserve_canvas_size() {
+        const CHILD: &str = "NYATIDRAW_HIDDEN_RESIZE_REOPEN";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let location = ProjectLocation::Explicit {
+                path: PathBuf::from(path),
+                bootstrap_png: None,
+            };
+            let (_, _, _, spec, _, _) = open_materialization_session(&location).unwrap();
+            assert_eq!([spec.width_px, spec.height_px], [64, 48]);
+            return;
+        }
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("GPU adapter required");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("hidden resize acceptance"),
+            ..Default::default()
+        }))
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "nyatidraw-hidden-{}-{}.ntdr",
+            std::process::id(),
+            system_timestamp_ns()
+        ));
+        let location = ProjectLocation::Explicit {
+            path: path.clone(),
+            bootstrap_png: None,
+        };
+        let ink = LiveInkBridge::with_capacity(64, LIVE_LAYER);
+        let mut canvas = SharedGpuCanvas::new(ink.clone());
+        canvas.project_location = location;
+        canvas.resume(&adapter, &device, &queue);
+        let _ = canvas.render(640, 480, 1.0);
+        let before = ink.protocol_snapshot().0;
+        let rejected = ink
+            .push_tracked_command(
+                Revision(u64::MAX),
+                EditorCommand::Edit(EditCommand::ResizePage { size: [12, 12] }),
+            )
+            .unwrap();
+        canvas.apply_hidden_commands(640, 480, 1.0);
+        assert!(matches!(ink.take_command_receipt(rejected.0), Some(Err(_))));
+        assert_eq!(ink.protocol_snapshot().0.canvas, before.canvas);
+        let revision = ink.protocol_snapshot().0.revision;
+        let id = ink
+            .push_tracked_command(
+                revision,
+                EditorCommand::Edit(EditCommand::ResizePage { size: [64, 48] }),
+            )
+            .unwrap();
+        canvas.apply_hidden_commands(640, 480, 1.0);
+        assert_eq!(ink.take_command_receipt(id.0), Some(Ok(())));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while canvas.has_pending_artwork() {
+            assert!(Instant::now() < deadline, "hidden artwork did not settle");
+            std::thread::sleep(Duration::from_millis(2));
+            canvas.apply_hidden_commands(640, 480, 1.0);
+        }
+        assert_eq!(ink.protocol_snapshot().0.edit.error, None);
+        assert_eq!(
+            [
+                ink.protocol_snapshot().0.canvas.width_px,
+                ink.protocol_snapshot().0.canvas.height_px
+            ],
+            [64, 48]
+        );
+        let save = ink
+            .push_tracked_command(
+                ink.protocol_snapshot().0.revision,
+                EditorCommand::Project(ProjectCommand::Save),
+            )
+            .unwrap();
+        canvas.apply_hidden_commands(640, 480, 1.0);
+        assert_eq!(ink.take_command_receipt(save.0), Some(Ok(())));
+        canvas.begin_close(640, 480, 1.0);
+        canvas.suspend();
+        assert!(!ink.workspace_failed());
+        drop(canvas);
+        drop(ink);
+        assert!(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "native_canvas::hidden_command_acceptance::hidden_resize_receipt_and_project_reopen_preserve_canvas_size", "--ignored"])
+            .env(CHILD, &path).status().unwrap().success());
+        if path.with_extension("png").exists() {
+            std::fs::remove_file(path.with_extension("png")).unwrap();
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

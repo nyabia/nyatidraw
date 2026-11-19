@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>NyatiDraw</title>
+  <link rel="icon" href="data:,">
+  <style>
+    * { box-sizing: border-box }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #25252a; color: #eee; font: 14px system-ui, sans-serif }
+    body.hosted { padding-bottom: 46px }
+    [hidden] { display: none !important }
+    #drawing-canvas-slot { position: fixed; overflow: hidden; z-index: 1; touch-action: none }
+    #drawing-canvas-slot[data-dock-drag] { pointer-events: none }
+    #drawing-canvas { width: 100%; height: 100%; display: block; touch-action: none; outline: none }
+    #startup-status, #notice, #integration { position: fixed; z-index: 2; padding: 8px 12px; background: #24252a }
+    #recovery-status { position: fixed; right: 8px; bottom: 5px; z-index: 2; color: #aaa; background: #24252acc; padding: 3px 7px; border-radius: 4px; font-size: 11px; pointer-events: none }
+    .hosted #recovery-status { bottom: 50px }
+    #startup-status { inset: 50% auto auto 50%; transform: translate(-50%,-50%); max-width: 90vw }
+    #notice { bottom: 4px; left: 4px; max-width: min(640px,95vw) }
+    .hosted #notice { bottom: 48px }
+    #integration { bottom: 0; right: 0; left: 0; height: 46px; display: flex; gap: 8px; justify-content: flex-end }
+    dialog { color: #eee; background: #2d2e34; border: 1px solid #61636a; padding: 20px; max-width: 92vw }
+    dialog::backdrop { background: #0009 }
+    dialog h2 { font-size: 18px; margin-top: 0 }
+    button { font: inherit; padding: 4px 10px; cursor: pointer }
+    #picker { position: fixed; z-index: 2; pointer-events: none; width: 110px; padding: 4px; background: #24252a; text-align: center }
+    #picker img { display: block; width: 100%; image-rendering: pixelated }
+  </style>
+</head>
+<body>
+  <div id="drawing-canvas-slot"></div>
+  <aside id="picker" aria-label="스포이트 확대 미리보기" hidden><img alt=""><span></span></aside>
+  <div id="recovery-status" hidden></div>
+  <div id="startup-status" role="status"><span>편집기를 여는 중…</span> <button data-action="recovery" hidden>복구 원본 내려받기</button></div>
+  <div id="notice" role="alert" hidden><span></span> <button data-action="dismiss-notice">닫기</button></div>
+  <nav id="integration" aria-label="호스트 편집 명령" hidden>
+    <button data-action="save">작업 파일</button><button data-action="png">PNG 내려받기</button><button data-action="copy">PNG 복사</button>
+    <button data-action="request-cancel">취소</button><button data-action="complete">완료</button>
+  </nav>
+  <dialog id="project-dialog" aria-labelledby="dialog-title">
+    <h2 id="dialog-title"></h2>
+    <div data-group="new" hidden>
+      <button data-action="create" data-size="1280x720">HD · 1280 × 720</button>
+      <button data-action="create" data-size="1920x1080">FHD · 1920 × 1080</button>
+      <button data-action="create" data-size="512x512">512 × 512</button>
+      <button data-action="create" data-size="64x64">64 × 64</button>
+    </div>
+    <div data-group="replace" hidden><p>현재 그림을 보관하려면 먼저 작업 파일을 내려받아 주세요.</p><button data-action="replace">그림 바꾸기</button></div>
+    <div data-group="cancel" hidden><p>현재 그림을 호스트에 보내지 않고 편집을 끝냅니다.</p><button data-action="cancel">편집 취소</button></div>
+    <button data-action="close">돌아가기</button>
+  </dialog>
+  <script type="module" src="./start.js"></script>
+</body>
+</html>

@@ -77,9 +77,6 @@ impl ActiveCanvas {
         tool: DrawingTool,
         pencil_template: Option<nyatidraw_api::PencilTemplate>,
     ) {
-        if tool == self.drawing.tool && self.stroke.pending_tool.is_none() {
-            return;
-        }
         // Switching intent stays bounded while the worker owns the draft. Do
         // not mutate the selected tool until its commit/cancel is adopted.
         self.stroke.pending_tool = Some(tool);

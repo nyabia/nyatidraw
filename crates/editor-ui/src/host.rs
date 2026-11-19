@@ -3,9 +3,13 @@ use crate::{
     preview::{FrameThumbnailSnapshot, LayerThumbnailSnapshot, NavigatorSnapshot},
     workspace_appearance::WorkspaceAppearance,
 };
+#[cfg(feature = "chrome")]
 use dioxus::prelude::*;
-use nyatidraw_api::{EditorCommand, EventEnvelope, Revision, ToolCommand, UiProjection};
+#[cfg(feature = "chrome")]
+use nyatidraw_api::ToolCommand;
+use nyatidraw_api::{EditorCommand, EventEnvelope, Revision, UiProjection};
 use nyatidraw_input::{CanvasInputMode, PressurePreset};
+#[cfg(feature = "chrome")]
 use std::{ops::Deref, rc::Rc};
 
 pub type PalettePins = [Option<[u8; 4]>; 10];
@@ -84,12 +88,15 @@ pub trait UiBackend {
     fn preview_preset(&self, projection: &UiProjection) -> nyatidraw_brush::BrushPreset;
 }
 
+#[cfg(feature = "chrome")]
 #[derive(Clone)]
 pub struct UiHost(pub Rc<dyn UiBackend>);
 
+#[cfg(feature = "chrome")]
 #[derive(Clone, Copy)]
 pub(crate) struct HostUpdate(pub Signal<u64>);
 
+#[cfg(feature = "chrome")]
 impl UiHost {
     /// # Errors
     /// Rejects unsupported commands or host admission failures.
@@ -145,6 +152,7 @@ impl UiHost {
     }
 }
 
+#[cfg(feature = "chrome")]
 impl Deref for UiHost {
     type Target = dyn UiBackend;
     fn deref(&self) -> &Self::Target {
@@ -152,6 +160,7 @@ impl Deref for UiHost {
     }
 }
 
+#[cfg(feature = "chrome")]
 #[derive(Clone, Copy)]
 pub struct UiSlots {
     pub canvas: fn() -> Element,

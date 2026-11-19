@@ -359,11 +359,11 @@ Astro/Starlight 사용자 문서와 범용 유저스크립트는 Windows 버전�
 
 ## 자동화 범위
 
-- `Windows CI`: PR/main의 코드 변경에서 기존 핵심 테스트, fmt, Clippy, DX release 빌드.
+- `Windows CI`: PR/main의 코드 변경에서 기존 핵심 테스트, fmt, Clippy, GPUI release 빌드.
 - `Website`: 홈페이지 변경/릴리스 게시 변경 및 릴리스 workflow의 직접 호출로 Pages 갱신.
   실행 파일은 Releases에서 받는다.
 - `Windows alpha release`: `v0.1.0-alpha.1` 형태의 태그 push로
-  검증→DX release 빌드→설치 파일/업데이트 피드 생성→파일 업로드→
+  검증→GPUI release 빌드→설치 파일/업데이트 피드 생성→파일 업로드→
   GitHub 사전 릴리스 자동 공개→Pages 다운로드 링크 갱신까지 진행한다.
   업로드 중에만 초안을 사용하며, 성공하면 별도 승인 없이 공개한다.
   테스트·빌드·패키징·업로드 실패 시 공개 단계로 진행하지 않는다.
@@ -384,7 +384,9 @@ CI 성공만으로 설치·실제 펜·GUI 검증을 대신하지 않는다.
 
 모든 workflow는 GitHub 기본 실행 환경을 사용한다. 외부 PR은 읽기 권한이며 배포하지 않는다.
 집 머신 runner, 유료 대형 runner, 상시 서버, 매 커밋 바이너리 보관은 사용하지 않는다.
-도구 버전: Rust 1.96.0, Dioxus CLI 0.7.9, Velopack SDK/packager 1.2.0.
+Windows에는 Rust 1.96.0과 Velopack SDK/packager 1.2.0을 사용한다.
+GPUI 웹 UI는 Rust `nightly-2026-06-09`로 빌드하며, 웹과 복구 Worker의
+바인딩은 wasm-bindgen CLI 0.2.127로 생성한다.
 
 ## 로컬 패키징
 
@@ -395,9 +397,13 @@ CI 성공만으로 설치·실제 펜·GUI 검증을 대신하지 않는다.
 ```
 
 패키징에는 .NET 8 이상이 필요하지만 앱 사용자에게 .NET SDK를 요구하지 않는다.
-설치 프로그램은 WebView2 runtime이 없으면 준비하도록 구성한다.
+설치 프로그램은 GPUI Windows 실행 파일을 포장한다.
 산출물은 `target/releases/<version>/`에 두며 같은 버전의 기존 산출물을 덮어쓰지 않는다.
 배포 대상은 해당 폴더 바로 아래의 파일이다. `stage/`는 포장 전 중간 결과다.
+
+웹 공개 산출물은 `tools/build-web.ps1`로 만든 GPUI 앱과 복구 Worker를
+`tools/build-site.ps1 -RequireWeb`로 함께 조립한다. Pages 편집기 주소는 `draw/`다.
+홈페이지 설치 링크는 공개 릴리즈에서 생성한 `release.json`을 읽어 표시한다.
 
 ## 태그 생성 전 확인
 
@@ -418,7 +424,7 @@ NyatiDraw 로고, Alpha 별도 설치 정체성 제거, 사이드바 폭 조절.
 
 새 설치 제품 ID/표시명은 `NyatiDraw`이며 설치 실행파일은
 `%LOCALAPPDATA%\NyatiDraw\current\nyatidraw.exe`이다. 개발 단계 이름을 설치 경로에 넣지 않는다.
-배포 설치파일은 `NyatiDraw-win-Setup.exe`다. Cargo/DX 빌드 산출물 이름은 유지하고 패키징 stage에서만 바꾼다.
+배포 설치파일은 `NyatiDraw-win-Setup.exe`다. GPUI 빌드 산출물은 패키징 stage에서 `nyatidraw.exe`로 넣는다.
 기존 `NyatiDraw.Alpha` 설치·레지스트리·기본 파일 연결은 자동으로 제거하거나 승계하지 않는다.
 기존 설치를 지우고 새 설치로 전환하는 실제 작업은 별도로 사용자가 선택한다.
 

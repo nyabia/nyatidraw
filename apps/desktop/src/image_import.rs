@@ -1,19 +1,22 @@
-use std::{
-    io::Read,
-    path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+#[cfg(feature = "legacy-ui")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
+use std::{io::Read, path::Path};
 
+#[cfg(feature = "legacy-ui")]
 use dioxus::prelude::*;
-use nyatidraw_api::{EditCommand, EditorCommand, LayerId, RasterImport, TransformCommand};
+#[cfg(feature = "legacy-ui")]
+use nyatidraw_api::{EditCommand, EditorCommand, TransformCommand};
+use nyatidraw_api::{LayerId, RasterImport};
 
+#[cfg(feature = "legacy-ui")]
 use crate::live_ink::LiveInkBridge;
 
 const MAX_PNG_BYTES: u64 = 72 * 1024 * 1024;
 
+#[cfg(feature = "legacy-ui")]
 #[component]
 pub(crate) fn ImportImageButton() -> Element {
     let live_ink = use_context::<LiveInkBridge>();
@@ -59,7 +62,7 @@ pub(crate) fn ImportImageButton() -> Element {
     }
 }
 
-fn decode_import(path: &Path, project_epoch: u64) -> Result<RasterImport, String> {
+pub(crate) fn decode_import(path: &Path, project_epoch: u64) -> Result<RasterImport, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
     file.take(MAX_PNG_BYTES + 1)

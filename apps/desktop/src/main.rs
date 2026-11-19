@@ -1,46 +1,17 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod artwork_clipboard;
+include!("desktop_runtime_modules.rs");
+#[cfg(windows)]
+const GPUI_SHELL: bool = false;
+
 #[cfg(windows)]
 mod canvas_host;
-#[cfg(windows)]
-mod desktop_canvas;
 mod desktop_shell;
-mod edit_gesture;
-mod edit_worker;
-#[cfg(windows)]
-mod file_associations;
-mod layout_store;
-mod live_ink;
-mod native_canvas;
-mod performance;
-mod performance_probe;
-mod performance_workload;
-mod preview;
-#[cfg(windows)]
-mod recent_projects;
-#[cfg(windows)]
-mod render_host;
-mod save_as;
-mod scaled_export;
-#[cfg(windows)]
-mod single_instance;
-#[cfg(windows)]
-mod sketchbook;
-mod sprite_export;
-mod transform_gesture;
-mod transform_worker;
-#[cfg(windows)]
-mod updates;
-mod workspace_appearance;
-
 mod editor_ui_host;
-#[cfg(windows)]
-mod image_import;
-mod input_preferences;
 mod palette_preferences;
-mod pressure_preferences;
 mod reference_image;
+#[cfg(windows)]
+mod window_placement;
 
 use dioxus::prelude::*;
 use live_ink::{CloseStatus, LiveInkBridge};

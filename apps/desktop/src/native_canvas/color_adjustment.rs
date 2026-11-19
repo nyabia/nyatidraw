@@ -188,7 +188,11 @@ impl ActiveCanvas {
             self.stage_color_adjustment();
             return Ok(false);
         }
-        if command == ColorAdjustmentCommand::Begin {
+        let starting = matches!(
+            command,
+            ColorAdjustmentCommand::Begin | ColorAdjustmentCommand::BeginLayer(_)
+        );
+        if starting {
             if self.color_adjustment_active() {
                 return Err(CommandRejectReason::CommandQueueBusy);
             }
@@ -213,12 +217,15 @@ impl ActiveCanvas {
         if !self.stroke.live_ink.try_pause_for_edit() {
             return Err(CommandRejectReason::CommandQueueBusy);
         }
-        let starting = command == ColorAdjustmentCommand::Begin;
+        let target = match command {
+            ColorAdjustmentCommand::BeginLayer(layer) => layer,
+            _ => self.active_layer,
+        };
         let (reply, received) = sync_channel(1);
         let result = self.enqueue_artwork(
             WorkerRequest::Edit {
                 command: EditCommand::ColorAdjustment(command),
-                target: self.active_layer,
+                target,
                 reply,
             },
             received,
@@ -273,7 +280,10 @@ impl ActiveCanvas {
     }
 
     pub(super) fn reject_color_adjustment(&mut self, command: Option<&ColorAdjustmentCommand>) {
-        if matches!(command, Some(ColorAdjustmentCommand::Begin)) {
+        if matches!(
+            command,
+            Some(ColorAdjustmentCommand::Begin | ColorAdjustmentCommand::BeginLayer(_))
+        ) {
             self.color_adjustment.starting = false;
             self.color_adjustment.preview = None;
             self.color_adjustment.cancel = false;

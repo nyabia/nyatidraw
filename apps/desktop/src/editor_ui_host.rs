@@ -130,7 +130,9 @@ impl UiBackend for DesktopUiBackend {
     }
 
     fn save_palette_pins(&self, pins: PalettePins) {
-        self.palette.save(pins);
+        if let Err(reason) = self.palette.save(pins) {
+            self.live_ink.publish_activation_notice(reason);
+        }
     }
 
     fn palette_notice(&self) -> Option<String> {

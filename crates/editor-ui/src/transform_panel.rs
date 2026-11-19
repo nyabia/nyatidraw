@@ -15,23 +15,7 @@ struct PendingPreview {
     project_epoch: u64,
 }
 
-pub fn can_begin_transform(projection: &UiProjection) -> bool {
-    !projection.edit.busy
-        && projection.edit.transform.is_none()
-        && projection.edit.color_adjustment.is_none()
-        && !projection.animation.playing
-        && !matches!(
-            projection.raster_target,
-            Some(nyatidraw_api::RasterEditTarget::Mask { .. })
-        )
-        && projection.active_layer.is_some_and(|id| {
-            projection.layers.iter().any(|layer| {
-                layer.id == nyatidraw_api::LayerTreeNodeId::Raster(id)
-                    && !layer.locked
-                    && !layer.alpha_locked
-            })
-        })
-}
+pub use crate::can_begin_transform;
 
 #[derive(Clone)]
 struct TransformInputs {

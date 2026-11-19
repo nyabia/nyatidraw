@@ -1,0 +1,21 @@
+[package]
+name = "nyatidraw-editor-gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true, features = ["component", "assets"] }
+nyatidraw-api.workspace = true
+nyatidraw-tiles.workspace = true
+nyatidraw-editor-ui.workspace = true
+base64 = "0.22"
+nyatidraw-input.workspace = true
+nyatidraw-png-io.workspace = true
+
+[target.'cfg(any(windows, target_arch = "wasm32"))'.dependencies]
+rfd = { version = "=0.17.2", default-features = false, features = ["file-handle-inner"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "=0.3.104"
+wasm-bindgen-futures = "=0.4.77"

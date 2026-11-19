@@ -2,7 +2,7 @@ use crate::UiHost;
 use dioxus::prelude::*;
 use nyatidraw_api::{EditorCommand, ToolCommand, UiProjection};
 
-const CAPACITY: usize = 10;
+use crate::palette::Palette;
 type Pins = crate::PalettePins;
 #[derive(Clone)]
 struct PalettePreferences(UiHost);
@@ -16,119 +16,6 @@ impl PalettePreferences {
     }
     fn save(&self, pins: Pins) {
         self.0.save_palette_pins(pins);
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PaletteEntry {
-    color: [u8; 4],
-    pinned: bool,
-    used: u64,
-}
-
-struct Palette {
-    slots: [Option<PaletteEntry>; CAPACITY],
-    observed: Vec<[u8; 4]>,
-    clock: u64,
-}
-
-impl Palette {
-    fn new(pins: Pins) -> Self {
-        Self {
-            slots: pins.map(|pin| {
-                pin.map(|color| PaletteEntry {
-                    color,
-                    pinned: true,
-                    used: 0,
-                })
-            }),
-            observed: Vec::new(),
-            clock: 0,
-        }
-    }
-
-    fn observe(&mut self, incoming: &[[u8; 4]]) {
-        let incoming = &incoming[..incoming.len().min(CAPACITY)];
-        if self.observed == incoming {
-            return;
-        }
-        // Native MRU order remains the only source of usage. UI renders and pin
-        // changes never manufacture color selections or artwork commands.
-        // Only replay the promoted prefix. Replaying the entire MRU would
-        // reinsert already-evicted colors when pins occupy some of the slots.
-        let promoted = (0..=incoming.len())
-            .find(|&count| {
-                self.observed
-                    .iter()
-                    .filter(|color| !incoming[..count].contains(color))
-                    .take(incoming.len() - count)
-                    .copied()
-                    .eq(incoming[count..].iter().copied())
-            })
-            .unwrap_or(incoming.len());
-        for &color in incoming[..promoted].iter().rev() {
-            if color[3] == 0 {
-                continue;
-            }
-            self.clock = self.clock.saturating_add(1);
-            let slot = self
-                .slots
-                .iter()
-                .position(|entry| entry.is_some_and(|entry| entry.color == color))
-                .or_else(|| self.slots.iter().position(Option::is_none))
-                .or_else(|| {
-                    self.slots
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, entry)| {
-                            entry
-                                .filter(|entry| !entry.pinned)
-                                .map(|entry| (index, entry.used))
-                        })
-                        .min_by_key(|(_, used)| *used)
-                        .map(|(index, _)| index)
-                });
-            if let Some(index) = slot {
-                let pinned = self.slots[index].is_some_and(|entry| entry.pinned);
-                self.slots[index] = Some(PaletteEntry {
-                    color,
-                    pinned,
-                    used: self.clock,
-                });
-            }
-        }
-        self.order_recent_slots();
-        self.observed = incoming.to_vec();
-    }
-
-    fn order_recent_slots(&mut self) {
-        let mut recent: Vec<_> = self
-            .slots
-            .iter()
-            .flatten()
-            .copied()
-            .filter(|entry| !entry.pinned)
-            .collect();
-        recent.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.used));
-        let mut recent = recent.into_iter();
-        for slot in &mut self.slots {
-            if !slot.is_some_and(|entry| entry.pinned) {
-                *slot = recent.next();
-            }
-        }
-    }
-
-    fn toggle_pin(&mut self, index: usize, color: [u8; 4]) -> Option<Pins> {
-        let entry = self.slots.get_mut(index)?.as_mut()?;
-        if entry.color != color {
-            return None;
-        }
-        entry.pinned = !entry.pinned;
-        self.order_recent_slots();
-        Some(
-            self.slots
-                .map(|entry| entry.filter(|entry| entry.pinned).map(|entry| entry.color)),
-        )
     }
 }
 
@@ -154,7 +41,7 @@ pub fn use_palette_preferences(ui_projection: Signal<UiProjection>) {
     }
     use_effect(move || {
         let incoming = ui_projection.read().recent_colors.clone();
-        if context.state.peek().observed != incoming {
+        if !context.state.peek().matches_recent(&incoming) {
             context.state.write().observe(&incoming);
         }
     });

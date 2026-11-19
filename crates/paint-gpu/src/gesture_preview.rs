@@ -55,8 +55,8 @@ impl GesturePreview {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("nyatidraw-gesture-pipeline-layout"),
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[crate::pipeline_slot(&layout)],
+            ..Default::default()
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("nyatidraw-gesture-pipeline"),
@@ -65,11 +65,11 @@ impl GesturePreview {
                 module: &shader,
                 entry_point: Some("vertex_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[crate::pipeline_slot(wgpu::VertexBufferLayout {
                     array_stride: SEGMENT_BYTES,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
-                }],
+                })],
             },
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -84,7 +84,10 @@ impl GesturePreview {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
+            #[cfg(not(target_arch = "wasm32"))]
             multiview: None,
+            #[cfg(target_arch = "wasm32")]
+            multiview_mask: None,
             cache: None,
         });
         Self {
@@ -175,8 +178,7 @@ impl GesturePreview {
                 depth_slice: None,
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
+            ..Default::default()
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.group, &[]);

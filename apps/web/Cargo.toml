@@ -4,11 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "nyatidraw-web"
+path = "src/main.rs"
+required-features = ["web"]
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-dioxus = { version = "=0.7.9", default-features = false, features = ["web", "launch", "lib"] }
+dioxus = { version = "=0.7.9", optional = true, default-features = false, features = ["web", "launch", "lib"] }
 nyatidraw-api.workspace = true
 nyatidraw-editor.workspace = true
-nyatidraw-editor-ui.workspace = true
+nyatidraw-editor-ui = { workspace = true, default-features = false }
 nyatidraw-input.workspace = true
 nyatidraw-document.workspace = true
 nyatidraw-tiles.workspace = true
@@ -17,16 +22,18 @@ nyatidraw-paint-cpu.workspace = true
 nyatidraw-web-core.workspace = true
 nyatidraw-project-web.workspace = true
 png.workspace = true
-wgpu.workspace = true
+wgpu = "=30.0.2"
 wasm-bindgen = "=0.2.127"
 wasm-bindgen-futures = "=0.4.77"
 js-sys = "=0.3.104"
 base64 = "=0.22.1"
+generational-box = { version = "=0.7.10", optional = true }
 web-sys = { version = "=0.3.104", features = ["Window", "Performance", "Document", "Element", "HtmlCanvasElement", "DomRect", "Location", "console"] }
 
 [features]
 default = ["web"]
-web = []
+web = ["dep:dioxus", "nyatidraw-editor-ui/chrome"]
+gpui-host = ["dep:generational-box"]
 
 [lints]
 workspace = true

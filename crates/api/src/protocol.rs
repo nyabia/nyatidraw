@@ -226,13 +226,18 @@ pub struct ColorAdjustment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ColorAdjustmentCommand {
     Begin,
+    /// Pin the named image layer without changing the current editing target.
+    BeginLayer(LayerId),
     Preview(ColorAdjustment),
-    Commit { generation: u64 },
+    Commit {
+        generation: u64,
+    },
     Cancel,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColorAdjustmentProjection {
+    pub target: LayerId,
     pub generation: u64,
     pub adjustment: ColorAdjustment,
     pub can_commit: bool,

@@ -5,6 +5,7 @@ members = [
     "apps/cli",
     "apps/desktop",
     "apps/web",
+    "apps/gpui-web",
     "apps/web-worker",
     "crates/api",
     "crates/brush",
@@ -12,6 +13,7 @@ members = [
     "crates/document",
     "crates/editor",
     "crates/editor-ui",
+    "crates/editor-gpui",
     "crates/history",
     "crates/input",
     "crates/input-queue",
@@ -38,7 +40,9 @@ nyatidraw-brush = { path = "crates/brush" }
 nyatidraw-diagnostics = { path = "crates/diagnostics" }
 nyatidraw-document = { path = "crates/document" }
 nyatidraw-editor = { path = "crates/editor" }
-nyatidraw-editor-ui = { path = "crates/editor-ui" }
+nyatidraw-editor-ui = { path = "crates/editor-ui", default-features = false }
+nyatidraw-editor-gpui = { path = "crates/editor-gpui" }
+gpui-kit = { version = "=0.10.0", default-features = false }
 nyatidraw-history = { path = "crates/history" }
 nyatidraw-input = { path = "crates/input" }
 nyatidraw-input-queue = { path = "crates/input-queue" }

@@ -1,5 +1,15 @@
 NyatiDraw third-party artwork notices
 
+The GPUI web editor embeds IBM Plex Sans from the Longbridge GPUI Kit v0.10.0
+web font bundle. Copyright 2017 IBM Corp. The font is provided under SIL Open
+Font License 1.1. The web build includes IBM-Plex-LICENSE.txt alongside index.html.
+https://github.com/longbridge/gpui-kit/blob/v0.10.0/crates/story-web/fonts/IBMPlexSans-Regular.ttf
+https://github.com/IBM/plex
+
+The shared editor embeds selected Lucide SVGs from Longbridge GPUI Kit Assets
+v0.10.0 (Lucide 1.43.0). The ISC and Feather MIT notices below also apply to
+those SVGs. https://github.com/longbridge/gpui-kit/tree/v0.10.0/crates/assets
+
 The trash icon in crates/editor-ui/src/lib.rs uses Lucide's trash.svg:
 https://github.com/lucide-icons/lucide/blob/66d8f9fc394b8530377e5f6112f0b8908ba01280/icons/trash.svg
 License source: https://github.com/lucide-icons/lucide/blob/66d8f9fc394b8530377e5f6112f0b8908ba01280/LICENSE

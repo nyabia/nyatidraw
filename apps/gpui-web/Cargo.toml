@@ -1,0 +1,22 @@
+[package]
+name = "nyatidraw-gpui-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gpui-kit.workspace = true
+base64 = "=0.22.1"
+nyatidraw-api.workspace = true
+nyatidraw-editor-gpui.workspace = true
+nyatidraw-editor-ui = { workspace = true, default-features = false }
+nyatidraw-input.workspace = true
+nyatidraw-web = { path = "../web", default-features = false, features = ["gpui-host"] }
+wasm-bindgen = "=0.2.127"
+wasm-bindgen-futures = "=0.4.77"
+
+[lints]
+workspace = true

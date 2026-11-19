@@ -203,7 +203,7 @@ fn BrowserFileButtons(extended: bool) -> Element {
             }
             button { class: "command", disabled: !ready, onclick: move |_| editor.download_project(), "작업 파일 저장" }
             button { class: "command", disabled: !ready, onclick: move |_| editor.download_png(), "PNG 내보내기" }
-            crate::sprite_export::SpriteExportButton {}
+            SpriteExportButton {}
             nyatidraw_editor_ui::scaled_export::ScaledExportButton {
                 source: [canvas.width_px, canvas.height_px],
                 disabled: !ready || (editor.exporting_png)() || projection.edit.busy || projection.edit.transform.is_some() || projection.edit.color_adjustment.is_some(),
@@ -301,6 +301,24 @@ fn BrowserDialog() -> Element {
                     }
                 }
             }
+        }
+    }
+}
+
+#[component]
+pub(crate) fn SpriteExportButton() -> Element {
+    let editor = use_context::<Editor>();
+    let host = use_context::<UiHost>();
+    let projection = host.protocol_snapshot().0;
+    rsx! {
+        button {
+            class: "command",
+            disabled: !(editor.ready)() || (editor.exporting_png)() || projection.animation.frames.is_empty()
+                || projection.animation.playing || projection.edit.busy || projection.edit.transform.is_some()
+                || projection.edit.color_adjustment.is_some(),
+            title: "모든 프레임을 PNG 시트와 JSON 메타데이터로 내보내기",
+            onclick: move |_| crate::sprite_export::download(editor, None),
+            "스프라이트 시트 내보내기"
         }
     }
 }

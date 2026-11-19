@@ -4,9 +4,11 @@ use nyatidraw_input::ViewportTransform;
 use nyatidraw_paint_gpu::GpuCompositeScene;
 use nyatidraw_web_core::{TILE_BYTE_LEN, TileKey, WebDocument};
 use web_sys::HtmlCanvasElement;
+use wgpu::CurrentSurfaceTexture as Frame;
 
 pub struct WebRenderer {
     canvas: HtmlCanvasElement,
+    instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -26,23 +28,26 @@ impl WebRenderer {
     }
     #[allow(clippy::too_many_lines)]
     pub async fn new(canvas: HtmlCanvasElement, doc: &WebDocument) -> Result<Self, String> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
-            .map_err(|error| format!("WebGPU canvas could not be created: {error}"))?;
+            .map_err(|error| {
+                format!("그리기 화면을 열 수 없습니다. WebGPU를 지원하는 브라우저에서 HTTPS 또는 localhost로 접속해 주세요. ({error})")
+            })?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|error| {
                 format!(
-                    "WebGPU is unavailable. Use a WebGPU-enabled browser over HTTPS or localhost: {error}"
+                    "WebGPU 그래픽 장치를 찾을 수 없습니다. 브라우저의 그래픽 가속 및 WebGPU 지원을 확인해 주세요. ({error})"
                 )
             })?;
         let (device, queue) = adapter
@@ -64,7 +69,7 @@ impl WebRenderer {
             );
         });
         let uncaptured_failure = Arc::clone(&failure);
-        device.on_uncaptured_error(Box::new(move |error| {
+        device.on_uncaptured_error(Arc::new(move |error| {
             record_failure(
                 &uncaptured_failure,
                 format!("WebGPU rendering failed: {error}"),
@@ -96,17 +101,18 @@ impl WebRenderer {
             alpha_mode: wgpu::CompositeAlphaMode::Opaque,
             view_formats: vec![view_format],
             desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         let document_size = document_size(doc);
         validate_texture_size(&device, document_size)?;
-        device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let memory_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         surface.configure(&device, &config);
         let presenter = TexturePresenter::new(&device, view_format);
         let scene_result =
             GpuCompositeScene::new(&device, &queue, document_size, doc.display_layers().clone());
-        let validation_error = device.pop_error_scope().await;
-        let memory_error = device.pop_error_scope().await;
+        let validation_error = validation_scope.pop().await;
+        let memory_error = memory_scope.pop().await;
         if let Some(error) = validation_error.or(memory_error) {
             return Err(format!("WebGPU renderer initialization failed: {error}"));
         }
@@ -115,6 +121,7 @@ impl WebRenderer {
         upload_snapshot(&mut scene, doc)?;
         let renderer = Self {
             canvas,
+            instance,
             surface,
             device,
             queue,
@@ -287,14 +294,22 @@ impl WebRenderer {
             .display_texture()
             .ok_or("Canvas compositor produced no display texture")?;
         let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            issue @ (Frame::Lost | Frame::Outdated) => {
+                if matches!(issue, Frame::Lost) {
+                    self.surface = self
+                        .instance
+                        .create_surface(wgpu::SurfaceTarget::Canvas(self.canvas.clone()))
+                        .map_err(|e| format!("Recreate WebGPU canvas: {e}"))?;
+                }
                 self.surface.configure(&self.device, &self.config);
-                self.surface
-                    .get_current_texture()
-                    .map_err(|error| format!("WebGPU surface recovery failed: {error}"))?
+                self.surface.get_current_texture()
             }
-            Err(error) => return Err(format!("Acquire WebGPU canvas frame: {error}")),
+            frame => frame,
+        };
+        let frame = match frame {
+            Frame::Success(frame) | Frame::Suboptimal(frame) => frame,
+            Frame::Timeout | Frame::Occluded => return Ok(()),
+            error => return Err(format!("Acquire WebGPU canvas frame: {error:?}")),
         };
         let target = frame.texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.view_format),
@@ -302,7 +317,7 @@ impl WebRenderer {
         });
         self.presenter
             .present(&self.device, &self.queue, &texture, &target);
-        frame.present();
+        self.queue.present(frame);
         self.check_device()
     }
 
@@ -419,8 +434,8 @@ impl TexturePresenter {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("nyatidraw-web-present-pipeline-layout"),
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&layout)],
+            ..Default::default()
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("nyatidraw-web-present-pipeline"),
@@ -444,7 +459,7 @@ impl TexturePresenter {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         Self {
@@ -494,6 +509,7 @@ impl TexturePresenter {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);

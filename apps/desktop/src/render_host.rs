@@ -1,5 +1,5 @@
 //! Windows render actor. The HWND thread never borrows GPU state or waits for
-//! a live actor. Each actor retains the Tao parent until its surface is gone.
+//! a live actor during normal drawing, saving, or close handling.
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -86,7 +86,7 @@ struct Inner {
     started: AtomicBool,
     finished: AtomicBool,
     surface_retired: AtomicBool,
-    parent: Weak<dioxus_desktop::tao::window::Window>,
+    parent: Option<Weak<dyn Send + Sync>>,
     child: isize,
     live_ink: LiveInkBridge,
 }
@@ -106,7 +106,7 @@ impl Drop for RenderLifetime {
 
 impl RenderHost {
     pub(crate) fn new(
-        parent: &Arc<dioxus_desktop::tao::window::Window>,
+        parent: Option<Weak<dyn Send + Sync>>,
         child: isize,
         live_ink: LiveInkBridge,
     ) -> Self {
@@ -117,7 +117,7 @@ impl RenderHost {
             started: AtomicBool::new(false),
             finished: AtomicBool::new(true),
             surface_retired: AtomicBool::new(true),
-            parent: Arc::downgrade(parent),
+            parent,
             child,
             live_ink,
         }))
@@ -129,8 +129,12 @@ impl RenderHost {
         if self.0.started.swap(true, Ordering::AcqRel) {
             return;
         }
-        let Some(parent) = self.0.parent.upgrade() else {
-            return;
+        let parent = match &self.0.parent {
+            Some(anchor) => match anchor.upgrade() {
+                Some(parent) => Some(parent),
+                None => return,
+            },
+            None => None,
         };
         if self
             .0
@@ -251,6 +255,11 @@ impl RenderHost {
         true
     }
 
+    #[cfg(feature = "legacy-ui")]
+    #[cfg_attr(
+        feature = "gpui",
+        allow(dead_code, reason = "Only the legacy shell uses this adapter.")
+    )]
     pub(crate) fn exit_ready(&self) -> bool {
         self.retire();
         self.finished()
@@ -258,6 +267,26 @@ impl RenderHost {
 
     pub(crate) fn surface_retired(&self) -> bool {
         self.0.surface_retired.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn finish_before_window_destruction(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_QS_SENDMESSAGE, PeekMessageW,
+            QS_SENDMESSAGE,
+        };
+        if self.finished() {
+            return;
+        }
+        self.retire();
+        let mut message = MSG::default();
+        while !self.finished() {
+            // SAFETY: these calls service sent messages on the calling UI
+            // thread. No queued application events are removed or dispatched.
+            unsafe {
+                MsgWaitForMultipleObjectsEx(None, 10, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE);
+                let _ = PeekMessageW(&raw mut message, None, 0, 0, PM_QS_SENDMESSAGE);
+            }
+        }
     }
 
     pub(crate) fn has_started(&self) -> bool {
@@ -289,7 +318,11 @@ fn run(inner: &Inner) {
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !pending.wake && !closing && !inner.live_ink.is_saving_as() {
+        while !pending.wake
+            && !closing
+            && !inner.live_ink.is_saving_as()
+            && !renderer.canvas.has_pending_artwork()
+        {
             pending = inner
                 .changed
                 .wait(pending)
@@ -332,11 +365,7 @@ fn run(inner: &Inner) {
             // the suspended canvas would republish a retained export failure
             // after the user acknowledged it and selected exit.
             if !closing {
-                renderer.canvas.begin_close(
-                    renderer.config.width,
-                    renderer.config.height,
-                    renderer.scale,
-                );
+                renderer.begin_close();
             }
             renderer.canvas.suspend();
             break;
@@ -352,11 +381,7 @@ fn run(inner: &Inner) {
             }
         }
         if work.controls.close {
-            renderer.canvas.begin_close(
-                renderer.config.width,
-                renderer.config.height,
-                renderer.scale,
-            );
+            renderer.begin_close();
             closing = true;
         }
         if closing {

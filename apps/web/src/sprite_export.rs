@@ -1,30 +1,10 @@
-use dioxus::prelude::*;
+use crate::model_state::{ReadableExt, WritableExt};
 use js_sys::{Array, Uint8Array};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::{browser, runtime::Editor};
-use nyatidraw_editor_ui::UiHost;
-
-#[component]
-pub(crate) fn SpriteExportButton() -> Element {
-    let editor = use_context::<Editor>();
-    let host = use_context::<UiHost>();
-    let projection = host.protocol_snapshot().0;
-    rsx! {
-        button {
-            class: "command",
-            disabled: !(editor.ready)() || (editor.exporting_png)() || projection.animation.frames.is_empty()
-                || projection.animation.playing || projection.edit.busy || projection.edit.transform.is_some()
-                || projection.edit.color_adjustment.is_some(),
-            title: "모든 프레임을 PNG 시트와 JSON 메타데이터로 내보내기",
-            onclick: move |_| download(editor, None),
-            "스프라이트 시트 내보내기"
-        }
-    }
-}
-
 pub(crate) fn download(mut editor: Editor, columns: Option<u32>) {
-    if (editor.exporting_png)() {
+    if *editor.exporting_png.peek() {
         return;
     }
     let Some(result) = editor.read(|runtime| {

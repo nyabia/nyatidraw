@@ -2276,8 +2276,7 @@ impl GpuCompositeScene {
                         depth_slice: None,
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
+                    ..Default::default()
                 });
                 pass.set_pipeline(&self.workspace_pipeline);
                 for (index, &coordinate) in batch.iter().enumerate() {
@@ -2378,8 +2377,7 @@ impl GpuCompositeScene {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
+                ..Default::default()
             });
             pass.set_pipeline(&self.viewport_pipeline);
             pass.set_bind_group(0, &root.presentation_bind_group, &[]);
@@ -2411,8 +2409,7 @@ impl GpuCompositeScene {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
+                ..Default::default()
             });
             pass.set_pipeline(&self.selection_pipeline);
             pass.set_bind_group(0, &self.selection_overlay.group, &[]);
@@ -2504,8 +2501,7 @@ impl GpuCompositeScene {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
+                ..Default::default()
             });
         }
         self.queue.submit([encoder.finish()]);
@@ -2534,8 +2530,7 @@ impl GpuCompositeScene {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
+                ..Default::default()
             });
             pass.set_pipeline(&self.workspace_resolve_pipeline);
             pass.set_bind_group(0, &accumulation.source_bind_group, &[]);
@@ -2768,8 +2763,7 @@ impl GpuCompositeScene {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
+                ..Default::default()
             });
         }
         for (index, operation) in passes.iter().enumerate() {
@@ -2785,8 +2779,7 @@ impl GpuCompositeScene {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
+                ..Default::default()
             });
             pass.set_pipeline(&self.composite_pipeline);
             pass.set_bind_group(3, &self.mask_buffers.binding, &[]);
@@ -2933,12 +2926,12 @@ fn create_composite_pipeline(
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("nayati-composite-pipeline-layout"),
         bind_group_layouts: &[
-            source_layout,
-            source_layout,
-            opacity_layout,
-            color_transfer_layout,
+            crate::pipeline_slot(source_layout),
+            crate::pipeline_slot(source_layout),
+            crate::pipeline_slot(opacity_layout),
+            crate::pipeline_slot(color_transfer_layout),
         ],
-        push_constant_ranges: &[],
+        ..Default::default()
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("nayati-composite-pipeline"),
@@ -2962,7 +2955,10 @@ fn create_composite_pipeline(
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
+        #[cfg(not(target_arch = "wasm32"))]
         multiview: None,
+        #[cfg(target_arch = "wasm32")]
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -2996,7 +2992,10 @@ fn create_viewport_binding(
         label: Some("nayati-viewport-sampler"),
         mag_filter: wgpu::FilterMode::Nearest,
         min_filter: wgpu::FilterMode::Linear,
+        #[cfg(not(target_arch = "wasm32"))]
         mipmap_filter: wgpu::FilterMode::Linear,
+        #[cfg(target_arch = "wasm32")]
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
         address_mode_u: wgpu::AddressMode::ClampToEdge,
         address_mode_v: wgpu::AddressMode::ClampToEdge,
         ..Default::default()
@@ -3030,8 +3029,11 @@ fn create_viewport_pipeline(
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("nayati-viewport-pipeline-layout"),
-        bind_group_layouts: &[source_layout, viewport_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[
+            crate::pipeline_slot(source_layout),
+            crate::pipeline_slot(viewport_layout),
+        ],
+        ..Default::default()
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("nayati-viewport-pipeline"),
@@ -3055,7 +3057,10 @@ fn create_viewport_pipeline(
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
+        #[cfg(not(target_arch = "wasm32"))]
         multiview: None,
+        #[cfg(target_arch = "wasm32")]
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -3074,8 +3079,11 @@ fn create_workspace_pipeline(
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("nayati-workspace-tile-pipeline-layout"),
-        bind_group_layouts: &[source_layout, workspace_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[
+            crate::pipeline_slot(source_layout),
+            crate::pipeline_slot(workspace_layout),
+        ],
+        ..Default::default()
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("nayati-workspace-tile-pipeline"),
@@ -3099,7 +3107,10 @@ fn create_workspace_pipeline(
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
+        #[cfg(not(target_arch = "wasm32"))]
         multiview: None,
+        #[cfg(target_arch = "wasm32")]
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -3179,8 +3190,7 @@ fn create_presentation_texture(
                 depth_slice: None,
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
+            ..Default::default()
         });
     }
     queue.submit([encoder.finish()]);

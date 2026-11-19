@@ -18,6 +18,11 @@ mod tool_preferences;
 mod ui;
 
 #[cfg(target_arch = "wasm32")]
+mod model_state {
+    pub use dioxus::prelude::{ReadableExt, Signal, WritableExt};
+}
+
+#[cfg(target_arch = "wasm32")]
 fn main() {
     dioxus::launch(ui::App);
 }

@@ -1,4 +1,4 @@
-use dioxus::prelude::ReadableExt;
+use crate::model_state::ReadableExt;
 use nyatidraw_api::{AnimationCommand, AnimationProjection, FrameId};
 use nyatidraw_web_core::CanvasUpdate;
 

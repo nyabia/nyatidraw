@@ -8,7 +8,7 @@ use windows::Win32::{
         Input::{
             GetRawInputData, GetRegisteredRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE,
             RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RAWMOUSE, RID_HEADER, RID_INPUT,
-            RIM_TYPEMOUSE,
+            RIDEV_REMOVE, RIM_TYPEMOUSE, RegisterRawInputDevices,
         },
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
@@ -61,6 +61,77 @@ struct HookState {
     context: usize,
 }
 
+fn record_size() -> u32 {
+    u32::try_from(size_of::<RAWINPUTDEVICE>()).expect("Win32 raw input device size fits u32")
+}
+
+fn registered_mouse() -> Result<Option<RAWINPUTDEVICE>, &'static str> {
+    let mut devices = [RAWINPUTDEVICE::default(); 64];
+    let mut count = u32::try_from(devices.len()).expect("bounded raw-device query");
+    let record_size = record_size();
+    // SAFETY: the fixed array and count are writable for this query.
+    let count = unsafe {
+        GetRegisteredRawInputDevices(Some(devices.as_mut_ptr()), &raw mut count, record_size)
+    };
+    Ok(devices
+        .get(..count as usize)
+        .ok_or("raw registration query failed")?
+        .iter()
+        .find(|device| device.usUsagePage == 1 && device.usUsage == 2)
+        .copied())
+}
+
+/// An app-owned foreground raw mouse registration for a shell that has no receiver.
+pub struct WindowsRawMouseRegistration(HWND);
+
+impl WindowsRawMouseRegistration {
+    /// # Errors
+    /// Returns an error if the receiver is invalid or Windows rejects registration.
+    pub fn install_if_absent(target: usize) -> Result<Option<Self>, &'static str> {
+        if registered_mouse()?.is_some() {
+            return Ok(None);
+        }
+        let target = HWND(target as *mut _);
+        // SAFETY: only a UI-thread window owned by the caller can receive input.
+        if target.is_invalid()
+            || unsafe { GetWindowThreadProcessId(target, None) != GetCurrentThreadId() }
+        {
+            return Err("invalid foreground raw mouse receiver");
+        }
+        let device = RAWINPUTDEVICE {
+            usUsagePage: 1,
+            usUsage: 2,
+            hwndTarget: target,
+            ..Default::default()
+        };
+        // SAFETY: the record points at the validated HWND and requests foreground
+        // delivery alongside ordinary mouse messages.
+        unsafe { RegisterRawInputDevices(&[device], record_size()) }
+            .map_err(|_| "register foreground raw mouse")?;
+        Ok(Some(Self(target)))
+    }
+}
+
+impl Drop for WindowsRawMouseRegistration {
+    fn drop(&mut self) {
+        if registered_mouse()
+            .ok()
+            .flatten()
+            .is_some_and(|device| device.hwndTarget == self.0)
+        {
+            let device = RAWINPUTDEVICE {
+                usUsagePage: 1,
+                usUsage: 2,
+                dwFlags: RIDEV_REMOVE,
+                ..Default::default()
+            };
+            // SAFETY: removal requires a null target. Preserve any registration
+            // that another receiver has taken over since startup.
+            let _ = unsafe { RegisterRawInputDevices(&[device], record_size()) };
+        }
+    }
+}
+
 /// UI-thread observation of the framework's existing raw-input receiver.
 /// Registration and default `WM_INPUT` cleanup remain owned by the framework.
 pub struct WindowsRawMouseHook {
@@ -79,21 +150,7 @@ impl WindowsRawMouseHook {
         context: usize,
         callback: fn(usize, Option<WindowsRawMousePacket>),
     ) -> Result<Self, &'static str> {
-        let mut devices = [RAWINPUTDEVICE::default(); 64];
-        let mut count = 64;
-        let record_size = u32::try_from(size_of::<RAWINPUTDEVICE>())
-            .map_err(|_| "raw registration record size invalid")?;
-        // SAFETY: the fixed array and count are writable for this query.
-        let count = unsafe {
-            GetRegisteredRawInputDevices(Some(devices.as_mut_ptr()), &raw mut count, record_size)
-        };
-        let count = usize::try_from(count).map_err(|_| "raw registration count invalid")?;
-        let devices = devices
-            .get(..count)
-            .ok_or("raw registration query failed")?;
-        let target = devices
-            .iter()
-            .find(|device| device.usUsagePage == 1 && device.usUsage == 2)
+        let target = registered_mouse()?
             .map(|device| device.hwndTarget)
             .filter(|hwnd| !hwnd.is_invalid())
             .ok_or("no explicit registered raw mouse receiver")?;

@@ -10,8 +10,7 @@ Set-StrictMode -Version Latest
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $programsRoot = [System.IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs'))
 $installPath = [System.IO.Path]::GetFullPath((Join-Path $programsRoot 'NyatiDraw Development'))
-$sourcePath = Join-Path $repositoryRoot 'target\dx\nyatidraw-desktop\release\windows\app'
-$sourceExecutable = Join-Path $sourcePath 'nyatidraw-desktop.exe'
+$sourceExecutable = Join-Path $repositoryRoot 'target/release/nyatidraw-gpui-desktop.exe'
 $installedExecutable = Join-Path $installPath 'NyatiDraw.exe'
 $classes = 'HKCU:\Software\Classes'
 $projectProgId = 'NyatiDraw.Project.1'
@@ -176,7 +175,7 @@ if (-not $SkipBuild) {
 }
 
 if (-not (Test-Path -LiteralPath $sourceExecutable -PathType Leaf)) {
-    throw "Dioxus release output is missing: $sourceExecutable"
+    throw "GPUI release output is missing: $sourceExecutable"
 }
 
 $runningInstalled = Get-Process -Name 'NyatiDraw' -ErrorAction SilentlyContinue |
@@ -191,14 +190,11 @@ $stagingPath = "$installPath.~staging-$nonce"
 $backupPath = "$installPath.~backup-$nonce"
 Assert-InstallFilePath $programsRoot $stagingPath
 Assert-InstallFilePath $programsRoot $backupPath
-# Reject source junctions before Copy-Item traverses the bundle.
-$null = @(Get-InstallFileInventory $sourcePath)
-if (Test-Path -LiteralPath (Join-Path $sourcePath $installManifestName)) {
-    throw 'Release bundle contains the reserved installation ownership manifest.'
+if ((Get-Item -LiteralPath $sourceExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+    throw 'Refusing a linked source executable.'
 }
 New-Item -ItemType Directory -Path $stagingPath | Out-Null
-Copy-Item -Path (Join-Path $sourcePath '*') -Destination $stagingPath -Recurse -Force
-Rename-Item -LiteralPath (Join-Path $stagingPath 'nyatidraw-desktop.exe') -NewName 'NyatiDraw.exe'
+Copy-Item -LiteralPath $sourceExecutable -Destination (Join-Path $stagingPath 'NyatiDraw.exe')
 $ownedFiles = @(Get-InstallFileInventory $stagingPath)
 @{ Schema = 1; Owner = $installManifestOwner; Files = $ownedFiles } |
     ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stagingPath $installManifestName) -Encoding UTF8

@@ -97,16 +97,23 @@ impl PalettePreferences {
         )
     }
 
-    pub(super) fn save(&self, pins: Pins) {
+    pub(super) fn save(&self, pins: Pins) -> Result<(), String> {
         let Some(wake) = &self.writer.wake else {
-            return;
+            return Err(self
+                .notice()
+                .unwrap_or_else(|| "고정색 설정을 저장할 수 없습니다.".into()));
         };
         self.shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pins = Some(pins);
         // One wake and one latest value are enough even during repeated pin changes.
-        let _ = wake.try_send(());
+        match wake.try_send(()) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(())) => {
+                Err("고정색 저장 작업이 종료되었습니다.".into())
+            }
+        }
     }
 
     pub(super) fn notice(&self) -> Option<String> {

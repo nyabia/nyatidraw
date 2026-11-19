@@ -5,6 +5,7 @@ on:
     paths:
       - 'site/**'
       - 'site-docs/**'
+      - 'apps/gpui-web/**'
       - 'apps/web/**'
       - 'apps/web-worker/**'
       - 'web-integration/**'
@@ -13,9 +14,9 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
-      - 'tools/dioxus-cli.version'
+      - 'tools/web-rustflags.ps1'
       - 'tools/build-web.ps1'
-      - 'tools/setup-web-ci.ps1'
+      - 'tools/build-gpui-web.ps1'
       - 'tools/setup-worker-ci.ps1'
       - 'tools/build-web-worker.ps1'
       - 'tools/build-site.ps1'
@@ -25,6 +26,10 @@ on:
     types: [published, unpublished, deleted, edited]
   workflow_dispatch:
   workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        default: main
 permissions:
   contents: read
 concurrency:
@@ -33,7 +38,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
@@ -49,7 +54,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-          ref: main
+          ref: ${{ inputs.source_ref || 'main' }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
@@ -78,12 +83,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node --check apps/web/src/clipboard.js
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check apps/gpui-web/start.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check apps/gpui-web/src/platform.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Browser artwork and recovery core tests
         run: cargo test -p nyatidraw-brush -p nyatidraw-paint-cpu -p nyatidraw-project -p nyatidraw-web-core -p nyatidraw-project-web --locked
       - name: WebAssembly Clippy
         run: cargo clippy -p nyatidraw-web -p nyatidraw-web-worker --target wasm32-unknown-unknown --locked -- -D warnings
-      - name: Install verified Dioxus CLI
-        run: ./tools/setup-web-ci.ps1
+      - name: Install GPUI WebAssembly toolchain
+        run: rustup toolchain install nightly-2026-06-09 --profile minimal --target wasm32-unknown-unknown --component clippy
+      - name: Check shared GPUI browser application
+        run: cargo +nightly-2026-06-09 clippy -p nyatidraw-gpui-web --target wasm32-unknown-unknown --locked -- -D warnings
       - name: Install matching Worker bindings tool
         run: ./tools/setup-worker-ci.ps1
       - name: Build web editor

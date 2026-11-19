@@ -1,12 +1,12 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][string] $PublicDirectory, [switch] $DebugBuild)
+param([Parameter(Mandatory)][string] $PublicDirectory, [switch] $DebugBuild, [string] $CargoTargetDirectory)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $public = [IO.Path]::GetFullPath($PublicDirectory)
 $relative = [IO.Path]::GetRelativePath($repositoryRoot, $public).Replace('\', '/')
-if ($relative -notmatch '^target/dx/nyatidraw-web/(release|debug)/web/public$') {
+if ($relative -notmatch '^target/(?:dx/nyatidraw-web/(?:release|debug)/web/public|gpui-web/(?:release|debug)/(?:public|stage-[0-9a-f]{32}))$') {
     throw 'Worker output must be inside the generated web build.'
 }
 $version = '0.2.127'
@@ -16,12 +16,14 @@ if (-not (Test-Path -LiteralPath $executable)) { throw 'Run tools/setup-worker-c
 if (((& $executable --version) -join ' ').Trim() -ne "wasm-bindgen $version") { throw 'Worker build tool version mismatch.' }
 $profile = if ($DebugBuild) { 'debug' } else { 'release' }
 $arguments = @('build', '-p', 'nyatidraw-web-worker', '--target', 'wasm32-unknown-unknown', '--locked')
+if ($CargoTargetDirectory) { $arguments += @('--target-dir', $CargoTargetDirectory) }
+else { $CargoTargetDirectory = Join-Path $repositoryRoot 'target' }
 if (-not $DebugBuild) { $arguments += '--release' }
 & cargo @arguments
 if ($LASTEXITCODE -ne 0) { throw 'Worker WASM build failed.' }
 $generated = Join-Path $repositoryRoot "target/web-worker/$profile"
 New-Item -ItemType Directory -Force $generated | Out-Null
-& $executable (Join-Path $repositoryRoot "target/wasm32-unknown-unknown/$profile/nyatidraw_web_worker.wasm") --target web --out-name ntdr --out-dir $generated --no-typescript
+& $executable (Join-Path $CargoTargetDirectory "wasm32-unknown-unknown/$profile/nyatidraw_web_worker.wasm") --target web --out-name ntdr --out-dir $generated --no-typescript
 if ($LASTEXITCODE -ne 0) { throw 'Worker bindings failed.' }
 $output = Join-Path $public 'worker'
 New-Item -ItemType Directory -Force $output | Out-Null

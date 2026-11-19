@@ -1,5 +1,5 @@
-use dioxus::prelude::ReadableExt;
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use crate::model_state::ReadableExt;
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 use nyatidraw_api::{
     BrushSettings, DockCommand, DockTree, DrawingTool, EditorCommand, EditorEvent, EventEnvelope,
@@ -163,7 +163,22 @@ impl Preferences {
 pub struct WebUiBackend {
     pub editor: Editor,
     preferences: RefCell<Preferences>,
-    previews: RefCell<(u64, NavigatorSnapshot, LayerThumbnailSnapshot)>,
+    previews: RefCell<WebPreviews>,
+}
+
+#[derive(Default)]
+struct WebPreviews {
+    generation: Option<(u64, u64)>,
+    navigator: NavigatorSnapshot,
+    layers: LayerThumbnailSnapshot,
+    layer_inputs: BTreeMap<nyatidraw_api::LayerId, LayerPreviewInput>,
+}
+
+#[derive(PartialEq)]
+struct LayerPreviewInput {
+    tiles: nyatidraw_tiles::ContentRoot,
+    canvas: nyatidraw_api::CanvasSpec,
+    mask: Option<nyatidraw_document::LayerMask>,
 }
 
 impl WebUiBackend {
@@ -171,11 +186,7 @@ impl WebUiBackend {
         Rc::new(Self {
             editor: *editor,
             preferences: RefCell::new(Preferences::load(editor)),
-            previews: RefCell::new((
-                u64::MAX,
-                NavigatorSnapshot::default(),
-                LayerThumbnailSnapshot::default(),
-            )),
+            previews: RefCell::default(),
         })
     }
 
@@ -214,16 +225,17 @@ impl WebUiBackend {
     }
 
     fn update_previews(&self) {
-        let revision = self
+        let generation = self
             .editor
-            .read(|runtime| runtime.preview_generation)
-            .unwrap_or(0);
-        if self.previews.borrow().0 == revision {
+            .read(|runtime| (runtime.project_epoch, runtime.preview_generation));
+        if self.previews.borrow().generation == generation {
             return;
         }
         let started = browser::monotonic_now();
-        let Some((navigator, layers)) = self.editor.read(|runtime| {
+        let Some(next) = self.editor.read(|runtime| {
+            let previous = self.previews.borrow();
             let document = &runtime.document;
+            let revision = runtime.preview_generation;
             let frame = crate::preview::navigator(document, revision).map(Arc::new);
             let rect = runtime.canvas.get_bounding_client_rect();
             let page = document.canvas();
@@ -245,26 +257,42 @@ impl WebUiBackend {
                     ]
                 }),
             };
+            let tiles = document.snapshot().root();
+            let mut layer_inputs = BTreeMap::new();
+            let same_project = previous.generation.map(|g| g.0) == Some(runtime.project_epoch);
             let frames = nyatidraw_editor::layer_edit::raster_layer_ids(document.render_layers())
                 .into_iter()
                 .filter_map(|id| {
-                    crate::preview::layer_thumbnail(document, id).map(|frame| (id, Arc::new(frame)))
+                    let input = LayerPreviewInput {
+                        tiles,
+                        canvas: page,
+                        mask: document.render_layers().raster(id)?.mask,
+                    };
+                    let frame = if same_project && previous.layer_inputs.get(&id) == Some(&input) {
+                        previous.layers.frame(id)?
+                    } else {
+                        Arc::new(crate::preview::layer_thumbnail(document, id)?)
+                    };
+                    layer_inputs.insert(id, input);
+                    Some((id, frame))
                 })
                 .collect();
-            (
-                NavigatorSnapshot {
+            WebPreviews {
+                generation,
+                navigator: NavigatorSnapshot {
                     frame,
                     viewport: Some(viewport),
                 },
-                LayerThumbnailSnapshot {
+                layers: LayerThumbnailSnapshot {
                     generation: revision,
                     frames,
                 },
-            )
+                layer_inputs,
+            }
         }) else {
             return;
         };
-        *self.previews.borrow_mut() = (revision, navigator, layers);
+        *self.previews.borrow_mut() = next;
         browser::record_work("previews", started);
     }
 
@@ -809,7 +837,7 @@ impl UiBackend for WebUiBackend {
         based_on: Revision,
         command: EditorCommand,
     ) -> Result<(), String> {
-        if (self.editor.integration_busy)() || (self.editor.integration_closed)() {
+        if *self.editor.integration_busy.peek() || *self.editor.integration_closed.peek() {
             return Err("호스트 응답을 기다리는 중입니다.".into());
         }
         self.restore_project_tool();
@@ -924,7 +952,7 @@ impl UiBackend for WebUiBackend {
     }
     fn navigator_snapshot(&self) -> NavigatorSnapshot {
         self.update_previews();
-        let mut snapshot = self.previews.borrow().1.clone();
+        let mut snapshot = self.previews.borrow().navigator.clone();
         snapshot.viewport = self.editor.read(|runtime| {
             let rect = runtime.canvas.get_bounding_client_rect();
             let page = runtime.document.canvas();
@@ -951,7 +979,7 @@ impl UiBackend for WebUiBackend {
     }
     fn layer_thumbnail_snapshot(&self) -> LayerThumbnailSnapshot {
         self.update_previews();
-        self.previews.borrow().2.clone()
+        self.previews.borrow().layers.clone()
     }
     fn frame_thumbnail_snapshot(&self) -> nyatidraw_editor_ui::preview::FrameThumbnailSnapshot {
         self.editor.frame_thumbnail_snapshot()

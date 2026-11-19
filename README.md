@@ -25,15 +25,16 @@ Linux/macOS 설치판·고급 텍스처/습식 브러시·벡터 기능은 후�
 - 새 알파판을 받으면 **저장 후 업데이트**로 적용하고 현재 그림을 다시 엽니다.
   다운로드 실패 시 기존 앱은 계속 사용할 수 있습니다.
 
-alpha.21은 웹의 그림 이동·레이어 터치와 연필의 약한 필압 처리를 개선합니다.
-[변경 내용과 남은 검수](docs/releases/0.1.0-alpha.21.md)를 참고하세요.
+공용 편집 화면 전환과 도킹·레이어·저장 조작의 변경 내용은
+[alpha.24 변경 기록](docs/releases/0.1.0-alpha.24.md)을 참고하세요.
 실제 펜/고주사율 하드웨어 검증과 설치·업데이트 검증은 별도입니다.
 고급 메시 변형과 물리 장치별 필기 감각은 별도 검토 범위입니다.
 자동 업데이트의 운영·검증 범위는 [배포 문서](docs/releasing.md)를 참고하세요.
 
 ## 현재 구현 범위
 
-- Dioxus Desktop UI와 Win32 child canvas
+- Windows와 웹이 함께 쓰는 Longbridge GPUI Kit 편집 UI
+- Win32 정밀 입력·DirectComposition 캔버스와 브라우저 Pointer Events·WebGPU 캔버스
 - Windows pointer/pen 입력과 WGPU live ink
 - 무한 작업공간 좌표와 출력 페이지 crop
 - sparse signed tiles, raster layer/group, undo/history
@@ -62,15 +63,25 @@ Web Locks를 지원하는 최신 브라우저가 필요합니다. 데스크톱 �
 
 ## 개발
 
-프로젝트에 고정된 Rust 1.96.0과 Dioxus CLI 0.7.9가 필요합니다.
-setup은 CLI를 저장소의 `.nyatidraw/toolchains/`에 설치합니다.
+Windows에서는 저장소의 Rust 도구 모음과 Visual Studio C++ 빌드 도구를 사용합니다.
 
 ```powershell
-./tools/setup-dev.ps1
-cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked
+cargo run --locked -p nyatidraw-desktop
 ./tools/build-dev.ps1
 ```
+
+웹판은 동일한 Rust 뷰를 WebAssembly로 컴파일합니다. LLVM Clang을 준비한 뒤 실행합니다.
+
+```powershell
+rustup toolchain install nightly-2026-06-09 --profile minimal --target wasm32-unknown-unknown
+rustup target add wasm32-unknown-unknown
+./tools/setup-worker-ci.ps1
+./tools/build-web.ps1
+python -m http.server 8768 --bind 127.0.0.1 --directory target/gpui-web/release/public
+```
+
+브라우저에서 `http://127.0.0.1:8768/`을 엽니다. 편집기와 저장 Worker는 정적 파일로 배포할 수 있습니다.
+UI와 플랫폼 어댑터의 경계는 [공용 GPUI 편집기 결정](docs/decisions/ADR-0066-gpui-editor.md)에 기록합니다.
 
 개발판 설치와 파일 연결:
 

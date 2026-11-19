@@ -1,3 +1,4 @@
+#[cfg(feature = "chrome")]
 use dioxus::prelude::*;
 use std::sync::Arc;
 const PATCH_SIZE: u16 = 13;
@@ -6,6 +7,8 @@ const PATCH_SIZE: u16 = 13;
 pub struct PickerFrame {
     pub size: u16,
     pub data_uri: Arc<str>,
+    /// Full-resolution, premultiplied linear RGBA for native presentation.
+    pub linear_pixels: Arc<[u8]>,
     /// Opaque sRGB, exactly as a successful release would set foreground RGB.
     /// Transparent artwork has no candidate; the PNG still shows its neighbors.
     pub candidate: Option<[u8; 4]>,
@@ -60,12 +63,14 @@ pub fn sample_frame(
         size: PATCH_SIZE,
         candidate,
         data_uri: crate::preview::png_data_uri(&png, 4096, "picker")?,
+        linear_pixels: surface.pixels.into(),
     })
 }
 
 /// Read-only feedback; gesture ownership stays with the host.
 /// # Errors
 /// Propagates Dioxus rendering errors.
+#[cfg(feature = "chrome")]
 pub fn picker_loupe(snapshot: PickerSnapshot) -> Element {
     let [x, y] = snapshot.cursor_css;
     let top = if y >= 190.0 { y - 180.0 } else { y + 26.0 };

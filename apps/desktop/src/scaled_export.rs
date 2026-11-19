@@ -1,12 +1,12 @@
-#[cfg(windows)]
+#[cfg(all(windows, feature = "legacy-ui"))]
 use dioxus::prelude::*;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "legacy-ui"))]
 use nyatidraw_api::{EditorCommand, ProjectCommand};
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "legacy-ui"))]
 use crate::live_ink::LiveInkBridge;
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "legacy-ui"))]
 #[component]
 pub(crate) fn ScaledExportButton() -> Element {
     let live_ink = use_context::<LiveInkBridge>();

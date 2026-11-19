@@ -1,12 +1,16 @@
 //! Disposable, bounded chrome preview using the selected engine and CPU renderer.
 //! Never admitted to the editor, project, history, or recent-size list.
+#[cfg(feature = "chrome")]
 use dioxus::prelude::*;
-use nyatidraw_api::{BrushSettings, DrawingTool, PencilTemplate, UiProjection};
+use nyatidraw_api::DrawingTool;
+#[cfg(feature = "chrome")]
+use nyatidraw_api::{BrushSettings, PencilTemplate, UiProjection};
 use nyatidraw_brush::{BrushEvaluator, RoundBrushEvaluator, begin_round_stroke};
 use nyatidraw_input::{PenButtons, Point, PointerPhase, StylusSample};
 use nyatidraw_paint_cpu::{CpuCanvas, PremultipliedRgba8};
 use nyatidraw_tiles::FlattenedRgba8;
 
+#[cfg(feature = "chrome")]
 #[component]
 pub fn BrushStrokePreview(
     tool: DrawingTool,
@@ -31,7 +35,7 @@ pub fn BrushStrokePreview(
             projection.brush_size_tenths = size;
             projection.brush_opacity_u16 = opacity;
             projection.brush_settings = settings;
-            render(&host, &projection).ok()
+            render(host.preview_preset(&projection), tool).ok()
         },
     ));
     rsx! { div { class: "brush-stroke-preview", title: "현재 브러시의 필압 변화 예시 · 흑백 표시, 큰 크기는 축소 · 보정 감각은 실제 획으로 확인",
@@ -41,10 +45,16 @@ pub fn BrushStrokePreview(
     } }
 }
 
-fn render(host: &crate::UiHost, projection: &UiProjection) -> Result<std::sync::Arc<str>, String> {
+/// Renders an isolated exemplar stroke for the tool properties panel.
+///
+/// # Errors
+/// Returns an error if the preview pixels cannot be encoded as PNG.
+pub fn render(
+    mut preset: nyatidraw_brush::BrushPreset,
+    tool: DrawingTool,
+) -> Result<std::sync::Arc<str>, String> {
     const WIDTH: u32 = 160;
     const HEIGHT: u32 = 48;
-    let mut preset = host.preview_preset(projection);
     // A display thumbnail, not a 1:1 ruler. Bound allocations and raster work.
     preset.size_px = preset.size_px.min(26.0);
     let sample = |index: u32| {
@@ -82,7 +92,7 @@ fn render(host: &crate::UiHost, projection: &UiProjection) -> Result<std::sync::
     evaluator.push(&mut stroke, &samples, &mut dabs);
     evaluator.end(stroke, &mut dabs);
     let mut surface = CpuCanvas::new(WIDTH, HEIGHT);
-    if projection.drawing_tool == DrawingTool::Eraser {
+    if tool == DrawingTool::Eraser {
         surface =
             CpuCanvas::from_rgba8_premultiplied(WIDTH, HEIGHT, [32, 32, 32, 255].repeat(160 * 48))
                 .map_err(|e| format!("brush-preview:{e:?}"))?;

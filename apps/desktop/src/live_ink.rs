@@ -212,6 +212,7 @@ type Notifier = Arc<dyn Fn() + Send + Sync + 'static>;
 struct ProtocolMailbox {
     projection: UiProjection,
     latest_event: Option<EventEnvelope>,
+    tracked_receipt: Option<(CommandId, Option<EditorEvent>)>,
     next_event_sequence: u64,
 }
 
@@ -340,6 +341,11 @@ impl LiveInkBridge {
             .and_then(crate::layout_store::LayoutStore::notice)
     }
 
+    #[cfg(feature = "legacy-ui")]
+    #[cfg_attr(
+        feature = "gpui",
+        allow(dead_code, reason = "Only the legacy shell uses this adapter.")
+    )]
     pub(crate) fn submit_panel_heights(&self, heights: &crate::layout_store::PanelHeights) {
         if let Some(store) = self.inner.layout.get() {
             store.submit_heights(heights);
@@ -416,6 +422,7 @@ impl LiveInkBridge {
                 protocol: Mutex::new(ProtocolMailbox {
                     projection: UiProjection::empty(),
                     latest_event: None,
+                    tracked_receipt: None,
                     next_event_sequence: 1,
                 }),
                 export: Mutex::new(ExportMailbox {
@@ -628,6 +635,28 @@ impl LiveInkBridge {
         based_on: Revision,
         command: EditorCommand,
     ) -> Result<CommandId, CanvasCommandQueueFull> {
+        self.push_editor_command_inner(based_on, command, false)
+    }
+
+    #[cfg(any(test, feature = "gpui"))]
+    #[cfg_attr(
+        feature = "legacy-ui",
+        allow(dead_code, reason = "The GPUI canvas dialog awaits command receipts.")
+    )]
+    pub(crate) fn push_tracked_command(
+        &self,
+        based_on: Revision,
+        command: EditorCommand,
+    ) -> Result<CommandId, CanvasCommandQueueFull> {
+        self.push_editor_command_inner(based_on, command, true)
+    }
+
+    fn push_editor_command_inner(
+        &self,
+        based_on: Revision,
+        command: EditorCommand,
+        track: bool,
+    ) -> Result<CommandId, CanvasCommandQueueFull> {
         if matches!(&command, EditorCommand::Edit(nyatidraw_api::EditCommand::SelectLasso { vertices } | nyatidraw_api::EditCommand::CombineLasso { vertices, .. }) if !(3..=4096).contains(&vertices.len()))
         {
             return Err(CanvasCommandQueueFull);
@@ -673,6 +702,14 @@ impl LiveInkBridge {
             {
                 return Err(CanvasCommandQueueFull);
             }
+        }
+        if track {
+            let mut protocol = self.inner.protocol.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if protocol.tracked_receipt.is_some() {
+                return Err(CanvasCommandQueueFull);
+            }
+            protocol.tracked_receipt = Some((id, None));
         }
         commands.push_back(CanvasCommand::Ui(CommandEnvelope {
             id,
@@ -789,6 +826,15 @@ impl LiveInkBridge {
                 }
                 protocol.projection = projection;
             }
+            if let Some((id, receipt)) = protocol.tracked_receipt.as_mut()
+                && matches!(
+                    &event,
+                    EditorEvent::CommandAccepted { command, .. }
+                        | EditorEvent::CommandRejected { command, .. } if command == id
+                )
+            {
+                *receipt = Some(event.clone());
+            }
             let sequence = protocol.next_event_sequence;
             protocol.next_event_sequence = protocol.next_event_sequence.saturating_add(1);
             protocol.latest_event = Some(EventEnvelope { sequence, event });
@@ -803,6 +849,32 @@ impl LiveInkBridge {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (protocol.projection.clone(), protocol.latest_event.clone())
+    }
+
+    #[cfg(any(test, feature = "gpui"))]
+    #[cfg_attr(
+        feature = "legacy-ui",
+        allow(dead_code, reason = "The GPUI canvas dialog awaits command receipts.")
+    )]
+    pub(crate) fn take_command_receipt(&self, id: u128) -> Option<Result<(), String>> {
+        let mut protocol = self.inner.protocol.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (tracked, event) = protocol.tracked_receipt.as_ref()?;
+        if tracked.0 != id {
+            return None;
+        }
+        let result = match event {
+            Some(EditorEvent::CommandAccepted { .. }) => Ok(()),
+            Some(EditorEvent::CommandRejected { reason, .. }) => {
+                Err(format!("요청을 적용하지 못했습니다: {reason:?}"))
+            }
+            _ => match &protocol.projection.workspace {
+                WorkspaceProjection::Error { summary } => Err(summary.clone()),
+                _ => return None,
+            },
+        };
+        protocol.tracked_receipt = None;
+        Some(result)
     }
 
     pub(crate) fn project_epoch(&self) -> u64 {
@@ -865,6 +937,7 @@ impl LiveInkBridge {
             next.recent_colors = previous.recent_colors;
             protocol.projection = next;
             protocol.latest_event = None;
+            protocol.tracked_receipt = None;
         }
         self.inner
             .export
@@ -1127,18 +1200,23 @@ impl LiveInkBridge {
                 return;
             }
             let mut changed = generation != thumbnails.generation;
-            for frame in frames {
+            for mut frame in frames {
                 let layer = frame.layer;
-                let frame = Arc::new(frame);
-                if thumbnails.frames.contains_key(&layer)
-                    || thumbnails.frames.len() < crate::preview::MAX_LAYER_THUMBNAILS
-                {
-                    if thumbnails.frames.get(&layer) == Some(&frame) {
+                if let Some(previous) = thumbnails.frames.get(&layer) {
+                    if previous.as_ref() == &frame {
                         continue;
                     }
-                    thumbnails.frames.insert(layer, frame);
-                    changed = true;
+                    if previous.data_uri == frame.data_uri {
+                        frame.data_uri = previous.data_uri.clone();
+                    }
+                    if previous.mask == frame.mask {
+                        frame.mask.clone_from(&previous.mask);
+                    }
+                } else if thumbnails.frames.len() >= crate::preview::MAX_LAYER_THUMBNAILS {
+                    continue;
                 }
+                thumbnails.frames.insert(layer, Arc::new(frame));
+                changed = true;
             }
             thumbnails.generation = generation;
             changed

@@ -49,8 +49,8 @@ impl AreaReducer {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("nyatidraw-presentation-reduce-layout"),
-            bind_group_layouts: &[source_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[crate::pipeline_slot(source_layout)],
+            ..Default::default()
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("nyatidraw-presentation-reduce"),
@@ -74,7 +74,10 @@ impl AreaReducer {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
+            #[cfg(not(target_arch = "wasm32"))]
             multiview: None,
+            #[cfg(target_arch = "wasm32")]
+            multiview_mask: None,
             cache: None,
         });
         Self { pipeline }
@@ -124,8 +127,7 @@ impl AreaReducer {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
+                ..Default::default()
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &binding, &[]);

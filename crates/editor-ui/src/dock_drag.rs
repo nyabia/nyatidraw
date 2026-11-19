@@ -28,36 +28,7 @@ pub fn height_panel(node: &DockNode) -> PanelKind {
     }
 }
 
-pub fn minimum_width(node: &DockNode) -> u16 {
-    match node {
-        DockNode::Panel(panel) => match panel {
-            PanelKind::Tools => 48,
-            PanelKind::Brush | PanelKind::ToolProperties | PanelKind::BrushSizes => 224,
-            PanelKind::Canvas => 240,
-            PanelKind::Layers => 280,
-            _ => 160,
-        },
-        DockNode::Tabs { panels, .. } => panels
-            .iter()
-            .map(|panel| minimum_width(&DockNode::Panel(*panel)))
-            .max()
-            .unwrap_or(160),
-        DockNode::Split {
-            axis,
-            first,
-            second,
-            ..
-        } => {
-            let first = minimum_width(first);
-            let second = minimum_width(second);
-            if *axis == DockAxis::Horizontal {
-                first.saturating_add(second).saturating_add(6)
-            } else {
-                first.max(second)
-            }
-        }
-    }
-}
+pub use crate::layout_store::minimum_width;
 
 fn resize_split(node: &mut DockNode, key: &str, ratio: u16) -> bool {
     if let DockNode::Split {

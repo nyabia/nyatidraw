@@ -46,7 +46,5 @@ jobs:
         run: cargo test --workspace --all-features --locked
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Install verified Dioxus CLI
-        run: ./tools/setup-ci.ps1
       - name: Build Windows release app
         run: ./tools/build-dev.ps1

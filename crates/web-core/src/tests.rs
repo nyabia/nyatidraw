@@ -751,6 +751,74 @@ fn color_preview_never_enters_saved_artwork_and_confirmation_is_one_reversible_e
 }
 
 #[test]
+fn row_color_adjustment_never_edits_the_selected_layer_by_mistake() {
+    use nyatidraw_api::{
+        ColorAdjustment, ColorAdjustmentCommand as C, EditCommand as E, LayerCommand,
+    };
+    let mut doc = WebDocument::import_rgba8(1, 1, &[255, 0, 0, 255]).unwrap();
+    let target = doc.active_layer();
+    doc.apply_layer_command(LayerCommand::AddRaster).unwrap();
+    let active = doc.active_layer();
+    doc.apply_edit(E::SelectAll).unwrap();
+    doc.apply_edit(E::FillSelection {
+        color: [0, 0, 255, 255],
+    })
+    .unwrap();
+    doc.apply_edit(E::ClearSelection).unwrap();
+    let original = doc.snapshot().clone();
+    let active_key = TileKey {
+        layer: active,
+        x: 0,
+        y: 0,
+        mip: 0,
+    };
+    let target_key = TileKey {
+        layer: target,
+        ..active_key
+    };
+    let hue = ColorAdjustment {
+        hue_degrees: 120,
+        ..Default::default()
+    };
+
+    for commit in [false, true] {
+        doc.apply_edit(E::ColorAdjustment(C::BeginLayer(target)))
+            .unwrap();
+        doc.apply_edit(E::ColorAdjustment(C::Preview(hue))).unwrap();
+        let preview = doc.display_snapshot();
+        assert_ne!(
+            preview.get(target_key).unwrap().pixels(),
+            original.get(target_key).unwrap().pixels()
+        );
+        assert_eq!(
+            preview.get(active_key).unwrap().pixels(),
+            original.get(active_key).unwrap().pixels()
+        );
+        assert!(matches!(
+            doc.encode_portable(),
+            Err(WebError::StrokeInProgress)
+        ));
+
+        let draft = doc.color_adjustment_projection().unwrap();
+        assert_eq!(draft.target, target);
+        let finish = if commit {
+            C::Commit {
+                generation: draft.generation,
+            }
+        } else {
+            C::Cancel
+        };
+        doc.apply_edit(E::ColorAdjustment(finish)).unwrap();
+        assert_eq!(doc.snapshot() == &original, !commit);
+        assert_eq!(doc.active_layer(), active);
+    }
+    let portable = doc.encode_portable().unwrap();
+    let reopened = WebDocument::decode_portable(&portable).unwrap();
+    assert_eq!(reopened.snapshot(), doc.snapshot());
+    assert_eq!(reopened.active_layer(), active);
+}
+
+#[test]
 fn direct_artwork_move_preserves_off_page_pixels_and_undo_as_one_edit() {
     use nyatidraw_api::EditCommand as E;
     let mut doc = WebDocument::new(CanvasSpec {

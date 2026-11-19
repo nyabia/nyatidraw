@@ -606,6 +606,7 @@ export function bindCanvas(canvas, callback) {
     if (event.pointerId !== active) return;
     cancel();
   };
+  canvas.addEventListener("nyati-hide-canvas", cancel);
   canvas.addEventListener("pointercancel", cancelActivePointer);
   canvas.addEventListener("lostpointercapture", cancelActivePointer);
   window.addEventListener("blur", () => {

@@ -307,7 +307,8 @@ mod windows_raw_mouse;
 
 #[cfg(windows)]
 pub use windows_raw_mouse::{
-    WindowsRawMouseHook, WindowsRawMousePacket, windows_mouse_motion_policy,
+    WindowsRawMouseHook, WindowsRawMousePacket, WindowsRawMouseRegistration,
+    windows_mouse_motion_policy,
 };
 
 #[cfg(windows)]

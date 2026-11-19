@@ -1,5 +1,7 @@
 //! Process-wide workspace preferences; never part of a project transaction.
-use nyatidraw_api::{DockTree, PanelKind};
+use nyatidraw_api::DockTree;
+#[cfg(feature = "legacy-ui")]
+use nyatidraw_api::PanelKind;
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -9,6 +11,7 @@ use std::{
 };
 
 const MAX_BYTES: usize = 4096;
+#[cfg(feature = "legacy-ui")]
 pub(crate) use nyatidraw_editor_ui::layout_store::PANELS;
 
 pub(crate) fn settings_path() -> Option<PathBuf> {
@@ -25,11 +28,21 @@ pub(crate) fn settings_path() -> Option<PathBuf> {
 
 /// Small workspace-only sizing preferences. Zero means use the content default.
 #[derive(Clone, PartialEq)]
+#[cfg(feature = "legacy-ui")]
+#[cfg_attr(
+    feature = "gpui",
+    allow(dead_code, reason = "The legacy shell stores per-panel heights.")
+)]
 pub(crate) struct PanelHeights {
     values: [u16; 12],
     writable: bool,
 }
 
+#[cfg(feature = "legacy-ui")]
+#[cfg_attr(
+    feature = "gpui",
+    allow(dead_code, reason = "The legacy shell stores per-panel heights.")
+)]
 impl PanelHeights {
     pub(crate) fn load() -> Self {
         let mut result = Self {
@@ -238,6 +251,11 @@ impl LayoutStore {
             .clone()
     }
 
+    #[cfg(feature = "legacy-ui")]
+    #[cfg_attr(
+        feature = "gpui",
+        allow(dead_code, reason = "Only the legacy shell uses this adapter.")
+    )]
     pub(crate) fn submit_heights(&self, heights: &PanelHeights) {
         if self.worker.is_none() {
             return;

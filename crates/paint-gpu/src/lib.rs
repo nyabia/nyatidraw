@@ -22,6 +22,13 @@ use std::sync::mpsc;
 use nyatidraw_brush::BrushDab;
 use wgpu::util::DeviceExt;
 
+// WebGPU 30 permits holes in pipeline slots. Our brush and compositor bind every listed slot.
+#[cfg(target_arch = "wasm32")]
+use std::option::Option::Some as pipeline_slot;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::convert::identity as pipeline_slot;
+
 pub const WORKING_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 const FLOATS_PER_INSTANCE: usize = 12;
@@ -111,6 +118,8 @@ pub enum GpuReadbackError {
     Poll(wgpu::PollError),
     /// Mapping the staging buffer for CPU read access failed.
     Map(wgpu::BufferAsyncError),
+    #[cfg(target_arch = "wasm32")]
+    MapRange(wgpu::MapRangeError),
     /// The GPU callback exited without reporting a mapping result.
     CallbackDisconnected,
 }
@@ -222,15 +231,19 @@ impl GpuWorkingTile {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-        device
-            .poll(wgpu::PollType::Wait)
-            .map_err(GpuReadbackError::Poll)?;
+        #[cfg(target_arch = "wasm32")]
+        let wait = wgpu::PollType::wait_indefinitely();
+        #[cfg(not(target_arch = "wasm32"))]
+        let wait = wgpu::PollType::Wait;
+        device.poll(wait).map_err(GpuReadbackError::Poll)?;
         receiver
             .recv()
             .map_err(|_| GpuReadbackError::CallbackDisconnected)?
             .map_err(GpuReadbackError::Map)?;
 
         let mapped = slice.get_mapped_range();
+        #[cfg(target_arch = "wasm32")]
+        let mapped = mapped.map_err(GpuReadbackError::MapRange)?;
         let mut pixels = Vec::with_capacity(layout.tight_bytes);
         for row in mapped
             .chunks_exact(layout.padded_bytes_per_row_usize)
@@ -405,8 +418,11 @@ impl GpuRoundDabPainter {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("nayati-round-dab-pipeline-layout"),
-            bind_group_layouts: &[&brush_layout, &selection.layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[
+                crate::pipeline_slot(&brush_layout),
+                crate::pipeline_slot(&selection.layout),
+            ],
+            ..Default::default()
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("nayati-round-dab-pipeline"),
@@ -415,7 +431,7 @@ impl GpuRoundDabPainter {
                 module: &shader,
                 entry_point: Some("vertex_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[crate::pipeline_slot(wgpu::VertexBufferLayout {
                     array_stride: INSTANCE_STRIDE,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &[
@@ -455,7 +471,7 @@ impl GpuRoundDabPainter {
                             shader_location: 6,
                         },
                     ],
-                }],
+                })],
             },
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -478,7 +494,10 @@ impl GpuRoundDabPainter {
                     },
                 })],
             }),
+            #[cfg(not(target_arch = "wasm32"))]
             multiview: None,
+            #[cfg(target_arch = "wasm32")]
+            multiview_mask: None,
             cache: None,
         });
         let instance_capacity = INITIAL_INSTANCE_CAPACITY;
@@ -588,8 +607,7 @@ impl GpuRoundDabPainter {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
+                ..Default::default()
             });
         }
         self.queue.submit([encoder.finish()]);
@@ -707,8 +725,7 @@ impl GpuRoundDabPainter {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
+                ..Default::default()
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.brush_bind_group, &[]);

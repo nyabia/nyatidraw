@@ -52,14 +52,14 @@ impl MaskBuffers {
         bytes: &[u8],
     ) -> Result<(), super::CompositeRenderError> {
         let required = bytes.len().max(4);
-        if required > MAX_MASK_BYTES
-            || required as u64 > u64::from(device.limits().max_storage_buffer_binding_size)
-        {
+        let max_binding_size =
+            usize::try_from(device.limits().max_storage_buffer_binding_size).unwrap_or(usize::MAX);
+        if required > MAX_MASK_BYTES || required > max_binding_size {
             return Err(super::CompositeRenderError::TooManyChildren);
         }
         if required > self.capacity {
             let capacity = required.next_power_of_two();
-            if capacity as u64 > u64::from(device.limits().max_storage_buffer_binding_size) {
+            if capacity > max_binding_size {
                 return Err(super::CompositeRenderError::TooManyChildren);
             }
             self.capacity = capacity;

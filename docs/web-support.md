@@ -3,7 +3,9 @@
 새 창·iframe 연동의 API와 일반 작업 저장소로부터의 격리는 [웹 임베딩](web-embedding.md),
 현재 작업 트리의 실제 확인 범위는 [연동 검증](measurements/web-integration.md)을 참고한다.
 
-상태: 데스크톱과 같은 공용 Dioxus 화면과 NTDR 저장 형식을 Pages에 배포했다.
+개발판의 Windows와 웹은 Longbridge GPUI Kit 화면을 공유한다. 지원 브라우저와 확인한 작업은
+[GPUI 편집기 결정](decisions/ADR-0066-gpui-editor.md)에 기록했다.
+이전 릴리스에서는 데스크톱과 같은 공용 Dioxus 화면과 NTDR 저장 형식을 Pages에 배포했다.
 이후 선택·채우기·변형·그룹·도킹을 공용 편집 코어에 연결한 확장도 Pages에 배포했다.
 Windows alpha.14의 패키징·공개 결과는 [배포 기록](releasing.md)에서 확인한다. 아래 현재 소스 범위와 과거
 공용 UI/NTDR 배포 기록, 초기 별도 UI 스파이크 기록을 구분한다.
@@ -50,16 +52,15 @@ DOM Pointer / coalesced samples
   → existing GpuCompositeScene: wgpu / WebGPU composition
   → browser canvas present
 
-Dioxus controls / edit gestures → editor shared edit plans → web-core accepts history
+GPUI Kit controls / edit gestures → editor shared edit plans → web-core accepts history
 completed tile delta + metadata → dedicated Worker (own WASM)
   → shared NTDR compression / database → IndexedDB / .ntdr download
 ```
 
-- `crates/editor-ui`: 데스크톱을 기준으로 한 공용 Dioxus 화면. 툴바·도구·세부 도구·
-  속성·크기·내비게이터·색상환·레이어·히스토리·도킹·CSS·아이콘을 단일 소스로 유지한다.
-- `apps/desktop`: Dioxus Desktop, 네이티브 캔버스·입력·파일·설정·종료 어댑터.
-- `apps/web`: 같은 화면을 Dioxus Web으로 렌더링하는 브라우저 입력·파일·복구 어댑터와
-  WebGPU presenter. 웹 전용 CSS는 파일 대화상자·시작 실패·알림 등 호스트 요소만 다룬다.
+- `crates/editor-gpui`에 툴바, 도구 속성, 내비게이터, 색상환, 레이어, 히스토리, 도킹과 타임라인이 있다.
+- `apps/desktop`은 Windows 입력과 캔버스, 파일 및 창을 연결한다.
+- `apps/gpui-web`은 같은 Rust 뷰를 띄운다. `apps/web`이 브라우저 입력, WebGPU 캔버스,
+  작업 파일, 복구와 임베드 메시지를 처리한다.
 - `crates/editor`: 선택 제스처·레이어 변경 계획·픽셀 편집·스포이트·자유 변형 세션·핸들 좌표를
   데스크톱에서 추출했다. 양쪽이 같은 구현을 호출하며, DB 쓰기와 이력 수용은 호스트가 맡는다.
 - `crates/web-core`: `editor`/`brush`/`input`/`paint-cpu`/`tiles`/`document` 재사용.
@@ -306,19 +307,19 @@ Clang이 PATH에 없으면 `CC_wasm32_unknown_unknown`으로 지정한다. Windo
 
 ```powershell
 rustup target add wasm32-unknown-unknown
-./tools/setup-web-ci.ps1
+rustup toolchain install nightly-2026-06-09 --profile minimal --target wasm32-unknown-unknown
 ./tools/setup-worker-ci.ps1
 ./tools/build-web.ps1 -DebugBuild -BasePath /
-python -m http.server 8766 --bind 127.0.0.1 --directory target/dx/nyatidraw-web/debug/web/public
+python -m http.server 8766 --bind 127.0.0.1 --directory target/gpui-web/debug/public
 ```
 
 브라우저에서 `http://127.0.0.1:8766/`을 연다. `file://`로 직접 열지 않는다.
 마지막 명령은 정적 파일 확인용 서버이며 종료는 해당 터미널에서 한다.
 
 배포 산출물은 `./tools/build-web.ps1`로 만든다. 기본 URL 경로는 `/nyatidraw/draw/`,
-출력은 `target/dx/nyatidraw-web/release/web/public`이다. `tools/build-site.ps1 -RequireWeb`이
+출력은 `target/gpui-web/release/public`이다. `tools/build-site.ps1 -RequireWeb`이
 웹 산출물을 포함한 사이트를 조립하며, `.github/workflows/pages.yml`은 Linux에서 코어 테스트,
-WASM Clippy, 검증된 DX 설치, 웹 빌드와 Pages 배포를 이어서 수행하도록 구성했다.
+WASM Clippy, 편집기와 Worker 빌드, Pages 배포를 이어서 수행하도록 구성했다.
 실제 CI 성공·공개 페이지 실행은 아래 검증 근거에 별도로 기록한다.
 
 ## alpha.14 공용 편집 공개 검증

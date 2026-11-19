@@ -24,16 +24,17 @@ pub(super) struct CompositionSurface {
 }
 
 impl CompositionSurface {
-    pub(super) fn new(parent: HWND) -> Result<Self, String> {
+    pub(super) fn new(parent: HWND, above_children: bool) -> Result<Self, String> {
         let apartment = ActorMta::new()?;
         // SAFETY: the actor retains the parent HWND until its surface and all
-        // composition objects drop. The WebView owns the separate topmost tree.
+        // composition objects drop. GPUI owns the bottom target while the
+        // legacy WebView owns the top target; the canvas takes the other one.
         unsafe {
             let device: IDCompositionDesktopDevice =
                 DCompositionCreateDevice2(None::<&IUnknown>)
                     .map_err(|error| format!("create canvas composition device: {error}"))?;
             let target = device
-                .CreateTargetForHwnd(parent, false)
+                .CreateTargetForHwnd(parent, above_children)
                 .map_err(|error| format!("create parent canvas target: {error}"))?;
             let visual = device
                 .CreateVisual()

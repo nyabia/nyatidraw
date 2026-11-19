@@ -29,8 +29,7 @@ pub fn ScaledExportButton(
                         onchange: move |event| {
                             match event.value().parse::<f64>() {
                                 Ok(percent) if percent.is_finite() && percent > 0.0 && percent <= 100.0 => {
-                                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                                    let next = source.map(|dimension| (f64::from(dimension) * percent / 100.0).round().max(1.0) as u32);
+                                    let next = crate::canvas_size::scaled_export_percent(source, percent).expect("validated percent");
                                     size.set(next); error.set(None);
                                 }
                                 _ => error.set(Some("비율은 0보다 크고 100 이하로 입력하세요.".into())),
@@ -44,10 +43,7 @@ pub fn ScaledExportButton(
                             onchange: move |event| {
                                 match event.value().parse::<u32>() {
                                     Ok(value) if value > 0 && value <= source[axis] => {
-                                        let other = 1 - axis;
-                                        let mut next = [0; 2];
-                                        next[axis] = value;
-                                        next[other] = u32::try_from((u64::from(source[other]) * u64::from(value) + u64::from(source[axis]) / 2) / u64::from(source[axis].max(1))).unwrap_or(source[other]).max(1);
+                                        let next = crate::canvas_size::scaled_export_axis(source, axis, value).expect("validated dimension");
                                         size.set(next); error.set(None);
                                     }
                                     _ => error.set(Some("크기는 1 px부터 원본 크기까지 입력하세요.".into())),

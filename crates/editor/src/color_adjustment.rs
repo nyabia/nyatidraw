@@ -16,7 +16,6 @@ struct Draft {
     snapshot: SnapshotId,
     original: TileSnapshot,
     tree: LayerTree,
-    target: LayerId,
     selection: Option<Arc<SelectionMask>>,
     displayed: TileSnapshot,
     projection: ColorAdjustmentProjection,
@@ -40,7 +39,7 @@ impl ColorAdjustmentSession {
 
     #[must_use]
     pub fn target(&self) -> Option<LayerId> {
-        self.draft.as_ref().map(|draft| draft.target)
+        self.draft.as_ref().map(|draft| draft.projection.target)
     }
 
     /// # Errors
@@ -60,7 +59,11 @@ impl ColorAdjustmentSession {
         next_id: &mut u128,
     ) -> Result<ColorAdjustmentOutcome, TransformError> {
         match command {
-            ColorAdjustmentCommand::Begin => {
+            ColorAdjustmentCommand::Begin | ColorAdjustmentCommand::BeginLayer(_) => {
+                let target = match command {
+                    ColorAdjustmentCommand::BeginLayer(layer) => layer,
+                    _ => target,
+                };
                 if self.draft.is_some() {
                     return Err(rejected("AlreadyAdjusting"));
                 }
@@ -85,10 +88,10 @@ impl ColorAdjustmentSession {
                     snapshot: store.current_snapshot(),
                     original,
                     tree: tree.clone(),
-                    target,
                     selection: selection.clone(),
                     displayed: result.after,
                     projection: ColorAdjustmentProjection {
+                        target,
                         generation: self.generation,
                         adjustment: ColorAdjustment::default(),
                         can_commit: true,
@@ -101,11 +104,11 @@ impl ColorAdjustmentSession {
                     .as_mut()
                     .ok_or_else(|| rejected("NoAdjustment"))?;
                 draft.projection.can_commit = false;
-                draft.guard(target, tree, selection, store)?;
+                draft.guard(tree, selection, store)?;
                 let result = adjust_raster_colors(
                     &draft.original,
                     tree,
-                    target,
+                    draft.projection.target,
                     selection.as_deref(),
                     adjustment,
                     EditLimits::default(),
@@ -120,6 +123,7 @@ impl ColorAdjustmentSession {
                     .ok_or_else(|| rejected("GenerationExhausted"))?;
                 draft.displayed = result.after;
                 draft.projection = ColorAdjustmentProjection {
+                    target: draft.projection.target,
                     generation: self.generation,
                     adjustment,
                     can_commit: true,
@@ -130,7 +134,7 @@ impl ColorAdjustmentSession {
                     .draft
                     .as_ref()
                     .ok_or_else(|| rejected("NoAdjustment"))?;
-                draft.guard(target, tree, selection, store)?;
+                draft.guard(tree, selection, store)?;
                 if !draft.projection.can_commit || generation != draft.projection.generation {
                     return Err(rejected("StalePreview"));
                 }
@@ -157,7 +161,7 @@ impl ColorAdjustmentSession {
                     .draft
                     .as_ref()
                     .ok_or_else(|| rejected("NoAdjustment"))?;
-                draft.guard(target, tree, selection, store)?;
+                draft.guard(tree, selection, store)?;
                 let outcome = ColorAdjustmentOutcome {
                     tiles: draft.original.clone(),
                     projection: None,
@@ -183,13 +187,11 @@ impl Draft {
     #[allow(clippy::ref_option)]
     fn guard(
         &self,
-        target: LayerId,
         tree: &LayerTree,
         selection: &Option<Arc<SelectionMask>>,
         store: &dyn TransformStore,
     ) -> Result<(), TransformError> {
-        if target != self.target
-            || tree != &self.tree
+        if tree != &self.tree
             || selection != &self.selection
             || store.current_snapshot() != self.snapshot
             || store.tiles().root() != self.original.root()
